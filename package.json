@@ -1,0 +1,35 @@
+{
+  "name": "@adviser/ovn-fabric",
+  "version": "0.1.0",
+  "description": "Declarative OVN/OVS topology generator — one config, one self-installing shell script per host.",
+  "license": "Apache-2.0",
+  "bin": {
+    "ovn-fabric": "bin/ovn-fabric.js"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mabels/ovn-fabric.git"
+  },
+  "homepage": "https://github.com/mabels/ovn-fabric#readme",
+  "bugs": {
+    "url": "https://github.com/mabels/ovn-fabric/issues"
+  },
+  "keywords": [
+    "ovn",
+    "ovs",
+    "sdn",
+    "networking",
+    "topology",
+    "deno",
+    "cli"
+  ],
+  "dependencies": {
+    "deno": "^2.9.1"
+  }
+}

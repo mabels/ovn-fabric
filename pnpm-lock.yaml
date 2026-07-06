@@ -1,0 +1,80 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      deno:
+        specifier: ^2.9.1
+        version: 2.9.1
+
+packages:
+
+  '@deno/darwin-arm64@2.9.1':
+    resolution: {integrity: sha512-aIRpWGuy8CDFKsxVqq//77ftRGnkxvvah0qqAgTVTFV0L5f7PQEzspBmvuxPZzHJS86tcwiCXqRLlt+BY8SqtQ==}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@deno/darwin-x64@2.9.1':
+    resolution: {integrity: sha512-a3OiVR+uKnJRy9U+ByAHgqQQG1WSXe3udl76/ZMTuQM32GT8qiJLKQPx5QjpGDVFqaxWU64JNtpGv383/wVoRQ==}
+    cpu: [x64]
+    os: [darwin]
+
+  '@deno/linux-arm64-glibc@2.9.1':
+    resolution: {integrity: sha512-D/ye7zmd3uzl2eB/k25+gEepqJEOl6/xrmKA06pgyfyOSjePUfPHYDs/kvIZ0P97Fu/M/HdH3+OzC8ZQiiVDww==}
+    cpu: [arm64]
+    os: [linux]
+    libc: [glibc]
+
+  '@deno/linux-x64-glibc@2.9.1':
+    resolution: {integrity: sha512-6lYd+mnFXPguzTQiPkFgxQIUijIQtRH5oYhsT4aKIET3tuJh/8YlaSoqCtSK8DQIpyJPrLwdUlSpOaSHdsEr8w==}
+    cpu: [x64]
+    os: [linux]
+    libc: [glibc]
+
+  '@deno/win32-arm64@2.9.1':
+    resolution: {integrity: sha512-lEqIMBHzrcXjmNIEhte5wKyM07BgJqqytae0q/9cgwXVvtm7JPGQOzVx6VYLWJ8H4XazqVWGViB6mDi/r0yWQQ==}
+    cpu: [arm64]
+    os: [win32]
+
+  '@deno/win32-x64@2.9.1':
+    resolution: {integrity: sha512-U0LZnDMUObQ6oVgDk1yAc3IcckFL33801EEoK5r/JLNEY/fxZIH5ib5edXj3E5oVNxa+b3z8sF/89qnSp/n+Yg==}
+    cpu: [x64]
+    os: [win32]
+
+  deno@2.9.1:
+    resolution: {integrity: sha512-2nzFWNVGtg4W4BmCpYJE9bTRPHcqdpfV+NJ5+xe6nqtaiSMtzr2NwFkhMtWjyLboNh6FsEEESk5TYNyBkHJ96g==}
+    hasBin: true
+
+snapshots:
+
+  '@deno/darwin-arm64@2.9.1':
+    optional: true
+
+  '@deno/darwin-x64@2.9.1':
+    optional: true
+
+  '@deno/linux-arm64-glibc@2.9.1':
+    optional: true
+
+  '@deno/linux-x64-glibc@2.9.1':
+    optional: true
+
+  '@deno/win32-arm64@2.9.1':
+    optional: true
+
+  '@deno/win32-x64@2.9.1':
+    optional: true
+
+  deno@2.9.1:
+    optionalDependencies:
+      '@deno/darwin-arm64': 2.9.1
+      '@deno/darwin-x64': 2.9.1
+      '@deno/linux-arm64-glibc': 2.9.1
+      '@deno/linux-x64-glibc': 2.9.1
+      '@deno/win32-arm64': 2.9.1
+      '@deno/win32-x64': 2.9.1
