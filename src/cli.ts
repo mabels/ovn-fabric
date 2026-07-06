@@ -15,6 +15,7 @@ import {
   string,
   subcommands,
 } from "npm:cmd-ts@0.13.0";
+import { pathToFileURL } from "node:url";
 
 import { generateOvnScripts } from "./generate-ovn.ts";
 import type { NetworkDefinition } from "./define.ts";
@@ -56,7 +57,19 @@ function isNetworkDefinition(value: unknown): value is NetworkDefinition {
 
 async function loadConfig(configPath: string): Promise<NetworkDefinition> {
   const resolved = await Deno.realPath(configPath);
-  const mod = await import(`file://${resolved}`);
+  // pathToFileURL (not a hand-rolled "file://" + string template) is
+  // deliberate: something in the JSR publish pipeline appears to
+  // rewrite a literal `` `file://${resolved}` `` dynamic-import
+  // specifier into a broken relative path (confirmed live, 2026-07-06
+  // — v0.1.3/v0.1.4 were both published with that exact line silently
+  // corrupted into `../../../../../../${resolved}`, despite the
+  // committed source and a fresh git clone both showing the correct
+  // "file://" form — the JSR manifest's own recorded file size for
+  // src/cli.ts, 6020 bytes, matched the broken variant to the byte,
+  // not the correct 6009-byte original). Constructing the URL via the
+  // standard API instead of a string literal that merely starts with
+  // "file://" sidesteps whatever static pattern that transform keys on.
+  const mod = await import(pathToFileURL(resolved).href);
 
   const found = Object.values(mod).find(isNetworkDefinition);
   if (found === undefined) {
