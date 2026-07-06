@@ -8,9 +8,11 @@
     "./cli": "./src/cli.ts"
   },
   "tasks": {
-    "check": "deno check src/*.ts"
+    "check": "deno check src/*.ts",
+    "test": "deno test --allow-read --allow-env src/*_test.ts"
   },
   "publish": {
-    "include": ["src/**/*.ts", "README.md", "LICENSE"]
+    "include": ["src/**/*.ts", "README.md", "LICENSE"],
+    "exclude": ["src/*_test.ts"]
   }
 }

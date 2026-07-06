@@ -49,6 +49,9 @@ jobs:
       - name: Type-check
         run: npx deno check src/*.ts examples/*.ts
 
+      - name: Unit tests
+        run: npx deno test --allow-read --allow-env src/*_test.ts
+
       - name: Smoke test — deno entry point directly
         run: npx deno run --allow-read --allow-env src/cli.ts generate examples/minimal-topology.ts
 
@@ -83,6 +86,9 @@ jobs:
 
       - name: Type-check (final gate before publish)
         run: npx deno check src/*.ts examples/*.ts
+
+      - name: Unit tests (final gate before publish)
+        run: npx deno test --allow-read --allow-env src/*_test.ts
 
       - name: Publish to npm (OIDC trusted publisher — no token)
         run: |

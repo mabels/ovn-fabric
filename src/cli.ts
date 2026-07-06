@@ -38,6 +38,8 @@ function describeInterface(ifc: InterfaceKind): string {
       return `bridge-port ${ifc.port} on ${ifc.bridge}`;
     case "wireguard":
       return `wireguard ${ifc.ifaceName} -> ${ifc.config.peer.endpoint}`;
+    case "zerotier":
+      return `zerotier network ${ifc.networkId} (home ${ifc.instanceDir})`;
     case "dummy":
       return `dummy (placeholder, no real interface)`;
   }

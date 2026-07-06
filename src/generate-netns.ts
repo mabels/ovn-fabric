@@ -77,6 +77,7 @@ function netnsName(u: Uplink): string {
  * principle, different fork of the SAME check. */
 function realIfaceFor(u: Uplink): string | undefined {
   if (u.if.kind === "wireguard") return u.if.ifaceName;
+  if (u.if.kind === "zerotier") return `$${zerotierIfaceVarName(u)}`;
   if (u.backdoor !== undefined) return backdoorVethNetns(u.backdoor);
   if (u.if.kind === "vlan") {
     return u.if.ifaceName ?? `${u.if.vlanParent}.${u.if.vlanId}`;
@@ -84,6 +85,23 @@ function realIfaceFor(u: Uplink): string | undefined {
   if (u.if.kind === "dummy") return dummyIface(u);
   if (u.if.kind === "physical") return u.if.name;
   return undefined;
+}
+
+// ZeroTier names its own resulting interface (e.g. "ztppafp5un") —
+// unlike wireguard's ifaceName, this generator does not control it and
+// cannot know it at generation time. Captured into a shell variable at
+// RUNTIME instead (see emitZerotierInterface below), the same
+// "resolved live in the generated script, not by this generator" idiom
+// $CHASSIS already uses (see generate-ovn.ts header comment).
+// realIfaceFor above returns "$<this name>" (a live shell-variable
+// reference) so every OTHER emit function that consumes realIface
+// (NAT, discovery dispatch, ...) keeps working unmodified — they just
+// interpolate a variable reference instead of a literal name, and bash
+// expands it at the time each of THOSE lines actually runs, which is
+// always after this variable was assigned (emitZerotierInterface runs
+// before NAT/discovery in emitUplinkNetns's own ordering below).
+function zerotierIfaceVarName(u: Uplink): string {
+  return `ZT_IFACE_${u.slot}`;
 }
 
 /** WireGuard: writes the conf file (built from `ifc.config` — see
@@ -145,6 +163,69 @@ function emitWireguardInterface(
     "}",
     `ip netns exec ${ns} wg show ${ifc.ifaceName} >/dev/null 2>&1 || ` +
       `ip netns exec ${ns} wg-quick up ${confPath}`,
+  ];
+}
+
+/** ZeroTier: starts the daemon (confined to this uplink's own netns,
+ * using its own dedicated `ifc.instanceDir` — never the host's default
+ * `/var/lib/zerotier-one`), joins `ifc.networkId`, then captures the
+ * resulting real interface name into a shell variable at RUNTIME (see
+ * zerotierIfaceVarName/realIfaceFor above) since this generator has no
+ * way to know or control what ZeroTier will call it.
+ *
+ * NOT yet verified against a live host — first draft, same starting
+ * point wireguard's own integration had before several rounds of live
+ * correction (see emitWireguardInterface's history). Specifically
+ * unverified: the exact `-D<dir>` flag syntax on both `zerotier-one`
+ * and `zerotier-cli` (recalled from ZeroTier's own docs, not tested
+ * here), and the `portDeviceName` field name in `zerotier-cli -j
+ * listnetworks`'s JSON output (also recalled, not tested) — check both
+ * against the real installed version (1.16.2, confirmed on
+ * 192.168.129.88) before trusting this on a production box.
+ *
+ * Two short bounded-retry loops, not a fixed `sleep N`: the daemon
+ * needs a moment to create its control socket/authtoken before
+ * `zerotier-cli` can reach it at all, and again a moment after
+ * `join` before the network is authorized-and-configured enough for
+ * `listnetworks` to report a real portDeviceName — a fixed sleep would
+ * either flake (too short) or waste boot time (too long) for what's an
+ * inherently variable wait. Joining itself does NOT require
+ * authorization to succeed (an unauthorized member still shows up in
+ * `listnetworks`, just with no assigned addresses/routes yet) — the
+ * generator can get this far entirely on its own; authorizing the new
+ * member is a controller-side admin action on a DIFFERENT system (see
+ * InterfaceKind's "zerotier" variant, types.ts) that has to happen
+ * before any real traffic flows, regardless of how this script runs. */
+function emitZerotierInterface(
+  u: Uplink,
+  ns: string,
+  ifc: Extract<InterfaceKind, { kind: "zerotier" }>,
+): string[] {
+  const dir = ifc.instanceDir;
+  const varName = zerotierIfaceVarName(u);
+
+  return [
+    `# --- zerotier: ${u.name} (network ${ifc.networkId}, home ${dir}) ---`,
+    `mkdir -p ${dir}`,
+    // Idempotent daemon start — pgrep matches on the exact instance
+    // dir (not just "zerotier-one"), so a second zerotier-kind uplink
+    // on this same host would never false-positive against this one's
+    // already-running daemon.
+    `ip netns exec ${ns} pgrep -f "zerotier-one -d ${dir}" >/dev/null || ` +
+      `ip netns exec ${ns} zerotier-one -d ${dir}`,
+    `for i in $(seq 1 10); do ` +
+      `ip netns exec ${ns} zerotier-cli -D${dir} info >/dev/null 2>&1 && break; ` +
+      `sleep 1; done`,
+    // join is itself idempotent (a no-op if already a member) — no
+    // separate existence check needed, unlike the daemon-start line
+    // above.
+    `ip netns exec ${ns} zerotier-cli -D${dir} join ${ifc.networkId}`,
+    `for i in $(seq 1 30); do ` +
+      `${varName}=$(ip netns exec ${ns} zerotier-cli -D${dir} -j listnetworks | ` +
+      `jq -r '.[] | select(.nwid=="${ifc.networkId}") | .portDeviceName' ` +
+      `2>/dev/null); [ -n "$${varName}" ] && [ "$${varName}" != "null" ] && break; ` +
+      `sleep 1; done`,
+    `ip netns exec ${ns} ip link set "$${varName}" up`,
   ];
 }
 
@@ -356,6 +437,10 @@ export function emitUplinkNetns(
     // A real interface of its own — created here alongside (not
     // instead of) the backdoor block above.
     lines.push(...emitWireguardInterface(u, ns, u.if));
+  } else if (u.if.kind === "zerotier") {
+    // Same "real interface of its own, alongside any backdoor" shape
+    // as wireguard above.
+    lines.push(...emitZerotierInterface(u, ns, u.if));
   } else if (u.backdoor === undefined) {
     // No backdoor AND no wireguard tunnel: fall through to the plain
     // vlan/dummy/physical creation. (When a backdoor IS present and

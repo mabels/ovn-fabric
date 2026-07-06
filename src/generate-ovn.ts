@@ -70,6 +70,36 @@ function v6Prefix(addrIndex: { ipv6: { to_string(): string } }): string {
   return addrIndex.ipv6.to_string();
 }
 
+// `ovn-nbctl --may-exist lrp-add` is NOT actually idempotent across a
+// config change: it only no-ops when the EXISTING port's mac AND
+// networks both already match exactly — if either changed (e.g. a
+// segment's gatewaySuffix moves from .2 to .1, which folds into a
+// different mac too, see macFromV4), it errors out instead of
+// reconfiguring the port. Confirmed live, 2026-07-06, after regenerating
+// "neighbor" with a new gatewaySuffix:
+//   ovn-nbctl: lrp-neighbor: port already exists with mac 00:00:c0:a8:82:02
+// Rather than re-implementing ovn-nbctl's own mac/networks comparison
+// ourselves (which would mean parsing `--bare --columns=...` output in
+// the generated shell, fragile and unverified against a live box),
+// unconditionally drop and re-add the port — simple and always
+// correct. Nothing else is lost by the brief drop: gateway-chassis
+// assignment (emitGatewayChassis), the ipv6_ra_configs toggle, and the
+// switch-side lsp's router-port option are all re-applied
+// unconditionally right after, every time this script runs, regardless
+// of whether the port was just recreated or already existed unchanged.
+function emitIdempotentLrpAdd(
+  router: string,
+  lrp: string,
+  mac: string,
+  v4: string,
+  v6: string,
+): string[] {
+  return [
+    `ovn-nbctl --if-exists lrp-del ${lrp}`,
+    `ovn-nbctl lrp-add ${router} ${lrp} ${mac} ${v4} ${v6}`,
+  ];
+}
+
 // Every logical router port that faces a localnet network (segment
 // client-facing side, segment/uplink backbone-facing side, uplink
 // transfer-link side) needs a gateway chassis assignment, or
@@ -188,8 +218,13 @@ function emitSegment(s: Segment): string[] {
     `ovn-nbctl lsp-set-addresses ${lspLocalnet} unknown`,
     `ovn-nbctl lsp-set-options ${lspLocalnet} network_name=${networkName}`,
     `ovn-nbctl --may-exist lr-add ${router}`,
-    `ovn-nbctl --may-exist lrp-add ${router} ${lrp} ${mac} ` +
-      `${v4Prefix(s.addresses[0])} ${v6Prefix(s.addresses[0])}`,
+    ...emitIdempotentLrpAdd(
+      router,
+      lrp,
+      mac,
+      v4Prefix(s.addresses[0]),
+      v6Prefix(s.addresses[0]),
+    ),
     ...emitGatewayChassis(lrp),
   ];
 
@@ -245,8 +280,13 @@ function emitUplinkTransfer(u: Uplink): string[] {
     `ovn-nbctl lsp-set-addresses ${lspLocalnet} unknown`,
     `ovn-nbctl lsp-set-options ${lspLocalnet} network_name=${networkName}`,
     `ovn-nbctl --may-exist lr-add ${router}`,
-    `ovn-nbctl --may-exist lrp-add ${router} ${lrp} ${mac} ` +
-      `${v4Prefix(ovnSide)} ${v6Prefix(ovnSide)}`,
+    ...emitIdempotentLrpAdd(
+      router,
+      lrp,
+      mac,
+      v4Prefix(ovnSide),
+      v6Prefix(ovnSide),
+    ),
     ...emitGatewayChassis(lrp),
     `ovn-nbctl --may-exist lsp-add ${sw} ${lspRouter}`,
     `ovn-nbctl lsp-set-type ${lspRouter} router`,
@@ -294,8 +334,13 @@ function emitBackdoor(u: Uplink): string[] {
     `ovn-nbctl lsp-set-type ${lspLocalnet} localnet`,
     `ovn-nbctl lsp-set-addresses ${lspLocalnet} unknown`,
     `ovn-nbctl lsp-set-options ${lspLocalnet} network_name=${networkName}`,
-    `ovn-nbctl --may-exist lrp-add ${viaRouter} ${lrp} ${mac} ` +
-      `${v4Prefix(ovnSide)} ${v6Prefix(ovnSide)}`,
+    ...emitIdempotentLrpAdd(
+      viaRouter,
+      lrp,
+      mac,
+      v4Prefix(ovnSide),
+      v6Prefix(ovnSide),
+    ),
     ...emitGatewayChassis(lrp),
     `ovn-nbctl --may-exist lsp-add ${sw} ${lspRouter}`,
     `ovn-nbctl lsp-set-type ${lspRouter} router`,
@@ -306,28 +351,45 @@ function emitBackdoor(u: Uplink): string[] {
 }
 
 // ── tier 2: backbone join (segment <-> currently-resolved uplink) ───
+//
+// One segment can now have MULTIPLE simultaneous backbone joins: its
+// primary `uplink` (default route + NAT), plus zero or more
+// `extraRoutes` entries (a more-specific prefix into a SECONDARY
+// uplink — e.g. a private supernet into a ZeroTier-mesh uplink — see
+// ExtraRoute, types.ts). Each join needs its OWN object names (so a
+// segment joining two different uplinks doesn't reuse one LRP/LSP name
+// for both) and its OWN segment-side backbone address (so two joins
+// for the same segment don't claim the identical address on the
+// shared sw-backbone bus) — `nameSuffix`/`segBackboneHost` below exist
+// for exactly that: the primary join keeps today's exact names/host=1
+// (nameSuffix "", so nothing about an already-working segment's
+// primary join changes), and each extra route gets a distinct suffix
+// and host offset (2, 3, ...).
 
-function emitSegmentBackboneJoin(s: Segment): string[] {
-  // No uplink assigned yet — deliberately no backbone join, no route,
-  // no NAT for this segment (see Segment.uplink, types.ts). Isolated
-  // is the safe default until a real uplink (e.g. a WireGuard VPN
-  // tunnel) exists for it, rather than falling through to whichever
-  // uplink happens to be declared elsewhere in the config.
-  if (s.uplink === undefined) {
-    return [`# --- segment ${s.name}: no uplink assigned, isolated ---`, ""];
-  }
+interface BackboneRoute {
+  readonly v4Prefix: string;
+  /** Omit for a v4-only route (e.g. a private-supernet extra route
+   * with no IPv6 equivalent declared). */
+  readonly v6Prefix?: string;
+}
 
+function emitBackboneJoin(
+  s: Segment,
+  resolved: Uplink,
+  segBackboneHost: number,
+  nameSuffix: string,
+  routes: readonly BackboneRoute[],
+): string[] {
   const segRouter = `router-${s.name}`;
-  const segLrpBb = `lrp-${s.name}-bb`;
-  const segLspBb = `lsp-backbone-${s.name}`;
+  const segLrpBb = `lrp-${s.name}-bb${nameSuffix}`;
+  const segLspBb = `lsp-backbone-${s.name}${nameSuffix}`;
 
-  const resolved = s.uplink.resolve();
   const upRouter = `router-uplink-${resolved.name}`;
   const upLrpBb = `lrp-uplink-${resolved.name}-bb`;
   const upLspBb = `lsp-backbone-uplink-${resolved.name}`;
 
   const segId = s.addresses[0].id();
-  const segBackbone = segmentBackboneNet(segId, 1);
+  const segBackbone = segmentBackboneNet(segId, segBackboneHost);
   const upBackbone = uplinkBackboneNet(
     resolved.addresses[0].id(),
     resolved.slot,
@@ -337,24 +399,47 @@ function emitSegmentBackboneJoin(s: Segment): string[] {
   const segMac = macFromV4(segBackbone.ipv4);
   const upMac = macFromV4(upBackbone.ipv4);
 
+  const routeLines = routes.flatMap((r) => {
+    const lines = [
+      `ovn-nbctl --may-exist lr-route-add ${segRouter} ${r.v4Prefix} ${upBackbone.ipv4.to_s()}`,
+    ];
+    if (r.v6Prefix !== undefined) {
+      lines.push(
+        `ovn-nbctl --may-exist lr-route-add ${segRouter} ${r.v6Prefix} ${upBackbone.ipv6.to_s()}`,
+      );
+    }
+    return lines;
+  });
+
   return [
-    `# --- backbone join: segment ${s.name} -> uplink ${resolved.name} ---`,
-    `ovn-nbctl --may-exist lrp-add ${segRouter} ${segLrpBb} ${segMac} ` +
-      `${v4Prefix(segBackbone)} ${v6Prefix(segBackbone)}`,
+    `# --- backbone join: segment ${s.name} -> uplink ${resolved.name}${
+      nameSuffix ? ` (${nameSuffix.replace(/^-/, "")})` : ""
+    } ---`,
+    ...emitIdempotentLrpAdd(
+      segRouter,
+      segLrpBb,
+      segMac,
+      v4Prefix(segBackbone),
+      v6Prefix(segBackbone),
+    ),
     ...emitGatewayChassis(segLrpBb),
     `ovn-nbctl --may-exist lsp-add sw-backbone ${segLspBb}`,
     `ovn-nbctl lsp-set-type ${segLspBb} router`,
     `ovn-nbctl lsp-set-addresses ${segLspBb} router`,
     `ovn-nbctl lsp-set-options ${segLspBb} router-port=${segLrpBb}`,
-    `ovn-nbctl --may-exist lrp-add ${upRouter} ${upLrpBb} ${upMac} ` +
-      `${v4Prefix(upBackbone)} ${v6Prefix(upBackbone)}`,
+    ...emitIdempotentLrpAdd(
+      upRouter,
+      upLrpBb,
+      upMac,
+      v4Prefix(upBackbone),
+      v6Prefix(upBackbone),
+    ),
     ...emitGatewayChassis(upLrpBb),
     `ovn-nbctl --may-exist lsp-add sw-backbone ${upLspBb}`,
     `ovn-nbctl lsp-set-type ${upLspBb} router`,
     `ovn-nbctl lsp-set-addresses ${upLspBb} router`,
     `ovn-nbctl lsp-set-options ${upLspBb} router-port=${upLrpBb}`,
-    `ovn-nbctl --may-exist lr-route-add ${segRouter} 0.0.0.0/0 ${upBackbone.ipv4.to_s()}`,
-    `ovn-nbctl --may-exist lr-route-add ${segRouter} ::/0 ${upBackbone.ipv6.to_s()}`,
+    ...routeLines,
     // Backroute: the uplink router has no other way to learn how to
     // reach this segment's client subnet — it's two hops away
     // (uplink router -> sw-backbone -> segment router -> segment
@@ -366,7 +451,10 @@ function emitSegmentBackboneJoin(s: Segment): string[] {
     // reach the uplink router's backbone address (10.80.0.9) but then
     // get no further response — the uplink router had received the
     // packet and generated a TTL-exceeded reply, but had nowhere to
-    // route that reply back to, so it silently dropped it.
+    // route that reply back to, so it silently dropped it. Emitted
+    // unconditionally for EVERY join (primary or extra route) — the
+    // secondary uplink needs this just as much as the primary one
+    // does, regardless of which prefix(es) it's carrying.
     // `ovn-nbctl lr-route-add` normalizes a host+prefix (e.g.
     // 192.168.128.2/24) down to the true network address itself —
     // confirmed live — so v4Prefix(s.addresses[0]) is safe to pass
@@ -375,6 +463,48 @@ function emitSegmentBackboneJoin(s: Segment): string[] {
     `ovn-nbctl --may-exist lr-route-add ${upRouter} ${v6Prefix(s.addresses[0])} ${segBackbone.ipv6.to_s()}`,
     "",
   ];
+}
+
+function emitSegmentBackboneJoin(s: Segment): string[] {
+  const lines: string[] = [];
+
+  // No uplink assigned yet — deliberately no backbone join, no route,
+  // no NAT for this segment (see Segment.uplink, types.ts). Isolated
+  // is the safe default until a real uplink (e.g. a WireGuard VPN
+  // tunnel) exists for it, rather than falling through to whichever
+  // uplink happens to be declared elsewhere in the config.
+  if (s.uplink === undefined) {
+    lines.push(`# --- segment ${s.name}: no uplink assigned, isolated ---`, "");
+  } else {
+    lines.push(
+      ...emitBackboneJoin(s, s.uplink.resolve(), 1, "", [
+        { v4Prefix: "0.0.0.0/0", v6Prefix: "::/0" },
+      ]),
+    );
+  }
+
+  // Extra routes: each gets its own backbone join, its own segment-side
+  // backbone host offset (2, 3, ... — 1 is taken by the primary join
+  // above, or would be if this segment ever gets one later), and a
+  // name suffix that includes BOTH the entry's index and the target
+  // uplink's name. The index is required, not cosmetic: two
+  // extraRoutes entries for the same segment CAN target the same
+  // uplink (e.g. one route for the mesh's client subnets, a second
+  // narrower one just for that uplink's own transfer-link block, for
+  // debugging) — suffixing by uplink name alone would collide in that
+  // case. segBackboneNet's host range is 1-7 (see addressing.ts) —
+  // plenty for the primary join plus a handful of extra routes per
+  // segment.
+  (s.extraRoutes ?? []).forEach((extra, i) => {
+    const resolved = extra.uplink.resolve();
+    lines.push(
+      ...emitBackboneJoin(s, resolved, i + 2, `-extra-${i}-${resolved.name}`, [
+        { v4Prefix: extra.prefix, v6Prefix: extra.prefix6 },
+      ]),
+    );
+  });
+
+  return lines;
 }
 
 // ── required OS packages ────────────────────────────────────────────
@@ -424,6 +554,19 @@ function requiredPackages(uplinks: readonly Uplink[]): string[] {
       packages.add(CLIENT_PACKAGE.dhclient);
     }
     if (u.if.kind === "wireguard") packages.add("wireguard-tools");
+    if (u.if.kind === "zerotier") {
+      // "zerotier-one" is deliberately included here (for the boot-safe
+      // preflight check, emitPreflightChecks below — a plain `dpkg -s`
+      // works regardless of how it got installed) but excluded from
+      // emitAptInstall's plain `apt-get install` line below: it isn't
+      // installable that way with no ZeroTier apt repo configured yet
+      // — see emitZerotierInstall. "jq" IS a normal apt package (used
+      // to parse `zerotier-cli -j listnetworks`, see
+      // emitZerotierInterface, generate-netns.ts), so it stays in the
+      // regular apt-get line.
+      packages.add("zerotier-one");
+      packages.add("jq");
+    }
   }
   return [...packages].sort();
 }
@@ -432,12 +575,47 @@ function requiredPackages(uplinks: readonly Uplink[]): string[] {
  * spaces throughout: spliced directly inside scriptForHost's `$1 !=
  * --setup-only` block. */
 function emitAptInstall(uplinks: readonly Uplink[]): string[] {
-  const packages = requiredPackages(uplinks);
-  return [
+  const packages = requiredPackages(uplinks).filter((p) => p !== "zerotier-one");
+  const lines = [
     "  # install required packages (this branch only runs on a manual,",
     "  # direct invocation — never on the systemd/boot path, see header",
     "  # comment on requiredPackages above)",
     `  apt-get install -y ${packages.join(" ")}`,
+  ];
+  lines.push(...emitZerotierInstall(uplinks));
+  return lines;
+}
+
+/** Manual/first-run only, same as emitAptInstall above — only emitted
+ * (non-empty) when this topology actually declares a "zerotier"-kind
+ * uplink. ZeroTier isn't installable via a plain `apt-get install` with
+ * no repo configured yet; the official installer adds the repo AND
+ * installs the package in one step. Timeout-capped (curl, or the
+ * installer itself, can hang indefinitely on a stalled connection) —
+ * but this whole branch already only ever runs on a manual, direct
+ * invocation, never the systemd/boot path (see header comment above),
+ * so a slow or failed install here can't block startup either way. No
+ * `sudo` in the pipeline: this whole script already runs as root (same
+ * as the plain `apt-get install` line above, which also has none). */
+function emitZerotierInstall(uplinks: readonly Uplink[]): string[] {
+  if (!uplinks.some((u) => u.if.kind === "zerotier")) return [];
+  return [
+    "  # zerotier-one: no apt repo configured yet, so a plain apt-get",
+    "  # can't install it -- the official installer adds the repo AND",
+    "  # installs the package. Skipped if already present (idempotent,",
+    "  # and avoids re-curling on every manual run).",
+    "  dpkg -s zerotier-one >/dev/null 2>&1 || " +
+      'timeout 120 bash -c "curl -s https://install.zerotier.com | bash"',
+    "  # The installer enables+starts the package's own main",
+    "  # zerotier-one.service, running as a HOST-level daemon against",
+    "  # the default /var/lib/zerotier-one -- completely separate from,",
+    "  # and not needed alongside, the per-uplink instance(s) this",
+    "  # script manages itself inside each uplink's own netns (see",
+    "  # emitZerotierInterface, generate-netns.ts). Left running, it's",
+    "  # a second, pointless ZT identity nobody authorizes or uses.",
+    "  # `disable --now` is idempotent (safe even if already disabled)",
+    "  # and covers both 'never start at boot' and 'stop it now'.",
+    "  systemctl disable --now zerotier-one.service 2>/dev/null || true",
   ];
 }
 

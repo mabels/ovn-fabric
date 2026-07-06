@@ -119,18 +119,125 @@ export function uplinkBackboneNet(
 // (e.g. segment 128 is untagged on the wire, so its real VLAN concept
 // doesn't apply the same way — see untaggedOnWire on Segment).
 
+// A literal address the caller supplies directly (e.g. "192.168.130.5" or
+// "192.168.130.5/28") rather than one folded from the segment id + a
+// suffix. IPAddress.parse() itself defaults a bare address (no "/...")
+// to a /32 (v4) or /128 (v6) host route, which is never what a segment
+// gateway wants — so a missing prefix is filled in with this segment's
+// usual one (/24 v4, /64 v6) before parsing, not left as a host route.
+function parseGatewayLiteral(addr: string, defaultPrefix: number): IPAddress {
+  const withPrefix = addr.includes("/") ? addr : `${addr}/${defaultPrefix}`;
+  return IPAddress.parse(withPrefix);
+}
+
+// Extract the host-id embedded in a literal address, so it can be
+// "transferred" over to fold the OTHER family's address when that
+// family has no suffix/literal of its own (see segmentNet below).
+// Deliberately text-based (split + parseInt base 10), NOT a numeric
+// IPAddress operation: the host-id is a human-readable DECIMAL label
+// placed directly into the address text (see this file's header
+// comment), not a real integer derived from the address's binary
+// value — e.g. IPv6 "::10" is meant to read as "host 10", even though
+// as a real hex group it's worth 16. `IPAddress.sub()`/`.add()` operate
+// on the true binary value and would silently give the wrong number
+// here; text extraction preserves the label as typed.
+function extractSuffixFromIpv4Literal(addr: string): number {
+  const parts = addr.split("/")[0].split(".");
+  const last = parts[parts.length - 1];
+  const n = Number.parseInt(last, 10);
+  if (Number.isNaN(n)) {
+    throw new Error(
+      `segmentNet: could not extract a host-id from ipv4 literal "${addr}"`,
+    );
+  }
+  return n;
+}
+
+function extractSuffixFromIpv6Literal(addr: string): number {
+  const groups = addr.split("/")[0].split(":").filter((g) => g.length > 0);
+  const last = groups[groups.length - 1];
+  const n = Number.parseInt(last, 10);
+  if (Number.isNaN(n)) {
+    throw new Error(
+      `segmentNet: could not extract a host-id from ipv6 literal "${addr}"`,
+    );
+  }
+  return n;
+}
+
+export interface SegmentNetInput {
+  /** Host-id folded into the segment's standard pattern: IPv4
+   * 192.168.<id>.<suffix>/24, IPv6 fd00:192:168:<id>::<suffix>/64
+   * (unless `suffix6` or `ipv6` override the IPv6 side — see below).
+   * Required unless at least one of `ipv4`/`ipv6` is given — see the
+   * resolution rules on segmentNet() below for exactly how a partial
+   * set of these five fields gets filled in. */
+  readonly suffix?: number;
+  /** Override just the IPv6 host-id, if it should differ from `suffix`
+   * (e.g. gateway answers on ...::<suffix6> while IPv4 answers on
+   * .<suffix>). Defaults to `suffix`. Ignored if `ipv6` is set. */
+  readonly suffix6?: number;
+  /** A literal IPv4 address/prefix (e.g. "192.168.130.5" or
+   * "192.168.130.5/28") that replaces the folded pattern entirely for
+   * the v4 side — for a gateway address that doesn't fit this
+   * segment's usual 192.168.<id>.<n>/24 shape. A bare address without
+   * "/..." gets this segment's default /24, not IPAddress's own /32
+   * host-route default. */
+  readonly ipv4?: string;
+  /** Same as `ipv4`, for the v6 side (default prefix /64 if omitted). */
+  readonly ipv6?: string;
+  readonly vlan?: number;
+}
+
+// Resolution rules, per family (v4 shown; v6 is the mirror image):
+//   1. `ipv4` given -> use it, literally (parsed/validated).
+//   2. else `suffix` given -> fold it into the standard v4 pattern.
+//   3. else `ipv6` given -> "transfer": extract the host-id out of the
+//      literal ipv6 text and fold THAT into the standard v4 pattern,
+//      so a caller supplying only one family's literal doesn't also
+//      have to spell out a redundant suffix.
+//   4. else -> throw: nothing at all was given for this family.
 export function segmentNet(
   segment: SegmentId | number,
-  host: number,
-  vlan?: number,
+  input: SegmentNetInput,
 ): NetId {
   const id = typeof segment === "number" ? segmentId(segment) : segment;
-  return makeNetId(
-    `192.168.${id}.${host}/24`,
-    `fd00:192:168:${id}::${host}/64`,
-    id,
-    vlan ?? id,
-  );
+
+  let ipv4: IPAddress;
+  if (input.ipv4 !== undefined) {
+    ipv4 = parseGatewayLiteral(input.ipv4, 24);
+  } else if (input.suffix !== undefined) {
+    ipv4 = IPAddress.parse(`192.168.${id}.${input.suffix}/24`);
+  } else if (input.ipv6 !== undefined) {
+    const transferred = extractSuffixFromIpv6Literal(input.ipv6);
+    ipv4 = IPAddress.parse(`192.168.${id}.${transferred}/24`);
+  } else {
+    throw new Error(
+      `segmentNet: segment ${id} needs one of "suffix", "ipv4", or "ipv6"`,
+    );
+  }
+
+  let ipv6: IPAddress;
+  if (input.ipv6 !== undefined) {
+    ipv6 = parseGatewayLiteral(input.ipv6, 64);
+  } else if (input.suffix6 !== undefined || input.suffix !== undefined) {
+    const suffix6 = input.suffix6 ?? input.suffix as number;
+    ipv6 = IPAddress.parse(`fd00:192:168:${id}::${suffix6}/64`);
+  } else if (input.ipv4 !== undefined) {
+    const transferred = extractSuffixFromIpv4Literal(input.ipv4);
+    ipv6 = IPAddress.parse(`fd00:192:168:${id}::${transferred}/64`);
+  } else {
+    throw new Error(
+      `segmentNet: segment ${id} needs one of "suffix", "suffix6", or "ipv4"/"ipv6"`,
+    );
+  }
+
+  return {
+    ipv4,
+    ipv6,
+    id: () => id,
+    vlan: () => input.vlan ?? id,
+  };
 }
 
 // ── transfer links: one network PER UPLINK, identifier folds into the

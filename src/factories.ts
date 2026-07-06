@@ -28,6 +28,7 @@ import type {
   Backdoor,
   DhcpClient,
   Discovery,
+  ExtraRoute,
   Host,
   InterfaceKind,
   Nat,
@@ -365,6 +366,89 @@ export function uplinkWireguard(input: WireguardUplinkInput): UplinkBuilder {
   };
 }
 
+// ── zerotier() ───────────────────────────────────────────────────────
+// A real ZeroTier client, confined to this uplink's own netns — see
+// InterfaceKind's "zerotier" variant (types.ts) for why this is
+// modeled differently from wireguard() (persistent daemon, no
+// caller-controlled interface name, no credential material declared
+// here at all — ZeroTier generates its own identity locally on first
+// run, see emitZerotierInterface, generate-netns.ts). Same
+// backdoor/NAT shape as uplinkWireguard() otherwise: almost always
+// paired with `backdoor` for the daemon's own bootstrap traffic before
+// (and regardless of) the ZT network itself carrying anything.
+
+interface ZerotierUplinkInput {
+  readonly id: string | number;
+  /** The ZeroTier network ID to join (16 hex chars), e.g.
+   * "02cfbec15c2319ff". Joining only gets this node as far as an
+   * unauthorized member — a human still has to approve it on the
+   * controller (a different system) before any traffic flows. */
+  readonly networkId: string;
+  /** Override this uplink's dedicated ZeroTier home directory.
+   * Defaults to `/var/lib/zerotier-one-uplink-<name>` (this uplink's
+   * OWN name, the string given to net.uplink(name, ...)) — redundant
+   * to repeat in most cases. See InterfaceKind's "zerotier" variant
+   * (types.ts) for why this directory must persist across reapplies. */
+  readonly instanceDir?: string;
+  readonly nat?: Nat;
+  readonly host: Host;
+  /** Bootstrap egress for the daemon's own setup/keepalive traffic —
+   * see Backdoor (types.ts), same reasoning as uplinkWireguard()'s
+   * `backdoor` above. */
+  readonly backdoor?: { readonly via: Uplink };
+}
+
+export function uplinkZerotier(input: ZerotierUplinkInput): UplinkBuilder {
+  const id = uplinkId(
+    typeof input.id === "string" ? Number.parseInt(input.id, 10) : input.id,
+  );
+
+  return (allocSlot: () => number, name: string) => {
+    const slot = allocSlot();
+    const ifc: InterfaceKind = {
+      kind: "zerotier",
+      networkId: input.networkId,
+      instanceDir: input.instanceDir ?? `/var/lib/zerotier-one-uplink-${name}`,
+    };
+
+    const addresses: Addresses = [
+      transferNet(id, slot, 1),
+      transferNet(id, slot, 2),
+    ];
+
+    // Same separate-slot reasoning as uplinkWireguard()'s backdoor
+    // above — see Backdoor's doc comment (types.ts).
+    const backdoor: Backdoor | undefined = input.backdoor === undefined
+      ? undefined
+      : (() => {
+        const bdSlot = allocSlot();
+        return {
+          via: input.backdoor!.via,
+          slot: bdSlot,
+          addresses: [
+            transferNet(id, bdSlot, 3),
+            transferNet(id, bdSlot, 4),
+          ],
+        };
+      })();
+
+    return {
+      slot,
+      addresses,
+      if: ifc,
+      nat: input.nat,
+      // The ZeroTier daemon manages its own address(es) AND its own
+      // routes (via the controller's "managed routes", assuming
+      // allowManaged stays enabled — the default) entirely on its
+      // own — nothing for dhclient/dhcpcd/static to do here, same
+      // reasoning as uplinkWireguard() above.
+      discovery: { ipv4: "static", ipv6: "static" },
+      backdoor,
+      host: input.host,
+    };
+  };
+}
+
 // ── segment factories ─────────────────────────────────────────────
 // Mirror the uplink factories above, but produce a Segment-shaped
 // result (adds `uplink`, uses segmentNet() instead of transferNet()
@@ -381,19 +465,66 @@ function resolveUplinkSelector(
   return "resolve" in uplink ? uplink : new FixedUplink(uplink);
 }
 
+/** The sparse, config-facing shape of an ExtraRoute (types.ts) — same
+ * `Uplink | UplinkSelector` looseness as a segment's primary `uplink`,
+ * normalized the same way (see resolveExtraRoutes below). */
+export interface ExtraRouteInput {
+  readonly prefix: string;
+  readonly prefix6?: string;
+  readonly uplink: Uplink | UplinkSelector;
+}
+
+function resolveExtraRoutes(
+  extraRoutes: readonly ExtraRouteInput[] | undefined,
+): readonly ExtraRoute[] | undefined {
+  if (extraRoutes === undefined) return undefined;
+  return extraRoutes.map((r) => ({
+    prefix: r.prefix,
+    prefix6: r.prefix6,
+    uplink: resolveUplinkSelector(r.uplink) as UplinkSelector,
+  }));
+}
+
 interface SegmentPhysicalInput {
   readonly id: string | number;
   readonly name: string;
   readonly uplink?: Uplink | UplinkSelector;
+  /** Zero or more additional, more-specific routes via a SECONDARY
+   * uplink — see ExtraRoute (types.ts). Independent of `uplink`: this
+   * segment keeps its normal default route/NAT through `uplink`, and
+   * ALSO gets one additional backbone join per entry here, carrying
+   * only that entry's prefix (e.g. routing a private supernet into a
+   * VPN-mesh uplink instead of the segment's usual egress). */
+  readonly extraRoutes?: readonly ExtraRouteInput[];
   readonly nat?: Nat;
   /** Advertise RA/SLAAC for this segment's IPv6 prefix. Defaults to true. */
   readonly slaac?: boolean;
   /** The last octet/host-id OVN's own gateway answers on within this
-   * segment's /24 (e.g. 2 -> 192.168.<id>.2). Defaults to 2, matching
-   * the usual "existing router keeps .1, OVN answers on .2, both
-   * coexist" pattern. Override to 1 once the old router at .1 is
-   * decommissioned and OVN should take over that address instead. */
-  readonly gatewayHost?: number;
+   * segment's standard pattern (e.g. 2 -> 192.168.<id>.2 /
+   * fd00:192:168:<id>::2). Required unless both `gatewayIp` and
+   * `gatewayIpv6` are given instead (see below) — deliberately no
+   * silent default: whether OVN should coexist alongside an existing
+   * router (conventionally .2, existing router keeps .1) or take over
+   * .1 outright (once that router is decommissioned) is a real,
+   * per-segment operational fact with real consequences if picked
+   * wrong (address collision, or an outage when a router is turned
+   * off). */
+  readonly gatewaySuffix?: number;
+  /** Override just the IPv6 host-id, if it should differ from
+   * `gatewaySuffix` (e.g. gateway answers on
+   * fd00:192:168:<id>::<gatewaySuffix6> while IPv4 answers on
+   * 192.168.<id>.<gatewaySuffix>). Defaults to `gatewaySuffix`. Ignored
+   * if `gatewayIpv6` is set. */
+  readonly gatewaySuffix6?: number;
+  /** A literal IPv4 address/prefix (e.g. "192.168.130.5" or
+   * "192.168.130.5/28") that replaces the standard fold pattern
+   * entirely, for a gateway that doesn't fit 192.168.<id>.<n>/24 —
+   * parsed/validated via the `ipaddress` package, not string-pasted. A
+   * bare address (no "/...") gets this segment's default /24. */
+  readonly gatewayIp?: string;
+  /** Same as `gatewayIp`, for the IPv6 side (default prefix /64 if the
+   * address has none). */
+  readonly gatewayIpv6?: string;
   readonly host: Host;
 }
 
@@ -404,9 +535,17 @@ export function segmentPhysical(
     typeof input.id === "string" ? Number.parseInt(input.id, 10) : input.id,
   );
   return {
-    addresses: [segmentNet(id, input.gatewayHost ?? 2)],
+    addresses: [
+      segmentNet(id, {
+        suffix: input.gatewaySuffix,
+        suffix6: input.gatewaySuffix6,
+        ipv4: input.gatewayIp,
+        ipv6: input.gatewayIpv6,
+      }),
+    ],
     if: { kind: "physical", name: input.name },
     uplink: resolveUplinkSelector(input.uplink),
+    extraRoutes: resolveExtraRoutes(input.extraRoutes),
     nat: input.nat,
     slaac: input.slaac ?? true,
     host: input.host,
@@ -424,15 +563,39 @@ interface SegmentVlanInput {
    * own management IP on `ens18.129` outside OVS). */
   readonly ifaceName?: string;
   readonly uplink?: Uplink | UplinkSelector;
+  /** Zero or more additional, more-specific routes via a SECONDARY
+   * uplink — see ExtraRoute (types.ts) and the same field on
+   * SegmentPhysicalInput above. */
+  readonly extraRoutes?: readonly ExtraRouteInput[];
   readonly nat?: Nat;
   /** Advertise RA/SLAAC for this segment's IPv6 prefix. Defaults to true. */
   readonly slaac?: boolean;
   /** The last octet/host-id OVN's own gateway answers on within this
-   * segment's /24 (e.g. 2 -> 192.168.<id>.2). Defaults to 2, matching
-   * the usual "existing router keeps .1, OVN answers on .2, both
-   * coexist" pattern. Override to 1 once the old router at .1 is
-   * decommissioned and OVN should take over that address instead. */
-  readonly gatewayHost?: number;
+   * segment's standard pattern (e.g. 2 -> 192.168.<id>.2 /
+   * fd00:192:168:<id>::2). Required unless both `gatewayIp` and
+   * `gatewayIpv6` are given instead (see below) — deliberately no
+   * silent default: whether OVN should coexist alongside an existing
+   * router (conventionally .2, existing router keeps .1) or take over
+   * .1 outright (once that router is decommissioned) is a real,
+   * per-segment operational fact with real consequences if picked
+   * wrong (address collision, or an outage when a router is turned
+   * off). */
+  readonly gatewaySuffix?: number;
+  /** Override just the IPv6 host-id, if it should differ from
+   * `gatewaySuffix` (e.g. gateway answers on
+   * fd00:192:168:<id>::<gatewaySuffix6> while IPv4 answers on
+   * 192.168.<id>.<gatewaySuffix>). Defaults to `gatewaySuffix`. Ignored
+   * if `gatewayIpv6` is set. */
+  readonly gatewaySuffix6?: number;
+  /** A literal IPv4 address/prefix (e.g. "192.168.130.5" or
+   * "192.168.130.5/28") that replaces the standard fold pattern
+   * entirely, for a gateway that doesn't fit 192.168.<id>.<n>/24 —
+   * parsed/validated via the `ipaddress` package, not string-pasted. A
+   * bare address (no "/...") gets this segment's default /24. */
+  readonly gatewayIp?: string;
+  /** Same as `gatewayIp`, for the IPv6 side (default prefix /64 if the
+   * address has none). */
+  readonly gatewayIpv6?: string;
   readonly host: Host;
 }
 
@@ -441,7 +604,14 @@ export function segmentVlan(input: SegmentVlanInput): Omit<Segment, "name"> {
     typeof input.id === "string" ? Number.parseInt(input.id, 10) : input.id,
   );
   return {
-    addresses: [segmentNet(id, input.gatewayHost ?? 2)],
+    addresses: [
+      segmentNet(id, {
+        suffix: input.gatewaySuffix,
+        suffix6: input.gatewaySuffix6,
+        ipv4: input.gatewayIp,
+        ipv6: input.gatewayIpv6,
+      }),
+    ],
     if: {
       kind: "vlan",
       vlanParent: input.vlanParent,
@@ -449,6 +619,7 @@ export function segmentVlan(input: SegmentVlanInput): Omit<Segment, "name"> {
       ifaceName: input.ifaceName,
     },
     uplink: resolveUplinkSelector(input.uplink),
+    extraRoutes: resolveExtraRoutes(input.extraRoutes),
     nat: input.nat,
     slaac: input.slaac ?? true,
     host: input.host,

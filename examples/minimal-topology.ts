@@ -21,6 +21,7 @@ export const network = defineNetwork("minimal", (net) => {
     id: "10",
     name: "eth1",
     uplink: new ManualUplink(wan),
+    gatewaySuffix: 2,
     slaac: false,
     host,
   }));

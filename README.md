@@ -69,6 +69,7 @@ export const network = defineNetwork("minimal", (net) => {
     id: "10",
     name: "eth1",
     uplink: new ManualUplink(wan),
+    gatewaySuffix: 2, // or gatewayIp/gatewayIpv6 for a literal override — see segmentPhysical's doc comment
     slaac: false,
     host,
   }));

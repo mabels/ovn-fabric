@@ -185,6 +185,45 @@ export type InterfaceKind =
     ifaceName: string;
     config: WireguardInterfaceConfig;
   }
+  /** A real ZeroTier client confined to this uplink's own network
+   * namespace — same overall shape as "wireguard" above (a real tunnel
+   * this generator stands up and supervises inside the netns), but
+   * ZeroTier is a persistent userspace DAEMON (no in-kernel device the
+   * way WireGuard has), and it names its own resulting interface
+   * itself rather than accepting one from the caller. Because of that,
+   * the real interface name is NOT known at generation time — it gets
+   * captured into a shell variable at RUNTIME by emitZerotierInterface
+   * (generate-netns.ts), the same way `$CHASSIS` is already resolved
+   * live in the generated script rather than computed here (see
+   * generate-ovn.ts header comment). NOT yet verified against a live
+   * host (unlike "wireguard", which went through several rounds of
+   * live correction) — treat the exact zerotier-one/zerotier-cli
+   * invocations this produces as a first draft to test and iterate on,
+   * same as wireguard's own history.
+   *
+   * `authorization` is deliberately NOT modeled here: joining a
+   * network only gets this node as far as an unauthorized member —
+   * approving it is a controller-side admin action on a DIFFERENT
+   * system, outside anything this generator runs or has credentials
+   * for. */
+  | {
+    kind: "zerotier";
+    /** The ZeroTier network ID to join (16 hex chars), e.g.
+     * "02cfbec15c2319ff"). */
+    networkId: string;
+    /** This uplink's OWN dedicated ZeroTier home directory —
+     * identity.secret/identity.public and all per-network state live
+     * there, deliberately NOT shared with any host-level zerotier-one
+     * instance (or any other zerotier-kind uplink). Persistent across
+     * reboots/netns recreation on purpose: losing this directory means
+     * losing this node's ZT identity, which means losing its
+     * controller authorization too (see the "moving a ZeroTier
+     * installation" discussion, this session — identity.secret is the
+     * one truly load-bearing file). Defaults to
+     * `/var/lib/zerotier-one-uplink-<uplink name>` — see
+     * uplinkZerotier, factories.ts. */
+    instanceDir: string;
+  }
   /** A placeholder Linux dummy interface — no real backing device, no
    * real-world connectivity. Stands in for an uplink whose real
    * mechanism (e.g. a WireGuard tunnel) isn't built yet, so the rest of
@@ -379,6 +418,37 @@ export class ManualUplink implements UplinkSelector {
   }
 }
 
+// ── extra routes: a MORE-SPECIFIC route via a SECONDARY uplink ──────
+// A segment's primary `uplink` (below) gets the default route
+// (0.0.0.0/0 / ::/0) plus NAT — that's its one general-purpose
+// internet egress. An ExtraRoute is a completely separate, additional
+// backbone join to a DIFFERENT uplink, carrying only a specific prefix
+// — e.g. routing a private supernet (192.168.0.0/16) into a VPN-mesh
+// uplink (ZeroTier, a second WireGuard peer, ...) so traffic to OTHER
+// sites in that mesh goes there, while everything else still leaves
+// via the segment's normal uplink. Deliberately separate from `uplink`
+// rather than trying to extend UplinkSelector to return multiple
+// uplinks with per-uplink route scoping — a segment can have zero,
+// one, or several of these, each independent, each getting its own
+// backbone join (see emitBackboneJoin, generate-ovn.ts) distinctly
+// named from the primary join so multiple simultaneous joins for the
+// same segment never collide.
+export interface ExtraRoute {
+  /** e.g. "192.168.0.0/16". Passed straight to `ovn-nbctl
+   * lr-route-add` — no fold/derivation, this is a literal prefix the
+   * caller declares. */
+  readonly prefix: string;
+  /** IPv6 equivalent, if this route needs one too. Omit for a v4-only
+   * extra route (the common case for a private-supernet-shaped
+   * route). */
+  readonly prefix6?: string;
+  /** Already resolved to a selector by the factory (segmentPhysical/
+   * segmentVlan), same normalization as Segment.uplink — the caller in
+   * config/topology.ts may pass a plain Uplink or any UplinkSelector,
+   * see resolveUplinkSelector (factories.ts). */
+  readonly uplink: UplinkSelector;
+}
+
 // ── Segment ──────────────────────────────────────────────────────────
 
 export interface Segment {
@@ -400,6 +470,10 @@ export interface Segment {
    * (generate-ovn.ts), which returns no lines at all when this is
    * undefined. */
   readonly uplink?: UplinkSelector;
+  /** Zero or more additional, more-specific routes via a SECONDARY
+   * uplink — see ExtraRoute above. Independent of `uplink`; a segment
+   * can have a primary uplink, extra routes, both, or neither. */
+  readonly extraRoutes?: readonly ExtraRoute[];
   readonly nat?: Nat;
   /** Whether OVN advertises RA/SLAAC for this segment's IPv6 prefix so
    * clients self-configure a global address (see generate-ovn.ts). */
