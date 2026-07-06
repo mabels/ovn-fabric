@@ -5,9 +5,7 @@
 // backdoors, WireGuard, etc). This file is also used as a CI smoke
 // test (see .github/workflows/ci.yaml), so keep it runnable.
 
-import { defineNetwork } from "../src/define.ts";
-import { segmentPhysical, uplinkPhysical } from "../src/factories.ts";
-import { ManualUplink } from "../src/types.ts";
+import { defineNetwork, segmentPhysical, uplinkPhysical, ManualUplink } from "../src/mod.ts";
 
 export const network = defineNetwork("minimal", (net) => {
   const host = net.localHost("this-host");

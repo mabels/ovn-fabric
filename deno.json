@@ -4,10 +4,8 @@
   "license": "Apache-2.0",
   "nodeModulesDir": "none",
   "exports": {
-    ".": "./src/cli.ts",
-    "./define": "./src/define.ts",
-    "./factories": "./src/factories.ts",
-    "./types": "./src/types.ts"
+    ".": "./src/mod.ts",
+    "./cli": "./src/cli.ts"
   },
   "tasks": {
     "check": "deno check src/*.ts"

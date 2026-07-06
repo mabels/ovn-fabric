@@ -17,33 +17,41 @@ a disposable, regeneratable artifact.
 
 **Via npx** (no local Deno install required — the official
 [`deno`](https://www.npmjs.com/package/deno) npm package is pulled in
-automatically as a dependency the first time you run this):
+automatically as a dependency the first time you run this; note the package
+is scoped, so it's `npx @adviser/ovn-fabric`, not `npx ovn-fabric`):
 
 ```sh
-npx ovn-fabric generate-ovn path/to/topology.ts > install.sh
+npx @adviser/ovn-fabric generate-ovn path/to/topology.ts > install.sh
 ```
 
-**Via Deno**, if you already have it:
+**Via Deno**, if you already have it (the CLI is the `/cli` export — the bare
+package name is the library, for use from your own `topology.ts`, see below):
 
 ```sh
-deno run -A jsr:@adviser/ovn-fabric generate-ovn path/to/topology.ts > install.sh
+deno run -A jsr:@adviser/ovn-fabric/cli generate-ovn path/to/topology.ts > install.sh
 ```
 
 **As a permanent global command**:
 
 ```sh
-deno install -g -A -n ovn-fabric jsr:@adviser/ovn-fabric
+deno install -g -A -n ovn-fabric jsr:@adviser/ovn-fabric/cli
 ```
 
 ## Quickstart
 
 Copy [`examples/minimal-topology.ts`](examples/minimal-topology.ts) as a
-starting point:
+starting point. Everything you need to declare a topology comes from the one
+package import — `defineNetwork`, every uplink/segment factory, and the
+public types (`Host`, `Uplink`, `Segment`, `ManualUplink`, ...) all live at
+the same `@adviser/ovn-fabric` / `jsr:@adviser/ovn-fabric` path:
 
 ```ts
-import { defineNetwork } from "jsr:@adviser/ovn-fabric/define";
-import { segmentPhysical, uplinkPhysical } from "jsr:@adviser/ovn-fabric/factories";
-import { ManualUplink } from "jsr:@adviser/ovn-fabric/types";
+import {
+  defineNetwork,
+  segmentPhysical,
+  uplinkPhysical,
+  ManualUplink,
+} from "jsr:@adviser/ovn-fabric";
 
 export const network = defineNetwork("minimal", (net) => {
   const host = net.localHost("this-host");
@@ -68,8 +76,8 @@ export const network = defineNetwork("minimal", (net) => {
 Then:
 
 ```sh
-npx ovn-fabric generate topology.ts       # sanity-check what it declares
-npx ovn-fabric generate-ovn topology.ts   # emit the install script(s)
+npx @adviser/ovn-fabric generate topology.ts       # sanity-check what it declares
+npx @adviser/ovn-fabric generate-ovn topology.ts   # emit the install script(s)
 ```
 
 `generate-ovn` prints one script per distinct `Host` your config declares.

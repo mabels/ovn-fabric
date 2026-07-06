@@ -8,8 +8,8 @@
 # registry-side setup steps that only a human with the right account
 # access can do (not something this workflow or any CI run can
 # perform):
-#   1. npmjs.com → the "ovn-fabric" package → Settings → Trusted
-#      Publisher → GitHub Actions → this repo, workflow file
+#   1. npmjs.com → the "@adviser/ovn-fabric" package → Settings →
+#      Trusted Publisher → GitHub Actions → this repo, workflow file
 #      ".github/workflows/ci.yaml".
 #   2. jsr.io → create the "@adviser/ovn-fabric" package → Settings →
 #      link GitHub Actions publishing to this repo.
@@ -52,8 +52,12 @@ jobs:
       - name: Smoke test — deno entry point directly
         run: npx deno run --allow-read --allow-env src/cli.ts generate examples/minimal-topology.ts
 
-      - name: Smoke test — npm/npx entry point
-        run: node bin/ovn-fabric.js generate examples/minimal-topology.ts
+      # Note: no npm/npx smoke test here. bin/ovn-fabric.js delegates to
+      # the JSR-published "./cli" export at this exact version (see
+      # bin/ovn-fabric.js's own header comment for why) — that version
+      # doesn't exist on the registry yet for an ordinary push (only a
+      # "0.0.0" placeholder). See the "publish" job below for the real,
+      # post-publish end-to-end check of that path.
 
   publish:
     needs: ci
@@ -87,3 +91,6 @@ jobs:
 
       - name: Publish to JSR (OIDC)
         run: npx deno publish --allow-dirty
+
+      - name: Post-publish smoke test — npx round-trip
+        run: npx --yes @adviser/ovn-fabric@$(node -p "require('./package.json').version") generate examples/minimal-topology.ts
