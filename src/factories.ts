@@ -388,6 +388,12 @@ interface SegmentPhysicalInput {
   readonly nat?: Nat;
   /** Advertise RA/SLAAC for this segment's IPv6 prefix. Defaults to true. */
   readonly slaac?: boolean;
+  /** The last octet/host-id OVN's own gateway answers on within this
+   * segment's /24 (e.g. 2 -> 192.168.<id>.2). Defaults to 2, matching
+   * the usual "existing router keeps .1, OVN answers on .2, both
+   * coexist" pattern. Override to 1 once the old router at .1 is
+   * decommissioned and OVN should take over that address instead. */
+  readonly gatewayHost?: number;
   readonly host: Host;
 }
 
@@ -398,7 +404,7 @@ export function segmentPhysical(
     typeof input.id === "string" ? Number.parseInt(input.id, 10) : input.id,
   );
   return {
-    addresses: [segmentNet(id, 2)],
+    addresses: [segmentNet(id, input.gatewayHost ?? 2)],
     if: { kind: "physical", name: input.name },
     uplink: resolveUplinkSelector(input.uplink),
     nat: input.nat,
@@ -421,6 +427,12 @@ interface SegmentVlanInput {
   readonly nat?: Nat;
   /** Advertise RA/SLAAC for this segment's IPv6 prefix. Defaults to true. */
   readonly slaac?: boolean;
+  /** The last octet/host-id OVN's own gateway answers on within this
+   * segment's /24 (e.g. 2 -> 192.168.<id>.2). Defaults to 2, matching
+   * the usual "existing router keeps .1, OVN answers on .2, both
+   * coexist" pattern. Override to 1 once the old router at .1 is
+   * decommissioned and OVN should take over that address instead. */
+  readonly gatewayHost?: number;
   readonly host: Host;
 }
 
@@ -429,7 +441,7 @@ export function segmentVlan(input: SegmentVlanInput): Omit<Segment, "name"> {
     typeof input.id === "string" ? Number.parseInt(input.id, 10) : input.id,
   );
   return {
-    addresses: [segmentNet(id, 2)],
+    addresses: [segmentNet(id, input.gatewayHost ?? 2)],
     if: {
       kind: "vlan",
       vlanParent: input.vlanParent,
