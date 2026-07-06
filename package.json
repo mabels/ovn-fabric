@@ -1,6 +1,6 @@
 {
   "name": "@adviser/ovn-fabric",
-  "version": "0.1.0",
+  "version": "0.0.0",
   "description": "Declarative OVN/OVS topology generator — one config, one self-installing shell script per host.",
   "license": "Apache-2.0",
   "publishConfig": {

@@ -17,8 +17,12 @@
 # with an auth error — that's expected, not a bug in this file.
 #
 # Modeled after the ci/publish split in adviser/cement's
-# ng-nodejs-ci.yaml (deno.json/package.json version-tag pattern is the
-# same idea, adapted for this repo's Deno-first, npm-wrapped shape).
+# ng-nodejs-ci.yaml. Version handling also mirrors cement's
+# src/cli/utils.ts#getVersion + patch-version-cmd.ts (scaled down to a
+# plain script, see scripts/patch-version.mjs): package.json/deno.json
+# carry a "0.0.0" placeholder in git — the real version is derived from
+# the triggering tag (GITHUB_REF) and patched into both files right
+# before publish. Nothing to hand-bump/keep in sync before tagging.
 
 name: CI - ovn-fabric
 
@@ -70,15 +74,8 @@ jobs:
       - name: Install (pulls in `deno` as an npm dependency)
         run: npm install
 
-      - name: Verify tag matches package.json / deno.json version
-        run: |
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          DENO_VERSION=$(node -p "require('./deno.json').version")
-          if [ "$TAG_VERSION" != "$PKG_VERSION" ] || [ "$TAG_VERSION" != "$DENO_VERSION" ]; then
-            echo "::error::tag v$TAG_VERSION does not match package.json ($PKG_VERSION) / deno.json ($DENO_VERSION) — bump both before tagging"
-            exit 1
-          fi
+      - name: Patch version from tag into package.json / deno.json
+        run: node scripts/patch-version.mjs package.json deno.json
 
       - name: Type-check (final gate before publish)
         run: npx deno check src/*.ts examples/*.ts

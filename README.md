@@ -120,11 +120,13 @@ an explanation of what it's for and why it's shaped the way it is.
 
 ## Publishing (maintainers)
 
-Tag a commit `vX.Y.Z` (matching the version in both `package.json` and
-`deno.json`) and push it — CI publishes to npm and JSR automatically via
-OIDC trusted publishing (see `.github/workflows/ci.yaml`; no token secrets
-involved, but it does require a one-time registry-side setup — see the
-comment at the top of that file).
+`package.json`/`deno.json` carry a `0.0.0` placeholder version in git — there's
+nothing to bump by hand. Tag a commit `vX.Y.Z` and push it; CI derives the
+version from that tag, patches it into both files, then publishes to npm and
+JSR via OIDC trusted publishing (see `.github/workflows/ci.yaml` and
+`scripts/patch-version.mjs`; no token secrets involved, but it does require a
+one-time registry-side setup — see the comment at the top of that workflow
+file).
 
 ## License
 
