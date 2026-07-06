@@ -93,4 +93,10 @@ jobs:
         run: npx deno publish --allow-dirty
 
       - name: Post-publish smoke test — npx round-trip
-        run: npx --yes @adviser/ovn-fabric@$(node -p "require('./package.json').version") generate examples/minimal-topology.ts
+        # -p/--package is the unambiguous form: npx's implicit
+        # "guess the command from the package name" heuristic doesn't
+        # reliably match a scoped package name against a differently-
+        # named bin (it failed with "ovn-fabric: not found" in this
+        # exact job before this fix) — spelling out both the package
+        # and the bin name removes the ambiguity.
+        run: npx --yes -p @adviser/ovn-fabric@$(node -p "require('./package.json').version") ovn-fabric generate examples/minimal-topology.ts

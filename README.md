@@ -17,11 +17,13 @@ a disposable, regeneratable artifact.
 
 **Via npx** (no local Deno install required — the official
 [`deno`](https://www.npmjs.com/package/deno) npm package is pulled in
-automatically as a dependency the first time you run this; note the package
-is scoped, so it's `npx @adviser/ovn-fabric`, not `npx ovn-fabric`):
+automatically as a dependency the first time you run this). Use the explicit
+`-p`/package form — npx's implicit "guess the command from the package name"
+doesn't reliably resolve a scoped package name (`@adviser/ovn-fabric`)
+against its differently-named bin (`ovn-fabric`):
 
 ```sh
-npx @adviser/ovn-fabric generate-ovn path/to/topology.ts > install.sh
+npx -p @adviser/ovn-fabric ovn-fabric generate-ovn path/to/topology.ts > install.sh
 ```
 
 **Via Deno**, if you already have it (the CLI is the `/cli` export — the bare
@@ -76,8 +78,8 @@ export const network = defineNetwork("minimal", (net) => {
 Then:
 
 ```sh
-npx @adviser/ovn-fabric generate topology.ts       # sanity-check what it declares
-npx @adviser/ovn-fabric generate-ovn topology.ts   # emit the install script(s)
+npx -p @adviser/ovn-fabric ovn-fabric generate topology.ts       # sanity-check what it declares
+npx -p @adviser/ovn-fabric ovn-fabric generate-ovn topology.ts   # emit the install script(s)
 ```
 
 `generate-ovn` prints one script per distinct `Host` your config declares.
