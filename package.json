@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Declarative OVN/OVS topology generator — one config, one self-installing shell script per host.",
   "license": "Apache-2.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "ovn-fabric": "bin/ovn-fabric.js"
   },
