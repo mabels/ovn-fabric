@@ -32,7 +32,8 @@ router to another or spin up a backup router from it. Every one of them
 gives you one router's config, not a network's. None of them speak
 ZeroTier or Tailscale natively either, at least not without bolting on a
 package or a container — mesh-VPN-as-an-uplink just isn't a concept any of
-these appliances have. (DNS is its own story, for another time.)
+these appliances have. (DNS is its own story — see
+[It's always DNS](https://mabels.github.io/unified-dns-dhcp-chart/writeups/blog/its-always-dns.html).)
 
 At that point I decided not to take one more incremental step, but ten at
 once. Chasing the actual SR-IOV/multicast problem led me to Open vSwitch —
