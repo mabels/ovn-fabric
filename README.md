@@ -129,6 +129,13 @@ an explanation of what it's for and why it's shaped the way it is.
   traffic keeps using whatever path already exists (see Backdoor above)
   while everything else gets diverted into the tunnel.
 
+## Write-ups
+
+- [Bridging OVN into a physical home network (or: how "what is OVS?" led here)](docs/blog/ovn-fabric-writeup.md) —
+  the motivation, the OVN/OVS architecture, and how ovn-fabric bridges OVN's
+  virtual world to real VLANs and WireGuard. Also published at
+  [mabels.github.io/ovn-fabric](https://mabels.github.io/ovn-fabric/).
+
 ## Publishing (maintainers)
 
 `package.json`/`deno.json` carry a `0.0.0` placeholder version in git — there's

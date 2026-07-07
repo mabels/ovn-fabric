@@ -1,0 +1,12 @@
+title: ovn-fabric
+description: Write-ups on ovn-fabric, a declarative OVN/OVS network topology generator.
+theme: minima
+
+# Keep default (non-pretty) permalinks: the write-ups embed images with plain
+# relative paths (e.g. diagram-topology-overview.svg next to the .md file).
+# Pretty permalinks would nest the built page in its own directory and break
+# those relative paths.
+
+exclude:
+  - Gemfile
+  - Gemfile.lock

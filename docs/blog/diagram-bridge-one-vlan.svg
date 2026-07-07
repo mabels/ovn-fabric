@@ -1,0 +1,42 @@
+<svg viewBox="0 0 720 260" xmlns="http://www.w3.org/2000/svg" role="img">
+  <title>Bridge one: OVN logical switch to a real VLAN</title>
+  <desc>An OVN logical switch's localnet port maps, via ovn-bridge-mappings, to a real OVS bridge. That bridge has a real Linux VLAN sub-interface added as a port, which in turn connects to a managed physical switch and the devices on it.</desc>
+
+  <defs>
+    <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#666666"/>
+    </marker>
+  </defs>
+
+  <g font-family="sans-serif">
+    <line x1="185" y1="20" x2="185" y2="230" stroke="#4a86e8" stroke-dasharray="4,4"/>
+    <text x="95" y="30" text-anchor="middle" fill="#4a86e8" font-size="11">OVN's world</text>
+    <text x="450" y="30" text-anchor="middle" fill="#4a86e8" font-size="11">Linux kernel / real network</text>
+
+    <rect x="20" y="90" width="150" height="60" rx="8" fill="#f3f3f3" stroke="#666666"/>
+    <text x="95" y="115" text-anchor="middle" fill="#000000" font-size="14" font-weight="600">sw-neighbor</text>
+    <text x="95" y="133" text-anchor="middle" fill="#666666" font-size="11">OVN logical switch</text>
+
+    <rect x="220" y="90" width="150" height="60" rx="8" fill="#f3f3f3" stroke="#666666"/>
+    <text x="295" y="115" text-anchor="middle" fill="#000000" font-size="14" font-weight="600">br-neighbor</text>
+    <text x="295" y="133" text-anchor="middle" fill="#666666" font-size="11">OVS bridge</text>
+
+    <rect x="420" y="90" width="150" height="60" rx="8" fill="#f3f3f3" stroke="#666666"/>
+    <text x="495" y="115" text-anchor="middle" fill="#000000" font-size="14" font-weight="600">ens18.130</text>
+    <text x="495" y="133" text-anchor="middle" fill="#666666" font-size="11">VLAN sub-interface</text>
+
+    <rect x="600" y="90" width="105" height="60" rx="8" fill="#f3f3f3" stroke="#666666"/>
+    <text x="652" y="115" text-anchor="middle" fill="#000000" font-size="13" font-weight="600">Switch</text>
+    <text x="652" y="133" text-anchor="middle" fill="#666666" font-size="10">+ devices</text>
+
+    <path d="M170,120 L220,120" fill="none" stroke="#666666" marker-end="url(#a1)"/>
+    <text x="195" y="108" text-anchor="middle" fill="#666666" font-size="10">localnet</text>
+
+    <path d="M370,120 L420,120" fill="none" stroke="#666666" marker-end="url(#a1)"/>
+    <text x="395" y="108" text-anchor="middle" fill="#666666" font-size="10">port</text>
+
+    <path d="M570,120 L600,120" fill="none" stroke="#666666" marker-end="url(#a1)"/>
+
+    <text x="360" y="220" text-anchor="middle" fill="#666666" font-size="11">ovn-bridge-mappings ties the localnet port's network_name to this specific OVS bridge</text>
+  </g>
+</svg>

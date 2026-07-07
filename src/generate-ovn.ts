@@ -236,13 +236,40 @@ function emitSegment(s: Segment): string[] {
   // the ISP — see ADR 0001 / transfer-links.md). Per-segment
   // configurable (Segment.slaac) since not every segment should
   // necessarily advertise — e.g. disabled for "home".
+  //
+  // Deliberately NOT setting `ipv6_ra_configs:send_periodic` here.
+  // ovn-northd compiles an unconditional, very-high-priority flow on
+  // every logical router — `lr_in_ip_routing, priority=10550,
+  // match=(nd_rs || nd_ra), action=drop` — meant to stop RS/RA from
+  // ever being routed across router ports. Solicited RA (the
+  // lr_in_nd_ra_options/lr_in_nd_ra_response responder, driven by
+  // address_mode alone) answers via direct loopback output and never
+  // reaches that stage, so it works. But `send_periodic`'s
+  // self-timer-driven RA is pinctrl-injected via
+  // `resubmit(CONTROLLER,8)`, re-enters the pipeline near the top, and
+  // gets killed by that same drop rule before ever reaching a physical
+  // port — confirmed live 2026-07-07 (pinctrl:dbg showed the RA being
+  // generated on schedule with the correct MAC/LLA; ovn-sbctl
+  // lflow-list showed the drop rule verbatim; it never appeared on the
+  // wire). It's a no-op that only adds pinctrl churn, so we don't set
+  // it. A host-side radvd is not a viable workaround either: the
+  // router's IP/MAC here is a pure OVN logical construct with no
+  // backing Linux kernel netdev to bind radvd to.
   if (s.slaac) {
     lines.push(
       `ovn-nbctl set logical_router_port ${lrp} ipv6_ra_configs:address_mode=slaac`,
+      // Explicit cleanup, not a new behavior: earlier live testing
+      // (2026-07-06/07) set send_periodic=true by hand on real hosts
+      // before we knew it was a no-op — remove it so re-running this
+      // script against those hosts actually clears the stale value
+      // instead of silently leaving it stuck in the DB (ovn-nbctl set
+      // only touches the keys you name, it won't drop others).
+      `ovn-nbctl --if-exists remove logical_router_port ${lrp} ipv6_ra_configs send_periodic`,
     );
   } else {
     lines.push(
       `ovn-nbctl remove logical_router_port ${lrp} ipv6_ra_configs address_mode`,
+      `ovn-nbctl remove logical_router_port ${lrp} ipv6_ra_configs send_periodic`,
     );
   }
 

@@ -1,0 +1,45 @@
+<svg viewBox="0 0 720 260" xmlns="http://www.w3.org/2000/svg" role="img">
+  <title>Bridge two: OVN to a WireGuard interface via a network namespace</title>
+  <desc>An OVN logical router port connects, via a localnet port, to a small OVS bridge. A veth pair crosses from that bridge into a dedicated network namespace, where an ordinary wg-quick-managed WireGuard interface handles the real tunnel to the internet.</desc>
+
+  <defs>
+    <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#666666"/>
+    </marker>
+  </defs>
+
+  <g font-family="sans-serif">
+    <rect x="20" y="90" width="150" height="60" rx="8" fill="#f3f3f3" stroke="#666666"/>
+    <text x="95" y="115" text-anchor="middle" fill="#000000" font-size="13" font-weight="600">Logical router port</text>
+    <text x="95" y="133" text-anchor="middle" fill="#666666" font-size="10">OVN</text>
+
+    <rect x="205" y="90" width="140" height="60" rx="8" fill="#f3f3f3" stroke="#666666"/>
+    <text x="275" y="115" text-anchor="middle" fill="#000000" font-size="13" font-weight="600">br-up-3</text>
+    <text x="275" y="133" text-anchor="middle" fill="#666666" font-size="10">OVS bridge (transit link)</text>
+
+    <!-- namespace boundary -->
+    <rect x="410" y="45" width="280" height="150" rx="8" fill="none" stroke="#4a86e8" stroke-dasharray="4,4"/>
+    <text x="550" y="35" text-anchor="middle" fill="#4a86e8" font-size="11">network namespace: ns-uplink-mullvad-de</text>
+
+    <rect x="430" y="90" width="110" height="60" rx="8" fill="#f3f3f3" stroke="#666666"/>
+    <text x="485" y="112" text-anchor="middle" fill="#000000" font-size="12" font-weight="600">veth-krn-3</text>
+    <text x="485" y="130" text-anchor="middle" fill="#666666" font-size="10">veth peer</text>
+
+    <rect x="560" y="90" width="110" height="60" rx="8" fill="#f3f3f3" stroke="#666666"/>
+    <text x="615" y="112" text-anchor="middle" fill="#000000" font-size="12" font-weight="600">wg0</text>
+    <text x="615" y="130" text-anchor="middle" fill="#666666" font-size="10">wg-quick interface</text>
+
+    <path d="M170,120 L205,120" fill="none" stroke="#666666" marker-end="url(#a2)"/>
+    <text x="187" y="108" text-anchor="middle" fill="#666666" font-size="9">localnet</text>
+
+    <path d="M345,120 L430,120" fill="none" stroke="#666666" marker-end="url(#a2)"/>
+    <text x="388" y="108" text-anchor="middle" fill="#666666" font-size="9">veth-ovn-3</text>
+
+    <path d="M540,120 L560,120" fill="none" stroke="#666666" marker-end="url(#a2)"/>
+
+    <path d="M670,120 L700,120" fill="none" stroke="#666666" stroke-dasharray="2,3"/>
+    <text x="700" y="115" fill="#666666" font-size="11">internet</text>
+
+    <text x="360" y="225" text-anchor="middle" fill="#666666" font-size="11">Everything right of the veth is ordinary Linux: OVN only ever sees the bridge on its own side</text>
+  </g>
+</svg>
