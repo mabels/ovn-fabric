@@ -131,10 +131,9 @@ an explanation of what it's for and why it's shaped the way it is.
 
 ## Write-ups
 
-- [Bridging OVN into a physical home network (or: how "what is OVS?" led here)](docs/blog/ovn-fabric-writeup.md) —
+- [Bridging OVN into a physical home network (or: how "what is OVS?" led here)](https://mabels.github.io/ovn-fabric/blog/ovn-fabric-writeup.html) —
   the motivation, the OVN/OVS architecture, and how ovn-fabric bridges OVN's
-  virtual world to real VLANs and WireGuard. Also published at
-  [mabels.github.io/ovn-fabric](https://mabels.github.io/ovn-fabric/).
+  virtual world to real VLANs and WireGuard. Source: [docs/blog/ovn-fabric-writeup.md](docs/blog/ovn-fabric-writeup.md).
 
 ## Publishing (maintainers)
 
