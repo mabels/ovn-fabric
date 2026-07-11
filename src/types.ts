@@ -42,18 +42,50 @@ export type AccessMethod =
   | { method: "ssh"; user: string }
   | { method: "local" }; // the generator's own host — no SSH needed
 
+// ── monitoring: IPFIX flow export ──────────────────────────────────
+// Host-level, not per-Segment/Uplink, and deliberately scoped to
+// br-int only: that's OVN's own integration bridge, which already
+// carries every logical packet for every segment/uplink resolved onto
+// this chassis (ovn-controller creates and owns br-int itself — this
+// generator never creates it, only points IPFIX at it). Sampling
+// there once captures the whole chassis' traffic; sampling per-segment
+// bridge instead would mean N separate IPFIX declarations reporting
+// overlapping/duplicate data for anything that also crosses br-int.
+export interface IpfixExport {
+  /** "<collector-ip>:<port>" — passed straight to `ovs-vsctl create
+   * IPFIX targets=...`. E.g. an Akvorado inlet's NodePort listener. */
+  readonly target: string;
+  /** 1 = every packet, no sampling. N = export 1 in every N packets.
+   * Omit to leave OVS's own IPFIX table default in place (unsampled). */
+  readonly sampling?: number;
+  /** Seconds of inactivity before a cached flow is force-expired and
+   * exported. Omit for OVS's own default. */
+  readonly cacheActiveTimeout?: number;
+  readonly cacheMaxFlows?: number;
+}
+
+export interface HostMonitoring {
+  readonly ipfix?: IpfixExport;
+}
+
 export interface Host {
   readonly name: string;
   readonly address: string; // hostname or IP the generator connects to
   readonly access: AccessMethod;
+  readonly monitoring?: HostMonitoring;
 }
 
-export function sshHost(name: string, address: string, user: string): Host {
-  return { name, address, access: { method: "ssh", user } };
+export function sshHost(
+  name: string,
+  address: string,
+  user: string,
+  monitoring?: HostMonitoring,
+): Host {
+  return { name, address, access: { method: "ssh", user }, monitoring };
 }
 
-export function localHost(name: string): Host {
-  return { name, address: "127.0.0.1", access: { method: "local" } };
+export function localHost(name: string, monitoring?: HostMonitoring): Host {
+  return { name, address: "127.0.0.1", access: { method: "local" }, monitoring };
 }
 
 // ── NetId: the identity every segment/uplink/transfer-link carries ──

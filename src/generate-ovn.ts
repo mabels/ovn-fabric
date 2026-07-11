@@ -237,34 +237,50 @@ function emitSegment(s: Segment): string[] {
   // configurable (Segment.slaac) since not every segment should
   // necessarily advertise — e.g. disabled for "home".
   //
-  // Deliberately NOT setting `ipv6_ra_configs:send_periodic` here.
-  // ovn-northd compiles an unconditional, very-high-priority flow on
-  // every logical router — `lr_in_ip_routing, priority=10550,
-  // match=(nd_rs || nd_ra), action=drop` — meant to stop RS/RA from
-  // ever being routed across router ports. Solicited RA (the
-  // lr_in_nd_ra_options/lr_in_nd_ra_response responder, driven by
-  // address_mode alone) answers via direct loopback output and never
-  // reaches that stage, so it works. But `send_periodic`'s
-  // self-timer-driven RA is pinctrl-injected via
-  // `resubmit(CONTROLLER,8)`, re-enters the pipeline near the top, and
-  // gets killed by that same drop rule before ever reaching a physical
-  // port — confirmed live 2026-07-07 (pinctrl:dbg showed the RA being
-  // generated on schedule with the correct MAC/LLA; ovn-sbctl
-  // lflow-list showed the drop rule verbatim; it never appeared on the
-  // wire). It's a no-op that only adds pinctrl churn, so we don't set
-  // it. A host-side radvd is not a viable workaround either: the
-  // router's IP/MAC here is a pure OVN logical construct with no
-  // backing Linux kernel netdev to bind radvd to.
+  // ipv6_ra_configs:send_periodic — ENABLED as of 2026-07-11.
+  //
+  // This used to be a confirmed no-op, deliberately left unset: every
+  // logical router compiles an unconditional, very-high-priority flow —
+  // `lr_in_ip_routing, priority=10550, match=(nd_rs || nd_ra),
+  // action=drop` — meant to stop RS/RA from ever being routed across
+  // router ports. Solicited RA (the lr_in_nd_ra_options/
+  // lr_in_nd_ra_response responder, driven by address_mode alone)
+  // answers via direct loopback output and never reaches that stage, so
+  // it worked regardless. But `send_periodic`'s self-timer-driven RA is
+  // pinctrl-injected via `resubmit(CONTROLLER,8)`, re-enters the
+  // pipeline near the top, and got killed by that same drop rule before
+  // ever reaching a physical port — confirmed live 2026-07-07 (pinctrl:dbg
+  // showed the RA being generated on schedule with the correct MAC/LLA;
+  // ovn-sbctl lflow-list showed the drop rule verbatim; it never
+  // appeared on the wire).
+  //
+  // Root cause (upstream, Ilya Maximets, ovn-org/ovn#313, 2026-07-09):
+  // controller/pinctrl.c's prepare_ipv6_ras() only marks a periodic RA
+  // packet "preserved" (exempt from that drop rule) for
+  // l2gateway/l3gateway/chassisredirect port types — missing the DGP
+  // (distributed gateway port, type "patch") case every segment router
+  // here actually is, so the local-only bit stayed set and the packet
+  // was dropped like any other. Fixed upstream and installed as a local
+  // patched build on mam-hh-ovn (26.03.0-2+ravlocal11) — confirmed live
+  // 2026-07-11: enabling send_periodic (with a short interval, one LRP
+  // at a time) produced genuinely unsolicited RA (no preceding RS) on
+  // the physical wire, captured via tcpdump on the segment's own bridge
+  // and independently confirmed on a MikroTik packet trace on the same
+  // segment. Safe to turn on for real now. A host-side radvd is still
+  // not a viable alternative either way: the router's IP/MAC here is a
+  // pure OVN logical construct with no backing Linux kernel netdev to
+  // bind radvd to.
+  //
+  // min_interval/max_interval are left unset (OVN's own RFC 4861
+  // defaults apply) — tune these explicitly later if periodic
+  // notification needs to be faster, e.g. for the gateway-cutover
+  // re-solicit problem this also helps with (an already-connected client
+  // whose default router changed underneath it has no OTHER way to find
+  // out short of that entry's advertised lifetime expiring).
   if (s.slaac) {
     lines.push(
       `ovn-nbctl set logical_router_port ${lrp} ipv6_ra_configs:address_mode=slaac`,
-      // Explicit cleanup, not a new behavior: earlier live testing
-      // (2026-07-06/07) set send_periodic=true by hand on real hosts
-      // before we knew it was a no-op — remove it so re-running this
-      // script against those hosts actually clears the stale value
-      // instead of silently leaving it stuck in the DB (ovn-nbctl set
-      // only touches the keys you name, it won't drop others).
-      `ovn-nbctl --if-exists remove logical_router_port ${lrp} ipv6_ra_configs send_periodic`,
+      `ovn-nbctl set logical_router_port ${lrp} ipv6_ra_configs:send_periodic=true`,
     );
   } else {
     lines.push(
@@ -661,6 +677,34 @@ function emitPreflightChecks(uplinks: readonly Uplink[]): string[] {
   return lines;
 }
 
+/**
+ * IPFIX export off br-int — see HostMonitoring/IpfixExport (types.ts)
+ * for why this is host-level and br-int-scoped rather than per-segment.
+ * Idempotent by construction: `--if-exists clear ... ipfix` drops any
+ * previously-created IPFIX row for br-int before creating a fresh one,
+ * so re-running this never accumulates orphaned rows in the OVSDB —
+ * same "converge, don't accumulate" shape as every other emit* here.
+ */
+function emitMonitoring(host: Host): string[] {
+  const ipfix = host.monitoring?.ipfix;
+  if (ipfix === undefined) return [];
+
+  const createArgs = [`targets="${ipfix.target}"`];
+  if (ipfix.sampling !== undefined) createArgs.push(`sampling=${ipfix.sampling}`);
+  if (ipfix.cacheActiveTimeout !== undefined) {
+    createArgs.push(`cache_active_timeout=${ipfix.cacheActiveTimeout}`);
+  }
+  if (ipfix.cacheMaxFlows !== undefined) createArgs.push(`cache_max_flows=${ipfix.cacheMaxFlows}`);
+
+  return [
+    "# ── monitoring: IPFIX export off br-int ─────────────────────────",
+    "ovs-vsctl -- --if-exists clear Bridge br-int ipfix \\",
+    `  -- --id=@ipfix create IPFIX ${createArgs.join(" ")} \\`,
+    "  -- set Bridge br-int ipfix=@ipfix",
+    "",
+  ];
+}
+
 // ── per-host assembly: one self-installing script ────────────────────
 
 function scriptForHost(
@@ -804,6 +848,7 @@ function scriptForHost(
     ...ovnLines,
     "# ── uplink netns setup (SLAAC/dhclient/NAT) ─────────────────────",
     ...netnsLines,
+    ...emitMonitoring(host),
   ].join("\n");
 }
 
