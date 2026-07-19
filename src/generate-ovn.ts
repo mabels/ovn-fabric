@@ -573,14 +573,39 @@ function emitSegmentBackboneJoin(s: Segment): string[] {
 // Both share the same package list — iproute2 (`ip`) and iptables
 // (`iptables`/`ip6tables`) are hard, unconditional dependencies of
 // nearly every line this generator emits, so they're always included;
-// dhclient/dhcpcd/wireguard-tools are added only when this topology
-// actually uses them (derived from every uplink's discovery.client,
-// falling back to dhclient's package when discovery.ipv4 is "dhcp"
-// with no explicit client — same default emitIpv4Discovery uses, see
-// generate-netns.ts — and from whether any uplink is InterfaceKind
-// "wireguard"), not a fixed list.
+// openvswitch-switch/ovn-central/ovn-host are ALSO unconditional (added
+// 2026-07-19) — every line emitOvsBridge*/emitSegment/emitUplink* etc.
+// produces is an ovs-vsctl/ovn-nbctl/ovn-sbctl command, and the
+// self-installed systemd unit's own `After=/Wants=
+// openvswitch-switch.service ovn-central.service` already assumed these
+// packages exist — this generator just never actually installed them
+// itself, leaving that as an undocumented manual bootstrap step (the
+// gap that motivated this change: confirmed live on mam-hh-core, a
+// brand-new host, where none of ovs-vsctl/ovn-nbctl/ovn-controller nor
+// the openvswitch-switch/ovn-central/ovn-host packages existed at all
+// until installed by hand). Bundling all three together matches this
+// project's current single-chassis assumption (see header comment) —
+// ovn-central (northd + the NB/SB databases) only needs to run on ONE
+// host in a real multi-chassis topology, while every OTHER chassis
+// would need just openvswitch-switch + ovn-host (ovn-controller
+// pointing at the central host's ovn-remote, not a local ovn-central of
+// its own). Splitting that out is a real, un-implemented TODO for
+// whenever multi-chassis actually happens — not needed today, since
+// every Host this generator currently targets runs its own full stack.
+// dhclient/dhcpcd/wireguard-tools stay conditional, added only when
+// this topology actually uses them (derived from every uplink's
+// discovery.client, falling back to dhclient's package when
+// discovery.ipv4 is "dhcp" with no explicit client — same default
+// emitIpv4Discovery uses, see generate-netns.ts — and from whether any
+// uplink is InterfaceKind "wireguard"), not a fixed list.
 
-const ALWAYS_REQUIRED_PACKAGES = ["iproute2", "iptables"];
+const ALWAYS_REQUIRED_PACKAGES = [
+  "iproute2",
+  "iptables",
+  "openvswitch-switch",
+  "ovn-central",
+  "ovn-host",
+];
 
 const CLIENT_PACKAGE: Record<Exclude<DhcpClient, "static">, string> = {
   dhclient: "isc-dhcp-client",
@@ -701,6 +726,58 @@ function emitMonitoring(host: Host): string[] {
     "ovs-vsctl -- --if-exists clear Bridge br-int ipfix \\",
     `  -- --id=@ipfix create IPFIX ${createArgs.join(" ")} \\`,
     "  -- set Bridge br-int ipfix=@ipfix",
+    "",
+  ];
+}
+
+/**
+ * Chassis registration — the OTHER undocumented manual bootstrap step
+ * this generator never emitted (added 2026-07-19, same day as the
+ * OVS/OVN package-install fix above, and for the same reason: confirmed
+ * live on mam-hh-core that `ovn-controller` can be fully installed AND
+ * running and STILL never register a Chassis row in the SB database,
+ * because none of `ovn-remote`/`ovn-encap-type`/`ovn-encap-ip`/
+ * `ovn-cms-options` were set. Without a registered chassis, br-int gets
+ * zero patch ports and NOTHING routes, anywhere — not a segment-specific
+ * symptom, the whole host is dark. `ovn-sbctl show`/`list Chassis` being
+ * empty despite ovn-northd showing thousands of idl-cells of real
+ * southbound data is the tell: the data's there, nothing has claimed it.
+ *
+ * `system-id` is NOT set here — ovn-host's own postinst already
+ * generates and persists that automatically on first package install
+ * (confirmed present on both mam-hh-ovn and mam-hh-core without this
+ * generator ever touching it), so re-deriving or overwriting it here
+ * would only risk breaking an already-stable chassis identity.
+ *
+ * `ovn-encap-type=geneve` is hardcoded, not configurable — every real
+ * deployment so far uses it and there's no declared need for an
+ * alternative (stt/vxlan) yet; add a Host field if that ever changes.
+ *
+ * `ovn-remote` defaults to the local SB socket — matches this project's
+ * current single-chassis assumption (see header comment and
+ * requiredPackages' doc comment above): every Host this generator
+ * targets runs its own full ovn-central alongside ovn-controller. A
+ * real multi-chassis topology would need this to point at the
+ * DESIGNATED central host's SB db (e.g. tcp:<central-ip>:6642) for
+ * every OTHER chassis — an un-implemented TODO, same one flagged
+ * against ovn-central in ALWAYS_REQUIRED_PACKAGES above.
+ *
+ * `ovn-cms-options=enable-chassis-as-gw` is unconditional: every router
+ * port this generator emits gets `lrp-set-gateway-chassis` (see
+ * emitGatewayChassis above) — a chassis cannot be scheduled for ANY of
+ * them without this flag, and every Host here is (today) the only
+ * chassis in its topology, so it must always be gateway-eligible.
+ */
+function emitChassisRegistration(host: Host): string[] {
+  return [
+    "# ── chassis registration (ovn-controller needs ALL of this to ───",
+    "# actually register in the SB database — see emitChassisRegistration",
+    "# doc comment, generate-ovn.ts, for why this silently leaves the",
+    "# whole host dark otherwise) ────────────────────────────────────",
+    'ovs-vsctl set open_vswitch . external-ids:ovn-remote="unix:/var/run/ovn/ovnsb_db.sock"',
+    "ovs-vsctl set open_vswitch . external-ids:ovn-encap-type=geneve",
+    `ovs-vsctl set open_vswitch . external-ids:ovn-encap-ip="${host.address}"`,
+    "ovs-vsctl set open_vswitch . external-ids:ovn-cms-options=enable-chassis-as-gw",
     "",
   ];
 }
@@ -836,6 +913,7 @@ function scriptForHost(
     "fi",
     "",
     ...emitPreflightChecks(uplinks),
+    ...emitChassisRegistration(host),
     "# ── interface setup (must run before OVN config below) ─────────",
     ...interfaceLines,
     "# ── OVN logical topology ────────────────────────────────────────",
