@@ -42,6 +42,7 @@
 // names derived from the segment's/uplink's own name (sw-home, not
 // sw-128), one comment header per block naming what produced it.
 
+import { IPAddress } from "npm:ipaddress@0.2.6";
 import { macFromV4, segmentBackboneNet, uplinkBackboneNet } from "./addressing.ts";
 import {
   backdoorBridge,
@@ -519,11 +520,29 @@ function emitSegmentBackboneJoin(s: Segment): string[] {
   if (s.uplink === undefined) {
     lines.push(`# --- segment ${s.name}: no uplink assigned, isolated ---`, "");
   } else {
-    lines.push(
-      ...emitBackboneJoin(s, s.uplink.resolve(), 1, "", [
-        { v4Prefix: "0.0.0.0/0", v6Prefix: "::/0" },
-      ]),
-    );
+    const resolved = s.uplink.resolve();
+    const routes: BackboneRoute[] = [
+      { v4Prefix: "0.0.0.0/0", v6Prefix: "::/0" },
+    ];
+    // A static4-configured uplink (StaticIpv4, types.ts) sits on a real
+    // LAN of its own — e.g. voda-avm's 192.168.132.0/24 behind the
+    // Fritzbox — that this segment reaches only through this same
+    // primary join. Without an explicit route for it here, a broader
+    // extraRoutes prefix on this segment (e.g. zerotier's
+    // 192.168.0.0/16) is more specific than the bare 0.0.0.0/0 default
+    // above and wins the longest-prefix-match, silently swallowing
+    // traffic meant for that local LAN into the wrong uplink instead.
+    // StaticIpv4.address is a host+prefix literal (e.g.
+    // "192.168.132.94/24"), not already a network address, so it's
+    // run through IPAddress .network() here rather than handed to
+    // ovn-nbctl as-is.
+    if (resolved.discovery?.static4 !== undefined) {
+      const network = IPAddress.parse(resolved.discovery.static4.address)
+        .network()
+        .to_string();
+      routes.push({ v4Prefix: network });
+    }
+    lines.push(...emitBackboneJoin(s, resolved, 1, "", routes));
   }
 
   // Extra routes: each gets its own backbone join, its own segment-side
@@ -782,6 +801,111 @@ function emitChassisRegistration(host: Host): string[] {
   ];
 }
 
+/**
+ * dhclient AppArmor profile — confirmed live 2026-07-24 (anger-core, a
+ * fresh unprivileged LXC container running this topology): even with
+ * the CONTAINER's own top-level confinement set to unconfined (Proxmox's
+ * lxc.apparmor.profile setting), dhclient's own PER-BINARY AppArmor
+ * profile (/etc/apparmor.d/sbin.dhclient) is loaded and enforced
+ * completely independently, inside the container's OWN AppArmor policy
+ * namespace — every unprivileged (user-namespaced) LXC container gets
+ * one of these automatically, regardless of the outer
+ * lxc.apparmor.profile setting, because that per-userns isolation is a
+ * kernel guarantee, not something the outer profile can waive. Symptom:
+ * dhclient fails to acquire a lease with kernel audit lines like
+ * `apparmor="DENIED" ... profile="/{,usr/}sbin/dhclient" ...
+ * info="failed protocol match"`. This has NOTHING to do with dhclient
+ * running inside a network namespace (`ip netns exec` doesn't create a
+ * new AppArmor policy namespace — only a new USER namespace does, and
+ * this container already has one from being unprivileged) — confirmed
+ * by checking dhclient's profile status from both inside the container
+ * and on the Proxmox host: the host's copy is a separate, unrelated
+ * profile with no namespace-qualified duplicate for this container, so
+ * it's genuinely the container's own copy causing the denial.
+ *
+ * Fix, applied idempotently, entirely from INSIDE the container (no
+ * Proxmox host-level change needed, unlike the TUN device fix below):
+ * unload the currently-enforced profile via AppArmor's securityfs
+ * `.remove` interface — NOT `apparmor_parser -R`, which errored against
+ * a stale/mismatched compiled cache (`Unable to remove
+ * ".../nm-dhcp-helper" — Profile doesn't exist`, confirmed live, even
+ * though that path is never mentioned anywhere in sbin.dhclient's own
+ * source) — then symlink the profile file into /etc/apparmor.d/disable/
+ * so it stays off across any future apparmor_parser re-scan (e.g. next
+ * container boot re-loading all of /etc/apparmor.d).
+ *
+ * Only emitted when this topology actually has an uplink using
+ * dhclient (same conditional gate requiredPackages/CLIENT_PACKAGE
+ * already use) — a topology with no dhclient uplink has no reason to
+ * touch this profile at all.
+ */
+function emitDhclientApparmorFix(uplinks: readonly Uplink[]): string[] {
+  const usesDhclient = uplinks.some((u) => {
+    const client = u.discovery?.client ??
+      (u.discovery?.ipv4 === "dhcp" ? "dhclient" : undefined);
+    return client === "dhclient";
+  });
+  if (!usesDhclient) return [];
+
+  const profile = "/etc/apparmor.d/sbin.dhclient";
+  return [
+    "# ── dhclient AppArmor profile: unload + disable inside this ─────",
+    "# container's own AppArmor policy namespace — see",
+    "# emitDhclientApparmorFix doc comment, generate-ovn.ts, for why ───",
+    `if [ -f "${profile}" ] && ` +
+      `grep -qF '/{,usr/}sbin/dhclient' /sys/kernel/security/apparmor/profiles 2>/dev/null; then`,
+    `  printf '%s' '/{,usr/}sbin/dhclient' > /sys/kernel/security/apparmor/.remove 2>/dev/null || true`,
+    "fi",
+    "mkdir -p /etc/apparmor.d/disable",
+    `[ -f "${profile}" ] && ln -sf "${profile}" /etc/apparmor.d/disable/sbin.dhclient 2>/dev/null || true`,
+    "",
+  ];
+}
+
+/**
+ * /dev/net/tun — required for ZeroTier to create its virtual interface.
+ * Confirmed live 2026-07-24 (anger-core): ZeroTier failed with `ERROR:
+ * unable to configure virtual network port: could not open TUN/TAP
+ * device: No such file or directory` — /dev/net/tun simply didn't exist
+ * inside the container.
+ *
+ * UNLIKE the dhclient AppArmor fix above, this CANNOT be fixed from
+ * inside the container at all: it needs a device cgroup allow rule
+ * (`lxc.cgroup2.devices.allow: c 10:200 rwm`) and a bind-mount
+ * (`lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file`) in
+ * the container's OWN Proxmox config (/etc/pve/lxc/<ctid>.conf, on the
+ * PROXMOX HOST, not this container) — plus a full container restart,
+ * since both cgroup device rules and mount entries only apply at
+ * container start. This generator's contract is "one script, copy it to
+ * the target HOST, run it" (see file header) — a Proxmox host-level LXC
+ * config edit falls outside that entirely, so this can only ever be a
+ * loud, actionable warning, never an automatic fix, unlike everything
+ * else in this file.
+ *
+ * Best-effort, boot-safe check — same shape as emitPreflightChecks's
+ * check_pkg: never blocks startup, just makes the gap impossible to
+ * miss in the log instead of silently failing deep inside ZeroTier's
+ * own retry loop (which otherwise just spins for 30s per uplink and
+ * moves on with net1 in a permanently-broken state, no obvious error at
+ * the point that actually matters).
+ */
+function emitTunDeviceCheck(uplinks: readonly Uplink[]): string[] {
+  if (!uplinks.some((u) => u.if.kind === "zerotier")) return [];
+  return [
+    "# ── /dev/net/tun preflight (ZeroTier) — see emitTunDeviceCheck ──",
+    "# doc comment, generate-ovn.ts: this is a PROXMOX HOST-level LXC",
+    "# config gap, not something this script can fix itself ──────────",
+    "if [ ! -c /dev/net/tun ]; then",
+    '  echo "WARNING: /dev/net/tun missing -- ZeroTier uplink(s) will fail to create their virtual interface." >&2',
+    '  echo "  Fix on the PROXMOX HOST (not this container), in /etc/pve/lxc/<ctid>.conf:" >&2',
+    '  echo "    lxc.cgroup2.devices.allow: c 10:200 rwm" >&2',
+    '  echo "    lxc.mount.entry: /dev/net/tun dev/net/tun none bind,create=file" >&2',
+    '  echo "  then fully restart the container (pct stop/start -- cgroup/mount changes only apply at container start)." >&2',
+    "fi",
+    "",
+  ];
+}
+
 // ── per-host assembly: one self-installing script ────────────────────
 
 function scriptForHost(
@@ -913,6 +1037,8 @@ function scriptForHost(
     "fi",
     "",
     ...emitPreflightChecks(uplinks),
+    ...emitDhclientApparmorFix(uplinks),
+    ...emitTunDeviceCheck(uplinks),
     ...emitChassisRegistration(host),
     "# ── interface setup (must run before OVN config below) ─────────",
     ...interfaceLines,
