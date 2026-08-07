@@ -290,7 +290,7 @@ function emitDhclient(u: Uplink, ns: string, realIface: string): string[] {
   ];
 }
 
-function emitDhcpcd(u: Uplink, ns: string, realIface: string): string[] {
+function emitDhcpcd(_u: Uplink, ns: string, realIface: string): string[] {
   // NOTE: flags not yet verified against a live host — dhcpcd isn't
   // installed on the reference deployment (only dhclient has been
   // confirmed live so far). -b backgrounds immediately, -q quiets normal

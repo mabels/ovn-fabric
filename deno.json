@@ -13,7 +13,19 @@
   },
   "tasks": {
     "check": "deno check src/*.ts",
-    "test": "deno test --allow-read --allow-env src/*_test.ts"
+    "test": "deno test --allow-read --allow-env src/*_test.ts",
+    "fmt": "deno fmt",
+    "fmt-check": "deno fmt --check",
+    "lint": "deno lint"
+  },
+  "fmt": {
+    "include": ["src/**/*.ts", "examples/**/*.ts"]
+  },
+  "lint": {
+    "include": ["src/**/*.ts", "examples/**/*.ts"],
+    "rules": {
+      "exclude": ["no-import-prefix"]
+    }
   },
   "publish": {
     "include": ["src/**/*.ts", "README.md", "LICENSE"],

@@ -46,6 +46,12 @@ jobs:
       - name: Install (pulls in `deno` as an npm dependency)
         run: npm install
 
+      - name: Format check
+        run: npx deno fmt --check
+
+      - name: Lint
+        run: npx deno lint
+
       - name: Type-check
         run: npx deno check src/*.ts examples/*.ts
 
