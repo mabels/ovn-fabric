@@ -29,7 +29,10 @@ Deno.test("segmentNet: suffix + ipv4 (no ipv6) -> ipv4 literal wins, ipv6 folds 
 });
 
 Deno.test("segmentNet: suffix + ipv6 (no ipv4) -> ipv6 literal wins, ipv4 folds from suffix", () => {
-  const net = segmentNet(130, { suffix: 7, ipv6: IPv6.parse("fd00:dead:beef::99/64") });
+  const net = segmentNet(130, {
+    suffix: 7,
+    ipv6: IPv6.parse("fd00:dead:beef::99/64"),
+  });
   assertEquals(net.ipv4.to_string(), "192.168.130.7/24");
   assertEquals(net.ipv6.to_string(), "fd00:dead:beef::99/64");
 });
@@ -83,7 +86,10 @@ Deno.test("segmentNet: ipv4/ipv6 literals are used EXACTLY as given, no segment-
 });
 
 Deno.test("segmentNet: id()/vlan() still reflect the segment id, regardless of literal overrides", () => {
-  const net = segmentNet(130, { ipv4: IPv4.parse("10.0.0.1/28"), ipv6: IPv6.parse("fd00::1") });
+  const net = segmentNet(130, {
+    ipv4: IPv4.parse("10.0.0.1/28"),
+    ipv6: IPv6.parse("fd00::1"),
+  });
   assertEquals(net.id(), 130);
   assertEquals(net.vlan(), 130);
 });

@@ -64,8 +64,8 @@ export type UplinkBuilder = (
 ) => Omit<Uplink, "name">;
 import {
   FixedUplink,
-  segmentId,
   type Segment,
+  segmentId,
   uplinkId,
   type UplinkSelector,
 } from "./types.ts";

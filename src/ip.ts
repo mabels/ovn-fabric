@@ -59,7 +59,9 @@ export class IPv4 extends IPAddress {
    * string — still checks the family, just skips the text round-trip. */
   static from(addr: IPAddress): IPv4 {
     if (!addr.is_ipv4()) {
-      throw new Error(`IPv4.from: "${addr.to_s()}" is not a valid IPv4 address`);
+      throw new Error(
+        `IPv4.from: "${addr.to_s()}" is not a valid IPv4 address`,
+      );
     }
     return new IPv4(addr);
   }
@@ -85,7 +87,9 @@ export class IPv6 extends IPAddress {
   /** Wrap an IPAddress already known to be IPv6 — see IPv4.from(). */
   static from(addr: IPAddress): IPv6 {
     if (!addr.is_ipv6()) {
-      throw new Error(`IPv6.from: "${addr.to_s()}" is not a valid IPv6 address`);
+      throw new Error(
+        `IPv6.from: "${addr.to_s()}" is not a valid IPv6 address`,
+      );
     }
     return new IPv6(addr);
   }

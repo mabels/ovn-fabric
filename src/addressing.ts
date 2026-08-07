@@ -15,11 +15,11 @@
 import { IPv4, IPv6 } from "./ip.ts";
 import {
   type NetId,
-  segmentId,
   type SegmentGateway,
   type SegmentId,
-  uplinkId,
+  segmentId,
   type UplinkId,
+  uplinkId,
 } from "./types.ts";
 
 function makeNetId(
@@ -99,7 +99,9 @@ export function uplinkBackboneNet(
   // still used for the IPv6 fold, which has no such size constraint.
   const id = typeof uplink === "number" ? uplinkId(uplink) : uplink;
   if (slot < 0 || slot > 4095) {
-    throw new RangeError(`uplinkBackboneNet: slot out of range (0-4095): ${slot}`);
+    throw new RangeError(
+      `uplinkBackboneNet: slot out of range (0-4095): ${slot}`,
+    );
   }
   const blockBase = (slot << 4) | 0x8;
   return makeNetId(

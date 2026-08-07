@@ -85,7 +85,12 @@ export function sshHost(
 }
 
 export function localHost(name: string, monitoring?: HostMonitoring): Host {
-  return { name, address: "127.0.0.1", access: { method: "local" }, monitoring };
+  return {
+    name,
+    address: "127.0.0.1",
+    access: { method: "local" },
+    monitoring,
+  };
 }
 
 // ── NetId: the identity every segment/uplink/transfer-link carries ──

@@ -162,7 +162,7 @@ function emitWireguardInterface(
     `  mv ${tmpPath} ${confPath}`,
     "}",
     `ip netns exec ${ns} wg show ${ifc.ifaceName} >/dev/null 2>&1 || ` +
-      `ip netns exec ${ns} wg-quick up ${confPath}`,
+    `ip netns exec ${ns} wg-quick up ${confPath}`,
   ];
 }
 
@@ -212,19 +212,19 @@ function emitZerotierInterface(
     // on this same host would never false-positive against this one's
     // already-running daemon.
     `ip netns exec ${ns} pgrep -f "zerotier-one -d ${dir}" >/dev/null || ` +
-      `ip netns exec ${ns} zerotier-one -d ${dir}`,
+    `ip netns exec ${ns} zerotier-one -d ${dir}`,
     `for i in $(seq 1 10); do ` +
-      `ip netns exec ${ns} zerotier-cli -D${dir} info >/dev/null 2>&1 && break; ` +
-      `sleep 1; done`,
+    `ip netns exec ${ns} zerotier-cli -D${dir} info >/dev/null 2>&1 && break; ` +
+    `sleep 1; done`,
     // join is itself idempotent (a no-op if already a member) — no
     // separate existence check needed, unlike the daemon-start line
     // above.
     `ip netns exec ${ns} zerotier-cli -D${dir} join ${ifc.networkId}`,
     `for i in $(seq 1 30); do ` +
-      `${varName}=$(ip netns exec ${ns} zerotier-cli -D${dir} -j listnetworks | ` +
-      `jq -r '.[] | select(.nwid=="${ifc.networkId}") | .portDeviceName' ` +
-      `2>/dev/null); [ -n "$${varName}" ] && [ "$${varName}" != "null" ] && break; ` +
-      `sleep 1; done`,
+    `${varName}=$(ip netns exec ${ns} zerotier-cli -D${dir} -j listnetworks | ` +
+    `jq -r '.[] | select(.nwid=="${ifc.networkId}") | .portDeviceName' ` +
+    `2>/dev/null); [ -n "$${varName}" ] && [ "$${varName}" != "null" ] && break; ` +
+    `sleep 1; done`,
     `ip netns exec ${ns} ip link set "$${varName}" up`,
   ];
 }
@@ -283,10 +283,10 @@ function dummyIface(u: Uplink): string {
 function emitDhclient(u: Uplink, ns: string, realIface: string): string[] {
   return [
     `ip netns exec ${ns} pgrep -f "dhclient.*${realIface}" >/dev/null || ` +
-      `ip netns exec ${ns} dhclient -nw ` +
-      `-pf /run/dhclient.${u.name}.pid ` +
-      `-lf /var/lib/dhcp/dhclient.${u.name}.leases ` +
-      `${realIface}`,
+    `ip netns exec ${ns} dhclient -nw ` +
+    `-pf /run/dhclient.${u.name}.pid ` +
+    `-lf /var/lib/dhcp/dhclient.${u.name}.leases ` +
+    `${realIface}`,
   ];
 }
 
@@ -299,7 +299,7 @@ function emitDhcpcd(u: Uplink, ns: string, realIface: string): string[] {
   // default pidfile naming varies by distro/version.
   return [
     `ip netns exec ${ns} pgrep -f "dhcpcd.*${realIface}" >/dev/null || ` +
-      `ip netns exec ${ns} dhcpcd -b -q ${realIface}`,
+    `ip netns exec ${ns} dhcpcd -b -q ${realIface}`,
   ];
 }
 
@@ -315,7 +315,7 @@ function emitStaticIpv4(u: Uplink, ns: string, realIface: string): string[] {
   if (cfg === undefined) {
     return [
       `# WARNING: client "static" requested for ${u.name} but no ` +
-        `discovery.static4 given — nothing configured, see types.ts`,
+      `discovery.static4 given — nothing configured, see types.ts`,
     ];
   }
   // cfg.address/cfg.gateway are already-parsed, already-validated IPv4
@@ -326,9 +326,9 @@ function emitStaticIpv4(u: Uplink, ns: string, realIface: string): string[] {
   // add`, which needs it.
   return [
     `ip netns exec ${ns} ip addr show ${realIface} | grep -q ${cfg.address.to_s()} || ` +
-      `ip netns exec ${ns} ip addr add ${cfg.address.to_string()} dev ${realIface}`,
+    `ip netns exec ${ns} ip addr add ${cfg.address.to_string()} dev ${realIface}`,
     `ip netns exec ${ns} ip route show | grep -q '^default' || ` +
-      `ip netns exec ${ns} ip route add default via ${cfg.gateway.to_s()} dev ${realIface}`,
+    `ip netns exec ${ns} ip route add default via ${cfg.gateway.to_s()} dev ${realIface}`,
   ];
 }
 
@@ -343,14 +343,14 @@ function emitStaticIpv6(u: Uplink, ns: string, realIface: string): string[] {
   if (cfg === undefined) {
     return [
       `# WARNING: discovery.ipv6 "static" requested for ${u.name} but no ` +
-        `discovery.static6 given — nothing configured, see types.ts`,
+      `discovery.static6 given — nothing configured, see types.ts`,
     ];
   }
   return [
     `ip netns exec ${ns} ip -6 addr show ${realIface} | grep -q ${cfg.address.to_s()} || ` +
-      `ip netns exec ${ns} ip -6 addr add ${cfg.address.to_string()} dev ${realIface}`,
+    `ip netns exec ${ns} ip -6 addr add ${cfg.address.to_string()} dev ${realIface}`,
     `ip netns exec ${ns} ip -6 route show | grep -q '^default' || ` +
-      `ip netns exec ${ns} ip -6 route add default via ${cfg.gateway.to_s()} dev ${realIface}`,
+    `ip netns exec ${ns} ip -6 route add default via ${cfg.gateway.to_s()} dev ${realIface}`,
   ];
 }
 
@@ -397,7 +397,7 @@ export function emitUplinkNetns(
   if (realIface === undefined) {
     return [
       `# unsupported uplink interface kind "${u.if.kind}" for ${u.name} ` +
-        `— skipped, see generate-netns.ts`,
+      `— skipped, see generate-netns.ts`,
       "",
     ];
   }

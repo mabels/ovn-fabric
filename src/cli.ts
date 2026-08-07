@@ -85,8 +85,7 @@ async function loadConfig(configPath: string): Promise<NetworkDefinition> {
 
 const generate = command({
   name: "generate",
-  description:
-    "Load a topology config and report what it declares.",
+  description: "Load a topology config and report what it declares.",
   args: {
     configPath: positional({
       type: string,
@@ -105,7 +104,9 @@ const generate = command({
         .join(", ");
       console.log(
         `    - ${u.name} (if=${describeInterface(u.if)}, ` +
-          `addresses=[${addrSummary}], host=${u.host.name} [${describeAccess(u.host)}])`,
+          `addresses=[${addrSummary}], host=${u.host.name} [${
+            describeAccess(u.host)
+          }])`,
       );
     }
     console.log(`  segments: ${net.allSegments.length}`);
@@ -120,7 +121,9 @@ const generate = command({
       console.log(
         `    - ${s.name} (if=${describeInterface(s.if)}, ` +
           `addresses=[${addrSummary}], uplink=${uplinkName}, ` +
-          `selector=${selectorKind}, host=${s.host.name} [${describeAccess(s.host)}])`,
+          `selector=${selectorKind}, host=${s.host.name} [${
+            describeAccess(s.host)
+          }])`,
       );
     }
   },

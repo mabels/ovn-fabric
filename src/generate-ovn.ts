@@ -42,7 +42,11 @@
 // names derived from the segment's/uplink's own name (sw-home, not
 // sw-128), one comment header per block naming what produced it.
 
-import { macFromV4, segmentBackboneNet, uplinkBackboneNet } from "./addressing.ts";
+import {
+  macFromV4,
+  segmentBackboneNet,
+  uplinkBackboneNet,
+} from "./addressing.ts";
 import {
   backdoorBridge,
   emitBackdoorNat,
@@ -503,8 +507,12 @@ function emitBackboneJoin(
     // 192.168.128.2/24) down to the true network address itself —
     // confirmed live — so v4Prefix(s.addresses[0]) is safe to pass
     // directly here without a separate network-address helper.
-    `ovn-nbctl --may-exist lr-route-add ${upRouter} ${v4Prefix(s.addresses[0])} ${segBackbone.ipv4.to_s()}`,
-    `ovn-nbctl --may-exist lr-route-add ${upRouter} ${v6Prefix(s.addresses[0])} ${segBackbone.ipv6.to_s()}`,
+    `ovn-nbctl --may-exist lr-route-add ${upRouter} ${
+      v4Prefix(s.addresses[0])
+    } ${segBackbone.ipv4.to_s()}`,
+    `ovn-nbctl --may-exist lr-route-add ${upRouter} ${
+      v6Prefix(s.addresses[0])
+    } ${segBackbone.ipv6.to_s()}`,
     "",
   ];
 }
@@ -660,7 +668,9 @@ function requiredPackages(uplinks: readonly Uplink[]): string[] {
  * spaces throughout: spliced directly inside scriptForHost's `$1 !=
  * --setup-only` block. */
 function emitAptInstall(uplinks: readonly Uplink[]): string[] {
-  const packages = requiredPackages(uplinks).filter((p) => p !== "zerotier-one");
+  const packages = requiredPackages(uplinks).filter((p) =>
+    p !== "zerotier-one"
+  );
   const lines = [
     "  # install required packages (this branch only runs on a manual,",
     "  # direct invocation — never on the systemd/boot path, see header",
@@ -690,7 +700,7 @@ function emitZerotierInstall(uplinks: readonly Uplink[]): string[] {
     "  # installs the package. Skipped if already present (idempotent,",
     "  # and avoids re-curling on every manual run).",
     "  dpkg -s zerotier-one >/dev/null 2>&1 || " +
-      'timeout 120 bash -c "curl -s https://install.zerotier.com | bash"',
+    'timeout 120 bash -c "curl -s https://install.zerotier.com | bash"',
     "  # The installer enables+starts the package's own main",
     "  # zerotier-one.service, running as a HOST-level daemon against",
     "  # the default /var/lib/zerotier-one -- completely separate from,",
@@ -711,7 +721,7 @@ function emitPreflightChecks(uplinks: readonly Uplink[]): string[] {
     "# blocks startup — 5s cap per package, see header comment) ─────",
     "check_pkg() {",
     '  timeout 5 dpkg -s "$1" >/dev/null 2>&1 || ' +
-      'echo "WARNING: package \\"$1\\" not detected (or check timed out) -- continuing anyway" >&2',
+    'echo "WARNING: package \\"$1\\" not detected (or check timed out) -- continuing anyway" >&2',
     "}",
   ];
   for (const pkg of requiredPackages(uplinks)) lines.push(`check_pkg ${pkg}`);
@@ -732,11 +742,15 @@ function emitMonitoring(host: Host): string[] {
   if (ipfix === undefined) return [];
 
   const createArgs = [`targets="${ipfix.target}"`];
-  if (ipfix.sampling !== undefined) createArgs.push(`sampling=${ipfix.sampling}`);
+  if (ipfix.sampling !== undefined) {
+    createArgs.push(`sampling=${ipfix.sampling}`);
+  }
   if (ipfix.cacheActiveTimeout !== undefined) {
     createArgs.push(`cache_active_timeout=${ipfix.cacheActiveTimeout}`);
   }
-  if (ipfix.cacheMaxFlows !== undefined) createArgs.push(`cache_max_flows=${ipfix.cacheMaxFlows}`);
+  if (ipfix.cacheMaxFlows !== undefined) {
+    createArgs.push(`cache_max_flows=${ipfix.cacheMaxFlows}`);
+  }
 
   return [
     "# ── monitoring: IPFIX export off br-int ─────────────────────────",
@@ -851,7 +865,7 @@ function emitDhclientApparmorFix(uplinks: readonly Uplink[]): string[] {
     "# container's own AppArmor policy namespace — see",
     "# emitDhclientApparmorFix doc comment, generate-ovn.ts, for why ───",
     `if [ -f "${profile}" ] && ` +
-      `grep -qF '/{,usr/}sbin/dhclient' /sys/kernel/security/apparmor/profiles 2>/dev/null; then`,
+    `grep -qF '/{,usr/}sbin/dhclient' /sys/kernel/security/apparmor/profiles 2>/dev/null; then`,
     `  printf '%s' '/{,usr/}sbin/dhclient' > /sys/kernel/security/apparmor/.remove 2>/dev/null || true`,
     "fi",
     "mkdir -p /etc/apparmor.d/disable",
@@ -920,7 +934,10 @@ function scriptForHost(
 
   for (const s of segments) {
     interfaceLines.push(...emitSegmentInterface(s));
-    bridgeMappings.push({ networkName: `seg-${s.name}`, bridge: `br-${s.name}` });
+    bridgeMappings.push({
+      networkName: `seg-${s.name}`,
+      bridge: `br-${s.name}`,
+    });
   }
   for (const u of uplinks) {
     interfaceLines.push(...emitUplinkTransferInterface(u));
@@ -954,7 +971,9 @@ function scriptForHost(
   }
 
   const ovnLines: string[] = [];
-  if (segments.length > 0) ovnLines.push("ovn-nbctl --may-exist ls-add sw-backbone", "");
+  if (segments.length > 0) {
+    ovnLines.push("ovn-nbctl --may-exist ls-add sw-backbone", "");
+  }
   for (const segment of segments) ovnLines.push(...emitSegment(segment));
   for (const uplink of uplinks) {
     ovnLines.push(...emitUplinkTransfer(uplink));
@@ -1045,7 +1064,7 @@ function scriptForHost(
     // generator itself (ADR 0001 §2, generator never touches live
     // state). Every router port below needs this for gateway-chassis
     // scheduling; on a single-chassis host this is the only chassis.
-    'CHASSIS=$(ovs-vsctl get open . external-ids:system-id | tr -d \'"\')',
+    "CHASSIS=$(ovs-vsctl get open . external-ids:system-id | tr -d '\"')",
     "",
     ...ovnLines,
     "# ── uplink netns setup (SLAAC/dhclient/NAT) ─────────────────────",
