@@ -42,7 +42,6 @@
 // names derived from the segment's/uplink's own name (sw-home, not
 // sw-128), one comment header per block naming what produced it.
 
-import { IPAddress } from "npm:ipaddress@0.2.6";
 import { macFromV4, segmentBackboneNet, uplinkBackboneNet } from "./addressing.ts";
 import {
   backdoorBridge,
@@ -51,6 +50,7 @@ import {
   uplinkTransferBridge,
 } from "./generate-netns.ts";
 import type { NetworkDefinition } from "./define.ts";
+import { IPv4, IPv6 } from "./ip.ts";
 import type { DhcpClient, Host, Segment, Uplink } from "./types.ts";
 
 /** One (network_name, OVS bridge) pair that must appear in
@@ -411,10 +411,10 @@ function emitBackdoor(u: Uplink): string[] {
 // and host offset (2, 3, ...).
 
 interface BackboneRoute {
-  readonly v4Prefix: string;
+  readonly v4Prefix: IPv4;
   /** Omit for a v4-only route (e.g. a private-supernet extra route
    * with no IPv6 equivalent declared). */
-  readonly v6Prefix?: string;
+  readonly v6Prefix?: IPv6;
 }
 
 function emitBackboneJoin(
@@ -445,11 +445,11 @@ function emitBackboneJoin(
 
   const routeLines = routes.flatMap((r) => {
     const lines = [
-      `ovn-nbctl --may-exist lr-route-add ${segRouter} ${r.v4Prefix} ${upBackbone.ipv4.to_s()}`,
+      `ovn-nbctl --may-exist lr-route-add ${segRouter} ${r.v4Prefix.to_string()} ${upBackbone.ipv4.to_s()}`,
     ];
     if (r.v6Prefix !== undefined) {
       lines.push(
-        `ovn-nbctl --may-exist lr-route-add ${segRouter} ${r.v6Prefix} ${upBackbone.ipv6.to_s()}`,
+        `ovn-nbctl --may-exist lr-route-add ${segRouter} ${r.v6Prefix.to_string()} ${upBackbone.ipv6.to_s()}`,
       );
     }
     return lines;
@@ -522,7 +522,7 @@ function emitSegmentBackboneJoin(s: Segment): string[] {
   } else {
     const resolved = s.uplink.resolve();
     const routes: BackboneRoute[] = [
-      { v4Prefix: "0.0.0.0/0", v6Prefix: "::/0" },
+      { v4Prefix: IPv4.parse("0.0.0.0/0"), v6Prefix: IPv6.parse("::/0") },
     ];
     // A static4-configured uplink (StaticIpv4, types.ts) sits on a real
     // LAN of its own — e.g. voda-avm's 192.168.132.0/24 behind the
@@ -533,13 +533,11 @@ function emitSegmentBackboneJoin(s: Segment): string[] {
     // above and wins the longest-prefix-match, silently swallowing
     // traffic meant for that local LAN into the wrong uplink instead.
     // StaticIpv4.address is a host+prefix literal (e.g.
-    // "192.168.132.94/24"), not already a network address, so it's
-    // run through IPAddress .network() here rather than handed to
-    // ovn-nbctl as-is.
+    // "192.168.132.94/24"), not already a network address, so it's run
+    // through IPv4 .network() here rather than handed to ovn-nbctl
+    // as-is.
     if (resolved.discovery?.static4 !== undefined) {
-      const network = IPAddress.parse(resolved.discovery.static4.address)
-        .network()
-        .to_string();
+      const network = resolved.discovery.static4.address.network();
       routes.push({ v4Prefix: network });
     }
     lines.push(...emitBackboneJoin(s, resolved, 1, "", routes));

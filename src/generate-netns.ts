@@ -318,12 +318,39 @@ function emitStaticIpv4(u: Uplink, ns: string, realIface: string): string[] {
         `discovery.static4 given — nothing configured, see types.ts`,
     ];
   }
-  const addrHost = cfg.address.split("/")[0];
+  // cfg.address/cfg.gateway are already-parsed, already-validated IPv4
+  // (see StaticIpv4, types.ts, and IPv4, ip.ts) — built directly in
+  // topology.ts via IPv4.parse(...)/StaticIpv4.of(...), never a bare
+  // string. to_s() gives the bare host (no prefix) for `ip addr show`/
+  // `ip route add via`; to_string() keeps the prefix for `ip addr
+  // add`, which needs it.
   return [
-    `ip netns exec ${ns} ip addr show ${realIface} | grep -q ${addrHost} || ` +
-      `ip netns exec ${ns} ip addr add ${cfg.address} dev ${realIface}`,
+    `ip netns exec ${ns} ip addr show ${realIface} | grep -q ${cfg.address.to_s()} || ` +
+      `ip netns exec ${ns} ip addr add ${cfg.address.to_string()} dev ${realIface}`,
     `ip netns exec ${ns} ip route show | grep -q '^default' || ` +
-      `ip netns exec ${ns} ip route add default via ${cfg.gateway} dev ${realIface}`,
+      `ip netns exec ${ns} ip route add default via ${cfg.gateway.to_s()} dev ${realIface}`,
+  ];
+}
+
+/** discovery.ipv6 === "static": the v6 mirror of emitStaticIpv4 above —
+ * configure the fixed address + default gateway directly (see
+ * StaticIpv6, types.ts), what accept_ra/SLAAC would otherwise learn.
+ * No client/daemon dispatch needed here (unlike v4's dhclient/dhcpcd/
+ * static three-way): SLAAC is a pure kernel mechanism, so "static" is
+ * the only other state and this is its one implementation. */
+function emitStaticIpv6(u: Uplink, ns: string, realIface: string): string[] {
+  const cfg = u.discovery?.static6;
+  if (cfg === undefined) {
+    return [
+      `# WARNING: discovery.ipv6 "static" requested for ${u.name} but no ` +
+        `discovery.static6 given — nothing configured, see types.ts`,
+    ];
+  }
+  return [
+    `ip netns exec ${ns} ip -6 addr show ${realIface} | grep -q ${cfg.address.to_s()} || ` +
+      `ip netns exec ${ns} ip -6 addr add ${cfg.address.to_string()} dev ${realIface}`,
+    `ip netns exec ${ns} ip -6 route show | grep -q '^default' || ` +
+      `ip netns exec ${ns} ip -6 route add default via ${cfg.gateway.to_s()} dev ${realIface}`,
   ];
 }
 
@@ -475,13 +502,17 @@ export function emitUplinkNetns(
   );
 
   // discovery: SLAAC needs accept_ra=2 (forwarding suppresses RA
-  // otherwise — confirmed live, this session). DHCPv4 needs dhclient
-  // started on the real interface, inside the netns.
+  // otherwise — confirmed live, this session). "static" configures the
+  // fixed address+gateway directly instead (see emitStaticIpv6 above).
+  // DHCPv4 needs dhclient started on the real interface, inside the
+  // netns.
   if (u.discovery?.ipv6 === "slaac") {
     lines.push(
       `ip netns exec ${ns} sh -c "echo 2 > ` +
         `/proc/sys/net/ipv6/conf/${realIface}/accept_ra"`,
     );
+  } else if (u.discovery?.ipv6 === "static") {
+    lines.push(...emitStaticIpv6(u, ns, realIface));
   }
   lines.push(...emitIpv4Discovery(u, ns, realIface));
 

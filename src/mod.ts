@@ -12,4 +12,5 @@
 // something a config module needs to import.)
 export * from "./define.ts";
 export * from "./factories.ts";
+export * from "./ip.ts";
 export * from "./types.ts";

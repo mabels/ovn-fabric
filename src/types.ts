@@ -2,7 +2,7 @@
 // No topology data lives here. This file defines the SHAPE; model.ts
 // declares the FACTS.
 
-import { IPAddress } from "npm:ipaddress@0.2.6";
+import type { IPv4, IPv6 } from "./ip.ts";
 
 // ── distinct identity types ──────────────────────────────────────
 // Branded types: structurally still numbers at runtime, but the type
@@ -110,8 +110,8 @@ export function localHost(name: string, monitoring?: HostMonitoring): Host {
 // after the address string is fully built.
 
 export interface NetId {
-  readonly ipv4: IPAddress;
-  readonly ipv6: IPAddress;
+  readonly ipv4: IPv4;
+  readonly ipv6: IPv6;
   id(): number;
   vlan(): number | undefined;
 }
@@ -123,6 +123,35 @@ export interface NetId {
  * conceptually carries both its OVN-side and netns-side identity.
  */
 export type Addresses = readonly NetId[];
+
+// ── SegmentGateway: how a segment's own gateway address is expressed ──
+// The config-facing input to segmentNet() (addressing.ts) and, via it,
+// segmentPhysical()/segmentVlan() (factories.ts). Either family can be
+// given as an explicit, already-parsed IPv4/IPv6 — used EXACTLY as
+// given, no segment-default-prefix substitution: if the standard /24
+// (v4) or /64 (v6) doesn't fit, write the prefix yourself, e.g.
+// `IPv4.parse("192.168.130.5/28")` — or folded from `suffix`/`suffix6`
+// into the segment's standard pattern (192.168.<id>.<suffix>/24,
+// fd00:192:168:<id>::<suffix6 ?? suffix>/64). At least one field must
+// resolve an address for EACH family — see segmentNet's resolution
+// rules (addressing.ts) for exactly how a partial combination gets
+// filled in (e.g. only `ipv6` given transfers its host-id into the v4
+// fold too, so a caller supplying one family's literal doesn't also
+// have to spell out a redundant suffix).
+export interface SegmentGateway {
+  /** Host-id folded into the segment's standard pattern. Required
+   * unless at least one of `ipv4`/`ipv6` is given instead. */
+  readonly suffix?: number;
+  /** Override just the IPv6 host-id, if it should differ from `suffix`
+   * (e.g. gateway answers on ...::<suffix6> while IPv4 answers on
+   * .<suffix>). Defaults to `suffix`. Ignored if `ipv6` is set. */
+  readonly suffix6?: number;
+  /** Replaces the folded v4 pattern entirely — for a gateway address
+   * that doesn't fit this segment's usual 192.168.<id>.<n>/24 shape. */
+  readonly ipv4?: IPv4;
+  /** Same as `ipv4`, for the v6 side. */
+  readonly ipv6?: IPv6;
+}
 
 // ── physical realization ─────────────────────────────────────────
 // HOW a Segment/Uplink actually attaches to a real wire. Deliberately
@@ -308,12 +337,63 @@ export type DhcpClient = "dhclient" | "dhcpcd" | "static";
 /** The fixed address+prefix and default gateway to configure directly
  * on a real interface when Discovery.client is "static" — see
  * emitStaticIpv4 (generate-netns.ts). Only consulted then; every other
- * client ignores it. */
-export interface StaticIpv4 {
-  /** e.g. "192.0.2.93/24" */
-  readonly address: string;
-  /** e.g. "192.0.2.1" */
-  readonly gateway: string;
+ * client ignores it. Holds real, family-checked IPv4 values (see
+ * ip.ts) — a config author builds these directly in topology.ts via
+ * `IPv4.parse(...)`, so a v6 literal handed here fails to parse right
+ * there, not on a live host months later. A named constructor
+ * (StaticIpv4.of) rather than a plain object literal so a SECOND
+ * real-world mistake — a gateway that isn't actually on the address's
+ * own subnet, e.g. address 192.0.2.93/24 with gateway 198.51.100.1 —
+ * fails the same way, at config-build time, instead of surfacing as an
+ * unreachable default route on the live host. */
+export class StaticIpv4 {
+  readonly address: IPv4;
+  readonly gateway: IPv4;
+
+  private constructor(address: IPv4, gateway: IPv4) {
+    this.address = address;
+    this.gateway = gateway;
+  }
+
+  static of(address: IPv4, gateway: IPv4): StaticIpv4 {
+    if (!address.includes(gateway)) {
+      throw new Error(
+        `StaticIpv4.of: gateway ${gateway.to_s()} is not within ${address.to_string()}`,
+      );
+    }
+    return new StaticIpv4(address, gateway);
+  }
+}
+
+/** The fixed address+prefix and default gateway to configure directly
+ * on a real interface when Discovery.ipv6 is "static" — see
+ * emitStaticIpv6 (generate-netns.ts). Mirrors StaticIpv4 exactly (built
+ * from `IPv6.parse(...)`/`StaticIpv6.of(...)` instead — see ip.ts); the
+ * only reason this is a separate class rather than reusing StaticIpv4
+ * is readability at the call site (an "ipv6:" field holding something
+ * literally named StaticIpv4 would read wrong), not a difference in
+ * shape or behavior. Added 2026-08-03 to close a real gap:
+ * discovery.ipv6 already accepted the literal "static" value, but
+ * nothing ever consulted an actual address for it — every uplink that
+ * wanted a fixed v6 address had no way to express one, unlike v4's
+ * static4/client:"static" pair. */
+export class StaticIpv6 {
+  readonly address: IPv6;
+  readonly gateway: IPv6;
+
+  private constructor(address: IPv6, gateway: IPv6) {
+    this.address = address;
+    this.gateway = gateway;
+  }
+
+  static of(address: IPv6, gateway: IPv6): StaticIpv6 {
+    if (!address.includes(gateway)) {
+      throw new Error(
+        `StaticIpv6.of: gateway ${gateway.to_s()} is not within ${address.to_string()}`,
+      );
+    }
+    return new StaticIpv6(address, gateway);
+  }
 }
 
 export interface Discovery {
@@ -326,6 +406,12 @@ export interface Discovery {
   readonly client?: DhcpClient;
   /** Only consulted when client === "static". See StaticIpv4. */
   readonly static4?: StaticIpv4;
+  /** Only consulted when ipv6 === "static". See StaticIpv6. Unlike
+   * v4, there's no pluggable "client" concept here — SLAAC is a pure
+   * kernel mechanism (accept_ra), not a userspace daemon, so "static"
+   * is the only other state and static6's mere presence is what
+   * triggers it (see resolveDiscovery, factories.ts). */
+  readonly static6?: StaticIpv6;
 }
 
 // ── backdoor: borrowed egress for a VPN-like uplink ─────────────────
@@ -466,14 +552,14 @@ export class ManualUplink implements UplinkSelector {
 // named from the primary join so multiple simultaneous joins for the
 // same segment never collide.
 export interface ExtraRoute {
-  /** e.g. "192.168.0.0/16". Passed straight to `ovn-nbctl
-   * lr-route-add` — no fold/derivation, this is a literal prefix the
-   * caller declares. */
-  readonly prefix: string;
+  /** e.g. IPv4.parse("192.168.0.0/16"). Passed straight to `ovn-nbctl
+   * lr-route-add` — no fold/derivation, just the literal, family-checked
+   * prefix the caller built directly in topology.ts (see ip.ts). */
+  readonly prefix: IPv4;
   /** IPv6 equivalent, if this route needs one too. Omit for a v4-only
    * extra route (the common case for a private-supernet-shaped
    * route). */
-  readonly prefix6?: string;
+  readonly prefix6?: IPv6;
   /** Already resolved to a selector by the factory (segmentPhysical/
    * segmentVlan), same normalization as Segment.uplink — the caller in
    * config/topology.ts may pass a plain Uplink or any UplinkSelector,

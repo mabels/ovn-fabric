@@ -23,6 +23,7 @@
 // vs sparse input at all.
 
 import { segmentNet, transferNet } from "./addressing.ts";
+import type { IPv4, IPv6 } from "./ip.ts";
 import type {
   Addresses,
   Backdoor,
@@ -32,7 +33,9 @@ import type {
   Host,
   InterfaceKind,
   Nat,
+  SegmentGateway,
   StaticIpv4,
+  StaticIpv6,
   Uplink,
   WireguardInterfaceConfig,
 } from "./types.ts";
@@ -83,6 +86,7 @@ function resolveDiscovery(
   spec: AddressSpec | undefined,
   client?: DhcpClient,
   static4?: StaticIpv4,
+  static6?: StaticIpv6,
 ): Discovery {
   // client === "static" implies ipv4 "static" outright — the caller
   // doesn't also have to remember to set addresses.ipv4: "static"
@@ -93,10 +97,16 @@ function resolveDiscovery(
     : spec?.ipv4 === undefined || spec.ipv4 === "dhcp"
     ? "dhcp"
     : "static";
-  const ipv6 = spec?.ipv6 === undefined || spec.ipv6 === "slaac"
+  // static6 given implies ipv6 "static" outright — the v6 mirror of
+  // client === "static" above. No pluggable client for v6 (SLAAC is
+  // kernel-only, not a daemon), so static6's mere presence is the only
+  // signal needed.
+  const ipv6 = static6 !== undefined
+    ? "static"
+    : spec?.ipv6 === undefined || spec.ipv6 === "slaac"
     ? "slaac"
     : "static";
-  return { ipv4, ipv6, client, static4 };
+  return { ipv4, ipv6, client, static4, static6 };
 }
 
 // ── vlan() ───────────────────────────────────────────────────────────
@@ -118,8 +128,15 @@ interface VlanUplinkInput {
    * DhcpClient (types.ts). Set to "static" (with `static4` below) for
    * a real interface whose address is fixed/known rather than leased. */
   readonly client?: DhcpClient;
-  /** Only consulted when client === "static" — see StaticIpv4 (types.ts). */
+  /** Only consulted when client === "static" — built directly in
+   * topology.ts via `StaticIpv4.of(IPv4.parse(...), IPv4.parse(...))`
+   * (types.ts, ip.ts), never a bare string. */
   readonly static4?: StaticIpv4;
+  /** A fixed IPv6 address+gateway for this uplink's real interface,
+   * replacing SLAAC — the v6 mirror of `static4`. Giving this alone
+   * selects static v6 discovery; there's no v6 equivalent of `client`
+   * to also set. Built via `StaticIpv6.of(...)` — see `static4` above. */
+  readonly static6?: StaticIpv6;
 }
 
 export function uplinkVlan(input: VlanUplinkInput): UplinkBuilder {
@@ -146,7 +163,12 @@ export function uplinkVlan(input: VlanUplinkInput): UplinkBuilder {
       addresses,
       if: ifc,
       nat: input.nat,
-      discovery: resolveDiscovery(input.addresses, input.client, input.static4),
+      discovery: resolveDiscovery(
+        input.addresses,
+        input.client,
+        input.static4,
+        input.static6,
+      ),
       host: input.host,
     };
   };
@@ -168,8 +190,15 @@ interface PhysicalUplinkInput {
    * DhcpClient (types.ts). Set to "static" (with `static4` below) for
    * a real interface whose address is fixed/known rather than leased. */
   readonly client?: DhcpClient;
-  /** Only consulted when client === "static" — see StaticIpv4 (types.ts). */
+  /** Only consulted when client === "static" — built directly in
+   * topology.ts via `StaticIpv4.of(IPv4.parse(...), IPv4.parse(...))`
+   * (types.ts, ip.ts), never a bare string. */
   readonly static4?: StaticIpv4;
+  /** A fixed IPv6 address+gateway for this uplink's real interface,
+   * replacing SLAAC — the v6 mirror of `static4`. Giving this alone
+   * selects static v6 discovery; there's no v6 equivalent of `client`
+   * to also set. Built via `StaticIpv6.of(...)` — see `static4` above. */
+  readonly static6?: StaticIpv6;
 }
 
 export function uplinkPhysical(input: PhysicalUplinkInput): UplinkBuilder {
@@ -191,7 +220,12 @@ export function uplinkPhysical(input: PhysicalUplinkInput): UplinkBuilder {
       addresses,
       if: ifc,
       nat: input.nat,
-      discovery: resolveDiscovery(input.addresses, input.client, input.static4),
+      discovery: resolveDiscovery(
+        input.addresses,
+        input.client,
+        input.static4,
+        input.static6,
+      ),
       host: input.host,
     };
   };
@@ -467,10 +501,14 @@ function resolveUplinkSelector(
 
 /** The sparse, config-facing shape of an ExtraRoute (types.ts) — same
  * `Uplink | UplinkSelector` looseness as a segment's primary `uplink`,
- * normalized the same way (see resolveExtraRoutes below). */
+ * normalized the same way (see resolveExtraRoutes below). `prefix`/
+ * `prefix6` are already-parsed IPv4/IPv6 (see ip.ts) — built directly
+ * in topology.ts via `IPv4.parse(...)`/`IPv6.parse(...)`, matching
+ * ExtraRoute.prefix/prefix6 exactly, so there's nothing left to parse
+ * here. */
 export interface ExtraRouteInput {
-  readonly prefix: string;
-  readonly prefix6?: string;
+  readonly prefix: IPv4;
+  readonly prefix6?: IPv6;
   readonly uplink: Uplink | UplinkSelector;
 }
 
@@ -499,32 +537,16 @@ interface SegmentPhysicalInput {
   readonly nat?: Nat;
   /** Advertise RA/SLAAC for this segment's IPv6 prefix. Defaults to true. */
   readonly slaac?: boolean;
-  /** The last octet/host-id OVN's own gateway answers on within this
-   * segment's standard pattern (e.g. 2 -> 192.168.<id>.2 /
-   * fd00:192:168:<id>::2). Required unless both `gatewayIp` and
-   * `gatewayIpv6` are given instead (see below) — deliberately no
-   * silent default: whether OVN should coexist alongside an existing
-   * router (conventionally .2, existing router keeps .1) or take over
-   * .1 outright (once that router is decommissioned) is a real,
-   * per-segment operational fact with real consequences if picked
-   * wrong (address collision, or an outage when a router is turned
-   * off). */
-  readonly gatewaySuffix?: number;
-  /** Override just the IPv6 host-id, if it should differ from
-   * `gatewaySuffix` (e.g. gateway answers on
-   * fd00:192:168:<id>::<gatewaySuffix6> while IPv4 answers on
-   * 192.168.<id>.<gatewaySuffix>). Defaults to `gatewaySuffix`. Ignored
-   * if `gatewayIpv6` is set. */
-  readonly gatewaySuffix6?: number;
-  /** A literal IPv4 address/prefix (e.g. "192.168.130.5" or
-   * "192.168.130.5/28") that replaces the standard fold pattern
-   * entirely, for a gateway that doesn't fit 192.168.<id>.<n>/24 —
-   * parsed/validated via the `ipaddress` package, not string-pasted. A
-   * bare address (no "/...") gets this segment's default /24. */
-  readonly gatewayIp?: string;
-  /** Same as `gatewayIp`, for the IPv6 side (default prefix /64 if the
-   * address has none). */
-  readonly gatewayIpv6?: string;
+  /** How OVN's own gateway address on this segment is expressed — see
+   * SegmentGateway (types.ts). Most segments just give `{ suffix: N }`
+   * (folds into 192.168.<id>.<n> / fd00:192:168:<id>::<n>) — deliberately
+   * no silent default for it: whether OVN should coexist alongside an
+   * existing router (conventionally .2, existing router keeps .1) or
+   * take over .1 outright (once that router is decommissioned) is a
+   * real, per-segment operational fact with real consequences if
+   * picked wrong (address collision, or an outage when a router is
+   * turned off). */
+  readonly gateway: SegmentGateway;
   readonly host: Host;
 }
 
@@ -535,14 +557,7 @@ export function segmentPhysical(
     typeof input.id === "string" ? Number.parseInt(input.id, 10) : input.id,
   );
   return {
-    addresses: [
-      segmentNet(id, {
-        suffix: input.gatewaySuffix,
-        suffix6: input.gatewaySuffix6,
-        ipv4: input.gatewayIp,
-        ipv6: input.gatewayIpv6,
-      }),
-    ],
+    addresses: [segmentNet(id, input.gateway)],
     if: { kind: "physical", name: input.name },
     uplink: resolveUplinkSelector(input.uplink),
     extraRoutes: resolveExtraRoutes(input.extraRoutes),
@@ -570,32 +585,10 @@ interface SegmentVlanInput {
   readonly nat?: Nat;
   /** Advertise RA/SLAAC for this segment's IPv6 prefix. Defaults to true. */
   readonly slaac?: boolean;
-  /** The last octet/host-id OVN's own gateway answers on within this
-   * segment's standard pattern (e.g. 2 -> 192.168.<id>.2 /
-   * fd00:192:168:<id>::2). Required unless both `gatewayIp` and
-   * `gatewayIpv6` are given instead (see below) — deliberately no
-   * silent default: whether OVN should coexist alongside an existing
-   * router (conventionally .2, existing router keeps .1) or take over
-   * .1 outright (once that router is decommissioned) is a real,
-   * per-segment operational fact with real consequences if picked
-   * wrong (address collision, or an outage when a router is turned
-   * off). */
-  readonly gatewaySuffix?: number;
-  /** Override just the IPv6 host-id, if it should differ from
-   * `gatewaySuffix` (e.g. gateway answers on
-   * fd00:192:168:<id>::<gatewaySuffix6> while IPv4 answers on
-   * 192.168.<id>.<gatewaySuffix>). Defaults to `gatewaySuffix`. Ignored
-   * if `gatewayIpv6` is set. */
-  readonly gatewaySuffix6?: number;
-  /** A literal IPv4 address/prefix (e.g. "192.168.130.5" or
-   * "192.168.130.5/28") that replaces the standard fold pattern
-   * entirely, for a gateway that doesn't fit 192.168.<id>.<n>/24 —
-   * parsed/validated via the `ipaddress` package, not string-pasted. A
-   * bare address (no "/...") gets this segment's default /24. */
-  readonly gatewayIp?: string;
-  /** Same as `gatewayIp`, for the IPv6 side (default prefix /64 if the
-   * address has none). */
-  readonly gatewayIpv6?: string;
+  /** How OVN's own gateway address on this segment is expressed — see
+   * SegmentGateway (types.ts) and the same field on SegmentPhysicalInput
+   * above. */
+  readonly gateway: SegmentGateway;
   readonly host: Host;
 }
 
@@ -604,14 +597,7 @@ export function segmentVlan(input: SegmentVlanInput): Omit<Segment, "name"> {
     typeof input.id === "string" ? Number.parseInt(input.id, 10) : input.id,
   );
   return {
-    addresses: [
-      segmentNet(id, {
-        suffix: input.gatewaySuffix,
-        suffix6: input.gatewaySuffix6,
-        ipv4: input.gatewayIp,
-        ipv6: input.gatewayIpv6,
-      }),
-    ],
+    addresses: [segmentNet(id, input.gateway)],
     if: {
       kind: "vlan",
       vlanParent: input.vlanParent,

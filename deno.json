@@ -7,6 +7,10 @@
     ".": "./src/mod.ts",
     "./cli": "./src/cli.ts"
   },
+  "imports": {
+    "jsr:@adviser/ovn-fabric": "./src/mod.ts",
+    "jsr:@adviser/ovn-fabric/cli": "./src/cli.ts"
+  },
   "tasks": {
     "check": "deno check src/*.ts",
     "test": "deno test --allow-read --allow-env src/*_test.ts"
