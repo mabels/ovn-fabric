@@ -209,9 +209,10 @@ later, a direct API call — without the reconciler changing.
 | `net.uplink` | `host:<h>\|uplink:<name>` | `hostRef` | container-level attrs | split: `ovn-nbctl` (logical side), `ip`/`wg-quick`/`zerotier-cli` (real side) |
 | `net.segment` | `host:<h>\|segment:<name>` | `hostRef` | same shape as `net.uplink` | same split |
 | `ovn.lrp` | `router:<scope>\|lrp:<name>` | `ownerRef` | unconditional delete+recreate (already true today, `emitIdempotentLrpAdd`) | `ovn-nbctl` |
-| `ipv4.addr` / `ipv6.addr` | `<scope>\|addr:<value>` | `owner` | value-keyed — owner change = del-old + add-new | `ip addr add/del` (real) or `ovn-nbctl lrp-add` + `--if-exists lrp-del` (OVN, already unconditional) |
+| `ipv4.addr` / `ipv6.addr` | `<scope>\|addr:<addr>` | `interface` | addr-keyed — interface change = del-old + add-new | `ip addr add/del` (real) or `ovn-nbctl lrp-add` + `--if-exists lrp-del` (OVN, already unconditional) |
 | `ipv4.route` / `ipv6.route` | `router:<scope>\|route:<prefix>` | `nexthopRef` | prefix-keyed — nexthop change = del-old + add-new | `ovn-nbctl lr-route-add` + `--if-exists lr-route-del`, or `ip route add/del` netns-side |
 | `net.iface` | `<scope>\|link:<ifname>` | `scope` (a device reparents by which namespace it's in, not a `hostRef`/`ownerRef` field) | presence-keyed — pure add/remove | `ip link set <dev> netns <ns>` |
+| `net.netns` | `<scope>` (no further local identity — the namespace *is* the scope, same pattern as `infra.host`) | — | attribute diff (`data.interfaces` roster) | `ip netns add/del` |
 | `ovs.iface` | `host:<h>\|ovsiface:<name>` | — | attribute diff | `ovs-vsctl` |
 
 `ovn.lrp`'s key gained the port's own `<name>` — the table originally
@@ -225,6 +226,93 @@ built against real data — added so "which devices exist in a namespace"
 (the record of what got moved into it from the global namespace) and
 OVS's own port/interface inventory are both represented, not just
 addresses/routes.
+
+`net.netns` — one node per namespace (including the global one),
+`data.interfaces` a roster of the same ifnames already reconciled as
+individual `net.iface` nodes, not a second real query: `ip netns` has no
+subcommand that reports a given namespace's interface membership
+(confirmed — `ip netns list` only returns names/ids), so the roster is
+*derived* from the same `ip -j link show` call `net.iface` already
+makes inside that namespace. This is the direct answer to "which devices
+were added to this namespace from global," without a caller having to
+reconstruct it by filtering every `net.iface` node by scope itself.
+
+Both writer columns above are real now, not just documented intent:
+`ladops.netns.add_netns`/`delete_netns` (`ip netns add/delete`, always
+run globally — `/var/run/netns` isn't namespace-relative) and
+`ladops.linux_net.add_if_to_netns`/`delete_if_to_netns` (`ip link set
+<dev> netns <target>`). The pair isn't symmetric in *where* they run,
+which is real and not a bug: a device is only visible to `ip link set`
+from whichever namespace currently holds it, so `add_if_to_netns` runs
+from global (where a device starts) targeting the real destination
+name, while `delete_if_to_netns` (moving it back) has to run from
+*inside* that namespace, targeting `netns 1` — PID 1's namespace, the
+standard idiom for "the root/global namespace" when no bind-mounted
+name for it is reachable from in there.
+
+Each roster entry (and each `net.iface` node's own `data`) also carries
+`peerInOtherNetns: bool` — real `ip -j link show` sets a `link_netnsid`
+field on any device whose `link` (parent/peer) lives in a different
+namespace, and this isn't veth-specific: confirmed on the real router
+for both a moved veth end (`veth-krn-0`) and a moved VLAN sub-interface
+(`ens18.1280`), and symmetrically on the global-namespace side too
+(`veth-ovn-*`/`veth-bdo-*`, one per real uplink). `lo` and purely local
+devices (bridges, physical NICs) never carry it. Deliberately a
+boolean, not a resolved source-namespace name — `link_netnsid` is a
+small integer scoped *locally* to whichever namespace you're viewing
+from (confirmed: `ip netns list-id` run from inside a real ns-uplink-*
+netns shows only `nsid 0` with no name attached; names are only
+resolvable from wherever created the `/var/run/netns` bind mounts, i.e.
+the global namespace specifically). Claiming a specific source
+namespace from inside a non-root netns would mean trusting an
+unverified topology assumption (every cross-netns link here happens to
+point back to global) rather than something this data alone proves.
+
+`ipv4.addr`/`ipv6.addr`'s `owner` field was renamed to `interface` (and
+the local identity's `value` to `addr`) once real router output made the
+generic naming actively confusing to read (`"owner": "veth-ovn-0"` reads
+like an ownership relationship, not "which interface this address is
+on"). Not a semantic change — the field always meant the same thing.
+
+### Node envelope: `id` (string) + `key` (structured), not one opaque string
+
+Every node's shape is `{id, kind, key, data}`, not the `{key, kind,
+scope, data}` shown when this ADR was first written. Found once real
+reconciler output was actually inspected: a node like an address fact
+came back as `{"key": "host:mam-hh-ovn|netns:ns-uplink-voda-avm|addr:
+127.0.0.1/8", ...}` — every identity attribute (host, namespace, the
+address itself) only existed *inside* that one opaque string, so
+anything downstream (a diff, a human, eventually the deployer) had to
+parse it back apart just to answer "which host is this" or "what
+address is this."
+
+- `id` is what the table's `key` column above still documents — the
+  same flat `{scope}|{kind}:{identity}` string as always, and still what
+  `reconcile_all`/`_serialize` (§ Decision, point 1's flat map) dedupe
+  and sort by. Nothing about the flat-map/diff design changes.
+- `key` is a plain object carrying the *same* identity as real,
+  independently readable attributes — `{host, netns, addr}` for an
+  `ipv4.addr` node, `{router, name}` for an `ovn.lrp`, and so on per
+  kind — so no caller ever needs to parse `id` as a string to recover
+  them. This generalizes the "Canonical, self-typed keys for multi-
+  field identities" mechanism (§ Firewall subschema) to *every* kind,
+  not just the ones whose identity was already multi-field.
+- `key` never repeats `kind` inside it — `kind` is already the node's
+  own top-level field, so embedding it in `key` too would just be the
+  same duplication problem `id` had, recurring one level down. `id`'s
+  own canonical-JSON local part (for multi-field kinds like `ipv4.
+  fwrule`) still includes `kind`, unchanged — that's a separate,
+  pre-existing mechanism for flat-string uniqueness, not something this
+  touches.
+- `scope` (the old flat string field) is gone, fully subsumed by `key`
+  — `key.host`/`key.netns` (or `key.router`, for `ovn.lrp`) carry
+  exactly what `scope` used to encode as a string, now as real
+  attributes. `scope` itself became structured too, threaded as a plain
+  dict from `reconciler/cli.py` (`{"host": ...}`, built once from the
+  `--host` override or real hostname discovery) down through every
+  reconciler's node-key construction via `ladops.netns.netns_scope()` —
+  so nothing anywhere parses a string to recover which host/namespace a
+  fact belongs to, not even internally.
 
 `NatRule`'s `{ kind: "masq" }` is not a one-shot instruction consumed
 when building the IR — the rule it produces is bound to a specific real
@@ -423,16 +511,44 @@ needs the same IR node types. See § Reconciler package layout below.
 
 ### Reconciler package layout
 
+Split into two top-level packages, not one: `ladops/` (List/Add/Delete —
+"CRUD" minus Update, since no kind here has an atomic update primitive
+either, see below) is the one place that knows *how* to actually reach
+the real system per kind; `reconciler/` only ever calls its `list_*()`
+side to shape IR nodes. The split exists because the deployer (§ Multi-
+router coordination, step 3 — not yet built) needs the exact same
+per-kind knowledge `reconciler/` already has for its write side
+(`add_*`/`delete_*`), and duplicating that knowledge between a read-only
+reconciler and a separately-written deployer would mean two places that
+both have to independently stay correct about, say, the exact `ip
+route add` argv shape. `ladops/` is the single source of truth for that
+either side calls into.
+
+No `update_*` anywhere in `ladops/` — every kind in the node-kind tables
+above already documents "no atomic update, del-old + add-new" as its own
+reconciler strategy (`ipv4.addr`/`ipv6.addr`, `ipv4.route`/`ipv6.route`,
+`ovn.lrp`, `ipv4.fwrule`/`ipv6.fwrule` alike). Composing an add+delete
+pair into what looks like an update from the outside is a *decision*
+the deployer makes when it walks a diff, not a primitive `ladops` itself
+should expose.
+
 ```
+ladops/             # List/Add/Delete against the real system — reconciler's read side, deployer's read+write side
+  netns.py          # shared: list_netns(), netns_scope(), run() — every net-aware module takes netns as an argument, doesn't enumerate it itself
+  ovsdb.py          # shared: OVSDB CLI JSON decoding (`-f json list <table>`), used by both ovn.py and ovs.py
+  linux_net.py      # `ip -j link/addr/route` + `ip addr/route add/del` — list_* implemented, add_addr/delete_addr/add_route/delete_route implemented (genuinely per-key, unlike iptables)
+  iptables.py       # `nft -j list ruleset` — list_rules implemented; no write primitive yet, see § Firewall subschema's writer-strategy note
+  ovn.py            # `ovn-nbctl -f json list <table>` + `lrp-add`/`--if-exists lrp-del` — list_lrps, add_lrp, delete_lrp implemented
+  ovs.py            # `ovs-vsctl -f json list <table>` — list_interfaces implemented; no write need identified yet
+
 reconciler/
-  cli.py            # argparse entry point, sweeps every namespace, orchestrates per-kind reconcilers
-  netns.py          # shared: list_netns(), netns_scope(), run() — every net-aware reconciler takes netns as an argument, doesn't enumerate it itself
-  ovsdb.py          # shared: OVSDB CLI JSON decoding (`-f json list <table>`), used by both ovn/ and ovs/
+  cli.py            # argparse entry point, sweeps every namespace (via ladops.netns), orchestrates per-kind reconcilers
   ir_types/         # generated dataclasses (datamodel-code-generator output) — shared, not owned by any one reconciler
-  linux_net/        # `ip -j link/addr/route`, global + every real netns — implemented
-  iptables/         # `nft -j list ruleset`, per-netns — implemented
-  ovn/              # `ovn-nbctl -f json list <table>` — implemented (ovn.lrp only; logical switches/ports still deferred)
-  ovs/              # `ovs-vsctl -f json list <table>` — implemented (ovs.iface only)
+  host/             # hostname/uname/timestamp identity — implemented, not netns-aware (there's one per host, not one per namespace)
+  linux_net/        # shapes ladops.linux_net's facts into net.iface/ipv4.addr/ipv6.addr/ipv4.route/ipv6.route nodes, global + every real netns
+  iptables/         # shapes ladops.iptables's facts into ipv4.fwrule/ipv6.fwrule nodes, per-netns
+  ovn/              # shapes ladops.ovn's facts into ovn.lrp nodes (logical switches/ports still deferred)
+  ovs/              # shapes ladops.ovs's facts into ovs.iface nodes
 ```
 
 CLI shape, deliberately extensible from the start rather than

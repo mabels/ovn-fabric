@@ -1,20 +1,11 @@
-# reconciler/linux_net/test_reconcile.py — stdlib unittest, no pytest:
-# keeps the "zero installs" principle this whole stack is built on
-# consistent even for tests, not just the runtime.
+# reconciler/linux_net/test_reconcile.py — stdlib unittest, no pytest.
 #
-# Fixtures below are synthetic but shape-accurate — not captured real
-# data. They reproduce the exact patterns found by testing against a
-# real router (docs/adr/0002-intermediate-representation.md,
-# "Reconciler/deployer runtime"): a bare "default" destination in BOTH
-# the v4 and v6 route lists (no colon in the string either way, so
-# family can't be sniffed from the value), and the same prefix
-# (fe80::/64) legitimately present as a distinct route on more than one
-# interface — the two cases that silently collapsed 77 real facts down
-# to 53 nodes before the fix this test guards against regressing.
-#
-# reconcile(scope, netns) is called once per namespace here, matching
-# how reconciler/cli.py actually drives it — the netns sweep itself
-# lives in cli.py/reconciler/netns.py, not in this reconciler.
+# This module is a thin IR-shaping layer over ladops.linux_net now —
+# these tests mock ladops.linux_net.list_links/list_addrs/list_routes
+# directly (the reconciler/ladops boundary) rather than the underlying
+# `ip -j` calls, which ladops/test_linux_net.py already covers on its
+# own. reconcile(scope, netns) is called once per namespace here,
+# matching how reconciler/cli.py actually drives it.
 
 from __future__ import annotations
 
@@ -22,116 +13,80 @@ import importlib
 import unittest
 from unittest import mock
 
-# NOT `from . import reconcile as mod` — this package's __init__.py does
-# `from .reconcile import reconcile`, which rebinds the package's own
-# `reconcile` attribute to the FUNCTION, shadowing the submodule of the
-# same name. importlib.import_module reaches the real submodule
-# directly, bypassing that rebinding — needed here specifically because
-# the test has to monkeypatch _run_ip_json, an implementation detail
-# only the submodule (not the re-exported function) exposes.
 mod = importlib.import_module("reconciler.linux_net.reconcile")
 
-FAKE_LINK = [
-    {"ifname": "lo", "link_type": "loopback", "operstate": "UNKNOWN"},
-    {"ifname": "ens19", "link_type": "ether", "operstate": "UP"},
-    {"ifname": "veth-ovn-0", "link_type": "ether", "operstate": "UP"},
+SCOPE = {"host": "test"}
+
+FAKE_LINKS = [
+    {"ifname": "lo", "linkType": "loopback", "operstate": "UNKNOWN", "peerInOtherNetns": False},
+    {"ifname": "ens19", "linkType": "ether", "operstate": "UP", "peerInOtherNetns": False},
+    {"ifname": "veth-ovn-0", "linkType": "ether", "operstate": "UP", "peerInOtherNetns": True},
 ]
 
-FAKE_ADDR = [
-    {
-        "ifname": "lo",
-        "addr_info": [
-            {"family": "inet", "local": "127.0.0.1", "prefixlen": 8},
-            {"family": "inet6", "local": "::1", "prefixlen": 128},
-        ],
-    },
-    {
-        "ifname": "ens19",
-        "addr_info": [
-            {"family": "inet", "local": "192.168.129.20", "prefixlen": 24},
-            {"family": "inet6", "local": "fd00:192:168:129::20", "prefixlen": 64},
-            {"family": "inet6", "local": "fe80::1", "prefixlen": 64},
-        ],
-    },
-    {
-        "ifname": "veth-ovn-0",
-        "addr_info": [
-            {"family": "inet", "local": "10.99.0.1", "prefixlen": 28},
-            {"family": "inet6", "local": "fe80::2", "prefixlen": 64},
-        ],
-    },
+FAKE_ADDRS = [
+    {"addr": "192.168.129.20/24", "interface": "ens19", "family": "ipv4"},
+    {"addr": "fd00:192:168:129::20/64", "interface": "ens19", "family": "ipv6"},
+    {"addr": "fe80::1/64", "interface": "ens19", "family": "ipv6"},
+    {"addr": "fe80::2/64", "interface": "veth-ovn-0", "family": "ipv6"},
 ]
 
-# two DIFFERENT "default" entries, one per family, same bare literal —
-# the case that silently mislabeled every v6 default as ipv4.route
-FAKE_ROUTE4 = [
-    {"dst": "default", "gateway": "192.168.129.1", "dev": "ens19"},
-    {"dst": "192.168.129.0/24", "dev": "ens19", "prefsrc": "192.168.129.20"},
+FAKE_ROUTES4 = [{"prefix": "default", "dev": "ens19", "nexthop": "192.168.129.1", "family": "ipv4"}]
+FAKE_ROUTES6 = [
+    {"prefix": "default", "dev": "ens19", "nexthop": "fd00:192:168:129::1", "family": "ipv6"},
+    {"prefix": "fe80::/64", "dev": "ens19", "nexthop": "ens19", "family": "ipv6"},
+    {"prefix": "fe80::/64", "dev": "veth-ovn-0", "nexthop": "veth-ovn-0", "family": "ipv6"},
 ]
 
-# fe80::/64 on TWO different devices — the case that collapsed distinct
-# per-interface routes into one node when keyed by prefix alone
-FAKE_ROUTE6 = [
-    {"dst": "default", "gateway": "fd00:192:168:129::1", "dev": "ens19"},
-    {"dst": "fe80::/64", "dev": "ens19"},
-    {"dst": "fe80::/64", "dev": "veth-ovn-0"},
+FAKE_NETNS_LINKS = [
+    {"ifname": "lo", "linkType": "loopback", "operstate": "UNKNOWN", "peerInOtherNetns": False},
+    {"ifname": "veth-krn-0", "linkType": "ether", "operstate": "UP", "peerInOtherNetns": True},
 ]
-
-FAKE_NETNS_LINK = [
-    {"ifname": "lo", "link_type": "loopback", "operstate": "UNKNOWN"},
-    {"ifname": "veth-krn-0", "link_type": "ether", "operstate": "UP"},
-]
-FAKE_NETNS_ADDR = [
-    {
-        "ifname": "veth-krn-0",
-        "addr_info": [{"family": "inet", "local": "10.99.0.2", "prefixlen": 28}],
-    },
-]
-FAKE_NETNS_ROUTE4 = [{"dst": "default", "gateway": "10.99.0.1", "dev": "veth-krn-0"}]
-FAKE_NETNS_ROUTE6: list[dict] = []
+FAKE_NETNS_ADDRS = [{"addr": "10.99.0.2/28", "interface": "veth-krn-0", "family": "ipv4"}]
+FAKE_NETNS_ROUTES4 = [{"prefix": "default", "dev": "veth-krn-0", "nexthop": "10.99.0.1", "family": "ipv4"}]
+FAKE_NETNS_ROUTES6: list[dict] = []
 
 
-def _fake_run_ip_json(args: list[str], netns: str | None):
+def _fake_list_links(netns):
+    return FAKE_NETNS_LINKS if netns is not None else FAKE_LINKS
+
+
+def _fake_list_addrs(netns):
+    return FAKE_NETNS_ADDRS if netns is not None else FAKE_ADDRS
+
+
+def _fake_list_routes(netns, family):
     if netns is not None:
-        assert netns == "ns-uplink-voda-avm", netns
-        if args == ["link", "show"]:
-            return FAKE_NETNS_LINK
-        if args == ["addr", "show"]:
-            return FAKE_NETNS_ADDR
-        if args == ["route", "show"]:
-            return FAKE_NETNS_ROUTE4
-        if args == ["-6", "route", "show"]:
-            return FAKE_NETNS_ROUTE6
-        raise AssertionError(f"unexpected ip invocation inside {netns}: {args}")
-    if args == ["link", "show"]:
-        return FAKE_LINK
-    if args == ["addr", "show"]:
-        return FAKE_ADDR
-    if args == ["route", "show"]:
-        return FAKE_ROUTE4
-    if args == ["-6", "route", "show"]:
-        return FAKE_ROUTE6
-    raise AssertionError(f"unexpected ip invocation: {args}")
+        return FAKE_NETNS_ROUTES4 if family == "-4" else FAKE_NETNS_ROUTES6
+    return FAKE_ROUTES4 if family == "-4" else FAKE_ROUTES6
+
+
+def _patch_ladops():
+    return (
+        mock.patch.object(mod, "list_links", side_effect=_fake_list_links),
+        mock.patch.object(mod, "list_addrs", side_effect=_fake_list_addrs),
+        mock.patch.object(mod, "list_routes", side_effect=_fake_list_routes),
+    )
+
+
+# every reconcile() call adds exactly one net.netns node (the namespace
+# itself), on top of whatever links/addrs/routes it found.
+NETNS_NODE_COUNT = 1
 
 
 class GlobalNamespaceTest(unittest.TestCase):
     def setUp(self) -> None:
-        patcher = mock.patch.object(mod, "_run_ip_json", side_effect=_fake_run_ip_json)
-        self.addCleanup(patcher.stop)
-        patcher.start()
-        self.nodes = mod.reconcile("host:test", None)
+        for patcher in _patch_ladops():
+            self.addCleanup(patcher.stop)
+            patcher.start()
+        self.nodes = mod.reconcile(SCOPE, None)
 
     def test_no_facts_lost(self) -> None:
-        link_count = len(FAKE_LINK)
-        addr_count = sum(len(e["addr_info"]) for e in FAKE_ADDR)
-        route_count = len(FAKE_ROUTE4) + len(FAKE_ROUTE6)
-        self.assertEqual(len(self.nodes), link_count + addr_count + route_count)
+        self.assertEqual(
+            len(self.nodes),
+            len(FAKE_LINKS) + NETNS_NODE_COUNT + len(FAKE_ADDRS) + len(FAKE_ROUTES4) + len(FAKE_ROUTES6),
+        )
 
     def test_v4_and_v6_default_routes_both_survive_with_correct_kind(self) -> None:
-        # both defaults share a device (ens19) in this fixture, so they'd
-        # collide on key alone if kind weren't also distinguishing them —
-        # confirm both are actually present and correctly typed instead
-        # of one silently overwriting the other.
         matches = [
             n
             for n in self.nodes.values()
@@ -146,50 +101,96 @@ class GlobalNamespaceTest(unittest.TestCase):
         b = self.nodes["host:test|netns:*global*|route:ipv6.route:veth-ovn-0:fe80::/64"]
         self.assertEqual(a["kind"], "ipv6.route")
         self.assertEqual(b["kind"], "ipv6.route")
+        self.assertNotEqual(a["id"], b["id"])
         self.assertNotEqual(a["key"], b["key"])
 
     def test_link_local_addresses_are_not_filtered(self) -> None:
-        # "get all data in the reconciler, let the deployer decide what
-        # matters" — fe80:: addresses are captured, not dropped.
         link_local = [
-            n for n in self.nodes.values() if n["data"].get("value", "").startswith("fe80:")
+            n for n in self.nodes.values() if n["data"].get("addr", "").startswith("fe80:")
         ]
         self.assertEqual(len(link_local), 2)
 
-    def test_global_namespace_scope_is_literal_asterisk_global(self) -> None:
+    def test_addr_node_uses_addr_and_interface_field_names(self) -> None:
         node = self.nodes["host:test|netns:*global*|addr:192.168.129.20/24"]
-        self.assertEqual(node["scope"], "host:test|netns:*global*")
+        self.assertEqual(node["key"], {"host": "test", "netns": "*global*", "addr": "192.168.129.20/24"})
+        self.assertEqual(
+            node["data"], {"addr": "192.168.129.20/24", "interface": "ens19", "role": "interface"}
+        )
 
     def test_bare_devices_with_no_address_are_still_captured_as_iface_facts(self) -> None:
         node = self.nodes["host:test|netns:*global*|link:lo"]
         self.assertEqual(node["kind"], "net.iface")
         self.assertEqual(node["data"]["linkType"], "loopback")
 
+    def test_key_never_duplicates_kind(self) -> None:
+        # kind is already the node's own top-level field — key only
+        # carries scope + the kind-specific local identity, not kind
+        # again inside it.
+        for node in self.nodes.values():
+            self.assertNotIn("kind", node["key"])
+
+    def test_netns_node_lists_every_interface_in_the_namespace(self) -> None:
+        node = self.nodes["host:test|netns:*global*"]
+        self.assertEqual(node["kind"], "net.netns")
+        self.assertEqual(node["key"], {"host": "test", "netns": "*global*"})
+        self.assertEqual(
+            node["data"]["interfaces"],
+            [
+                {"ifname": "ens19", "peerInOtherNetns": False},
+                {"ifname": "lo", "peerInOtherNetns": False},
+                {"ifname": "veth-ovn-0", "peerInOtherNetns": True},
+            ],
+        )
+
 
 class RealNamespaceTest(unittest.TestCase):
     def setUp(self) -> None:
-        patcher = mock.patch.object(mod, "_run_ip_json", side_effect=_fake_run_ip_json)
-        self.addCleanup(patcher.stop)
-        patcher.start()
-        self.nodes = mod.reconcile("host:test", "ns-uplink-voda-avm")
+        for patcher in _patch_ladops():
+            self.addCleanup(patcher.stop)
+            patcher.start()
+        self.nodes = mod.reconcile(SCOPE, "ns-uplink-voda-avm")
 
-    def test_scope_is_a_sub_scope_of_host_not_a_separate_scope(self) -> None:
+    def test_key_is_a_sub_scope_of_host_not_a_separate_scope(self) -> None:
         node = self.nodes["host:test|netns:ns-uplink-voda-avm|addr:10.99.0.2/28"]
-        self.assertEqual(node["scope"], "host:test|netns:ns-uplink-voda-avm")
-        self.assertTrue(node["scope"].startswith("host:test|"))
+        self.assertEqual(node["key"], {"host": "test", "netns": "ns-uplink-voda-avm", "addr": "10.99.0.2/28"})
 
     def test_devices_moved_into_the_namespace_are_captured_as_iface_facts(self) -> None:
-        # By netns semantics a namespace starts with nothing but `lo` —
-        # every other net.iface node under this scope IS the record of
-        # what was added to it from the global namespace.
         moved = [n for n in self.nodes.values() if n["kind"] == "net.iface" and n["data"]["ifname"] != "lo"]
         self.assertEqual([n["data"]["ifname"] for n in moved], ["veth-krn-0"])
 
+    def test_netns_node_lists_the_moved_in_devices_too(self) -> None:
+        # this is the actual answer to "which devices were added to this
+        # namespace from global" — a single, direct roster, not
+        # something a caller has to reconstruct by filtering net.iface
+        # nodes by scope itself.
+        node = self.nodes["host:test|netns:ns-uplink-voda-avm"]
+        self.assertEqual(
+            node["data"]["interfaces"],
+            [
+                {"ifname": "lo", "peerInOtherNetns": False},
+                {"ifname": "veth-krn-0", "peerInOtherNetns": True},
+            ],
+        )
+
+    def test_moved_device_is_marked_peer_in_other_netns_lo_is_not(self) -> None:
+        # the real, verifiable marker for "added" — a device with a real
+        # link/peer relationship to something in another namespace,
+        # confirmed via `ip -j link show`'s own link_netnsid field
+        # (ladops/linux_net.py) — not just "isn't lo".
+        moved = self.nodes["host:test|netns:ns-uplink-voda-avm|link:veth-krn-0"]
+        lo = self.nodes["host:test|netns:ns-uplink-voda-avm|link:lo"]
+        self.assertTrue(moved["data"]["peerInOtherNetns"])
+        self.assertFalse(lo["data"]["peerInOtherNetns"])
+
     def test_no_facts_lost(self) -> None:
-        link_count = len(FAKE_NETNS_LINK)
-        addr_count = sum(len(e["addr_info"]) for e in FAKE_NETNS_ADDR)
-        route_count = len(FAKE_NETNS_ROUTE4) + len(FAKE_NETNS_ROUTE6)
-        self.assertEqual(len(self.nodes), link_count + addr_count + route_count)
+        self.assertEqual(
+            len(self.nodes),
+            len(FAKE_NETNS_LINKS)
+            + NETNS_NODE_COUNT
+            + len(FAKE_NETNS_ADDRS)
+            + len(FAKE_NETNS_ROUTES4)
+            + len(FAKE_NETNS_ROUTES6),
+        )
 
 
 if __name__ == "__main__":

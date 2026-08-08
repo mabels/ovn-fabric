@@ -1,5 +1,10 @@
-# reconciler/ovn/reconcile.py — ovn-nbctl-based reconciler: Logical_Router
-# + Logical_Router_Port -> ovn.lrp IR nodes.
+# reconciler/ovn/reconcile.py — shapes ladops.ovn's real LRP facts into
+# ovn.lrp IR nodes.
+#
+# Thin on purpose: every "how do I actually talk to ovn-nbctl" concern —
+# running `-f json list <table>`, decoding OVSDB atoms, joining a port
+# back to its owning router — lives in ladops/ovn.py, not here. This
+# module's only job is IR shaping.
 #
 # OVN's northbound DB is one cluster-wide store, not namespace-scoped
 # like addr/route/iptables are — reconcile(scope, netns) still takes the
@@ -8,18 +13,20 @@
 # produces nodes on the netns=None (global) pass, same pattern as
 # reconciler/host/reconcile.py.
 #
-# `ovn-nbctl -f json list <table>`, not `ovn-nbctl show` — `show`
-# ignores --format entirely (confirmed against the real router: still
-# prints its normal tree-text output with -f json passed), while `list`
-# returns real self-describing structured data, decoded via the shared
-# reconciler/ovsdb.py (the same OVSDB wire format reconciler/ovs uses).
-#
-# Key extends the ADR's node-kind table (`router:<scope>|lrp`) with the
+# `id` extends the ADR's node-kind table (`router:<scope>|lrp`) with the
 # port's own name as the local identity (`router:<scope>|lrp:<port-
 # name>`) — the table's literal key omits it, but a router legitimately
 # owns more than one LRP (confirmed on the real router: router-home
 # alone has 4 — lrp-home, lrp-home-bb, and two backbone-extra ports), so
 # the bare form collides every LRP under the same router onto one key.
+#
+# `key` is scoped by the owning OVN logical router (`{"router": name}`),
+# not by `scope`/host — an ovn.lrp's real container is the router it
+# belongs to, not the physical host (this deployment only has one
+# physical host, but OVN's own NB DB isn't host-partitioned the way
+# addr/route/iptables state is). `scope` is accepted only for calling-
+# convention uniformity with every other reconciler; unused here, same
+# as before this envelope redesign.
 #
 # Still deferred, matching the ADR's own "Consequences" section: only
 # each router's LRPs are reconciled here, not logical switches/ports —
@@ -27,36 +34,25 @@
 
 from __future__ import annotations
 
-from ..ovsdb import list_table
-
-_NBCTL = ["ovn-nbctl"]
+from ladops.ovn import list_lrps
 
 
-def reconcile(scope: str, netns: str | None = None) -> dict[str, dict]:
+def reconcile(scope: dict, netns: str | None = None) -> dict[str, dict]:
     if netns is not None:
         return {}
 
-    router_name_by_port_uuid: dict[str, str] = {}
-    for router in list_table(_NBCTL, "Logical_Router"):
-        for port_uuid in router["ports"]:
-            router_name_by_port_uuid[port_uuid] = router["name"]
-
     nodes: dict[str, dict] = {}
-    for port in list_table(_NBCTL, "Logical_Router_Port"):
-        router_name = router_name_by_port_uuid.get(port["_uuid"])
-        if router_name is None:
-            continue  # an LRP not (yet) attached to any router — nothing to scope it under
-        port_scope = f"router:{router_name}"
-        key = f"{port_scope}|lrp:{port['name']}"
-        nodes[key] = {
-            "key": key,
+    for lrp in list_lrps():
+        id_ = f"router:{lrp['router']}|lrp:{lrp['name']}"
+        nodes[id_] = {
+            "id": id_,
             "kind": "ovn.lrp",
-            "scope": port_scope,
+            "key": {"router": lrp["router"], "name": lrp["name"]},
             "data": {
-                "name": port["name"],
-                "mac": port["mac"],
-                "networks": port["networks"],
-                "gatewayChassis": port["gateway_chassis"],
+                "name": lrp["name"],
+                "mac": lrp["mac"],
+                "networks": lrp["networks"],
+                "gatewayChassis": lrp["gatewayChassis"],
             },
         }
     return nodes

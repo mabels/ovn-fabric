@@ -1,13 +1,13 @@
-# reconciler/test_netns.py — stdlib unittest for the shared netns
-# plumbing every net-related reconciler (linux_net today, iptables/ovn/
-# ovs later) is built on.
+# ladops/test_netns.py — stdlib unittest for the shared netns plumbing
+# every net-related ladops module (linux_net, iptables, ovn, ovs) is
+# built on, and reconciler/cli.py's namespace sweep uses directly.
 
 from __future__ import annotations
 
 import unittest
 from unittest import mock
 
-from reconciler import netns as mod
+from ladops import netns as mod
 
 # real `ip netns list` output includes a "(id: N)" suffix per line —
 # only the leading name is the actual namespace `ip netns exec` expects.
@@ -47,12 +47,31 @@ class ListNetnsTest(unittest.TestCase):
 
 class NetnsScopeTest(unittest.TestCase):
     def test_global_is_the_literal_asterisk_global(self) -> None:
-        self.assertEqual(mod.netns_scope("host:test", None), "host:test|netns:*global*")
+        self.assertEqual(mod.netns_scope({"host": "test"}, None), {"host": "test", "netns": "*global*"})
 
     def test_real_namespace_is_a_sub_scope_of_host(self) -> None:
-        scope = mod.netns_scope("host:test", "ns-uplink-voda-avm")
-        self.assertEqual(scope, "host:test|netns:ns-uplink-voda-avm")
-        self.assertTrue(scope.startswith("host:test|"))
+        scope = mod.netns_scope({"host": "test"}, "ns-uplink-voda-avm")
+        self.assertEqual(scope, {"host": "test", "netns": "ns-uplink-voda-avm"})
+
+    def test_does_not_mutate_the_base_scope_dict(self) -> None:
+        base = {"host": "test"}
+        mod.netns_scope(base, "ns-uplink-voda-avm")
+        self.assertEqual(base, {"host": "test"})
+
+
+class ScopeIdTest(unittest.TestCase):
+    def test_host_only_scope(self) -> None:
+        self.assertEqual(mod.scope_id({"host": "test"}), "host:test")
+
+    def test_host_and_netns_scope(self) -> None:
+        self.assertEqual(
+            mod.scope_id({"host": "test", "netns": "ns-uplink-voda-avm"}),
+            "host:test|netns:ns-uplink-voda-avm",
+        )
+
+    def test_matches_the_output_of_netns_scope(self) -> None:
+        scope = mod.netns_scope({"host": "test"}, None)
+        self.assertEqual(mod.scope_id(scope), "host:test|netns:*global*")
 
 
 class RunTest(unittest.TestCase):
@@ -72,6 +91,22 @@ class RunTest(unittest.TestCase):
             capture_output=True,
             text=True,
         )
+
+
+# add_netns/delete_netns/add_if_to_netns/delete_if_to_netns are never
+# run for real here (or anywhere in this session) — this project's only
+# real router is live production infrastructure; these are verified by
+# asserting the exact argv built for `mod.run`, not by executing it.
+class WriteTest(unittest.TestCase):
+    def test_add_netns_builds_the_real_ip_command(self) -> None:
+        with mock.patch.object(mod, "run") as run:
+            mod.add_netns("ns-uplink-test")
+        run.assert_called_once_with(["ip", "netns", "add", "ns-uplink-test"], None)
+
+    def test_delete_netns_builds_the_real_ip_command(self) -> None:
+        with mock.patch.object(mod, "run") as run:
+            mod.delete_netns("ns-uplink-test")
+        run.assert_called_once_with(["ip", "netns", "delete", "ns-uplink-test"], None)
 
 
 if __name__ == "__main__":

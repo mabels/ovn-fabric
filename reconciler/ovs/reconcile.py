@@ -1,5 +1,8 @@
-# reconciler/ovs/reconcile.py — ovs-vsctl-based reconciler: Interface ->
-# ovs.iface IR nodes.
+# reconciler/ovs/reconcile.py — shapes ladops.ovs's real interface facts
+# into ovs.iface IR nodes.
+#
+# Thin on purpose: every "how do I actually talk to ovs-vsctl" concern
+# lives in ladops/ovs.py, not here.
 #
 # Not netns-scoped, same reasoning as reconciler/ovn/reconcile.py — OVS's
 # own database is host-global, so this only produces nodes on the
@@ -14,29 +17,21 @@
 
 from __future__ import annotations
 
-from ..ovsdb import list_table
+from ladops.netns import scope_id
+from ladops.ovs import list_interfaces
 
-_VSCTL = ["ovs-vsctl"]
 
-
-def reconcile(scope: str, netns: str | None = None) -> dict[str, dict]:
+def reconcile(scope: dict, netns: str | None = None) -> dict[str, dict]:
     if netns is not None:
         return {}
 
     nodes: dict[str, dict] = {}
-    for iface in list_table(_VSCTL, "Interface"):
-        name = iface["name"]
-        key = f"{scope}|ovsiface:{name}"
-        nodes[key] = {
-            "key": key,
+    for iface in list_interfaces():
+        id_ = f"{scope_id(scope)}|ovsiface:{iface['name']}"
+        nodes[id_] = {
+            "id": id_,
             "kind": "ovs.iface",
-            "scope": scope,
-            "data": {
-                "name": name,
-                "type": iface["type"],
-                "adminState": iface["admin_state"],
-                "linkState": iface["link_state"],
-                "ofport": iface["ofport"],
-            },
+            "key": {**scope, "name": iface["name"]},
+            "data": iface,
         }
     return nodes

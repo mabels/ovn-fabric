@@ -39,7 +39,7 @@ def _reconciled_at() -> str:
     return datetime.now().astimezone().isoformat()
 
 
-def reconcile(scope: str, netns: str | None = None) -> dict[str, dict]:
+def reconcile(scope: dict, netns: str | None = None) -> dict[str, dict]:
     # Host identity isn't namespace-scoped — there's exactly one of it
     # per host, not one per netns. Takes the same (scope, netns) shape
     # as every other reconciler so cli.py's orchestration loop can call
@@ -47,13 +47,19 @@ def reconcile(scope: str, netns: str | None = None) -> dict[str, dict]:
     # (global) pass; every other namespace contributes nothing here.
     if netns is not None:
         return {}
-    name = hostname()
-    key = f"host:{name}"
+    # name comes from scope["host"], not a second hostname() call here —
+    # cli.py already resolved it once (real discovery, or a --host
+    # override), and this node has to agree with every other node's
+    # scope, not silently re-discover the real hostname even when the
+    # caller asked to override it.
+    name = scope["host"]
+    key = {"host": name}
+    id_ = f"host:{name}"
     return {
-        key: {
-            "key": key,
+        id_: {
+            "id": id_,
             "kind": "infra.host",
-            "scope": scope,
+            "key": key,
             "data": {
                 "name": name,
                 "unameA": _uname_a(),

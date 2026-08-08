@@ -1,5 +1,5 @@
-# reconciler/test_ovsdb.py — stdlib unittest for the shared OVSDB JSON
-# decoding both reconciler/ovn and reconciler/ovs are built on.
+# ladops/test_ovsdb.py — stdlib unittest for the shared OVSDB JSON
+# decoding both ladops/ovn.py and ladops/ovs.py are built on.
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 import unittest
 from unittest import mock
 
-from reconciler import ovsdb as mod
+from ladops import ovsdb as mod
 
 
 class DecodeTest(unittest.TestCase):

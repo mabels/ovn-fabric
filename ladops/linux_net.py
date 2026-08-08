@@ -1,0 +1,136 @@
+# ladops/linux_net.py — real List/Add/Delete against a namespace's
+# link/addr/route state via `ip -j ...`/`ip ...`. list_*() is used by
+# reconciler/linux_net/reconcile.py to build IR nodes (read only); the
+# add_*/delete_*() functions exist for the deployer, which needs the
+# same "how do I run `ip` inside a given namespace" knowledge to apply a
+# diff, not a separately reimplemented copy of it. No update_* — there's
+# no atomic "change this fact in place" primitive at this layer either
+# (same reasoning as every kind in docs/adr/0002-intermediate-
+# representation.md's node-kind tables: del-old + add-new, always);
+# composing add+delete into what looks like an update is the deployer's
+# call, not something this module decides for it.
+#
+# add_addr/delete_addr and add_route/delete_route are genuinely per-key
+# operations — unlike reconciler/iptables (nft rule handles aren't
+# stable identity, so the deployer has to replace a whole table+chain
+# atomically, see docs/adr/0002-intermediate-representation.md,
+# "Firewall / security-group subschema") — `ip addr add/del <value> dev
+# <dev>` and `ip route add/del <prefix> dev <dev> [via <nexthop>]` are
+# real, atomic, single-fact operations with no equivalent handle-
+# instability problem.
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+from .netns import run as run_in_netns
+
+
+def _run_ip_json(args: list[str], netns: str | None) -> Any:
+    out = run_in_netns(["ip", "-j", *args], netns).stdout
+    return json.loads(out)
+
+
+def list_links(netns: str | None) -> list[dict]:
+    # peerInOtherNetns: real `ip -j link show` sets `link_netnsid` on a
+    # device whose `link` (parent/peer, e.g. a veth's other end, or a
+    # VLAN sub-interface's parent NIC) lives in a different namespace —
+    # confirmed on the real router for both cases: a moved veth end
+    # (`veth-krn-0`) and a moved VLAN sub-interface (`ens18.1280`) both
+    # carry it, `lo` never does. This is the closest real, verifiable
+    # signal to "was this device added to the namespace from elsewhere"
+    # — not `netns exec`-derivable any other way (`ip netns` itself has
+    # no membership-listing subcommand at all).
+    #
+    # Deliberately just a boolean, not a resolved source namespace name:
+    # `link_netnsid` is a small integer that's *locally* scoped to
+    # whichever namespace you're viewing from (confirmed: `ip netns
+    # list-id` run from inside a real ns-uplink-* netns shows only "nsid
+    # 0" with no name attached — names are only resolvable from wherever
+    # created the /var/run/netns bind mounts). Claiming a specific
+    # source namespace from inside a non-root netns would mean trusting
+    # an unverified topology assumption (that every cross-netns link
+    # here points back to global specifically), not something this data
+    # alone proves.
+    return [
+        {
+            "ifname": entry["ifname"],
+            "linkType": entry.get("link_type", "unknown"),
+            "operstate": entry.get("operstate", "UNKNOWN"),
+            "peerInOtherNetns": "link_netnsid" in entry,
+        }
+        for entry in _run_ip_json(["link", "show"], netns)
+    ]
+
+
+def list_addrs(netns: str | None) -> list[dict]:
+    # Deliberately unfiltered — every address including fe80:: link-local
+    # ones is returned. Reporting a complete, faithful record of what's
+    # real is this module's job; deciding what's relevant (autoconfigured
+    # vs. topology-managed) is the caller's.
+    out = []
+    for entry in _run_ip_json(["addr", "show"], netns):
+        ifname = entry["ifname"]
+        for a in entry.get("addr_info", []):
+            addr = f"{a['local']}/{a['prefixlen']}"
+            out.append({"addr": addr, "interface": ifname, "family": "ipv6" if ":" in addr else "ipv4"})
+    return out
+
+
+def list_routes(netns: str | None, family: str) -> list[dict]:
+    # Family comes from which command produced the entry, not from
+    # sniffing the value for ":" — the destination is literally the bare
+    # string "default" for BOTH families (confirmed against a real
+    # router's `ip route show`/`ip -6 route show`), so string-sniffing
+    # silently mislabels every v6 default route as v4.
+    args = ["-6", "route", "show"] if family == "-6" else ["route", "show"]
+    out = []
+    for r in _run_ip_json(args, netns):
+        dev = r.get("dev", "unknown")
+        out.append(
+            {
+                "prefix": r["dst"],
+                "dev": dev,
+                "nexthop": r.get("gateway") or dev,
+                "family": "ipv6" if family == "-6" else "ipv4",
+            }
+        )
+    return out
+
+
+def add_addr(addr: str, dev: str, netns: str | None) -> None:
+    run_in_netns(["ip", "addr", "add", addr, "dev", dev], netns)
+
+
+def delete_addr(addr: str, dev: str, netns: str | None) -> None:
+    run_in_netns(["ip", "addr", "del", addr, "dev", dev], netns)
+
+
+def add_route(prefix: str, dev: str, nexthop: str | None, netns: str | None) -> None:
+    args = ["ip", "route", "add", prefix, "dev", dev]
+    if nexthop and nexthop != dev:
+        args += ["via", nexthop]
+    run_in_netns(args, netns)
+
+
+def delete_route(prefix: str, dev: str, netns: str | None) -> None:
+    run_in_netns(["ip", "route", "del", prefix, "dev", dev], netns)
+
+
+def add_if_to_netns(dev: str, netns: str) -> None:
+    """Move `dev` (currently in the global/root namespace) into `netns`
+    — `ip link set <dev> netns <netns>`, run from global, since a device
+    is only visible to `ip link set` from whichever namespace it's
+    currently in."""
+    run_in_netns(["ip", "link", "set", dev, "netns", netns], None)
+
+
+def delete_if_to_netns(dev: str, netns: str) -> None:
+    """The inverse of add_if_to_netns: move `dev` back out of `netns`,
+    into the global/root namespace. Must run from inside `netns` itself
+    (same "only visible from its current namespace" reasoning), target
+    is `netns 1` — PID 1's namespace, the standard idiom for "the root/
+    global namespace" when a bare name for it isn't otherwise reachable
+    from inside another namespace."""
+    run_in_netns(["ip", "link", "set", dev, "netns", "1"], netns)

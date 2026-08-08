@@ -3,11 +3,15 @@
 # once per namespace, merges their IR nodes, emits canonical JSON.
 #
 # The namespace sweep lives here, in exactly one place, not inside any
-# individual reconciler — every net-related reconciler (linux_net, and
-# eventually iptables/ovn/ovs) takes the namespace as an explicit
-# argument (reconcile(scope, netns)) rather than enumerating `ip netns
-# list` itself, so this loop is the only place that logic exists. See
-# reconciler/netns.py.
+# individual reconciler — every net-related reconciler (linux_net,
+# iptables, ovn, ovs) takes the namespace as an explicit argument
+# (reconcile(scope, netns)) rather than enumerating `ip netns list`
+# itself, so this loop is the only place that logic exists. See
+# ladops/netns.py — the reconciler package only ever reads through
+# ladops, never talks to `ip`/`nft`/`ovn-nbctl`/`ovs-vsctl` directly;
+# that's the whole point of the split (ladops/, not reconciler/, is
+# what actually knows how to reach the real system, so the deployer can
+# reuse the exact same knowledge for writes later).
 #
 # Extensible on purpose (see docs/adr/0002-intermediate-representation.md,
 # "Reconciler/deployer runtime" -> "Reconciler package layout"): adding a
@@ -23,15 +27,16 @@ import json
 import sys
 from typing import Callable
 
+from ladops.netns import list_netns
+
 from .host import hostname as host_hostname
 from .host import reconcile as host_reconcile
 from .iptables import reconcile as iptables_reconcile
 from .linux_net import reconcile as linux_net_reconcile
-from .netns import list_netns
 from .ovn import reconcile as ovn_reconcile
 from .ovs import reconcile as ovs_reconcile
 
-ReconcileFn = Callable[[str, "str | None"], dict[str, dict]]
+ReconcileFn = Callable[[dict, "str | None"], dict[str, dict]]
 
 _RECONCILERS: dict[str, ReconcileFn] = {
     "host": host_reconcile,
@@ -43,20 +48,20 @@ _RECONCILERS: dict[str, ReconcileFn] = {
 
 
 def _serialize(nodes: dict[str, dict], nice: bool) -> str:
-    # A JSON array of nodes, not an object keyed by node key: every node
-    # already carries its own "key" field, so a dict wrapper would just
+    # A JSON array of nodes, not an object keyed by node id: every node
+    # already carries its own "id" field, so a dict wrapper would just
     # repeat that same string twice on the wire for no reason. The dict
     # form (dict[str, dict]) is still what reconcile_all merges through
     # internally — it's what gives cross-kind/cross-namespace "last one
-    # wins by matching key" merge semantics O(1) — this only changes the
+    # wins by matching id" merge semantics O(1) — this only changes the
     # shape at the actual output boundary.
-    array = sorted(nodes.values(), key=lambda n: n["key"])
+    array = sorted(nodes.values(), key=lambda n: n["id"])
     if nice:
         return json.dumps(array, indent=2)
     return json.dumps(array, separators=(",", ":"))
 
 
-def reconcile_all(kinds: list[str], scope: str, *, strict: bool) -> dict[str, dict]:
+def reconcile_all(kinds: list[str], scope: dict, *, strict: bool) -> dict[str, dict]:
     # strict=True (an explicit --kind was requested): a stub reconciler
     # raising NotImplementedError is a real failure, propagate it.
     # strict=False (default: every known kind): skip a still-stub kind
@@ -92,10 +97,10 @@ def main(argv: list[str] | None = None) -> int:
         help="reconciler(s) to run, repeatable (default: all known kinds)",
     )
     parser.add_argument(
-        "--scope",
+        "--host",
         default=None,
-        help='node-key scope prefix (default: "host:<hostname>", '
-        "hostname discovered by the host reconciler)",
+        help="override the discovered hostname used as every node's base scope "
+        "(default: real hostname, discovered by the host reconciler)",
     )
     parser.add_argument(
         "--nice",
@@ -104,10 +109,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    # Scope comes from the host reconciler, not from cli.py calling
-    # socket.gethostname() itself — hostname discovery lives in exactly
-    # one place (reconciler/host/reconcile.py).
-    scope = args.scope if args.scope is not None else f"host:{host_hostname()}"
+    # Scope is a structured dict from here all the way down through every
+    # reconciler's node-key construction, not a string — so nothing
+    # anywhere needs to parse a string to recover which host/namespace a
+    # fact belongs to. Hostname comes from the host reconciler, not from
+    # cli.py calling socket.gethostname() itself — hostname discovery
+    # lives in exactly one place (reconciler/host/reconcile.py).
+    scope = {"host": args.host if args.host is not None else host_hostname()}
 
     kinds = args.kind if args.kind else sorted(_RECONCILERS)
     nodes = reconcile_all(kinds, scope, strict=bool(args.kind))

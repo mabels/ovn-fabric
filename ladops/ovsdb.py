@@ -1,5 +1,5 @@
-# reconciler/ovsdb.py — shared OVSDB CLI JSON decoding, used by both
-# reconciler/ovn and reconciler/ovs — they're different databases
+# ladops/ovsdb.py — shared OVSDB CLI JSON decoding, used by both
+# ladops/ovn.py and ladops/ovs.py — they're different databases
 # (OVN's northbound DB vs. OVS's own), but `ovn-nbctl`/`ovs-vsctl -f
 # json list <table>` both speak the same OVSDB wire encoding (RFC 7047):
 # scalars appear bare, everything else is a tagged 2-element array —
