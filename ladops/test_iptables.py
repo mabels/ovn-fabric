@@ -190,7 +190,9 @@ class ListRulesTest(unittest.TestCase):
             self.assertNotIn(dimension, rule["fields"])
 
     def test_order_is_zero_padded_and_per_table_chain(self) -> None:
-        orders = sorted(r["order"] for r in self.rules if r["action"] == "MASQUERADE" and r["family"] == "ip")
+        orders = sorted(
+            r["order"] for r in self.rules if r["action"] == "MASQUERADE" and r["family"] == "ip"
+        )
         self.assertEqual(orders, ["000", "001"])
 
     def test_dport_match_infers_proto_and_native_verdict_is_captured(self) -> None:

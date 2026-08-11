@@ -76,6 +76,24 @@ jobs:
       # post-publish end-to-end check of that path.
 
       # ── Python side: ladops/reconciler/deployer/protocol ────────────
+      # .venv-build/ is build-time-only tooling (never shipped to a
+      # router, see pyproject.toml's own comment) — created here, once,
+      # with all three tools this job needs from it (black/ruff for the
+      # hand-written source below, datamodel-code-generator for
+      # generate-pytypes next). generate-pytypes's own bootstrap
+      # (ensureDatamodelCodegen(), src/cli.ts) finds this venv already
+      # present and just adds datamodel-code-generator to it.
+      - name: Set up Python build venv (black, ruff)
+        run: |
+          python3 -m venv .venv-build
+          .venv-build/bin/pip install --quiet black ruff
+
+      - name: Python format check (black)
+        run: .venv-build/bin/black --check ladops/ deployer/ protocol/ reconciler/
+
+      - name: Python lint (ruff)
+        run: .venv-build/bin/ruff check ladops/ deployer/ protocol/ reconciler/
+
       # protocol/generated.py doesn't exist until this runs — it's
       # ephemeral, regenerated here fresh every CI run (see .gitignore),
       # never committed as source. This step is itself the real

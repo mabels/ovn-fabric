@@ -42,7 +42,9 @@ FAKE_NETNS_LINKS = [
     {"ifname": "veth-krn-0", "linkType": "ether", "operstate": "UP", "peerInOtherNetns": True},
 ]
 FAKE_NETNS_ADDRS = [{"addr": "10.99.0.2/28", "interface": "veth-krn-0", "family": "ipv4"}]
-FAKE_NETNS_ROUTES4 = [{"prefix": "default", "dev": "veth-krn-0", "nexthop": "10.99.0.1", "family": "ipv4"}]
+FAKE_NETNS_ROUTES4 = [
+    {"prefix": "default", "dev": "veth-krn-0", "nexthop": "10.99.0.1", "family": "ipv4"}
+]
 FAKE_NETNS_ROUTES6: list[dict] = []
 
 
@@ -83,7 +85,11 @@ class GlobalNamespaceTest(unittest.TestCase):
     def test_no_facts_lost(self) -> None:
         self.assertEqual(
             len(self.nodes),
-            len(FAKE_LINKS) + NETNS_NODE_COUNT + len(FAKE_ADDRS) + len(FAKE_ROUTES4) + len(FAKE_ROUTES6),
+            len(FAKE_LINKS)
+            + NETNS_NODE_COUNT
+            + len(FAKE_ADDRS)
+            + len(FAKE_ROUTES4)
+            + len(FAKE_ROUTES6),
         )
 
     def test_v4_and_v6_default_routes_both_survive_with_correct_kind(self) -> None:
@@ -112,7 +118,9 @@ class GlobalNamespaceTest(unittest.TestCase):
 
     def test_addr_node_uses_addr_and_interface_field_names(self) -> None:
         node = self.nodes["host:test|netns:*global*|addr:192.168.129.20/24"]
-        self.assertEqual(node["key"], {"host": "test", "netns": "*global*", "addr": "192.168.129.20/24"})
+        self.assertEqual(
+            node["key"], {"host": "test", "netns": "*global*", "addr": "192.168.129.20/24"}
+        )
         self.assertEqual(
             node["data"], {"addr": "192.168.129.20/24", "interface": "ens19", "role": "interface"}
         )
@@ -152,10 +160,16 @@ class RealNamespaceTest(unittest.TestCase):
 
     def test_key_is_a_sub_scope_of_host_not_a_separate_scope(self) -> None:
         node = self.nodes["host:test|netns:ns-uplink-voda-avm|addr:10.99.0.2/28"]
-        self.assertEqual(node["key"], {"host": "test", "netns": "ns-uplink-voda-avm", "addr": "10.99.0.2/28"})
+        self.assertEqual(
+            node["key"], {"host": "test", "netns": "ns-uplink-voda-avm", "addr": "10.99.0.2/28"}
+        )
 
     def test_devices_moved_into_the_namespace_are_captured_as_iface_facts(self) -> None:
-        moved = [n for n in self.nodes.values() if n["kind"] == "net.iface" and n["data"]["ifname"] != "lo"]
+        moved = [
+            n
+            for n in self.nodes.values()
+            if n["kind"] == "net.iface" and n["data"]["ifname"] != "lo"
+        ]
         self.assertEqual([n["data"]["ifname"] for n in moved], ["veth-krn-0"])
 
     def test_netns_node_lists_the_moved_in_devices_too(self) -> None:

@@ -31,13 +31,17 @@ NODES: list[pt.Model] = [
         id="host:central-1",
         kind="infra.host",
         key=pt.InfraHostKey(host="central-1"),
-        data=pt.InfraHostData(connectAddress="10.0.0.1", ovnRole=pt.OvnRole.central, encapIp="10.0.0.1"),
+        data=pt.InfraHostData(
+            connectAddress="10.0.0.1", ovnRole=pt.OvnRole.central, encapIp="10.0.0.1"
+        ),
     ),
     pt.InfraHostNode(
         id="host:chassis-1",
         kind="infra.host",
         key=pt.InfraHostKey(host="chassis-1"),
-        data=pt.InfraHostData(connectAddress="10.0.0.2", ovnRole=pt.OvnRole.chassis, encapIp="10.0.0.2"),
+        data=pt.InfraHostData(
+            connectAddress="10.0.0.2", ovnRole=pt.OvnRole.chassis, encapIp="10.0.0.2"
+        ),
     ),
     pt.OvnLsNode(
         id="ls:home",
@@ -45,7 +49,9 @@ NODES: list[pt.Model] = [
         key=pt.OvnLsKey(name="home"),
         data=pt.OvnLsData(
             interfaces=[
-                pt.Interface(host="chassis-1", iface={"kind": "vlan", "vlanParent": "eth0", "vlanId": 129}),
+                pt.Interface(
+                    host="chassis-1", iface={"kind": "vlan", "vlanParent": "eth0", "vlanId": 129}
+                ),
             ],
         ),
     ),
@@ -82,7 +88,11 @@ NODES: list[pt.Model] = [
 
 def _replace_home_ls(nodes: list[pt.Model], **changes: object) -> list[pt.Model]:
     return [
-        dataclasses.replace(n, **changes) if isinstance(n, pt.OvnLsNode) and n.key.name == "home" else n
+        (
+            dataclasses.replace(n, **changes)
+            if isinstance(n, pt.OvnLsNode) and n.key.name == "home"
+            else n
+        )
         for n in nodes
     ]
 
@@ -106,7 +116,9 @@ class ClusterScriptCreateTest(unittest.TestCase):
         self.assertEqual(self.cluster.count("ovn-nbctl lr-add router-home"), 1)
 
     def test_gateway_chassis_pin_only_on_the_pinned_side(self) -> None:
-        self.assertIn("ovn-nbctl lrp-set-gateway-chassis lrp-router-home-left chassis-1 100", self.cluster)
+        self.assertIn(
+            "ovn-nbctl lrp-set-gateway-chassis lrp-router-home-left chassis-1 100", self.cluster
+        )
         self.assertNotIn("lrp-set-gateway-chassis lrp-router-home-right", self.cluster)
 
     def test_lrp_add_carries_mac_and_addresses(self) -> None:
@@ -117,7 +129,10 @@ class ClusterScriptCreateTest(unittest.TestCase):
 
     def test_switch_side_lsp_bound_to_the_right_lrp(self) -> None:
         self.assertIn("ovn-nbctl lsp-add home lsp-router-home-left", self.cluster)
-        self.assertIn("ovn-nbctl lsp-set-options lsp-router-home-left router-port=lrp-router-home-left", self.cluster)
+        self.assertIn(
+            "ovn-nbctl lsp-set-options lsp-router-home-left router-port=lrp-router-home-left",
+            self.cluster,
+        )
 
     def test_one_host_script_per_infra_host_node(self) -> None:
         self.assertEqual(set(self.hosts), {"central-1", "chassis-1"})
@@ -187,7 +202,9 @@ class IfaceBindingCreateTest(unittest.TestCase):
         self.assertIn("ovn-nbctl lsp-add home lsp-home-localnet", self.cluster)
         self.assertIn("ovn-nbctl lsp-set-type lsp-home-localnet localnet", self.cluster)
         self.assertIn("ovn-nbctl lsp-set-addresses lsp-home-localnet unknown", self.cluster)
-        self.assertIn("ovn-nbctl lsp-set-options lsp-home-localnet network_name=net-home", self.cluster)
+        self.assertIn(
+            "ovn-nbctl lsp-set-options lsp-home-localnet network_name=net-home", self.cluster
+        )
         self.assertNotIn("lsp-backbone-localnet", self.cluster)  # backbone has no real interfaces
 
     def test_vlan_created_and_brought_up_on_the_owning_host(self) -> None:
@@ -258,7 +275,10 @@ class IfaceBindingDeleteTest(unittest.TestCase):
         self.assertIn("ip link delete eth0.129", self.hosts["chassis-1"])
 
     def test_bridge_mapping_removed(self) -> None:
-        self.assertIn("ovs-vsctl remove open_vswitch . external-ids ovn-bridge-mappings", self.hosts["chassis-1"])
+        self.assertIn(
+            "ovs-vsctl remove open_vswitch . external-ids ovn-bridge-mappings",
+            self.hosts["chassis-1"],
+        )
 
 
 class UnsupportedIfaceKindTest(unittest.TestCase):
@@ -275,7 +295,11 @@ class UnsupportedIfaceKindTest(unittest.TestCase):
 
 class NoCentralChassisTest(unittest.TestCase):
     def test_a_chassis_with_no_declared_central_raises(self) -> None:
-        nodes = [n for n in NODES if not (isinstance(n, pt.InfraHostNode) and n.data.ovnRole == pt.OvnRole.central)]
+        nodes = [
+            n
+            for n in NODES
+            if not (isinstance(n, pt.InfraHostNode) and n.data.ovnRole == pt.OvnRole.central)
+        ]
         with self.assertRaises(ValueError):
             mod.build_scripts(nodes, "create")
 

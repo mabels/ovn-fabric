@@ -30,7 +30,13 @@ FAKE_LINK = [
     # link show` sets link_netnsid (and link_index) for this case,
     # confirmed against the real router for both a veth peer and a
     # moved VLAN sub-interface.
-    {"ifname": "veth-ovn-0", "link_type": "ether", "operstate": "UP", "link_index": 26, "link_netnsid": 0},
+    {
+        "ifname": "veth-ovn-0",
+        "link_type": "ether",
+        "operstate": "UP",
+        "link_index": 26,
+        "link_netnsid": 0,
+    },
 ]
 
 FAKE_ADDR = [
@@ -75,9 +81,24 @@ class ListTest(unittest.TestCase):
         self.assertEqual(
             links,
             [
-                {"ifname": "lo", "linkType": "loopback", "operstate": "UNKNOWN", "peerInOtherNetns": False},
-                {"ifname": "ens19", "linkType": "ether", "operstate": "UP", "peerInOtherNetns": False},
-                {"ifname": "veth-ovn-0", "linkType": "ether", "operstate": "UP", "peerInOtherNetns": True},
+                {
+                    "ifname": "lo",
+                    "linkType": "loopback",
+                    "operstate": "UNKNOWN",
+                    "peerInOtherNetns": False,
+                },
+                {
+                    "ifname": "ens19",
+                    "linkType": "ether",
+                    "operstate": "UP",
+                    "peerInOtherNetns": False,
+                },
+                {
+                    "ifname": "veth-ovn-0",
+                    "linkType": "ether",
+                    "operstate": "UP",
+                    "peerInOtherNetns": True,
+                },
             ],
         )
 
@@ -94,11 +115,19 @@ class ListTest(unittest.TestCase):
     def test_list_routes_tags_family_from_which_command_produced_it(self) -> None:
         v4 = mod.list_routes(None, "-4")
         v6 = mod.list_routes(None, "-6")
-        self.assertEqual(v4, [{"prefix": "default", "dev": "ens19", "nexthop": "192.168.129.1", "family": "ipv4"}])
+        self.assertEqual(
+            v4,
+            [{"prefix": "default", "dev": "ens19", "nexthop": "192.168.129.1", "family": "ipv4"}],
+        )
         self.assertEqual(
             v6,
             [
-                {"prefix": "default", "dev": "ens19", "nexthop": "fd00:192:168:129::1", "family": "ipv6"},
+                {
+                    "prefix": "default",
+                    "dev": "ens19",
+                    "nexthop": "fd00:192:168:129::1",
+                    "family": "ipv6",
+                },
                 {"prefix": "fe80::/64", "dev": "ens19", "nexthop": "ens19", "family": "ipv6"},
             ],
         )
@@ -115,7 +144,9 @@ class WriteTest(unittest.TestCase):
     def test_delete_addr_builds_the_real_ip_command(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:
             mod.delete_addr("10.99.0.2/28", "veth-krn-0", None)
-        run.assert_called_once_with(["ip", "addr", "del", "10.99.0.2/28", "dev", "veth-krn-0"], None)
+        run.assert_called_once_with(
+            ["ip", "addr", "del", "10.99.0.2/28", "dev", "veth-krn-0"], None
+        )
 
     def test_add_route_with_a_real_gateway_includes_via(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:
@@ -142,7 +173,9 @@ class WriteTest(unittest.TestCase):
     def test_add_if_to_netns_runs_from_global_targeting_the_real_netns(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:
             mod.add_if_to_netns("veth-krn-0", "ns-uplink-voda-avm")
-        run.assert_called_once_with(["ip", "link", "set", "veth-krn-0", "netns", "ns-uplink-voda-avm"], None)
+        run.assert_called_once_with(
+            ["ip", "link", "set", "veth-krn-0", "netns", "ns-uplink-voda-avm"], None
+        )
 
     def test_delete_if_to_netns_runs_from_inside_the_netns_targeting_pid_1(self) -> None:
         # the inverse of add_if_to_netns — must run from inside the
@@ -152,7 +185,9 @@ class WriteTest(unittest.TestCase):
         # root/global namespace" from in there.
         with mock.patch.object(mod, "run_in_netns") as run:
             mod.delete_if_to_netns("veth-krn-0", "ns-uplink-voda-avm")
-        run.assert_called_once_with(["ip", "link", "set", "veth-krn-0", "netns", "1"], "ns-uplink-voda-avm")
+        run.assert_called_once_with(
+            ["ip", "link", "set", "veth-krn-0", "netns", "1"], "ns-uplink-voda-avm"
+        )
 
 
 class VlanWriteTest(unittest.TestCase):
@@ -160,7 +195,20 @@ class VlanWriteTest(unittest.TestCase):
         with mock.patch.object(mod, "run_in_netns") as run:
             mod.add_vlan("ens18", "ens18.128", 128)
         run.assert_called_once_with(
-            ["ip", "link", "add", "link", "ens18", "name", "ens18.128", "type", "vlan", "id", "128"], None
+            [
+                "ip",
+                "link",
+                "add",
+                "link",
+                "ens18",
+                "name",
+                "ens18.128",
+                "type",
+                "vlan",
+                "id",
+                "128",
+            ],
+            None,
         )
 
     def test_set_link_up(self) -> None:

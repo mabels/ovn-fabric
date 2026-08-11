@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import sys
 
 from protocol.hydrate import hydrate_nodes
 
@@ -31,7 +30,7 @@ def main(argv: list[str] | None = None) -> int:
         "--action",
         choices=["create", "delete"],
         default="create",
-        help="create (default): plain adds. delete: --if-exists removes, cascading per ladops/ovn.py.",
+        help="create (default, plain adds) or delete (--if-exists, cascading — see ladops/ovn.py).",
     )
     args = parser.parse_args(argv)
 

@@ -74,7 +74,9 @@ def list_addrs(netns: str | None) -> list[dict]:
         ifname = entry["ifname"]
         for a in entry.get("addr_info", []):
             addr = f"{a['local']}/{a['prefixlen']}"
-            out.append({"addr": addr, "interface": ifname, "family": "ipv6" if ":" in addr else "ipv4"})
+            out.append(
+                {"addr": addr, "interface": ifname, "family": "ipv6" if ":" in addr else "ipv4"}
+            )
     return out
 
 

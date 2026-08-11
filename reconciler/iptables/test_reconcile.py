@@ -64,7 +64,11 @@ class ReconcileTest(unittest.TestCase):
     def test_oif_and_src_distinguish_otherwise_identical_looking_rules(self) -> None:
         keys = {(n["key"]["host"], n["key"]["netns"]) for n in self.nodes.values()}
         self.assertEqual(keys, {("test", "*global*")})
-        matches = [n for n in self.nodes.values() if n["data"]["action"] == "MASQUERADE" and n["kind"] == "ipv4.fwrule"]
+        matches = [
+            n
+            for n in self.nodes.values()
+            if n["data"]["action"] == "MASQUERADE" and n["kind"] == "ipv4.fwrule"
+        ]
         self.assertEqual(len(matches), 2)
         self.assertNotEqual(matches[0]["id"], matches[1]["id"])
         self.assertNotEqual(matches[0]["key"], matches[1]["key"])
@@ -73,7 +77,9 @@ class ReconcileTest(unittest.TestCase):
         kinds = {n["kind"] for n in self.nodes.values()}
         self.assertEqual(kinds, {"ipv4.fwrule", "ipv6.fwrule"})
 
-    def test_match_fields_are_duplicated_into_data_for_diffing_without_reparsing_the_key(self) -> None:
+    def test_match_fields_are_duplicated_into_data_for_diffing_without_reparsing_the_key(
+        self,
+    ) -> None:
         node = next(n for n in self.nodes.values() if n["data"].get("src") == "10.99.0.64/28")
         self.assertEqual(
             node["data"],
@@ -109,7 +115,11 @@ class ReconcileTest(unittest.TestCase):
             self.assertNotIn(dimension, node["key"])
 
     def test_dport_and_proto_carried_through_into_the_key(self) -> None:
-        node = next(n for n in self.nodes.values() if n["kind"] == "ipv4.fwrule" and n["data"]["action"] == "ACCEPT")
+        node = next(
+            n
+            for n in self.nodes.values()
+            if n["kind"] == "ipv4.fwrule" and n["data"]["action"] == "ACCEPT"
+        )
         self.assertEqual(node["key"]["dport"], "22")
         self.assertEqual(node["key"]["proto"], "tcp")
 

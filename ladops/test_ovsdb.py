@@ -21,7 +21,9 @@ class DecodeTest(unittest.TestCase):
 
     def test_empty_and_populated_set(self) -> None:
         self.assertEqual(mod.decode(["set", []]), [])
-        self.assertEqual(mod.decode(["set", ["10.99.0.1/28", "fe80::1/64"]]), ["10.99.0.1/28", "fe80::1/64"])
+        self.assertEqual(
+            mod.decode(["set", ["10.99.0.1/28", "fe80::1/64"]]), ["10.99.0.1/28", "fe80::1/64"]
+        )
 
     def test_set_of_uuids_decodes_each_element(self) -> None:
         self.assertEqual(
@@ -31,7 +33,9 @@ class DecodeTest(unittest.TestCase):
 
     def test_map(self) -> None:
         self.assertEqual(
-            mod.decode(["map", [["hosting-chassis", "effd37ab"], ["reside-on-redirect-chassis", "true"]]]),
+            mod.decode(
+                ["map", [["hosting-chassis", "effd37ab"], ["reside-on-redirect-chassis", "true"]]]
+            ),
             {"hosting-chassis": "effd37ab", "reside-on-redirect-chassis": "true"},
         )
 
@@ -55,9 +59,13 @@ FAKE_LIST_OUTPUT = json.dumps(
 
 class ListTableTest(unittest.TestCase):
     def test_rows_are_keyed_by_real_heading_names_with_atoms_decoded(self) -> None:
-        with mock.patch.object(mod, "run_in_netns", return_value=mock.Mock(stdout=FAKE_LIST_OUTPUT)) as run:
+        with mock.patch.object(
+            mod, "run_in_netns", return_value=mock.Mock(stdout=FAKE_LIST_OUTPUT)
+        ) as run:
             rows = mod.list_table(["ovn-nbctl"], "Logical_Router_Port")
-        run.assert_called_once_with(["ovn-nbctl", "-f", "json", "list", "Logical_Router_Port"], None)
+        run.assert_called_once_with(
+            ["ovn-nbctl", "-f", "json", "list", "Logical_Router_Port"], None
+        )
         self.assertEqual(
             rows,
             [

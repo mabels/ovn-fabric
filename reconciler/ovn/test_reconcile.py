@@ -48,7 +48,9 @@ class ReconcileTest(unittest.TestCase):
         patcher.start()
         self.nodes = mod.reconcile(SCOPE, None)
 
-    def test_a_router_with_multiple_lrps_gets_one_node_per_port_not_one_collapsed_node(self) -> None:
+    def test_a_router_with_multiple_lrps_gets_one_node_per_port_not_one_collapsed_node(
+        self,
+    ) -> None:
         # this is the exact case that broke the ADR's literal
         # `router:<scope>|lrp` key (no per-port identity) — router-home
         # really does own two distinct LRPs.

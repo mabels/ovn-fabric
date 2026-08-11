@@ -133,7 +133,11 @@ def reconcile(scope: dict, netns: str | None = None) -> dict[str, dict]:
                 "id": id_,
                 "kind": kind,
                 "key": {**ns_scope, "dev": route["dev"], "prefix": route["prefix"]},
-                "data": {"prefix": route["prefix"], "dev": route["dev"], "nexthopRef": route["nexthop"]},
+                "data": {
+                    "prefix": route["prefix"],
+                    "dev": route["dev"],
+                    "nexthopRef": route["nexthop"],
+                },
             }
 
     return nodes

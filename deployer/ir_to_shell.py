@@ -144,7 +144,11 @@ def _domains_with_bindable_interfaces(nodes: list[pt.Model]) -> set[str]:
 
 def _find_central_host(nodes: list[pt.Model]) -> pt.InfraHostNode | None:
     return next(
-        (n for n in nodes if isinstance(n, pt.InfraHostNode) and n.data.ovnRole == pt.OvnRole.central),
+        (
+            n
+            for n in nodes
+            if isinstance(n, pt.InfraHostNode) and n.data.ovnRole == pt.OvnRole.central
+        ),
         None,
     )
 
@@ -288,7 +292,9 @@ def _emit_iface_bindings_create(host_name: str, nodes: list[pt.Model]) -> list[s
         bridge = _bridge_name(domain)
         lines.append(f"# --- interface: {domain} on {host_name} ({real_name}) ---")
         if iface["kind"] == "vlan":
-            lines.append(_sh(linux_net_ops.add_vlan_argv(iface["vlanParent"], real_name, iface["vlanId"])))
+            lines.append(
+                _sh(linux_net_ops.add_vlan_argv(iface["vlanParent"], real_name, iface["vlanId"]))
+            )
             lines.append(_sh(linux_net_ops.set_link_up_argv(real_name)))
         lines.append(_sh(ovs_ops.add_br_argv(bridge)))
         lines.append(_sh(ovs_ops.set_bridge_fail_mode_argv(bridge)))
@@ -332,7 +338,9 @@ def _emit_host_create(host_node: pt.InfraHostNode, nodes: list[pt.Model]) -> lis
         lines.append("# central: expose the shared NB/SB DBs to every other chassis")
         lines.append(_sh(ovn_ops.nb_set_connection_argv()))
         lines.append(_sh(ovn_ops.sb_set_connection_argv()))
-        lines.append(_sh(ovs_ops.set_external_id_argv("ovn-remote", "unix:/var/run/ovn/ovnsb_db.sock")))
+        lines.append(
+            _sh(ovs_ops.set_external_id_argv("ovn-remote", "unix:/var/run/ovn/ovnsb_db.sock"))
+        )
     else:
         central = _find_central_host(nodes)
         if central is None:
@@ -345,7 +353,9 @@ def _emit_host_create(host_node: pt.InfraHostNode, nodes: list[pt.Model]) -> lis
                 f"central host {central.key.host}: no encapIp/address.ipv4/"
                 "address.ipv6 to build ovn-remote from"
             )
-        lines.append(_sh(ovs_ops.set_external_id_argv("ovn-remote", f"tcp:{central.data.encapIp}:6642")))
+        lines.append(
+            _sh(ovs_ops.set_external_id_argv("ovn-remote", f"tcp:{central.data.encapIp}:6642"))
+        )
 
     if data.encapIp is not None:
         lines.append(_sh(ovs_ops.set_external_id_argv("ovn-encap-type", "geneve")))
@@ -382,7 +392,11 @@ def _emit_host_delete(host_node: pt.InfraHostNode, nodes: list[pt.Model]) -> lis
 
 def _emit_host_script(host_node: pt.InfraHostNode, nodes: list[pt.Model], action: Action) -> str:
     host_name = host_node.key.host
-    body = _emit_host_create(host_node, nodes) if action == "create" else _emit_host_delete(host_node, nodes)
+    body = (
+        _emit_host_create(host_node, nodes)
+        if action == "create"
+        else _emit_host_delete(host_node, nodes)
+    )
     lines = [
         "#!/bin/sh",
         f"# Host-local OVS/chassis registration for {host_name}",

@@ -16,7 +16,9 @@ SCOPE = {"host": "test-router"}
 
 class ReconcileTest(unittest.TestCase):
     def setUp(self) -> None:
-        patcher_uname = mock.patch.object(mod, "_uname_a", return_value="Linux test-router 6.1.0 #1 SMP x86_64 GNU/Linux")
+        patcher_uname = mock.patch.object(
+            mod, "_uname_a", return_value="Linux test-router 6.1.0 #1 SMP x86_64 GNU/Linux"
+        )
         self.addCleanup(patcher_uname.stop)
         patcher_uname.start()
 

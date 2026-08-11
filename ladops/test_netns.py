@@ -27,7 +27,9 @@ class ListNetnsTest(unittest.TestCase):
             mod.subprocess, "run", return_value=mock.Mock(stdout=FAKE_NETNS_LIST)
         ) as run:
             names = mod.list_netns()
-        run.assert_called_once_with(["ip", "netns", "list"], check=True, capture_output=True, text=True)
+        run.assert_called_once_with(
+            ["ip", "netns", "list"], check=True, capture_output=True, text=True
+        )
         self.assertEqual(
             names,
             [
@@ -47,7 +49,9 @@ class ListNetnsTest(unittest.TestCase):
 
 class NetnsScopeTest(unittest.TestCase):
     def test_global_is_the_literal_asterisk_global(self) -> None:
-        self.assertEqual(mod.netns_scope({"host": "test"}, None), {"host": "test", "netns": "*global*"})
+        self.assertEqual(
+            mod.netns_scope({"host": "test"}, None), {"host": "test", "netns": "*global*"}
+        )
 
     def test_real_namespace_is_a_sub_scope_of_host(self) -> None:
         scope = mod.netns_scope({"host": "test"}, "ns-uplink-voda-avm")

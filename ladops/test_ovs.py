@@ -65,7 +65,9 @@ class ExternalIdWriteTest(unittest.TestCase):
     def test_remove_external_id_takes_just_the_key(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:
             mod.remove_external_id("ovn-encap-ip")
-        run.assert_called_once_with(["ovs-vsctl", "remove", "open_vswitch", ".", "external-ids", "ovn-encap-ip"], None)
+        run.assert_called_once_with(
+            ["ovs-vsctl", "remove", "open_vswitch", ".", "external-ids", "ovn-encap-ip"], None
+        )
 
 
 class BridgeAndPortWriteTest(unittest.TestCase):
@@ -82,7 +84,9 @@ class BridgeAndPortWriteTest(unittest.TestCase):
     def test_set_bridge_fail_mode_defaults_to_standalone(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:
             mod.set_bridge_fail_mode("br-home")
-        run.assert_called_once_with(["ovs-vsctl", "set", "bridge", "br-home", "fail-mode=standalone"], None)
+        run.assert_called_once_with(
+            ["ovs-vsctl", "set", "bridge", "br-home", "fail-mode=standalone"], None
+        )
 
     def test_add_port_has_no_may_exist(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:
@@ -92,7 +96,9 @@ class BridgeAndPortWriteTest(unittest.TestCase):
     def test_del_port_uses_if_exists(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:
             mod.del_port("br-home", "ens18.128")
-        run.assert_called_once_with(["ovs-vsctl", "--if-exists", "del-port", "br-home", "ens18.128"], None)
+        run.assert_called_once_with(
+            ["ovs-vsctl", "--if-exists", "del-port", "br-home", "ens18.128"], None
+        )
 
 
 if __name__ == "__main__":

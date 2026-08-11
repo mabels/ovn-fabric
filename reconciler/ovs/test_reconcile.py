@@ -51,7 +51,9 @@ class ReconcileTest(unittest.TestCase):
         self.assertEqual(node["key"], {"host": "test", "name": "br-bd-4"})
 
     def test_type_and_state_carried_through(self) -> None:
-        node = self.nodes["host:test|ovsiface:patch-lsp-uplink-voda-modem-transfer-localnet-to-br-int"]
+        node = self.nodes[
+            "host:test|ovsiface:patch-lsp-uplink-voda-modem-transfer-localnet-to-br-int"
+        ]
         self.assertEqual(node["data"]["type"], "patch")
         self.assertEqual(node["data"]["adminState"], "up")
         self.assertEqual(node["data"]["linkState"], "up")

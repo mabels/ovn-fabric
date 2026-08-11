@@ -78,7 +78,7 @@ class ListLrpsTest(unittest.TestCase):
         self.assertEqual(names, {"lrp-home", "lrp-home-bb"})
 
     def test_mac_networks_and_gateway_chassis_carried_through(self) -> None:
-        lrp = next(l for l in self.lrps if l["name"] == "lrp-home")
+        lrp = next(item for item in self.lrps if item["name"] == "lrp-home")
         self.assertEqual(lrp["mac"], "00:00:c0:a8:80:01")
         self.assertEqual(lrp["networks"], ["192.168.128.1/24", "fd00:192:168:128::1/64"])
         self.assertEqual(lrp["gatewayChassis"], ["effd37ab-685f-4c33-8c67-43017f4c7c52"])
@@ -93,7 +93,14 @@ class WriteTest(unittest.TestCase):
         with mock.patch.object(mod, "run_in_netns") as run:
             mod.add_lrp("router-home", "lrp-home", "00:00:c0:a8:80:01", ["192.168.128.1/24"])
         run.assert_called_once_with(
-            ["ovn-nbctl", "lrp-add", "router-home", "lrp-home", "00:00:c0:a8:80:01", "192.168.128.1/24"],
+            [
+                "ovn-nbctl",
+                "lrp-add",
+                "router-home",
+                "lrp-home",
+                "00:00:c0:a8:80:01",
+                "192.168.128.1/24",
+            ],
             None,
         )
 
@@ -106,7 +113,9 @@ class WriteTest(unittest.TestCase):
         self.assertEqual(mod.lr_add_argv("router-home"), ["ovn-nbctl", "lr-add", "router-home"])
 
     def test_lr_del_uses_if_exists(self) -> None:
-        self.assertEqual(mod.lr_del_argv("router-home"), ["ovn-nbctl", "--if-exists", "lr-del", "router-home"])
+        self.assertEqual(
+            mod.lr_del_argv("router-home"), ["ovn-nbctl", "--if-exists", "lr-del", "router-home"]
+        )
 
     def test_ls_add_has_no_may_exist(self) -> None:
         self.assertEqual(mod.ls_add_argv("home"), ["ovn-nbctl", "ls-add", "home"])
@@ -121,7 +130,12 @@ class WriteTest(unittest.TestCase):
                 ["ovn-nbctl", "lsp-add", "home", "lsp-router-home-left"],
                 ["ovn-nbctl", "lsp-set-type", "lsp-router-home-left", "router"],
                 ["ovn-nbctl", "lsp-set-addresses", "lsp-router-home-left", "router"],
-                ["ovn-nbctl", "lsp-set-options", "lsp-router-home-left", "router-port=lrp-router-home-left"],
+                [
+                    "ovn-nbctl",
+                    "lsp-set-options",
+                    "lsp-router-home-left",
+                    "router-port=lrp-router-home-left",
+                ],
             ],
         )
 
@@ -137,7 +151,10 @@ class WriteTest(unittest.TestCase):
         )
 
     def test_lsp_del_uses_if_exists(self) -> None:
-        self.assertEqual(mod.lsp_del_argv("lsp-home-localnet"), ["ovn-nbctl", "--if-exists", "lsp-del", "lsp-home-localnet"])
+        self.assertEqual(
+            mod.lsp_del_argv("lsp-home-localnet"),
+            ["ovn-nbctl", "--if-exists", "lsp-del", "lsp-home-localnet"],
+        )
 
 
 if __name__ == "__main__":
