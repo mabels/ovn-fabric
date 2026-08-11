@@ -155,5 +155,24 @@ class WriteTest(unittest.TestCase):
         run.assert_called_once_with(["ip", "link", "set", "veth-krn-0", "netns", "1"], "ns-uplink-voda-avm")
 
 
+class VlanWriteTest(unittest.TestCase):
+    def test_add_vlan_builds_the_real_ip_link_command(self) -> None:
+        with mock.patch.object(mod, "run_in_netns") as run:
+            mod.add_vlan("ens18", "ens18.128", 128)
+        run.assert_called_once_with(
+            ["ip", "link", "add", "link", "ens18", "name", "ens18.128", "type", "vlan", "id", "128"], None
+        )
+
+    def test_set_link_up(self) -> None:
+        with mock.patch.object(mod, "run_in_netns") as run:
+            mod.set_link_up("ens18.128")
+        run.assert_called_once_with(["ip", "link", "set", "ens18.128", "up"], None)
+
+    def test_delete_link(self) -> None:
+        with mock.patch.object(mod, "run_in_netns") as run:
+            mod.delete_link("ens18.128")
+        run.assert_called_once_with(["ip", "link", "delete", "ens18.128"], None)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -42,6 +42,83 @@ export type AccessMethod =
   | { method: "ssh"; user: string }
   | { method: "local" }; // the generator's own host — no SSH needed
 
+// ── host address: fqdn and/or real IPv4/IPv6 ────────────────────────
+// A host can be reachable at more than one of these simultaneously — an
+// FQDN for humans/SSH, real IPv4/IPv6 for OVN's own Geneve tunnel
+// endpoint (see OvnHostConfig.encapIp below). These are genuinely
+// independent concerns that can differ (SSH via a management name,
+// tunnel traffic via a dedicated network) — not three equivalent ways
+// to spell the same thing. At least one field must be given; validated
+// at construction (sshHost/localHost), not statically enforceable
+// without a much less readable union type.
+export interface HostAddress {
+  readonly fqdn?: string;
+  readonly ipv4?: IPv4;
+  readonly ipv6?: IPv6;
+}
+
+function primaryHostAddress(address: HostAddress): string {
+  if (address.fqdn !== undefined) return address.fqdn;
+  if (address.ipv4 !== undefined) return address.ipv4.to_s();
+  if (address.ipv6 !== undefined) return address.ipv6.to_s();
+  throw new Error(
+    "HostAddress requires at least one of fqdn/ipv4/ipv6",
+  );
+}
+
+// ── OVN cluster membership ──────────────────────────────────────────
+// `defineNetwork` is one OVN cluster (one shared control plane, ADR
+// 0003), not one host — every Host participating in it is a chassis,
+// and exactly one role in the cluster is "central" (runs ovn-central:
+// northd + the NB/SB databases). Every other chassis runs only
+// ovn-host/ovn-controller, pointed at the central chassis's SB DB
+// remotely instead of a local one — this is the real, previously
+// undone TODO from generate-ovn.ts's requiredPackages doc comment
+// (2026-07-19): today every Host gets its own full independent stack,
+// so N hosts under one defineNetwork silently become N uncoordinated
+// clusters, not one shared one.
+export type OvnRole =
+  | { readonly kind: "central" }
+  | { readonly kind: "chassis" };
+
+export interface OvnHostConfig {
+  readonly role: OvnRole;
+  /** Real IP used as this chassis's Geneve tunnel endpoint
+   * (external-ids:ovn-encap-ip). Defaults to this Host's own
+   * address.ipv4 ?? address.ipv6 when omitted — only needed as an
+   * explicit override when tunnel traffic and SSH/generator
+   * reachability use different networks. Never an FQDN: the SB DB's
+   * own Chassis.encaps.ip column is a real address, not a hostname —
+   * confirmed against a live 3-chassis cluster, 2026-08-09. */
+  readonly encapIp?: IPv4 | IPv6;
+  /** Defaults to "geneve" — OVN's modern default, and what every real
+   * chassis tested against so far actually uses. */
+  readonly encapType?: "geneve" | "stt" | "vxlan";
+}
+
+// ── OVN cluster-wide (NB_Global) options ────────────────────────────
+// Set once per cluster, not per chassis — these live on the NB
+// database itself. See ADR 0003 for where each of these came from
+// (OVN's real NB_Global schema, not this project's invention).
+export interface OvnClusterOptions {
+  /** Encrypt every inter-chassis Geneve tunnel via IPsec (ESP, IKE via
+   * libreswan/ovn-ipsec). Off by default — no real deployment uses
+   * this yet; identified against a live cluster but not yet verified
+   * end to end (ADR 0003, "Open questions"). */
+  readonly ipsec?: boolean;
+  /** OUI-ish prefix OVN uses when auto-generating MAC addresses for
+   * ports declared with dynamic addressing. Unused by this project
+   * today — every uplink/segment declares an explicit MAC. */
+  readonly macPrefix?: string;
+  /** Batches similar logical switches into shared flow tables — a real
+   * scale optimization, irrelevant at today's segment counts. */
+  readonly useLogicalDpGroups?: boolean;
+  readonly northd?: {
+    readonly probeInterval?: number;
+    readonly threads?: number;
+  };
+}
+
 // ── monitoring: IPFIX flow export ──────────────────────────────────
 // Host-level, not per-Segment/Uplink, and deliberately scoped to
 // br-int only: that's OVN's own integration bridge, which already
@@ -70,27 +147,95 @@ export interface HostMonitoring {
 
 export interface Host {
   readonly name: string;
-  readonly address: string; // hostname or IP the generator connects to
+  readonly address: HostAddress;
+  /** What the generator actually connects to — derived once from
+   * `address` (fqdn, else ipv4, else ipv6) rather than re-picked
+   * ad hoc everywhere a connection string is needed. */
+  readonly connectAddress: string;
   readonly access: AccessMethod;
   readonly monitoring?: HostMonitoring;
+  /** Undefined means this Host is not part of the OVN cluster at all
+   * (e.g. a pure bastion/management host with no chassis role) — no
+   * ovn-central/ovn-host gets installed there. See OvnHostConfig. */
+  readonly ovn?: OvnHostConfig;
 }
 
 export function sshHost(
   name: string,
-  address: string,
+  address: HostAddress,
   user: string,
+  ovn?: OvnHostConfig,
   monitoring?: HostMonitoring,
 ): Host {
-  return { name, address, access: { method: "ssh", user }, monitoring };
-}
-
-export function localHost(name: string, monitoring?: HostMonitoring): Host {
   return {
     name,
-    address: "127.0.0.1",
-    access: { method: "local" },
+    address,
+    connectAddress: primaryHostAddress(address),
+    access: { method: "ssh", user },
+    ovn,
     monitoring,
   };
+}
+
+export function localHost(
+  name: string,
+  ovn?: OvnHostConfig,
+  monitoring?: HostMonitoring,
+): Host {
+  return {
+    name,
+    address: { fqdn: "localhost" },
+    connectAddress: "127.0.0.1",
+    access: { method: "local" },
+    ovn,
+    monitoring,
+  };
+}
+
+// ── collision domain: a bare OVN logical switch ─────────────────────
+// The L2-only primitive underneath Uplink/Segment — those are a
+// SUPERSET (a collision domain plus addressing, uplink selection,
+// routes, NAT: real L3 concerns, deliberately out of scope here). A
+// collision domain is just a name plus whichever real interfaces have
+// been attached to it — matches OVN's own minimal Logical_Switch shape
+// (everything else — ports, ACLs, DHCP options — hangs off it as
+// separate, related objects, not fields on the switch itself).
+//
+// Deliberately NOT Host-scoped, unlike Uplink/Segment: a real OVN
+// logical switch is a cluster-wide object, not owned by any one
+// chassis — confirmed live (ADR 0003): sw-test's two ports lived on
+// two different chassis, at two different physical sites, with no
+// single chassis "owning" the switch itself.
+//
+// addInterface(), not an `if` field: physical attachment is additive,
+// not a fixed one-shot property of the domain — a real logical switch
+// can carry more than one localnet port (e.g. redundant physical
+// attachment across chassis), and there's no reason to special-case
+// "the first/only one" as a constructor field while every subsequent
+// one needs a different mechanism. A class with mutable internal state
+// (not a plain readonly interface), matching how ManualUplink already
+// holds mutable state (`switchTo`) elsewhere in this file — a bare
+// data literal can't expose a method.
+export class CollisionDomain {
+  readonly name: string;
+  private readonly interfaces: InterfaceKind[] = [];
+
+  constructor(name: string) {
+    this.name = name;
+  }
+
+  /** Returns the same `iface` it was given — so a caller can register
+   * it and get a handle back in one expression, e.g.
+   * `ifaces: [{ host, iface: domain.addInterface({...}) }]`, rather
+   * than needing a separate statement before the call that uses it. */
+  addInterface(iface: InterfaceKind): InterfaceKind {
+    this.interfaces.push(iface);
+    return iface;
+  }
+
+  get allInterfaces(): readonly InterfaceKind[] {
+    return this.interfaces;
+  }
 }
 
 // ── NetId: the identity every segment/uplink/transfer-link carries ──
@@ -128,6 +273,99 @@ export interface NetId {
  * conceptually carries both its OVN-side and netns-side identity.
  */
 export type Addresses = readonly NetId[];
+
+// ── security groups: not designed yet ───────────────────────────────
+// A dummy placeholder, not a real mechanism — see ADR 0002's "Firewall
+// / security-group subschema" (net.securitygroup/net.sgattachment) for
+// the intended real shape. Exists so RouterEndpoint (below) has
+// somewhere to hold "this will need a security group eventually"
+// without pretending the real mechanism exists yet, and without
+// silently omitting the field and forgetting the gap is there. Also:
+// as of OVN 26.03.0, whether ACLs even attach to a router port
+// directly (vs. only a Logical_Switch/Port_Group) hasn't been verified
+// against the live cluster (ADR 0003) — this may end up belonging on
+// CollisionDomain instead of RouterEndpoint once that's checked.
+export interface SecurityGroupRef {
+  readonly name: string;
+}
+
+// ── Router: connects exactly two collision domains ──────────────────
+// The L3 primitive underneath Uplink/Segment (which are becoming a
+// superset built on top of this + CollisionDomain, see ADR 0003) — one
+// OVN Logical_Router, with exactly two Logical_Router_Ports (`left`/
+// `right`), each bound into a different CollisionDomain. Real OVN
+// routers can have more than two ports; this project's actual deployed
+// topology never uses that — every router today is a bridge between
+// exactly its own segment/uplink and the shared backbone (confirmed:
+// router-home's real LRPs are lrp-home + lrp-home-bb, nothing else) —
+// so N-way routers are a deliberate non-goal here, not an oversight.
+// 3+-way connectivity is achieved by chaining through a shared
+// CollisionDomain (the backbone), not by one router with many legs.
+//
+// Deliberately no `routes` field yet — static routes are a
+// GLOBAL-topology concern (which hops does traffic between two
+// arbitrary domains actually cross), not something to hand-declare
+// per Router. See net.reachability() (define.ts) for the intended
+// direction: declare "domain A needs to reach domain B," compute the
+// path (and its return path) by walking the graph of CollisionDomains
+// connected by Routers, instead of manually restating the same fact at
+// every hop along the way.
+//
+// No `mac` field on RouterEndpoint: every existing case (segments,
+// uplinks, backbone joins) derives it from the endpoint's own IPv4 via
+// macFromV4 (addressing.ts) at emission time, never stores one
+// separately — RouterEndpoint follows the same convention rather than
+// reintroducing a redundant field.
+/** One real (host, interface) pair — see RouterEndpoint.ifaces. */
+export interface HostInterface {
+  readonly host: Host;
+  readonly iface: InterfaceKind;
+}
+
+export interface RouterEndpoint {
+  readonly l2Segment: CollisionDomain;
+  /** A router port's own addresses — plain parsed IPv4/IPv6 values, one
+   * array entry per address (IPv4.parse(...), IPv6.parse(...)), NOT
+   * Addresses/NetId: NetId pairs a v4+v6 fold together under one
+   * Segment/Uplink identity (id()/vlan()), which a router endpoint
+   * doesn't have — there's no segment/uplink id to fold from, and
+   * forcing one here means fabricating a meaningless id() just to
+   * satisfy the type. A router endpoint's addresses are simply
+   * declared, the same way SegmentGateway's explicit-override arm
+   * already is. */
+  readonly ipaddrs: readonly (IPv4 | IPv6)[];
+  /** Explicit MAC override. Required when ipaddrs has no IPv4 for
+   * macFromV4() to fold (e.g. an uplink's transfer-link endpoint whose
+   * real address isn't declared yet, or is DHCP-assigned) — undefined
+   * otherwise means "derive it from ipaddrs's IPv4, same as every
+   * Uplink/Segment already does." */
+  readonly mac?: string;
+  /** Real physical/tunnel attachment(s) for this endpoint's side of the
+   * collision domain — a segment's localnet port needs one (it bridges
+   * OVN's virtual world onto a real NIC/VLAN/tunnel), a router's
+   * backbone-facing port doesn't (OVN-internal transit never touches
+   * real hardware — northd compiles it straight into OpenFlow on
+   * br-int). Optional and plural for exactly that reason: not every
+   * endpoint has one, and a domain's physical presence isn't
+   * necessarily one interface on one chassis (redundant attachment
+   * across chassis is a real case, not just tolerated). */
+  readonly ifaces?: readonly HostInterface[];
+  /** Pins this endpoint's LRP to a specific chassis (OVN's native
+   * gateway-chassis mechanism — real captured data already carries
+   * this on every LRP, confirmed live 2026-08-09) instead of being
+   * fully distributed. Typically only the endpoint that needs
+   * NAT/external egress sets this, not both. Undefined means "fully
+   * distributed, no pinning" — OVN's own default. */
+  readonly gatewayChassis?: Host;
+  /** Not designed yet — see SecurityGroupRef above. */
+  readonly securityGroup?: SecurityGroupRef;
+}
+
+export interface Router {
+  readonly name: string;
+  readonly left: RouterEndpoint;
+  readonly right: RouterEndpoint;
+}
 
 // ── SegmentGateway: how a segment's own gateway address is expressed ──
 // The config-facing input to segmentNet() (addressing.ts) and, via it,

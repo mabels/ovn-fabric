@@ -43,6 +43,10 @@ jobs:
         with:
           node-version: 22.x
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install (pulls in `deno` as an npm dependency)
         run: npm install
 
@@ -61,12 +65,32 @@ jobs:
       - name: Smoke test — deno entry point directly
         run: npx deno run --allow-read --allow-env src/cli.ts generate examples/minimal-topology.ts
 
+      - name: Smoke test — generate-ir (desired-state IR JSON)
+        run: npx deno run --allow-read --allow-env src/cli.ts generate-ir examples/minimal-topology.ts
+
       # Note: no npm/npx smoke test here. bin/ovn-fabric.js delegates to
       # the JSR-published "./cli" export at this exact version (see
       # bin/ovn-fabric.js's own header comment for why) — that version
       # doesn't exist on the registry yet for an ordinary push (only a
       # "0.0.0" placeholder). See the "publish" job below for the real,
       # post-publish end-to-end check of that path.
+
+      # ── Python side: ladops/reconciler/deployer/protocol ────────────
+      # protocol/generated.py doesn't exist until this runs — it's
+      # ephemeral, regenerated here fresh every CI run (see .gitignore),
+      # never committed as source. This step is itself the real
+      # end-to-end proof that the ArkType -> JSON Schema ->
+      # datamodel-codegen pipeline still works, not just that the
+      # hand-written Python around it does.
+      - name: Generate protocol/generated.py (ArkType -> JSON Schema -> Python dataclasses)
+        # --allow-env: arktype's own dependency chain (debug, via
+        # node:process) needs it — confirmed live, 2026-08-11, fails
+        # with NotCapable without it even though nothing here reads an
+        # env var itself.
+        run: npx deno run --allow-read --allow-write --allow-run --allow-net --allow-env src/cli.ts generate-pytypes
+
+      - name: Python unit tests (ladops, reconciler, deployer, protocol)
+        run: python3 -m unittest discover -s . -p "test_*.py" -v
 
   publish:
     needs: ci

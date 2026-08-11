@@ -9,7 +9,8 @@
   },
   "imports": {
     "jsr:@adviser/ovn-fabric": "./src/mod.ts",
-    "jsr:@adviser/ovn-fabric/cli": "./src/cli.ts"
+    "jsr:@adviser/ovn-fabric/cli": "./src/cli.ts",
+    "arktype": "npm:arktype@^2.1.0"
   },
   "tasks": {
     "check": "deno check src/*.ts",

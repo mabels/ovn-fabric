@@ -1,0 +1,88 @@
+# protocol/hydrate.py — hand-written, NOT regenerated (generated.py is
+# — this file survives every `generate-pytypes` run). Converts a raw IR
+# JSON node (dict, as loaded from generate-ir's output) into its typed
+# dataclass (generated.InfraHostNode/OvnLsNode/OvnLrpNode), dispatched
+# by `kind`.
+#
+# A KeyError (unknown `kind`) or TypeError (a required field missing —
+# a real Python dataclass constructor call, not a hand-rolled check) IS
+# the intended failure mode for version skew: this data is internal,
+# produced by this project's own generator, not adversarial external
+# input, so what actually needs catching is a stale deployer bundle
+# receiving newer-shaped IR data, not defensive-grade validation (see
+# ADR 0002, "Type stability across the TypeScript/Python boundary").
+#
+# Every OTHER Python component (deployer/ir_to_shell.py, deployer/
+# cli.py) works with these typed nodes exclusively — this module is the
+# ONE place a raw dict is still indexed by string key, precisely so it
+# can be the one place that changes if the envelope shape ever does.
+
+from __future__ import annotations
+
+from . import generated as pt
+
+
+def _hydrate_infra_host(raw: dict) -> pt.InfraHostNode:
+    data = raw["data"]
+    return pt.InfraHostNode(
+        id=raw["id"],
+        kind=raw["kind"],
+        key=pt.InfraHostKey(host=raw["key"]["host"]),
+        data=pt.InfraHostData(
+            connectAddress=data["connectAddress"],
+            encapIp=data.get("encapIp"),
+            ovnRole=pt.OvnRole(data["ovnRole"]) if data.get("ovnRole") is not None else None,
+        ),
+    )
+
+
+def _hydrate_ovn_ls(raw: dict) -> pt.OvnLsNode:
+    data = raw["data"]
+    return pt.OvnLsNode(
+        id=raw["id"],
+        kind=raw["kind"],
+        key=pt.OvnLsKey(name=raw["key"]["name"]),
+        data=pt.OvnLsData(
+            interfaces=[pt.Interface(host=e["host"], iface=e["iface"]) for e in data["interfaces"]],
+        ),
+    )
+
+
+def _hydrate_ovn_lrp(raw: dict) -> pt.OvnLrpNode:
+    data = raw["data"]
+    return pt.OvnLrpNode(
+        id=raw["id"],
+        kind=raw["kind"],
+        key=pt.OvnLrpKey(router=raw["key"]["router"], side=pt.Side(raw["key"]["side"])),
+        data=pt.OvnLrpData(
+            l2Segment=data["l2Segment"],
+            addresses=data["addresses"],
+            mac=data["mac"],
+            gatewayChassis=data.get("gatewayChassis"),
+        ),
+    )
+
+
+_HYDRATORS = {
+    "infra.host": _hydrate_infra_host,
+    "ovn.ls": _hydrate_ovn_ls,
+    "ovn.lrp": _hydrate_ovn_lrp,
+}
+
+
+def hydrate_node(raw: dict) -> pt.Model:
+    kind = raw.get("kind")
+    hydrator = _HYDRATORS.get(kind)
+    if hydrator is None:
+        raise ValueError(
+            f"unknown IR node kind {kind!r} (id={raw.get('id')!r}) — protocol/generated.py "
+            "has no matching dataclass for it. Either this IR JSON is from a newer "
+            "ovn-fabric than this deployer bundle knows about, or generate-pytypes "
+            "(deno run -A src/cli.ts generate-pytypes) needs to be re-run for a "
+            "genuinely new kind."
+        )
+    return hydrator(raw)
+
+
+def hydrate_nodes(raw_nodes: list[dict]) -> list[pt.Model]:
+    return [hydrate_node(n) for n in raw_nodes]

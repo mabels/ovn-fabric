@@ -118,6 +118,37 @@ def delete_route(prefix: str, dev: str, netns: str | None) -> None:
     run_in_netns(["ip", "route", "del", prefix, "dev", dev], netns)
 
 
+# ── VLAN sub-interfaces (real-world binding for ovn.ls collision ────
+# domains — deployer/ir_to_shell.py's per-host script) ───────────────
+# Argv builders exposed separately from their run_in_netns wrappers,
+# same reasoning as ladops/ovn.py: the generator needs the exact argv
+# to print, not to execute.
+
+
+def add_vlan_argv(parent: str, name: str, vlan_id: int) -> list[str]:
+    return ["ip", "link", "add", "link", parent, "name", name, "type", "vlan", "id", str(vlan_id)]
+
+
+def set_link_up_argv(name: str) -> list[str]:
+    return ["ip", "link", "set", name, "up"]
+
+
+def delete_link_argv(name: str) -> list[str]:
+    return ["ip", "link", "delete", name]
+
+
+def add_vlan(parent: str, name: str, vlan_id: int, netns: str | None = None) -> None:
+    run_in_netns(add_vlan_argv(parent, name, vlan_id), netns)
+
+
+def set_link_up(name: str, netns: str | None = None) -> None:
+    run_in_netns(set_link_up_argv(name), netns)
+
+
+def delete_link(name: str, netns: str | None = None) -> None:
+    run_in_netns(delete_link_argv(name), netns)
+
+
 def add_if_to_netns(dev: str, netns: str) -> None:
     """Move `dev` (currently in the global/root namespace) into `netns`
     — `ip link set <dev> netns <netns>`, run from global, since a device

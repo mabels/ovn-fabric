@@ -18,12 +18,18 @@ import {
 import { pathToFileURL } from "node:url";
 
 import { generateOvnScripts } from "./generate-ovn.ts";
+import { toIR } from "./ir.ts";
+import { buildJsonSchema } from "./protocol.ts";
 import type { NetworkDefinition } from "./define.ts";
 import type { Host, InterfaceKind } from "./types.ts";
 
 function describeAccess(host: Host): string {
+  // host.connectAddress (a derived string), not host.address (a
+  // HostAddress object) — template-literal interpolation of an object
+  // is valid TypeScript (implicit toString()) but silently wrong at
+  // runtime ("[object Object]"), not something the type checker flags.
   return host.access.method === "ssh"
-    ? `ssh ${host.access.user}@${host.address}`
+    ? `ssh ${host.access.user}@${host.connectAddress}`
     : `local`;
 }
 
@@ -170,10 +176,141 @@ const generateOvn = command({
   },
 });
 
+const generateIr = command({
+  name: "generate-ir",
+  description: "Emit the desired-state IR (toIR(), src/ir.ts) as JSON: one " +
+    "{id, kind, key, data} node per host/collision-domain/router-port, " +
+    "the same envelope shape the reconciler produces from live state. " +
+    "Feed this into the Python deployer (deployer/cli.py) to convert " +
+    "it into shell scripts.",
+  args: {
+    configPath: positional({
+      type: string,
+      displayName: "config-path",
+      description: "Path to a topology config module (e.g. config/topology.ts)",
+    }),
+  },
+  handler: async ({ configPath }) => {
+    const net = await loadConfig(configPath);
+    const nodes = toIR(net);
+    console.log(JSON.stringify(Object.values(nodes), null, 2));
+  },
+});
+
+// ── generate-pytypes: the protocol, TS -> Python ────────────────────
+// src/protocol.ts's ArkType schema is the one contract both languages
+// agree on for the desired-state IR crossing the boundary (toIR()'s
+// JSON -> deployer/ir_to_shell.py) — the stabilizing factor against
+// version skew between the two sides, built and deployed independently.
+// This command regenerates BOTH artifacts from that one schema:
+// protocol/ir-nodes.schema.json (JSON Schema, draft 2020-12) and
+// protocol/generated.py (plain stdlib dataclasses via datamodel-
+// codegen) — bootstrapping a build-only .venv-build/ with
+// datamodel-code-generator installed if it isn't already there.
+//
+// .venv-build/ is build-time-only tooling on GENERATOR hardware, never
+// shipped to a router — same "zero pip-installed dependencies on the
+// router itself" boundary the eventual single-file deployer engine
+// needs (ADR 0002, "Type stability across the TypeScript/Python
+// boundary": the generated dataclasses module imports only
+// dataclasses/enum/typing from stdlib).
+
+const BUILD_VENV = ".venv-build";
+const SCHEMA_PATH = "protocol/ir-nodes.schema.json";
+const GENERATED_PY_PATH = "protocol/generated.py";
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await Deno.stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function runCommand(cmd: string, args: string[]): Promise<void> {
+  const { success, stderr } = await new Deno.Command(cmd, {
+    args,
+    stderr: "piped",
+  }).output();
+  if (!success) {
+    throw new Error(
+      `${cmd} ${args.join(" ")} failed:\n${new TextDecoder().decode(stderr)}`,
+    );
+  }
+}
+
+/** Bootstraps .venv-build/ (creates it, installs datamodel-code-
+ * generator) only when it isn't already usable — every subsequent
+ * `generate-pytypes` run reuses the same venv instead of reinstalling. */
+async function ensureDatamodelCodegen(): Promise<string> {
+  const codegenPath = `${BUILD_VENV}/bin/datamodel-codegen`;
+  if (await pathExists(codegenPath)) return codegenPath;
+
+  if (!await pathExists(BUILD_VENV)) {
+    console.error(
+      `# creating build-only venv at ${BUILD_VENV}/ (never shipped to a router)`,
+    );
+    await runCommand("python3", ["-m", "venv", BUILD_VENV]);
+  }
+
+  console.error(`# installing datamodel-code-generator into ${BUILD_VENV}/`);
+  await runCommand(`${BUILD_VENV}/bin/pip`, [
+    "install",
+    "--quiet",
+    "datamodel-code-generator",
+  ]);
+
+  return codegenPath;
+}
+
+const generatePytypes = command({
+  name: "generate-pytypes",
+  description: "Regenerate the protocol between ovn-fabric's TypeScript and " +
+    "Python halves (src/protocol.ts's ArkType schema for the " +
+    "desired-state IR): writes protocol/ir-nodes.schema.json, then " +
+    "runs datamodel-codegen (bootstrapping a build-only .venv-build/ " +
+    "with it installed, if needed) to produce protocol/generated.py " +
+    "— plain stdlib dataclasses, build-time-only, never shipped to a " +
+    "router.",
+  args: {},
+  handler: async () => {
+    const schema = buildJsonSchema();
+
+    await Deno.mkdir("protocol", { recursive: true });
+    await Deno.writeTextFile(
+      SCHEMA_PATH,
+      JSON.stringify(schema, null, 2) + "\n",
+    );
+    console.error(`wrote ${SCHEMA_PATH}`);
+
+    const codegen = await ensureDatamodelCodegen();
+    await runCommand(codegen, [
+      "--input",
+      SCHEMA_PATH,
+      "--input-file-type",
+      "jsonschema",
+      "--output",
+      GENERATED_PY_PATH,
+      "--output-model-type",
+      "dataclasses.dataclass",
+      "--target-python-version",
+      "3.11",
+      "--disable-timestamp",
+    ]);
+    console.error(`wrote ${GENERATED_PY_PATH}`);
+  },
+});
+
 const app = subcommands({
   name: "ovn-fabric",
   description: "Declarative OVN/OVS topology generator CLI",
-  cmds: { generate, "generate-ovn": generateOvn },
+  cmds: {
+    generate,
+    "generate-ovn": generateOvn,
+    "generate-ir": generateIr,
+    "generate-pytypes": generatePytypes,
+  },
 });
 
 if (import.meta.main) {

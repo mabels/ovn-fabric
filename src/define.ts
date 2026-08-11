@@ -6,9 +6,15 @@
 
 import type { UplinkBuilder } from "./factories.ts";
 import {
+  CollisionDomain,
   FixedUplink,
   type Host,
+  type HostAddress,
   localHost,
+  type OvnClusterOptions,
+  type OvnHostConfig,
+  type Router,
+  type RouterEndpoint,
   type Segment,
   sshHost,
   type Uplink,
@@ -19,6 +25,28 @@ export interface NetworkDefinition {
   readonly name: string;
   readonly allUplinks: readonly Uplink[];
   readonly allSegments: readonly Segment[];
+  /** Every Host declared via sshHost()/localHost() — not just the ones
+   * referenced by an Uplink/Segment. A pure-central chassis (ADR 0003:
+   * runs only ovn-central, hosts no uplink/segment of its own) would
+   * otherwise be unreachable from a NetworkDefinition at all. */
+  readonly allHosts: readonly Host[];
+  /** Every bare collision domain declared via net.collisionDomain()/
+   * net.backbone() — L2 only, see CollisionDomain (types.ts). Does NOT
+   * include the logical switches Uplink/Segment create for themselves
+   * (those stay implicit, derived at generation time, same as today). */
+  readonly allCollisionDomains: readonly CollisionDomain[];
+  /** The one collision domain declared via net.backbone(), if any —
+   * OVN's own internal backbone switch (sw-backbone in real captured
+   * data), made explicit instead of silently auto-created. */
+  readonly backbone?: CollisionDomain;
+  /** Every router declared via net.router() — see Router (types.ts).
+   * Does NOT include the routers Uplink/Segment create for themselves
+   * today (still implicit, same as allCollisionDomains above). */
+  readonly allRouters: readonly Router[];
+  /** Cluster-wide OVN settings (NB_Global) — see ovnGlobal() below.
+   * Undefined means "OVN defaults for everything," not "no OVN
+   * cluster" (that's whether any Host has an `ovn` role at all). */
+  readonly ovnGlobal?: OvnClusterOptions;
 }
 
 /**
@@ -46,25 +74,163 @@ export class NetworkBuilder {
   private readonly segmentsByName = new Map<string, Segment>();
   private readonly usedSegmentIds = new Set<number>();
   private readonly hostsByName = new Map<string, Host>();
+  private centralHostName: string | undefined;
+  private ovnGlobalOptions: OvnClusterOptions | undefined;
+  private readonly collisionDomainsByName = new Map<string, CollisionDomain>();
+  private backboneDomain: CollisionDomain | undefined;
+  private readonly routersByName = new Map<string, Router>();
 
-  /** Declare a host reachable via SSH. Returns a handle for reuse. */
-  sshHost(name: string, address: string, user: string): Host {
-    if (this.hostsByName.has(name)) {
-      throw new Error(`host "${name}" declared more than once`);
+  // Both host-declaring methods route through this — the "at most one
+  // central chassis per cluster" check has to live in exactly one
+  // place, not be duplicated between sshHost/localHost. HA central (a
+  // 3-node clustered NB/SB, more than one "central" chassis) is real
+  // OVN capability but not yet verified against a live cluster (ADR
+  // 0003, "Open questions") — rejected here rather than silently
+  // accepted and producing untested behavior.
+  private registerHost(host: Host): Host {
+    if (this.hostsByName.has(host.name)) {
+      throw new Error(`host "${host.name}" declared more than once`);
     }
-    const host = sshHost(name, address, user);
-    this.hostsByName.set(name, host);
+    if (host.ovn?.role.kind === "central") {
+      if (this.centralHostName !== undefined) {
+        throw new Error(
+          `host "${host.name}" declares a second central chassis — ` +
+            `"${this.centralHostName}" already is one. HA central (multiple ` +
+            `central chassis) isn't supported yet, see ADR 0003.`,
+        );
+      }
+      this.centralHostName = host.name;
+    }
+    this.hostsByName.set(host.name, host);
     return host;
   }
 
+  /** Declare a host reachable via SSH. Returns a handle for reuse. */
+  sshHost(
+    name: string,
+    address: HostAddress,
+    user: string,
+    ovn?: OvnHostConfig,
+  ): Host {
+    return this.registerHost(sshHost(name, address, user, ovn));
+  }
+
   /** Declare the generator's own host — no SSH needed. */
-  localHost(name: string): Host {
-    if (this.hostsByName.has(name)) {
-      throw new Error(`host "${name}" declared more than once`);
+  localHost(name: string, ovn?: OvnHostConfig): Host {
+    return this.registerHost(localHost(name, ovn));
+  }
+
+  /** Cluster-wide OVN settings (NB_Global) — see OvnClusterOptions,
+   * types.ts. At most once per defineNetwork call, same "declared more
+   * than once" fail-fast as every other builder method. */
+  ovnGlobal(options: OvnClusterOptions): void {
+    if (this.ovnGlobalOptions !== undefined) {
+      throw new Error("ovnGlobal() called more than once");
     }
-    const host = localHost(name);
-    this.hostsByName.set(name, host);
-    return host;
+    this.ovnGlobalOptions = options;
+  }
+
+  /** Declare a bare collision domain — an OVN logical switch, L2 only.
+   * See CollisionDomain (types.ts) for how this differs from
+   * uplink()/segment() (a superset: addressing, routes, NAT on top). */
+  collisionDomain(name: string): CollisionDomain {
+    if (this.collisionDomainsByName.has(name)) {
+      throw new Error(`collision domain "${name}" declared more than once`);
+    }
+    const domain = new CollisionDomain(name);
+    this.collisionDomainsByName.set(name, domain);
+    return domain;
+  }
+
+  /** Declare THE cluster's backbone collision domain — OVN's own
+   * internal transit switch (sw-backbone in real captured data),
+   * previously always auto-created and never visible in topology.ts at
+   * all. At most one per cluster, same "declared more than once"
+   * fail-fast as the central-chassis check above — a cluster has
+   * exactly one backbone, not several. */
+  backbone(name: string): CollisionDomain {
+    if (this.backboneDomain !== undefined) {
+      throw new Error(
+        `backbone collision domain "${name}" declared more than once — ` +
+          `"${this.backboneDomain.name}" already is one`,
+      );
+    }
+    const domain = this.collisionDomain(name);
+    this.backboneDomain = domain;
+    return domain;
+  }
+
+  // Shared by both endpoints of router() below — same "must already be
+  // declared via this builder" fail-fast as uplink()'s backdoor.via
+  // check and segment()'s uplink check.
+  private checkRouterEndpoint(
+    routerName: string,
+    endpoint: RouterEndpoint,
+  ): void {
+    if (!this.collisionDomainsByName.has(endpoint.l2Segment.name)) {
+      throw new Error(
+        `router "${routerName}" references collision domain ` +
+          `"${endpoint.l2Segment.name}", which was not declared via ` +
+          `net.collisionDomain()/net.backbone() in this defineNetwork call`,
+      );
+    }
+    if (
+      endpoint.gatewayChassis !== undefined &&
+      !this.hostsByName.has(endpoint.gatewayChassis.name)
+    ) {
+      throw new Error(
+        `router "${routerName}" pins an endpoint to gateway chassis ` +
+          `"${endpoint.gatewayChassis.name}", which was not declared via ` +
+          `net.sshHost()/net.localHost() in this defineNetwork call`,
+      );
+    }
+  }
+
+  // gatewayChassis's natural default when a config author leaves it
+  // unset: whichever host `ifaces` already names for this endpoint, IF
+  // there's exactly one. A distributed router port with no
+  // gateway-chassis pin and no bound VIF anywhere never gets scheduled
+  // onto ANY chassis at all (confirmed live, 2026-08-10: `ovn-appctl -t
+  // ovn-controller debug/dump-local-datapaths` on a real test chassis
+  // listed nothing for a topology whose routers left gatewayChassis
+  // unset, despite northd having compiled correct logical flows for
+  // them). generate-ovn.ts's older model never hit this because it
+  // pinned every LRP unconditionally (its own comment: "a chassis
+  // cannot be scheduled for ANY of them without this flag") — there was
+  // only ever one possible chassis to pin to. Injected HERE, at
+  // declaration time, not left for toIR()/the deployer to guess later
+  // — same "resolve it once, at the boundary that has the real Host
+  // objects" reasoning as macFromV4 (ir.ts). Ambiguous (0 or 2+ hosts
+  // on ifaces) leaves gatewayChassis unset, same as an explicit
+  // omission — this only fills in the unambiguous case.
+  private deriveGatewayChassis(endpoint: RouterEndpoint): RouterEndpoint {
+    if (endpoint.gatewayChassis !== undefined) return endpoint;
+    const hosts = new Set((endpoint.ifaces ?? []).map((hi) => hi.host));
+    if (hosts.size !== 1) return endpoint;
+    return { ...endpoint, gatewayChassis: [...hosts][0] };
+  }
+
+  /** Declare a router connecting exactly two collision domains — see
+   * Router/RouterEndpoint (types.ts) for why exactly two, not N. */
+  router(
+    name: string,
+    endpoints: {
+      readonly left: RouterEndpoint;
+      readonly right: RouterEndpoint;
+    },
+  ): Router {
+    if (this.routersByName.has(name)) {
+      throw new Error(`router "${name}" declared more than once`);
+    }
+    this.checkRouterEndpoint(name, endpoints.left);
+    this.checkRouterEndpoint(name, endpoints.right);
+    const router: Router = {
+      name,
+      left: this.deriveGatewayChassis(endpoints.left),
+      right: this.deriveGatewayChassis(endpoints.right),
+    };
+    this.routersByName.set(name, router);
+    return router;
   }
 
   uplink(name: string, builder: UplinkBuilder): Uplink {
@@ -173,6 +339,11 @@ export class NetworkBuilder {
       name,
       allUplinks: [...this.uplinksByName.values()],
       allSegments: [...this.segmentsByName.values()],
+      allHosts: [...this.hostsByName.values()],
+      allCollisionDomains: [...this.collisionDomainsByName.values()],
+      backbone: this.backboneDomain,
+      allRouters: [...this.routersByName.values()],
+      ovnGlobal: this.ovnGlobalOptions,
     };
   }
 }

@@ -102,6 +102,43 @@ class WriteTest(unittest.TestCase):
             mod.delete_lrp("lrp-home")
         run.assert_called_once_with(["ovn-nbctl", "--if-exists", "lrp-del", "lrp-home"], None)
 
+    def test_lr_add_has_no_may_exist(self) -> None:
+        self.assertEqual(mod.lr_add_argv("router-home"), ["ovn-nbctl", "lr-add", "router-home"])
+
+    def test_lr_del_uses_if_exists(self) -> None:
+        self.assertEqual(mod.lr_del_argv("router-home"), ["ovn-nbctl", "--if-exists", "lr-del", "router-home"])
+
+    def test_ls_add_has_no_may_exist(self) -> None:
+        self.assertEqual(mod.ls_add_argv("home"), ["ovn-nbctl", "ls-add", "home"])
+
+    def test_ls_del_uses_if_exists(self) -> None:
+        self.assertEqual(mod.ls_del_argv("home"), ["ovn-nbctl", "--if-exists", "ls-del", "home"])
+
+    def test_lsp_add_router_bundles_four_calls(self) -> None:
+        self.assertEqual(
+            mod.lsp_add_router_argv("home", "lsp-router-home-left", "lrp-router-home-left"),
+            [
+                ["ovn-nbctl", "lsp-add", "home", "lsp-router-home-left"],
+                ["ovn-nbctl", "lsp-set-type", "lsp-router-home-left", "router"],
+                ["ovn-nbctl", "lsp-set-addresses", "lsp-router-home-left", "router"],
+                ["ovn-nbctl", "lsp-set-options", "lsp-router-home-left", "router-port=lrp-router-home-left"],
+            ],
+        )
+
+    def test_lsp_add_localnet_bundles_four_calls(self) -> None:
+        self.assertEqual(
+            mod.lsp_add_localnet_argv("home", "lsp-home-localnet", "net-home"),
+            [
+                ["ovn-nbctl", "lsp-add", "home", "lsp-home-localnet"],
+                ["ovn-nbctl", "lsp-set-type", "lsp-home-localnet", "localnet"],
+                ["ovn-nbctl", "lsp-set-addresses", "lsp-home-localnet", "unknown"],
+                ["ovn-nbctl", "lsp-set-options", "lsp-home-localnet", "network_name=net-home"],
+            ],
+        )
+
+    def test_lsp_del_uses_if_exists(self) -> None:
+        self.assertEqual(mod.lsp_del_argv("lsp-home-localnet"), ["ovn-nbctl", "--if-exists", "lsp-del", "lsp-home-localnet"])
+
 
 if __name__ == "__main__":
     unittest.main()
