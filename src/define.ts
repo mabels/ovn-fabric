@@ -15,6 +15,7 @@ import {
   type OvnHostConfig,
   type Router,
   type RouterEndpoint,
+  type RoutingDomain,
   type Segment,
   sshHost,
   type Uplink,
@@ -43,6 +44,11 @@ export interface NetworkDefinition {
    * Does NOT include the routers Uplink/Segment create for themselves
    * today (still implicit, same as allCollisionDomains above). */
   readonly allRouters: readonly Router[];
+  /** Every named route set declared via net.routingDomain() — see
+   * RoutingDomain (types.ts). Referenced by name from Router.
+   * routingDomains, resolved into real per-router routes at IR time
+   * (src/ir.ts's computeRoutes), not here. */
+  readonly allRoutingDomains: readonly RoutingDomain[];
   /** Cluster-wide OVN settings (NB_Global) — see ovnGlobal() below.
    * Undefined means "OVN defaults for everything," not "no OVN
    * cluster" (that's whether any Host has an `ovn` role at all). */
@@ -79,6 +85,7 @@ export class NetworkBuilder {
   private readonly collisionDomainsByName = new Map<string, CollisionDomain>();
   private backboneDomain: CollisionDomain | undefined;
   private readonly routersByName = new Map<string, Router>();
+  private readonly routingDomainsByName = new Map<string, RoutingDomain>();
 
   // Both host-declaring methods route through this — the "at most one
   // central chassis per cluster" check has to live in exactly one
@@ -210,6 +217,22 @@ export class NetworkBuilder {
     return { ...endpoint, gatewayChassis: [...hosts][0] };
   }
 
+  /** Declare a named group of routers that should learn about each
+   * other's routes — see RoutingDomain (types.ts). No `routes`
+   * parameter here anymore: those live directly on whichever
+   * RouterEndpoint is the real anchor (RouterEndpoint.routes) — this
+   * only registers the membership tag, the same "register + fail fast
+   * on duplicates, resolve later" split every other builder method
+   * already follows. */
+  routingDomain(name: string): RoutingDomain {
+    if (this.routingDomainsByName.has(name)) {
+      throw new Error(`routing domain "${name}" declared more than once`);
+    }
+    const domain: RoutingDomain = { name };
+    this.routingDomainsByName.set(name, domain);
+    return domain;
+  }
+
   /** Declare a router connecting exactly two collision domains — see
    * Router/RouterEndpoint (types.ts) for why exactly two, not N. */
   router(
@@ -217,6 +240,7 @@ export class NetworkBuilder {
     endpoints: {
       readonly left: RouterEndpoint;
       readonly right: RouterEndpoint;
+      readonly routingDomains?: readonly RoutingDomain[];
     },
   ): Router {
     if (this.routersByName.has(name)) {
@@ -224,10 +248,20 @@ export class NetworkBuilder {
     }
     this.checkRouterEndpoint(name, endpoints.left);
     this.checkRouterEndpoint(name, endpoints.right);
+    for (const domain of endpoints.routingDomains ?? []) {
+      if (this.routingDomainsByName.get(domain.name) !== domain) {
+        throw new Error(
+          `router "${name}" references routing domain "${domain.name}", ` +
+            `which was not declared via net.routingDomain() in this ` +
+            `defineNetwork call`,
+        );
+      }
+    }
     const router: Router = {
       name,
       left: this.deriveGatewayChassis(endpoints.left),
       right: this.deriveGatewayChassis(endpoints.right),
+      routingDomains: endpoints.routingDomains,
     };
     this.routersByName.set(name, router);
     return router;
@@ -343,6 +377,7 @@ export class NetworkBuilder {
       allCollisionDomains: [...this.collisionDomainsByName.values()],
       backbone: this.backboneDomain,
       allRouters: [...this.routersByName.values()],
+      allRoutingDomains: [...this.routingDomainsByName.values()],
       ovnGlobal: this.ovnGlobalOptions,
     };
   }

@@ -359,12 +359,119 @@ export interface RouterEndpoint {
   readonly gatewayChassis?: Host;
   /** Not designed yet — see SecurityGroupRef above. */
   readonly securityGroup?: SecurityGroupRef;
+  /** IPv6 RA/SLAAC behavior on this endpoint's LRP — see
+   * RouterEndpointService above. Undefined/empty means neither
+   * ipv6_ra_configs key gets set (OVN's own default: no RA at all),
+   * matching Segment.slaac's existing "false" branch. */
+  readonly services?: readonly RouterEndpointService[];
+  /** Routes this endpoint is the ANCHOR for — see RouterEndpointRoute
+   * below. Declaring a route here IS what makes this (router, side)
+   * the anchor; nothing infers it from address containment anymore.
+   * Only takes effect for routers that also declare a shared
+   * Router.routingDomains membership (see RoutingDomain below) — a
+   * route declared here with no domain membership on this router
+   * reaches no one but this router itself. */
+  readonly routes?: readonly RouterEndpointRoute[];
+}
+
+// ── RouterEndpoint services: IPv6 RA/SLAAC ──────────────────────────
+// The Router/RouterEndpoint equivalent of the legacy Segment.slaac
+// boolean (generate-ovn.ts) — but split into its two REAL, independently
+// meaningful OVN behaviors instead of one flag toggling both together,
+// because they genuinely differ (confirmed live, generate-ovn.ts's own
+// ipv6_ra_configs history/upstream-bug comment):
+//   - "ipv6.slaac" sets ipv6_ra_configs:address_mode=slaac — this alone
+//     already makes OVN answer solicited Router Solicitations (the
+//     lr_in_nd_ra_options/lr_in_nd_ra_response responder), even with no
+//     other option set.
+//   - "ipv6.ra" sets ipv6_ra_configs:send_periodic=true (+ optional
+//     min/max interval overrides) — genuinely UNSOLICITED, self-timer-
+//     driven RA, pinctrl-injected, which needed a real upstream OVN fix
+//     (ovn-org/ovn#313) before it worked at all on a DGP/patch port —
+//     see generate-ovn.ts's emitSegmentBackboneJoin for the full story.
+// Both live in ipv6_ra_configs (a single OVSDB smap column), and the
+// legacy Segment.slaac always sets both together — but they're
+// independently useful (e.g. "ipv6.slaac" alone for solicited-only, no
+// periodic chatter), so RouterEndpoint models them as two composable
+// services instead of reintroducing one boolean that can't express that.
+export type RouterEndpointService =
+  | { readonly kind: "ipv6.slaac" }
+  | {
+    readonly kind: "ipv6.ra";
+    /** Seconds. Omit for OVN's own RFC 4861 default. */
+    readonly minInterval?: number;
+    /** Seconds. Omit for OVN's own RFC 4861 default. */
+    readonly maxInterval?: number;
+  };
+
+/** One route entry declared directly on the RouterEndpoint that IS the
+ * anchor for it — `dst` reachable via `via`, optionally NAT'd. Moved
+ * here from an earlier design where routes lived inside RoutingDomain
+ * itself and the anchor was INFERRED by searching every router's every
+ * endpoint for one whose declared subnet happened to contain `via`
+ * (confirmed live, 2026-08-12: that inference is unnecessary — the
+ * config author already knows which endpoint is the real egress, e.g.
+ * router-voda-avm-v2's WAN-facing `left`, so declaring the route right
+ * there removes a whole class of "which router owns this subnet"
+ * ambiguity instead of resolving it algorithmically). The anchor is now
+ * simply "whichever (router, side) this array lives on" — see
+ * computeRoutes, src/ir.ts, which no longer searches for it at all.
+ * `with: "masq"` (source NAT) is only ever meaningful here, at the
+ * anchor — never replicated onto routers that merely relay toward it.
+ *
+ * `via` is OPTIONAL on the ANCHOR side only — omitting it means "the
+ * anchor needs no literal route of its own here, it's handled some
+ * other way on its own side" (e.g. SLAAC/RA on a client-facing segment
+ * for an IPv6 default, or an existing less-specific route already
+ * covering it there — see RouterEndpointService above). It does NOT
+ * mean "no route at all": every OTHER router in the same RoutingDomain
+ * still gets a route to `dst`, rewritten to the anchor's own address on
+ * whichever CollisionDomain they share with it, exactly as when `via`
+ * IS given (confirmed live, 2026-08-12: "you need to add that route to
+ * all hops so that all packets will be transmitted to [the anchor's own
+ * side]" — computeRoutes() (src/ir.ts) only skips the ANCHOR's own
+ * emission when `via` is absent, every other participant is
+ * unaffected). */
+export interface RouterEndpointRoute {
+  readonly dst: IPv4 | IPv6;
+  readonly via?: IPv4 | IPv6;
+  readonly with?: "masq";
+}
+
+/** A named group of routers that should all learn about each other's
+ * anchor routes — declared once via net.routingDomain(), then
+ * referenced by any number of routers' Router.routingDomains. Purely a
+ * membership tag now, no routes of its own (see RouterEndpointRoute
+ * above for where those actually live): every participant router's own
+ * RouterEndpoint.routes get propagated to every OTHER participant,
+ * rewritten to the anchor's own address on whichever CollisionDomain
+ * the two routers actually share (src/ir.ts's computeRoutes) — and the
+ * SAME participant set also gets direct peer-to-peer routes to each
+ * other's own subnets regardless of whether any `routes` entry exists
+ * at all (src/ir.ts's computeInterconnectRoutes — "interconnect only
+ * exists if a routing domain exists," confirmed live 2026-08-12). A
+ * router with no shared domain to a given anchor, or where `via`'s
+ * family doesn't resolve at all (e.g. an IPv6-only route on a router
+ * whose own connectivity there is SLAAC/RA-derived, not static), simply
+ * gets no route from that entry — not an error, just a different route
+ * source owning that family for that router (confirmed live design
+ * discussion, 2026-08-11: "if you don't know the next hop you don't
+ * apply anything"). */
+export interface RoutingDomain {
+  readonly name: string;
 }
 
 export interface Router {
   readonly name: string;
   readonly left: RouterEndpoint;
   readonly right: RouterEndpoint;
+  /** RoutingDomains (net.routingDomain()) this router participates in
+   * — object references, not names, matching every other cross-
+   * reference in this file (l2Segment, gatewayChassis, ...), not a
+   * string that could typo/drift out of sync with what was actually
+   * declared. See RoutingDomain's own doc comment for how a domain's
+   * routes actually resolve per-router. */
+  readonly routingDomains?: readonly RoutingDomain[];
 }
 
 // ── SegmentGateway: how a segment's own gateway address is expressed ──

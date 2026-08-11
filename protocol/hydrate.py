@@ -59,14 +59,38 @@ def _hydrate_ovn_lrp(raw: dict) -> pt.OvnLrpNode:
             addresses=data["addresses"],
             mac=data["mac"],
             gatewayChassis=data.get("gatewayChassis"),
+            ipv6RaConfigs=data.get("ipv6RaConfigs"),
         ),
     )
+
+
+def _route_key_and_data(raw: dict) -> tuple[pt.RouteKey, pt.RouteData]:
+    return (
+        pt.RouteKey(router=raw["key"]["router"], prefix=raw["key"]["prefix"]),
+        pt.RouteData(
+            nexthop=raw["data"]["nexthop"],
+            masq=raw["data"]["masq"],
+            domain=raw["data"]["domain"],
+        ),
+    )
+
+
+def _hydrate_ipv4_route(raw: dict) -> pt.Ipv4RouteNode:
+    key, data = _route_key_and_data(raw)
+    return pt.Ipv4RouteNode(id=raw["id"], kind=raw["kind"], key=key, data=data)
+
+
+def _hydrate_ipv6_route(raw: dict) -> pt.Ipv6RouteNode:
+    key, data = _route_key_and_data(raw)
+    return pt.Ipv6RouteNode(id=raw["id"], kind=raw["kind"], key=key, data=data)
 
 
 _HYDRATORS = {
     "infra.host": _hydrate_infra_host,
     "ovn.ls": _hydrate_ovn_ls,
     "ovn.lrp": _hydrate_ovn_lrp,
+    "ipv4.route": _hydrate_ipv4_route,
+    "ipv6.route": _hydrate_ipv6_route,
 }
 
 

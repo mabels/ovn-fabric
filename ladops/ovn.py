@@ -95,12 +95,30 @@ def lr_del_argv(router: str) -> list[str]:
     return [*_NBCTL, "--if-exists", "lr-del", router]
 
 
+def lr_route_add_argv(router: str, prefix: str, nexthop: str) -> list[str]:
+    # No separate lr_route_del_argv/delete needed: lr_del_argv above
+    # already cascades a router's own static routes away with it (same
+    # strong-reference reasoning as its LRPs) — a route only ever needs
+    # deleting on its own when the ROUTE changes but the router doesn't,
+    # which is deployer/ir_to_shell.py's "unconditional add, no
+    # --may-exist" territory, not a delete-mode concern.
+    return [*_NBCTL, "lr-route-add", router, prefix, nexthop]
+
+
 def lrp_set_gateway_chassis_argv(lrp: str, chassis: str, priority: int = 100) -> list[str]:
     return [*_NBCTL, "lrp-set-gateway-chassis", lrp, chassis, str(priority)]
 
 
 def lrp_set_redirect_chassis_argv(lrp: str) -> list[str]:
     return [*_NBCTL, "set", "logical_router_port", lrp, "options:reside-on-redirect-chassis=true"]
+
+
+def lrp_set_ipv6_ra_config_argv(lrp: str, key: str, value: str) -> list[str]:
+    # One call per key, same as generate-ovn.ts's own emitSegmentBackboneJoin
+    # (address_mode/send_periodic set in separate ovn-nbctl calls, not one
+    # combined smap literal) — key/value themselves come pre-resolved from
+    # src/ir.ts's resolveIpv6RaConfigs, this only knows the invocation shape.
+    return [*_NBCTL, "set", "logical_router_port", lrp, f"ipv6_ra_configs:{key}={value}"]
 
 
 def add_lrp(router: str, name: str, mac: str, networks: list[str]) -> None:

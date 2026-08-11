@@ -117,6 +117,12 @@ class WriteTest(unittest.TestCase):
             mod.lr_del_argv("router-home"), ["ovn-nbctl", "--if-exists", "lr-del", "router-home"]
         )
 
+    def test_lr_route_add_has_no_may_exist(self) -> None:
+        self.assertEqual(
+            mod.lr_route_add_argv("router-home", "0.0.0.0/0", "172.22.12.80"),
+            ["ovn-nbctl", "lr-route-add", "router-home", "0.0.0.0/0", "172.22.12.80"],
+        )
+
     def test_ls_add_has_no_may_exist(self) -> None:
         self.assertEqual(mod.ls_add_argv("home"), ["ovn-nbctl", "ls-add", "home"])
 
@@ -154,6 +160,18 @@ class WriteTest(unittest.TestCase):
         self.assertEqual(
             mod.lsp_del_argv("lsp-home-localnet"),
             ["ovn-nbctl", "--if-exists", "lsp-del", "lsp-home-localnet"],
+        )
+
+    def test_lrp_set_ipv6_ra_config_argv(self) -> None:
+        self.assertEqual(
+            mod.lrp_set_ipv6_ra_config_argv("lrp-router-home-left", "address_mode", "slaac"),
+            [
+                "ovn-nbctl",
+                "set",
+                "logical_router_port",
+                "lrp-router-home-left",
+                "ipv6_ra_configs:address_mode=slaac",
+            ],
         )
 
 

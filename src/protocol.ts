@@ -78,6 +78,11 @@ export const OvnLrpData = type({
   // validation instead of reaching the deployer at all.
   mac: "string",
   "gatewayChassis?": "string",
+  // Already-resolved ipv6_ra_configs key/value pairs (src/ir.ts's own
+  // resolveIpv6RaConfigs, from RouterEndpoint.services — see
+  // RouterEndpointService, types.ts) — undefined means no RA service
+  // was declared, not "set zero keys."
+  "ipv6RaConfigs?": { "[string]": "string" },
 });
 export const OvnLrpNode = type({
   id: "string",
@@ -86,7 +91,42 @@ export const OvnLrpNode = type({
   data: OvnLrpData,
 });
 
-export const IRNode = InfraHostNode.or(OvnLsNode).or(OvnLrpNode);
+// ipv4.route / ipv6.route: computed by src/ir.ts's computeRoutes() and
+// computeInterconnectRoutes() from net.routingDomain() declarations
+// (see RoutingDomain, types.ts) — one node per router per resolved
+// route. Same key/data shape for both families (only `kind` differs),
+// so one pair of schemas covers both rather than duplicating an
+// identical shape twice.
+export const RouteKey = type({ router: "string", prefix: "string" });
+// `domain`: the net.routingDomain() name that produced this route —
+// every route belongs to exactly one domain (interconnect routes only
+// exist between a domain's own participants, confirmed live
+// 2026-08-12; see src/ir.ts's computeInterconnectRoutes). Lets the
+// deployer group a router's routes into labeled blocks instead of one
+// flat, unlabeled dump.
+export const RouteData = type({
+  nexthop: "string",
+  masq: "boolean",
+  domain: "string",
+});
+export const Ipv4RouteNode = type({
+  id: "string",
+  kind: "'ipv4.route'",
+  key: RouteKey,
+  data: RouteData,
+});
+export const Ipv6RouteNode = type({
+  id: "string",
+  kind: "'ipv6.route'",
+  key: RouteKey,
+  data: RouteData,
+});
+
+export const IRNode = InfraHostNode.or(OvnLsNode).or(OvnLrpNode).or(
+  Ipv4RouteNode,
+).or(
+  Ipv6RouteNode,
+);
 
 // Every node kind's envelope has the exact same shape (id: string,
 // kind: const, key: $ref, data: $ref) — generated once here instead of
@@ -118,11 +158,23 @@ export function buildJsonSchema(): Record<string, unknown> {
     OvnLrpKey: OvnLrpKey.toJsonSchema(),
     OvnLrpData: OvnLrpData.toJsonSchema(),
     OvnLrpNode: nodeSchema("ovn.lrp", "OvnLrpKey", "OvnLrpData"),
+    RouteKey: RouteKey.toJsonSchema(),
+    RouteData: RouteData.toJsonSchema(),
+    Ipv4RouteNode: nodeSchema("ipv4.route", "RouteKey", "RouteData"),
+    Ipv6RouteNode: nodeSchema("ipv6.route", "RouteKey", "RouteData"),
   };
   return {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$defs": defs,
-    "oneOf": ["InfraHostNode", "OvnLsNode", "OvnLrpNode"].map((name) => ({
+    "oneOf": [
+      "InfraHostNode",
+      "OvnLsNode",
+      "OvnLrpNode",
+      "Ipv4RouteNode",
+      "Ipv6RouteNode",
+    ].map((
+      name,
+    ) => ({
       "$ref": `#/$defs/${name}`,
     })),
   };

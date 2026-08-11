@@ -201,7 +201,49 @@ def _emit_localnet_lsp_create(name: str) -> list[str]:
     return lines
 
 
-def _emit_router_create(router: str, ports: list[pt.OvnLrpNode]) -> list[str]:
+RouteNode = pt.Ipv4RouteNode | pt.Ipv6RouteNode
+
+
+def _group_routes_by_router(nodes: list[pt.Model]) -> dict[str, list[RouteNode]]:
+    by_router: dict[str, list[RouteNode]] = {}
+    for node in nodes:
+        if not isinstance(node, (pt.Ipv4RouteNode, pt.Ipv6RouteNode)):
+            continue
+        by_router.setdefault(node.key.router, []).append(node)
+    return by_router
+
+
+# Grouped by `domain` within a router's own block — every route belongs
+# to exactly one net.routingDomain() (src/ir.ts's computeRoutes AND
+# computeInterconnectRoutes are both scoped to a domain's own
+# participants now — "interconnect only exists if a routing domain
+# exists", confirmed live 2026-08-12, after a blind peer-mesh across
+# every router sharing the backbone leaked routes between unrelated
+# sites/tenants) — so each domain gets its own labeled sub-block
+# instead of one flat, unlabeled dump of lr-route-add lines. Purely
+# mechanical otherwise — data.nexthop is already the FINAL resolved
+# address by the time this runs (src/ir.ts, not this module); this only
+# turns an already-computed fact into the command that applies it.
+# `masq` is carried in the IR but not yet acted on here — NAT has no
+# home in this pipeline yet (see src/ir.ts's own header comment).
+def _emit_router_routes(router: str, routes: list[RouteNode]) -> list[str]:
+    if not routes:
+        return []
+    by_domain: dict[str, list[RouteNode]] = {}
+    for node in routes:
+        by_domain.setdefault(node.data.domain, []).append(node)
+
+    lines: list[str] = []
+    for domain, domain_routes in by_domain.items():
+        lines.append(f"# --- routes: {router} ({domain}) ---")
+        for node in domain_routes:
+            lines.append(_sh(ovn_ops.lr_route_add_argv(router, node.key.prefix, node.data.nexthop)))
+    return lines
+
+
+def _emit_router_create(
+    router: str, ports: list[pt.OvnLrpNode], routes: list[RouteNode]
+) -> list[str]:
     lines = [f"# --- router: {router} ---", _sh(ovn_ops.lr_add_argv(router))]
     for node in ports:
         side = node.key.side.value
@@ -222,15 +264,21 @@ def _emit_router_create(router: str, ports: list[pt.OvnLrpNode]) -> list[str]:
         if data.gatewayChassis is not None:
             lines.append(_sh(ovn_ops.lrp_set_gateway_chassis_argv(lrp, data.gatewayChassis)))
             lines.append(_sh(ovn_ops.lrp_set_redirect_chassis_argv(lrp)))
+        if data.ipv6RaConfigs is not None:
+            for key, value in data.ipv6RaConfigs.items():
+                lines.append(_sh(ovn_ops.lrp_set_ipv6_ra_config_argv(lrp, key, value)))
+    lines.extend(_emit_router_routes(router, routes))
     lines.append("")
     return lines
 
 
 def _emit_router_delete(router: str) -> list[str]:
-    # lr_del_argv cascades — deletes the router's own LRPs, and (once
-    # the matching ls_del_argv runs too) the router-type peer LSPs go
-    # with their owning switch. No separate lrp_del_argv/lsp_del_argv
-    # calls needed here — see ladops/ovn.py's own doc comments.
+    # lr_del_argv cascades — deletes the router's own LRPs AND its own
+    # static routes (both are strongly referenced from Logical_Router,
+    # same as ports), and (once the matching ls_del_argv runs too) the
+    # router-type peer LSPs go with their owning switch. No separate
+    # lrp_del_argv/lsp_del_argv/route-delete calls needed here — see
+    # ladops/ovn.py's own doc comments.
     return [f"# --- router: {router} ---", _sh(ovn_ops.lr_del_argv(router)), ""]
 
 
@@ -250,6 +298,7 @@ def _emit_cluster_script(nodes: list[pt.Model], action: Action) -> str:
 
     switches = [n for n in nodes if isinstance(n, pt.OvnLsNode)]
     router_groups = _group_router_ports(nodes)
+    routes_by_router = _group_routes_by_router(nodes)
 
     if action == "create":
         bindable_domains = _domains_with_bindable_interfaces(nodes)
@@ -258,7 +307,7 @@ def _emit_cluster_script(nodes: list[pt.Model], action: Action) -> str:
             if node.key.name in bindable_domains:
                 lines.extend(_emit_localnet_lsp_create(node.key.name))
         for router, ports in router_groups.items():
-            lines.extend(_emit_router_create(router, ports))
+            lines.extend(_emit_router_create(router, ports, routes_by_router.get(router, [])))
     else:
         for router in router_groups:
             lines.extend(_emit_router_delete(router))
