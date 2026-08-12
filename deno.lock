@@ -7,6 +7,7 @@
     "npm:arktype@^2.1.0": "2.1.29",
     "npm:cmd-ts@0.13.0": "0.13.0",
     "npm:deno@^2.9.1": "2.9.4",
+    "npm:fnv1a@^1.1.1": "1.1.1",
     "npm:ipaddress@0.2.6": "0.2.6_eslint@8.57.1_typescript@6.0.3"
   },
   "jsr": {
@@ -1089,6 +1090,9 @@
     },
     "flatted@3.4.2": {
       "integrity": "sha512-PjDse7RzhcPkIJwy5t7KPWQSZ9cAbzQXcafsetQoD7sOJRQlGikNbx7yZp2OotDnJyrDcbyRq3Ttb18iYOqkxA=="
+    },
+    "fnv1a@1.1.1": {
+      "integrity": "sha512-S2HviLR9UyNbt8R+vU6YeQtL8RliPwez9DQEVba5MAvN3Od+RSgKUSL2+qveOMt3owIeBukKoRu2enoOck5uag=="
     },
     "for-each@0.3.5": {
       "integrity": "sha512-dKx12eRCVIzqCxFGplyFKJMPvLEWgmNtUrpTiJIR5u97zEhRG8ySrtboPHZXx7daLxQVrl643cTzbab2tkQjxg==",
@@ -2292,7 +2296,8 @@
   },
   "workspace": {
     "dependencies": [
-      "npm:arktype@^2.1.0"
+      "npm:arktype@^2.1.0",
+      "npm:fnv1a@^1.1.1"
     ],
     "packageJson": {
       "dependencies": [

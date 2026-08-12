@@ -60,7 +60,13 @@ export const InfraHostNode = type({
 
 export const OvnLsInterface = type({ host: "string", iface: "unknown" });
 export const OvnLsKey = type({ name: "string" });
-export const OvnLsData = type({ interfaces: OvnLsInterface.array() });
+// shortIfaceName: the real, IFNAMSIZ-safe OVS bridge name for this
+// domain (src/ir.ts's own shortIfaceName()) — always resolved by the
+// time toIR() emits it, never computed translator-side.
+export const OvnLsData = type({
+  interfaces: OvnLsInterface.array(),
+  shortIfaceName: "string",
+});
 export const OvnLsNode = type({
   id: "string",
   kind: "'ovn.ls'",

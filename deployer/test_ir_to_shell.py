@@ -53,13 +53,14 @@ NODES: list[pt.Model] = [
                     host="chassis-1", iface={"kind": "vlan", "vlanParent": "eth0", "vlanId": 129}
                 ),
             ],
+            shortIfaceName="br-home",
         ),
     ),
     pt.OvnLsNode(
         id="ls:backbone",
         kind="ovn.ls",
         key=pt.OvnLsKey(name="backbone"),
-        data=pt.OvnLsData(interfaces=[]),
+        data=pt.OvnLsData(interfaces=[], shortIfaceName="br-backbone"),
     ),
     pt.OvnLrpNode(
         id="router:router-home|lrp:left",
@@ -213,8 +214,6 @@ class IfaceBindingCreateTest(unittest.TestCase):
         self.assertIn("ip link set eth0.129 up", script)
 
     def test_bridge_created_and_port_attached_on_the_owning_host(self) -> None:
-        # "home" is short enough that br-<domain> fits IFNAMSIZ as-is —
-        # readable, not hashed (see _bridge_name's own doc comment).
         script = self.hosts["chassis-1"]
         self.assertIn("ovs-vsctl add-br br-home", script)
         self.assertIn("ovs-vsctl set bridge br-home fail-mode=standalone", script)
@@ -223,31 +222,25 @@ class IfaceBindingCreateTest(unittest.TestCase):
     def test_bridge_mapping_set_on_the_owning_host(self) -> None:
         self.assertIn("external-ids:ovn-bridge-mappings=net-home:br-home", self.hosts["chassis-1"])
 
-    def test_long_domain_name_falls_back_to_a_short_deterministic_hash(self) -> None:
-        # Regression: "br-voda-modem-v2" (16 chars) really failed on a
-        # live container with ofproto "Invalid argument" — IFNAMSIZ is
-        # 15 usable characters. A domain name long enough to blow that
-        # budget must still produce a short, valid bridge name — via
-        # FNV-1a (deterministic: the same long name always yields the
-        # same bridge, so a second create/delete pass still targets the
-        # same real object), not a running counter.
-        long_name = "voda-modem-v2-extremely-long-domain-name"
-        nodes = _replace_home_ls(NODES, id=f"ls:{long_name}", key=pt.OvnLsKey(name=long_name))
+    def test_uses_the_ir_supplied_short_iface_name_verbatim(self) -> None:
+        # The IFNAMSIZ-safe fallback for an over-length domain name (was
+        # "br-voda-modem-v2", 16 chars, really failing on a live
+        # container with ofproto "Invalid argument") is now computed by
+        # src/ir.ts's own shortIfaceName() — see src/ir_test.ts for that
+        # regression. This module only ever consumes the already-
+        # resolved value, verbatim, never re-derives it.
+        home_ls = next(n for n in NODES if isinstance(n, pt.OvnLsNode) and n.key.name == "home")
+        nodes = _replace_home_ls(
+            NODES,
+            data=dataclasses.replace(home_ls.data, shortIfaceName="br-8d8c0a55"),
+        )
         _, hosts = mod.build_scripts(nodes, "create")
         script = hosts["chassis-1"]
-        self.assertNotIn(f"br-{long_name}", script)
-
-        bridge_names = [
-            line.split()[-1] for line in script.splitlines() if line.startswith("ovs-vsctl add-br ")
-        ]
-        self.assertEqual(len(bridge_names), 1)
-        (bridge_name,) = bridge_names
-        self.assertLessEqual(len(bridge_name), 15)
-
-        # Same input, same output — regenerating the script must target
-        # the same real bridge, not a fresh random/incrementing one.
-        _, hosts_again = mod.build_scripts(nodes, "create")
-        self.assertEqual(hosts["chassis-1"], hosts_again["chassis-1"])
+        self.assertIn("ovs-vsctl add-br br-8d8c0a55", script)
+        self.assertIn(
+            "external-ids:ovn-bridge-mappings=net-home:br-8d8c0a55",
+            script,
+        )
 
     def test_no_binding_commands_on_a_host_with_no_interfaces(self) -> None:
         script = self.hosts["central-1"]
@@ -285,7 +278,10 @@ class UnsupportedIfaceKindTest(unittest.TestCase):
     def test_unsupported_kind_is_skipped_with_a_comment_not_crashed_on(self) -> None:
         nodes = _replace_home_ls(
             NODES,
-            data=pt.OvnLsData(interfaces=[pt.Interface(host="chassis-1", iface={"kind": "dummy"})]),
+            data=pt.OvnLsData(
+                interfaces=[pt.Interface(host="chassis-1", iface={"kind": "dummy"})],
+                shortIfaceName="br-home",
+            ),
         )
         cluster, hosts = mod.build_scripts(nodes, "create")
         self.assertIn("unsupported interface kind", hosts["chassis-1"])

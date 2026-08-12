@@ -174,7 +174,10 @@ export class NetworkBuilder {
     routerName: string,
     endpoint: RouterEndpoint,
   ): void {
-    if (!this.collisionDomainsByName.has(endpoint.l2Segment.name)) {
+    if (
+      endpoint.kind === "ovn" &&
+      !this.collisionDomainsByName.has(endpoint.l2Segment.name)
+    ) {
       throw new Error(
         `router "${routerName}" references collision domain ` +
           `"${endpoint.l2Segment.name}", which was not declared via ` +

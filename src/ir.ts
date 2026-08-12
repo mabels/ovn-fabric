@@ -30,11 +30,12 @@
 // covered either — toIR() only walks allCollisionDomains/allRouters/
 // allHosts, not allUplinks/allSegments.
 
-import { macFromV4 } from "./addressing.ts";
+import { fnv1a32, macFromV4 } from "./addressing.ts";
 import type { IPv4, IPv6 } from "./ip.ts";
 import type {
   CollisionDomain,
   Host,
+  OvnRouterEndpoint,
   Router,
   RouterEndpoint,
   RouterEndpointService,
@@ -92,6 +93,27 @@ function hostToIR(host: Host): IRNode {
   };
 }
 
+// IFNAMSIZ (16) minus the NUL terminator — a real OVS bridge is a real
+// kernel netdev, capped at 15 usable characters. Confirmed live,
+// 2026-08-10: "br-voda-modem-v2" (16 chars) failed with ofproto
+// "Invalid argument" on a real container while "br-voda-avm-v2" (14
+// chars) right next to it succeeded.
+const IFNAMSIZ_MAX = 15;
+
+// Readable (`${prefix}${name}`) whenever it fits; only falls back to a
+// short deterministic hash (fnv1a32, addressing.ts) when it doesn't.
+// Resolved HERE, not in deployer/ir_to_shell.py (the translator) — same
+// boundary reasoning as mac/gatewayChassis/routes throughout this file:
+// the generator computes the FINAL name a real kernel object needs, the
+// translator only ever applies an already-resolved fact. Moved here
+// 2026-08-12 — this used to live translator-side as deployer/
+// ir_to_shell.py's own `_bridge_name`/`_fnv1a_32`.
+function shortIfaceName(prefix: string, name: string): string {
+  const candidate = `${prefix}${name}`;
+  if (candidate.length <= IFNAMSIZ_MAX) return candidate;
+  return `${prefix}${fnv1a32(name).toString(16).padStart(8, "0")}`;
+}
+
 // ── ovn.ls (NEW — not in ADR 0002's original node-kind table) ────────
 // A bare OVN Logical_Switch — CollisionDomain's direct IR counterpart.
 // Not host-scoped (see CollisionDomain's own doc comment, types.ts —
@@ -106,6 +128,10 @@ function hostToIR(host: Host): IRNode {
 // currently-unresolved gap between the two mechanisms, not something
 // papered over here: relying on RouterEndpoint.ifaces directly sidesteps
 // it rather than pretending it's already reconciled).
+//
+// `shortIfaceName`: the real OVS bridge name this domain binds to on
+// any chassis with a bindable interface (see deployer/ir_to_shell.py's
+// _emit_iface_bindings_create/_delete) — see shortIfaceName() above.
 function collisionDomainToIR(
   domain: CollisionDomain,
   routers: readonly Router[],
@@ -114,7 +140,9 @@ function collisionDomainToIR(
   const interfaces: Array<{ host: string; iface: unknown }> = [];
   for (const router of routers) {
     for (const endpoint of [router.left, router.right]) {
-      if (endpoint.l2Segment.name !== domain.name) continue;
+      if (endpoint.kind !== "ovn" || endpoint.l2Segment.name !== domain.name) {
+        continue;
+      }
       for (const hi of endpoint.ifaces ?? []) {
         interfaces.push({ host: hi.host.name, iface: hi.iface });
       }
@@ -124,7 +152,7 @@ function collisionDomainToIR(
     id,
     kind: "ovn.ls",
     key: { name: domain.name },
-    data: { interfaces },
+    data: { interfaces, shortIfaceName: shortIfaceName("br-", domain.name) },
   };
 }
 
@@ -177,13 +205,30 @@ function resolveIpv6RaConfigs(
       configs.address_mode = "slaac";
       continue;
     }
-    configs.send_periodic = "true";
-    if (service.minInterval !== undefined) {
-      configs.min_interval = String(service.minInterval);
+    if (service.kind === "ipv6.ra") {
+      configs.send_periodic = "true";
+      if (service.minInterval !== undefined) {
+        configs.min_interval = String(service.minInterval);
+      }
+      if (service.maxInterval !== undefined) {
+        configs.max_interval = String(service.maxInterval);
+      }
+      continue;
     }
-    if (service.maxInterval !== undefined) {
-      configs.max_interval = String(service.maxInterval);
-    }
+    // Exhaustive on purpose, not "anything that isn't slaac must be
+    // ra" — confirmed live, 2026-08-12: a services entry with a kind
+    // outside RouterEndpointService's declared union (e.g. a config
+    // author's own in-progress sketch toward kernel-side NAT service
+    // kinds, still unimplemented) silently got treated as "ipv6.ra"
+    // and set send_periodic=true on an endpoint that never asked for
+    // it — TypeScript's own exhaustiveness checking doesn't help here
+    // if the config author's object literal reaches this function
+    // without ever being checked (e.g. `deno run` without a preceding
+    // `deno check`). A real runtime throw catches it instead.
+    const unknownKind: never = service;
+    throw new Error(
+      `unknown RouterEndpointService kind: ${JSON.stringify(unknownKind)}`,
+    );
   }
   return configs;
 }
@@ -191,7 +236,7 @@ function resolveIpv6RaConfigs(
 function routerEndpointToIR(
   router: Router,
   side: "left" | "right",
-  endpoint: RouterEndpoint,
+  endpoint: OvnRouterEndpoint,
 ): IRNode {
   const scope = `router:${router.name}`;
   const id = `${scope}|lrp:${side}`;
@@ -260,6 +305,17 @@ function isSameFamily(a: IPv4 | IPv6, b: IPv4 | IPv6): boolean {
   return a.is_ipv4() === b.is_ipv4();
 }
 
+// Two endpoints "share a CollisionDomain" only when BOTH are OVN-side —
+// a KernelRouterEndpoint has no l2Segment at all, so it never
+// participates in collision-domain-based routing (RoutingDomain/
+// computeRoutes/computeInterconnectRoutes are all OVN-world concepts
+// today; a kernel endpoint's own reachability, once built, will need
+// its own mechanism, not this one).
+function sharesL2Segment(a: RouterEndpoint, b: RouterEndpoint): boolean {
+  return a.kind === "ovn" && b.kind === "ovn" &&
+    a.l2Segment.name === b.l2Segment.name;
+}
+
 // The anchor's OWN address, of `dst`'s family, on whichever endpoint
 // `router` actually shares a CollisionDomain with — i.e. NOT the
 // anchor-side endpoint itself (that's what `via` already sits on),
@@ -272,9 +328,8 @@ function anchorAddressSharedWith(
   const anchorOtherSide = anchor.side === "left"
     ? anchor.router.right
     : anchor.router.left;
-  const shared = router.left.l2Segment.name === anchorOtherSide.l2Segment.name
-    ? true
-    : router.right.l2Segment.name === anchorOtherSide.l2Segment.name;
+  const shared = sharesL2Segment(router.left, anchorOtherSide) ||
+    sharesL2Segment(router.right, anchorOtherSide);
   if (!shared) return undefined;
   return anchorOtherSide.ipaddrs.find((addr) => isSameFamily(addr, dst));
 }
@@ -407,7 +462,7 @@ function computeInterconnectRoutes(network: NetworkDefinition): IRNode[] {
         if (r1.name === r2.name) continue;
         for (const r1side of [r1.left, r1.right]) {
           for (const r2side of [r2.left, r2.right]) {
-            if (r1side.l2Segment.name !== r2side.l2Segment.name) continue;
+            if (!sharesL2Segment(r1side, r2side)) continue;
             const r2OtherSide = r2side === r2.left ? r2.right : r2.left;
             for (const nexthop of r2side.ipaddrs) {
               for (const peerAddr of r2OtherSide.ipaddrs) {
@@ -445,10 +500,22 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
   }
 
   for (const router of network.allRouters) {
-    const left = routerEndpointToIR(router, "left", router.left);
-    const right = routerEndpointToIR(router, "right", router.right);
-    nodes[left.id] = left;
-    nodes[right.id] = right;
+    for (const side of ["left", "right"] as const) {
+      const endpoint = router[side];
+      if (endpoint.kind !== "ovn") {
+        // KernelRouterEndpoint (types.ts) — no emission strategy built
+        // for this kind yet (nothing in this codebase constructs one
+        // today). Throws rather than silently skipping, so the day a
+        // config author actually declares one, this says so loudly
+        // instead of quietly producing an incomplete IR.
+        throw new Error(
+          `router "${router.name}": ${side} endpoint is kind "${endpoint.kind}" — ` +
+            `toIR() has no emission strategy for it yet`,
+        );
+      }
+      const node = routerEndpointToIR(router, side, endpoint);
+      nodes[node.id] = node;
+    }
   }
 
   // Interconnect (peer-to-peer among a domain's own participants)

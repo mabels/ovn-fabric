@@ -1,4 +1,5 @@
-// src/factories.ts — sparse-input factories for Uplink/Segment.
+// src/factories.ts — sparse-input factories for Uplink/Segment/
+// RouterEndpoint.
 //
 // net.uplink(name, uplinkVlan({ ... })) reads as: "this uplink is realized as
 // a VLAN; here are the few facts that vary." Every factory here takes a
@@ -21,6 +22,14 @@
 // NetworkBuilder.uplink()/segment() accept the UplinkBuilder/Segment
 // these factories produce — they do not know about "vlan" vs "physical"
 // vs sparse input at all.
+//
+// ovnRouterEndpoint()/kernelRouterEndpoint() (bottom of this file) are
+// the same idea applied to net.router()'s left/right: a config author
+// writes `left: ovnRouterEndpoint({ l2Segment, ipaddrs, ... })` instead
+// of a raw object literal, so `kind: "ovn"`/`kind: "kernel"` (types.ts's
+// OvnRouterEndpoint/KernelRouterEndpoint discriminant) is never
+// hand-typed and can never drift out of sync with which factory was
+// actually called.
 
 import { segmentNet, transferNet } from "./addressing.ts";
 import type { IPv4, IPv6 } from "./ip.ts";
@@ -32,7 +41,9 @@ import type {
   ExtraRoute,
   Host,
   InterfaceKind,
+  KernelRouterEndpoint,
   Nat,
+  OvnRouterEndpoint,
   SegmentGateway,
   StaticIpv4,
   StaticIpv6,
@@ -610,4 +621,30 @@ export function segmentVlan(input: SegmentVlanInput): Omit<Segment, "name"> {
     slaac: input.slaac ?? true,
     host: input.host,
   };
+}
+
+// ── RouterEndpoint factories ─────────────────────────────────────────
+// No real sparse-input transformation yet (unlike segmentPhysical/
+// uplinkVlan above) — today these only inject the `kind` discriminant,
+// which is all that's needed to keep net.router()'s left/right calls
+// free of hand-typed `kind: "ovn"`/`kind: "kernel"` literals. NEXT STEP
+// (2026-08-12 design discussion, not yet built): kernelRouterEndpoint()
+// is where the OVN<->kernel transit CollisionDomain (two addresses,
+// folded via addressing.ts's transferNet() — the same building block
+// already proven for Uplink transfer links) gets derived automatically
+// instead of a config author declaring one by hand — that's why this
+// stays its own dedicated function rather than a bare object literal
+// or a generic `{ ...input, kind: "ovn" }` helper: there's real work to
+// grow into here.
+
+export function ovnRouterEndpoint(
+  input: Omit<OvnRouterEndpoint, "kind">,
+): OvnRouterEndpoint {
+  return { kind: "ovn", ...input };
+}
+
+export function kernelRouterEndpoint(
+  input: Omit<KernelRouterEndpoint, "kind">,
+): KernelRouterEndpoint {
+  return { kind: "kernel", ...input };
 }

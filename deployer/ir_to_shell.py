@@ -86,36 +86,17 @@ def _iface_real_name(iface: dict) -> str:
     return iface["name"]  # "physical"
 
 
-_IFNAMSIZ_MAX = 15  # IFNAMSIZ (16) minus the NUL terminator
-
-
-def _fnv1a_32(s: str) -> int:
-    h = 0x811C9DC5
-    for byte in s.encode("utf-8"):
-        h ^= byte
-        h = (h * 0x01000193) & 0xFFFFFFFF
-    return h
-
-
-def _bridge_name(domain: str) -> str:
-    # Readable (br-<domain>) whenever it fits — only falls back to a
-    # short deterministic hash when it doesn't. A real OVS bridge is a
-    # real kernel netdev, capped at IFNAMSIZ = 15 usable characters —
-    # confirmed live, 2026-08-10: "br-voda-modem-v2" (16 chars) failed
-    # with ofproto "Invalid argument" on a real container while
-    # "br-voda-avm-v2" (14 chars) right next to it succeeded. FNV-1a
-    # (not a running counter/slot): this stays purely a deployer/
-    # ir_to_shell.py concern — the IR itself carries only the domain's
-    # real name, nothing about how a name might eventually get
-    # shortened for a kernel object.
-    candidate = f"br-{domain}"
-    if len(candidate) <= _IFNAMSIZ_MAX:
-        return candidate
-    return f"br-{_fnv1a_32(domain):08x}"
-
-
 def _network_name(domain: str) -> str:
     return f"net-{domain}"
+
+
+# domain name -> its real, IFNAMSIZ-safe OVS bridge name — already
+# resolved by src/ir.ts's own shortIfaceName() (moved there 2026-08-12;
+# this module used to compute it itself via a hand-rolled _bridge_name/
+# _fnv1a_32 pair). Same boundary as mac/gatewayChassis/routes: this
+# module only ever reads an already-computed fact, it never derives one.
+def _short_iface_names(nodes: list[pt.Model]) -> dict[str, str]:
+    return {n.key.name: n.data.shortIfaceName for n in nodes if isinstance(n, pt.OvnLsNode)}
 
 
 # host -> [(domain, iface), ...] — every real (host, interface) pair
@@ -328,6 +309,7 @@ def _emit_cluster_script(nodes: list[pt.Model], action: Action) -> str:
 # append to it).
 def _emit_iface_bindings_create(host_name: str, nodes: list[pt.Model]) -> list[str]:
     bindings = _host_bindings(nodes).get(host_name, [])
+    short_iface_names = _short_iface_names(nodes)
     lines: list[str] = []
     mappings: list[str] = []
     for domain, iface in bindings:
@@ -338,7 +320,7 @@ def _emit_iface_bindings_create(host_name: str, nodes: list[pt.Model]) -> list[s
             )
             continue
         real_name = _iface_real_name(iface)
-        bridge = _bridge_name(domain)
+        bridge = short_iface_names[domain]
         lines.append(f"# --- interface: {domain} on {host_name} ({real_name}) ---")
         if iface["kind"] == "vlan":
             lines.append(
@@ -358,6 +340,7 @@ def _emit_iface_bindings_create(host_name: str, nodes: list[pt.Model]) -> list[s
 
 def _emit_iface_bindings_delete(host_name: str, nodes: list[pt.Model]) -> list[str]:
     bindings = _host_bindings(nodes).get(host_name, [])
+    short_iface_names = _short_iface_names(nodes)
     lines: list[str] = []
     any_bound = False
     for domain, iface in bindings:
@@ -365,7 +348,7 @@ def _emit_iface_bindings_delete(host_name: str, nodes: list[pt.Model]) -> list[s
             continue
         any_bound = True
         real_name = _iface_real_name(iface)
-        bridge = _bridge_name(domain)
+        bridge = short_iface_names[domain]
         lines.append(f"# --- interface: {domain} on {host_name} ({real_name}) ---")
         # del-br cascades its own ports — no separate del-port call
         # needed (same reasoning as ladops.ovn.ls_del_argv).

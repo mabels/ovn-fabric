@@ -44,6 +44,7 @@ def _hydrate_ovn_ls(raw: dict) -> pt.OvnLsNode:
         key=pt.OvnLsKey(name=raw["key"]["name"]),
         data=pt.OvnLsData(
             interfaces=[pt.Interface(host=e["host"], iface=e["iface"]) for e in data["interfaces"]],
+            shortIfaceName=data["shortIfaceName"],
         ),
     )
 

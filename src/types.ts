@@ -322,8 +322,16 @@ export interface HostInterface {
   readonly iface: InterfaceKind;
 }
 
-export interface RouterEndpoint {
-  readonly l2Segment: CollisionDomain;
+// ── RouterEndpoint: OVN-side or kernel-side, discriminated by `kind` ──
+// Everything a router endpoint needs REGARDLESS of which world its
+// OTHER side touches (an OVN CollisionDomain, or — not yet built, see
+// the netnsBridge/KernelRouterEndpoint design discussion, 2026-08-12 —
+// a Linux kernel netns) lives on the shared base below. `kind` lets
+// generation code (src/ir.ts's toIR()) branch to a different emission
+// strategy per side, instead of a structural ("does it have l2Segment")
+// check — same discriminated-union pattern InterfaceKind already uses
+// in this file.
+interface RouterEndpointBase {
   /** A router port's own addresses — plain parsed IPv4/IPv6 values, one
    * array entry per address (IPv4.parse(...), IPv6.parse(...)), NOT
    * Addresses/NetId: NetId pairs a v4+v6 fold together under one
@@ -373,6 +381,30 @@ export interface RouterEndpoint {
    * reaches no one but this router itself. */
   readonly routes?: readonly RouterEndpointRoute[];
 }
+
+/** Today's ONLY concrete shape — adds the one field that's actually
+ * OVN-specific: which CollisionDomain (Logical_Switch) this LRP binds
+ * into. */
+export interface OvnRouterEndpoint extends RouterEndpointBase {
+  readonly kind: "ovn";
+  readonly l2Segment: CollisionDomain;
+}
+
+/** The kernel side of a transit link — Meno's own design idea,
+ * 2026-08-12 (not yet implemented past this type existing): a netns
+ * bridge is basically also a router, whose `left` sits in the OVN world
+ * (an OvnRouterEndpoint) and whose `right` sits in the Linux kernel
+ * world. Empty for now — inherits everything from RouterEndpointBase
+ * as-is; real/host/discovery/nat/backdoor land here once the
+ * kernel-side generator design is settled. src/ir.ts's toIR() doesn't
+ * know how to emit anything for this kind yet — it throws rather than
+ * silently producing nothing, since nothing in this codebase
+ * constructs one today. */
+export interface KernelRouterEndpoint extends RouterEndpointBase {
+  readonly kind: "kernel";
+}
+
+export type RouterEndpoint = OvnRouterEndpoint | KernelRouterEndpoint;
 
 // ── RouterEndpoint services: IPv6 RA/SLAAC ──────────────────────────
 // The Router/RouterEndpoint equivalent of the legacy Segment.slaac

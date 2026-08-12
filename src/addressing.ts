@@ -12,6 +12,15 @@
 // 128 -> "80") which breaks the human-readability property these rules
 // exist for.
 
+// Deno's npm-CJS interop doesn't type this import as callable directly
+// (its .d.ts's `export default` doesn't resolve the way a real ESM
+// default would) — confirmed live, 2026-08-12: `import hash from
+// "fnv1a"` type-checks as the whole module namespace, not the function
+// itself. The runtime value IS the callable function either way (CJS
+// `module.exports = hash`), so a cast through `unknown` is honest here,
+// not a workaround for a real type mismatch.
+import fnv1aModule from "fnv1a";
+const hash = fnv1aModule as unknown as (s: string, h?: number) => number;
 import { IPv4, IPv6 } from "./ip.ts";
 import {
   type NetId,
@@ -298,4 +307,24 @@ export function macFromV4(ipv4: IPv4): string {
   }
   const hex = octets.map((o) => o.toString(16).padStart(2, "0"));
   return `00:00:${hex.join(":")}`;
+}
+
+// ── MAC derivation for real (vlan) attachments ──────────────────────
+// Unlike macFromV4 above, needs no address to exist at all yet — closes
+// the exact gap macFromV4 couldn't (a DHCP/transfer-link endpoint whose
+// real address isn't known at config time). `macSuffix` is network-wide
+// (see defineNetwork's own options — explicit, or fnv1a32(networkName)
+// when omitted) and folds into the upper 4 bytes; `vlanId` (0 when this
+// attachment isn't a vlan at all) folds into the lower 2.
+export function fnv1a32(s: string): number {
+  return hash(s);
+}
+
+export function macFromVlan(
+  macSuffix: number,
+  vlanId: number | undefined,
+): string {
+  const hi = (macSuffix >>> 0).toString(16).padStart(8, "0");
+  const lo = ((vlanId ?? 0) & 0xffff).toString(16).padStart(4, "0");
+  return (hi + lo).match(/../g)!.join(":");
 }

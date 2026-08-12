@@ -27,6 +27,7 @@ RAW_OVN_LS = {
         "interfaces": [
             {"host": "chassis-1", "iface": {"kind": "vlan", "vlanParent": "eth0", "vlanId": 129}},
         ],
+        "shortIfaceName": "br-home",
     },
 }
 
@@ -70,6 +71,7 @@ class HydrateOvnLsTest(unittest.TestCase):
         # iface itself stays a plain dict — InterfaceKind isn't modeled
         # in the cross-language protocol (see protocol.ts's own header).
         self.assertEqual(node.data.interfaces[0].iface["kind"], "vlan")
+        self.assertEqual(node.data.shortIfaceName, "br-home")
 
 
 class HydrateOvnLrpTest(unittest.TestCase):
