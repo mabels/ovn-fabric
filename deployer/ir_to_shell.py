@@ -100,13 +100,13 @@ def _network_name(domain: str) -> str:
 # module only ever reads it" boundary as mac/routes, just one lookup
 # removed from being a plain attribute access.
 def _host_name_by_id(nodes: list[pt.Model]) -> dict[str, str]:
-    return {n.id: n.key.host for n in nodes if isinstance(n, pt.InfraHostNode)}
+    return {n.id: n.key.host for n in nodes if n.kind == "infra.host"}
 
 
 # ovn.ls node id (`ls:<name>`) -> its real logical switch name — same
 # reasoning as _host_name_by_id above, for OvnLrpData.l2Segment.
 def _domain_name_by_id(nodes: list[pt.Model]) -> dict[str, str]:
-    return {n.id: n.key.name for n in nodes if isinstance(n, pt.OvnLsNode)}
+    return {n.id: n.key.name for n in nodes if n.kind == "ovn.ls"}
 
 
 # host -> [(domain, iface), ...] — every real (host, interface) pair
@@ -120,7 +120,7 @@ def _domain_name_by_id(nodes: list[pt.Model]) -> dict[str, str]:
 def _host_bindings(nodes: list[pt.Model]) -> dict[str, list[tuple[str, dict]]]:
     by_host: dict[str, list[tuple[str, dict]]] = {}
     for node in nodes:
-        if not isinstance(node, pt.OvnLsNode):
+        if node.kind != "ovn.ls":
             continue
         domain = node.key.name
         for entry in node.data.interfaces:
@@ -142,7 +142,7 @@ def _find_central_host(nodes: list[pt.Model]) -> pt.InfraHostNode | None:
         (
             n
             for n in nodes
-            if isinstance(n, pt.InfraHostNode) and n.data.ovnRole == pt.OvnRole.central
+            if n.kind == "infra.host" and n.data.ovnRole == pt.OvnRole.central
         ),
         None,
     )
@@ -162,7 +162,7 @@ def _gateway_eligible_hosts(nodes: list[pt.Model]) -> set[str]:
     host_names = _host_name_by_id(nodes)
     hosts: set[str] = set()
     for node in nodes:
-        if not isinstance(node, pt.OvnLrpNode):
+        if node.kind != "ovn.lrp":
             continue
         if node.data.gatewayChassis is not None:
             hosts.add(host_names[node.data.gatewayChassis])
@@ -172,7 +172,7 @@ def _gateway_eligible_hosts(nodes: list[pt.Model]) -> set[str]:
 def _group_router_ports(nodes: list[pt.Model]) -> dict[str, list[pt.OvnLrpNode]]:
     by_router: dict[str, list[pt.OvnLrpNode]] = {}
     for node in nodes:
-        if not isinstance(node, pt.OvnLrpNode):
+        if node.kind != "ovn.lrp":
             continue
         by_router.setdefault(node.key.ovnrouter, []).append(node)
     return by_router
@@ -205,7 +205,7 @@ RouteNode = pt.Ipv4RouteNode | pt.Ipv6RouteNode
 def _group_routes_by_router(nodes: list[pt.Model]) -> dict[str, list[RouteNode]]:
     by_router: dict[str, list[RouteNode]] = {}
     for node in nodes:
-        if not isinstance(node, (pt.Ipv4RouteNode, pt.Ipv6RouteNode)):
+        if node.kind not in ("ipv4.route", "ipv6.route"):
             continue
         by_router.setdefault(node.key.ovnrouter, []).append(node)
     return by_router
@@ -304,7 +304,7 @@ def _emit_cluster_script(nodes: list[pt.Model], action: Action) -> str:
         "",
     ]
 
-    switches = [n for n in nodes if isinstance(n, pt.OvnLsNode)]
+    switches = [n for n in nodes if n.kind == "ovn.ls"]
     router_groups = _group_router_ports(nodes)
     routes_by_router = _group_routes_by_router(nodes)
 
@@ -352,7 +352,7 @@ def _kernel_router_owners(host_id: str, nodes: list[pt.Model]) -> list[pt.Kernel
     return [
         n
         for n in nodes
-        if isinstance(n, pt.KernelRouterNode) and n.key.side is None and n.data.host == host_id
+        if n.kind == "kernel.router" and n.key.side is None and n.data.host == host_id
     ]
 
 
@@ -363,7 +363,7 @@ def _kernel_router_sides(name: str, nodes: list[pt.Model]) -> list[pt.KernelRout
     return [
         n
         for n in nodes
-        if isinstance(n, pt.KernelRouterNode) and n.key.side is not None and n.key.name == name
+        if n.kind == "kernel.router" and n.key.side is not None and n.key.name == name
     ]
 
 
@@ -575,6 +575,6 @@ def build_scripts(nodes: list[pt.Model], action: Action) -> tuple[str, dict[str,
     host_scripts = {
         node.key.host: _emit_host_script(node, nodes, action)
         for node in nodes
-        if isinstance(node, pt.InfraHostNode)
+        if node.kind == "infra.host"
     }
     return _emit_cluster_script(nodes, action), host_scripts

@@ -118,7 +118,7 @@ def _replace_home_ls(nodes: list[pt.Model], **changes: object) -> list[pt.Model]
     return [
         (
             dataclasses.replace(n, **changes)
-            if isinstance(n, pt.OvnLsNode) and n.key.name == "home"
+            if n.kind == "ovn.ls" and n.key.name == "home"
             else n
         )
         for n in nodes
@@ -411,7 +411,7 @@ class NoCentralChassisTest(unittest.TestCase):
         nodes = [
             n
             for n in NODES
-            if not (isinstance(n, pt.InfraHostNode) and n.data.ovnRole == pt.OvnRole.central)
+            if not (n.kind == "infra.host" and n.data.ovnRole == pt.OvnRole.central)
         ]
         with self.assertRaises(ValueError):
             mod.build_scripts(nodes, "create")
