@@ -19,11 +19,13 @@
 // methods that hand back a new address (network(), broadcast(),
 // first(), last(), ...) hardcode `new IPAddress(...)` internally, not
 // `new this.constructor(...)` — so called on an IPv4, they still
-// return a plain base-class IPAddress, not an IPv4. network() is the
-// only one of those this codebase actually calls through the wrapper,
-// so it's the only one overridden below to re-assert the family; add
-// another override here if a caller ever needs first()/last()/
-// broadcast() too.
+// return a plain base-class IPAddress, not an IPv4. network()/first()/
+// last() are the ones this codebase actually calls through the wrapper
+// (first()/last() added for addressing.ts's transitNetwork() — a
+// transit link's two endpoint addresses, folded from the network's own
+// first/last usable address), so those are the ones overridden below
+// to re-assert the family; add another override here if a caller ever
+// needs broadcast() too.
 //
 // The private constructor is what makes IPv4/IPv6 nominal types
 // (TypeScript would otherwise accept ANY object with the right shape,
@@ -69,6 +71,14 @@ export class IPv4 extends IPAddress {
   override network(): IPv4 {
     return IPv4.from(super.network());
   }
+
+  override first(): IPv4 {
+    return IPv4.from(super.first());
+  }
+
+  override last(): IPv4 {
+    return IPv4.from(super.last());
+  }
 }
 
 export class IPv6 extends IPAddress {
@@ -96,5 +106,13 @@ export class IPv6 extends IPAddress {
 
   override network(): IPv6 {
     return IPv6.from(super.network());
+  }
+
+  override first(): IPv6 {
+    return IPv6.from(super.first());
+  }
+
+  override last(): IPv6 {
+    return IPv6.from(super.last());
   }
 }

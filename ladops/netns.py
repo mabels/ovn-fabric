@@ -63,23 +63,44 @@ def scope_id(scope: dict) -> str:
     return "|".join(parts)
 
 
+def netns_exec_argv(argv: list[str], netns: str | None) -> list[str]:
+    """Wrap argv to run inside `netns` if given (via `ip netns exec`),
+    unwrapped otherwise — the SAME wrapping run() applies below, exposed
+    separately so a generator (deployer/ir_to_shell.py) can print the
+    exact argv without executing it, same reasoning as add_netns_argv/
+    delete_netns_argv above."""
+    return argv if netns is None else ["ip", "netns", "exec", netns, *argv]
+
+
 def run(argv: list[str], netns: str | None) -> subprocess.CompletedProcess:
     """Run argv, inside `netns` if given (via `ip netns exec`), in the
     root/global namespace otherwise. Not `ip`-specific — iptables-save,
     ovs-vsctl etc. are all netns-sensitive commands the same way."""
-    cmd = argv if netns is None else ["ip", "netns", "exec", netns, *argv]
+    cmd = netns_exec_argv(argv, netns)
     return subprocess.run(cmd, check=True, capture_output=True, text=True)
 
 
-def add_netns(name: str) -> None:
-    """Create a real named namespace (`ip netns add`, the mount-based
-    naming convention every list_netns()/net.netns fact already relies
-    on). `ip netns add/delete` themselves aren't netns-relative — they
+def add_netns_argv(name: str) -> list[str]:
+    """`ip netns add` — the mount-based naming convention every
+    list_netns()/net.netns fact already relies on. Argv exposed
+    separately from add_netns() below, same reasoning as ladops/ovn.py:
+    deployer/ir_to_shell.py (the generator) needs the exact argv to
+    print, not to execute. Not netns-relative — `ip netns add/delete`
     manage /var/run/netns, reachable the same way regardless of which
     namespace you happen to be running from — so this always runs in
-    the global context, unlike add_if_to_netns below."""
-    run(["ip", "netns", "add", name], None)
+    the global context, unlike add_if_to_netns (linux_net.py)."""
+    return ["ip", "netns", "add", name]
+
+
+def add_netns(name: str) -> None:
+    run(add_netns_argv(name), None)
+
+
+def delete_netns_argv(name: str) -> list[str]:
+    """`ip netns delete` — see add_netns_argv above for why this is
+    exposed separately from delete_netns() below."""
+    return ["ip", "netns", "delete", name]
 
 
 def delete_netns(name: str) -> None:
-    run(["ip", "netns", "delete", name], None)
+    run(delete_netns_argv(name), None)

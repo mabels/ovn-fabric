@@ -67,6 +67,7 @@ from __future__ import annotations
 import shlex
 
 from ladops import linux_net as linux_net_ops
+from ladops import netns as netns_ops
 from ladops import ovn as ovn_ops
 from ladops import ovs as ovs_ops
 from protocol import generated as pt
@@ -90,19 +91,32 @@ def _network_name(domain: str) -> str:
     return f"net-{domain}"
 
 
-# domain name -> its real, IFNAMSIZ-safe OVS bridge name — already
-# resolved by src/ir.ts's own shortIfaceName() (moved there 2026-08-12;
-# this module used to compute it itself via a hand-rolled _bridge_name/
-# _fnv1a_32 pair). Same boundary as mac/gatewayChassis/routes: this
-# module only ever reads an already-computed fact, it never derives one.
-def _short_iface_names(nodes: list[pt.Model]) -> dict[str, str]:
-    return {n.key.name: n.data.shortIfaceName for n in nodes if isinstance(n, pt.OvnLsNode)}
+# infra.host node id (`host:<name>`) -> its real, bare host name — every
+# cross-node reference in the IR (OvnLrpData.gatewayChassis,
+# KernelRouterData.host) carries the referenced node's own id, not the
+# bare name (2026-08-12, src/ir.ts), so anything that needs the REAL
+# name for an actual ovn-nbctl/ovs-vsctl/ip argument resolves it back
+# through this map first — same "generator computes the fact, this
+# module only ever reads it" boundary as mac/routes, just one lookup
+# removed from being a plain attribute access.
+def _host_name_by_id(nodes: list[pt.Model]) -> dict[str, str]:
+    return {n.id: n.key.host for n in nodes if isinstance(n, pt.InfraHostNode)}
+
+
+# ovn.ls node id (`ls:<name>`) -> its real logical switch name — same
+# reasoning as _host_name_by_id above, for OvnLrpData.l2Segment.
+def _domain_name_by_id(nodes: list[pt.Model]) -> dict[str, str]:
+    return {n.id: n.key.name for n in nodes if isinstance(n, pt.OvnLsNode)}
 
 
 # host -> [(domain, iface), ...] — every real (host, interface) pair
 # across every ovn.ls node's `interfaces`, grouped by the host that
 # actually owns the real hardware/VLAN (this drives that host's own
 # script, not the cluster one — bridges/kernel VLANs are host-local).
+# `iface` carries its own `shortName` (src/ir.ts's own
+# collisionDomainToIR, moved there from OvnLsData 2026-08-12) — every
+# entry for the same domain resolves to the same value, so reading it
+# off whichever entry is at hand is enough, no separate per-domain map.
 def _host_bindings(nodes: list[pt.Model]) -> dict[str, list[tuple[str, dict]]]:
     by_host: dict[str, list[tuple[str, dict]]] = {}
     for node in nodes:
@@ -141,14 +155,17 @@ def _find_central_host(nodes: list[pt.Model]) -> pt.InfraHostNode | None:
 # gatewayChassis itself is fully resolved upstream, in src/define.ts
 # (RouterEndpoint's single-binding-host default, same boundary
 # reasoning as mac/encapIp — see src/ir.ts) — this module only reads
-# data.gatewayChassis, it never derives one.
+# data.gatewayChassis, it never derives one. Returns real host names
+# (resolved via _host_name_by_id), matching every OTHER host-name set
+# this module builds.
 def _gateway_eligible_hosts(nodes: list[pt.Model]) -> set[str]:
+    host_names = _host_name_by_id(nodes)
     hosts: set[str] = set()
     for node in nodes:
         if not isinstance(node, pt.OvnLrpNode):
             continue
         if node.data.gatewayChassis is not None:
-            hosts.add(node.data.gatewayChassis)
+            hosts.add(host_names[node.data.gatewayChassis])
     return hosts
 
 
@@ -157,7 +174,7 @@ def _group_router_ports(nodes: list[pt.Model]) -> dict[str, list[pt.OvnLrpNode]]
     for node in nodes:
         if not isinstance(node, pt.OvnLrpNode):
             continue
-        by_router.setdefault(node.key.router, []).append(node)
+        by_router.setdefault(node.key.ovnrouter, []).append(node)
     return by_router
 
 
@@ -190,7 +207,7 @@ def _group_routes_by_router(nodes: list[pt.Model]) -> dict[str, list[RouteNode]]
     for node in nodes:
         if not isinstance(node, (pt.Ipv4RouteNode, pt.Ipv6RouteNode)):
             continue
-        by_router.setdefault(node.key.router, []).append(node)
+        by_router.setdefault(node.key.ovnrouter, []).append(node)
     return by_router
 
 
@@ -223,7 +240,11 @@ def _emit_router_routes(router: str, routes: list[RouteNode]) -> list[str]:
 
 
 def _emit_router_create(
-    router: str, ports: list[pt.OvnLrpNode], routes: list[RouteNode]
+    router: str,
+    ports: list[pt.OvnLrpNode],
+    routes: list[RouteNode],
+    host_names: dict[str, str],
+    domain_names: dict[str, str],
 ) -> list[str]:
     lines = [f"# --- router: {router} ---", _sh(ovn_ops.lr_add_argv(router))]
     for node in ports:
@@ -231,6 +252,11 @@ def _emit_router_create(
         data = node.data
         lrp = f"lrp-{router}-{side}"
         lsp = f"lsp-{router}-{side}"
+        # data.l2Segment/gatewayChassis are the referenced ovn.ls/
+        # infra.host node's own id (`ls:<name>`/`host:<name>` —
+        # 2026-08-12, src/ir.ts), resolved back to the real name every
+        # ovn-nbctl argument needs via domain_names/host_names.
+        domain = domain_names[data.l2Segment]
         # No "is mac None" check here anymore: OvnLrpData.mac is a
         # required (non-Optional) str field — a raw IR node missing it
         # already failed inside protocol/hydrate.py's hydrate_node(),
@@ -238,12 +264,13 @@ def _emit_router_create(
         # protocol actually doing its job, not this module trusting
         # blindly: the failure moved earlier and got clearer, it didn't
         # disappear.
-        lines.append(f"# --- router port: {lrp} ({data.l2Segment}) ---")
+        lines.append(f"# --- router port: {lrp} ({domain}) ---")
         lines.append(_sh(ovn_ops.lrp_add_argv(router, lrp, data.mac, data.addresses)))
-        for argv in ovn_ops.lsp_add_router_argv(data.l2Segment, lsp, lrp):
+        for argv in ovn_ops.lsp_add_router_argv(domain, lsp, lrp):
             lines.append(_sh(argv))
         if data.gatewayChassis is not None:
-            lines.append(_sh(ovn_ops.lrp_set_gateway_chassis_argv(lrp, data.gatewayChassis)))
+            chassis = host_names[data.gatewayChassis]
+            lines.append(_sh(ovn_ops.lrp_set_gateway_chassis_argv(lrp, chassis)))
             lines.append(_sh(ovn_ops.lrp_set_redirect_chassis_argv(lrp)))
         if data.ipv6RaConfigs is not None:
             for key, value in data.ipv6RaConfigs.items():
@@ -283,12 +310,18 @@ def _emit_cluster_script(nodes: list[pt.Model], action: Action) -> str:
 
     if action == "create":
         bindable_domains = _domains_with_bindable_interfaces(nodes)
+        host_names = _host_name_by_id(nodes)
+        domain_names = _domain_name_by_id(nodes)
         for node in switches:
             lines.extend(_emit_logical_switch(node, action))
             if node.key.name in bindable_domains:
                 lines.extend(_emit_localnet_lsp_create(node.key.name))
         for router, ports in router_groups.items():
-            lines.extend(_emit_router_create(router, ports, routes_by_router.get(router, [])))
+            lines.extend(
+                _emit_router_create(
+                    router, ports, routes_by_router.get(router, []), host_names, domain_names
+                )
+            )
     else:
         for router in router_groups:
             lines.extend(_emit_router_delete(router))
@@ -301,6 +334,99 @@ def _emit_cluster_script(nodes: list[pt.Model], action: Action) -> str:
 # ── per-host scripts: kernel/OVS chassis registration ────────────────
 
 
+def _netns_name(name: str) -> str:
+    return f"ns-{name}"
+
+
+def _dummy_name(side: pt.Side) -> str:
+    return f"dummy-{side.value}"
+
+
+# The router-level kernel.router node (`key.side` absent — src/ir.ts's
+# kernelRouterToIR) — one per KernelRouter, carrying just the host
+# reference. `host_id` (`host:<name>`, the owning infra.host node's own
+# id, not the bare name — 2026-08-12, src/ir.ts) is what data.host
+# actually carries: filtering on it directly here needs no separate
+# id->name lookup, unlike gatewayChassis/l2Segment above.
+def _kernel_router_owners(host_id: str, nodes: list[pt.Model]) -> list[pt.KernelRouterNode]:
+    return [
+        n
+        for n in nodes
+        if isinstance(n, pt.KernelRouterNode) and n.key.side is None and n.data.host == host_id
+    ]
+
+
+# The two per-side kernel.router nodes (`key.side` present) for one
+# KernelRouter, by its own `name` — same shape convention as ovn.lrp's
+# own per-side nodes.
+def _kernel_router_sides(name: str, nodes: list[pt.Model]) -> list[pt.KernelRouterNode]:
+    return [
+        n
+        for n in nodes
+        if isinstance(n, pt.KernelRouterNode) and n.key.side is not None and n.key.name == name
+    ]
+
+
+# One real netns per KernelRouter (types.ts) bound to this host, then —
+# per side — a dummy device standing in for the real interface binding
+# ("iface mappings into the namespace" is its own next step, 2026-08-12
+# design discussion, see KernelRouterSide's own doc comment, types.ts):
+# assign that side's already-resolved addresses to it, and apply
+# whatever routes have a real nexthop (a route with none means "handled
+# elsewhere," e.g. real-world RA/DHCP — src/ir.ts's kernelRouterSideToIR
+# already drops those before they ever reach here).
+#
+# `ip link add ... type dummy` runs OUTSIDE the netns (a device is only
+# visible to `ip link set <dev> netns <netns>` from whichever namespace
+# it's CURRENTLY in — same reasoning ladops.linux_net.add_if_to_netns
+# already documents, and the same create-in-global/move-in sequence this
+# module already uses for a real host's VLAN sub-interfaces), THEN
+# moved into the netns with that same `ip link set ... netns` call —
+# confirmed live, 2026-08-12. Only after the move does anything run via
+# `ip netns exec`: bring the link up, THEN assign addresses/routes to it
+# — up before addr/route, not after (a route through a device that
+# isn't up yet fails; an address on one is pointless until it is).
+def _emit_kernel_router_create(host_id: str, nodes: list[pt.Model]) -> list[str]:
+    lines: list[str] = []
+    for owner in _kernel_router_owners(host_id, nodes):
+        netns = _netns_name(owner.key.name)
+        lines.append(f"# --- kernel netns: {netns} ({owner.key.name}) ---")
+        lines.append(_sh(netns_ops.add_netns_argv(netns)))
+        for side_node in _kernel_router_sides(owner.key.name, nodes):
+            dummy = _dummy_name(side_node.key.side)
+            lines.append(f"# --- kernel router side: {owner.key.name} ({side_node.key.side.value}) ---")
+            lines.append(_sh(linux_net_ops.add_dummy_argv(dummy)))
+            lines.append(_sh(linux_net_ops.add_if_to_netns_argv(dummy, netns)))
+            lines.append(_sh(netns_ops.netns_exec_argv(linux_net_ops.set_link_up_argv(dummy), netns)))
+            for addr in side_node.data.ipaddrs or []:
+                argv = linux_net_ops.add_addr_argv(addr, dummy)
+                lines.append(_sh(netns_ops.netns_exec_argv(argv, netns)))
+            for route in side_node.data.routes or []:
+                argv = linux_net_ops.add_route_argv(route.dst, dummy, route.via)
+                lines.append(_sh(netns_ops.netns_exec_argv(argv, netns)))
+    if lines:
+        lines.append("")
+    return lines
+
+
+# Deletion stays just "delete the netns" — every dummy device/address/
+# route created above lives INSIDE it by the time this runs (moved in,
+# not left in global) and is destroyed along with it — `ip netns
+# delete` tears down every device currently inside a namespace
+# regardless of whether it was created there or moved in later, same
+# reasoning ovn-nbctl's own cascading
+# del- commands already rely on elsewhere in this module.
+def _emit_kernel_router_delete(host_id: str, nodes: list[pt.Model]) -> list[str]:
+    lines: list[str] = []
+    for owner in _kernel_router_owners(host_id, nodes):
+        netns = _netns_name(owner.key.name)
+        lines.append(f"# --- kernel netns: {netns} ({owner.key.name}) ---")
+        lines.append(_sh(netns_ops.delete_netns_argv(netns)))
+    if lines:
+        lines.append("")
+    return lines
+
+
 # The real (host, interface) pairs this host owns: create the kernel
 # VLAN sub-interface (if any), the bridge, add the interface as a port,
 # and collect one ovn-bridge-mappings entry per binding — a single
@@ -309,7 +435,6 @@ def _emit_cluster_script(nodes: list[pt.Model], action: Action) -> str:
 # append to it).
 def _emit_iface_bindings_create(host_name: str, nodes: list[pt.Model]) -> list[str]:
     bindings = _host_bindings(nodes).get(host_name, [])
-    short_iface_names = _short_iface_names(nodes)
     lines: list[str] = []
     mappings: list[str] = []
     for domain, iface in bindings:
@@ -320,7 +445,7 @@ def _emit_iface_bindings_create(host_name: str, nodes: list[pt.Model]) -> list[s
             )
             continue
         real_name = _iface_real_name(iface)
-        bridge = short_iface_names[domain]
+        bridge = iface["shortName"]
         lines.append(f"# --- interface: {domain} on {host_name} ({real_name}) ---")
         if iface["kind"] == "vlan":
             lines.append(
@@ -340,7 +465,6 @@ def _emit_iface_bindings_create(host_name: str, nodes: list[pt.Model]) -> list[s
 
 def _emit_iface_bindings_delete(host_name: str, nodes: list[pt.Model]) -> list[str]:
     bindings = _host_bindings(nodes).get(host_name, [])
-    short_iface_names = _short_iface_names(nodes)
     lines: list[str] = []
     any_bound = False
     for domain, iface in bindings:
@@ -348,7 +472,7 @@ def _emit_iface_bindings_delete(host_name: str, nodes: list[pt.Model]) -> list[s
             continue
         any_bound = True
         real_name = _iface_real_name(iface)
-        bridge = short_iface_names[domain]
+        bridge = iface["shortName"]
         lines.append(f"# --- interface: {domain} on {host_name} ({real_name}) ---")
         # del-br cascades its own ports — no separate del-port call
         # needed (same reasoning as ladops.ovn.ls_del_argv).
@@ -364,7 +488,8 @@ def _emit_iface_bindings_delete(host_name: str, nodes: list[pt.Model]) -> list[s
 def _emit_host_create(host_node: pt.InfraHostNode, nodes: list[pt.Model]) -> list[str]:
     host_name = host_node.key.host
     data = host_node.data
-    lines: list[str] = _emit_iface_bindings_create(host_name, nodes)
+    lines: list[str] = _emit_kernel_router_create(host_node.id, nodes)
+    lines.extend(_emit_iface_bindings_create(host_name, nodes))
 
     if data.ovnRole == pt.OvnRole.central:
         lines.append("# central: expose the shared NB/SB DBs to every other chassis")
@@ -418,6 +543,7 @@ def _emit_host_delete(host_node: pt.InfraHostNode, nodes: list[pt.Model]) -> lis
 
     lines.append("")
     lines.extend(_emit_iface_bindings_delete(host_name, nodes))
+    lines.extend(_emit_kernel_router_delete(host_node.id, nodes))
 
     return lines
 

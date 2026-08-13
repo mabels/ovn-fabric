@@ -13,20 +13,24 @@
 # produces nodes on the netns=None (global) pass, same pattern as
 # reconciler/host/reconcile.py.
 #
-# `id` extends the ADR's node-kind table (`router:<scope>|lrp`) with the
-# port's own name as the local identity (`router:<scope>|lrp:<port-
-# name>`) — the table's literal key omits it, but a router legitimately
-# owns more than one LRP (confirmed on the real router: router-home
-# alone has 4 — lrp-home, lrp-home-bb, and two backbone-extra ports), so
-# the bare form collides every LRP under the same router onto one key.
+# `id` extends the ADR's node-kind table (`ovnrouter:<scope>|lrp`) with
+# the port's own name as the local identity (`ovnrouter:<scope>|lrp:
+# <port-name>`) — the table's literal key omits it, but a router
+# legitimately owns more than one LRP (confirmed on the real router:
+# router-home alone has 4 — lrp-home, lrp-home-bb, and two
+# backbone-extra ports), so the bare form collides every LRP under the
+# same router onto one key.
 #
-# `key` is scoped by the owning OVN logical router (`{"router": name}`),
-# not by `scope`/host — an ovn.lrp's real container is the router it
-# belongs to, not the physical host (this deployment only has one
-# physical host, but OVN's own NB DB isn't host-partitioned the way
-# addr/route/iptables state is). `scope` is accepted only for calling-
-# convention uniformity with every other reconciler; unused here, same
-# as before this envelope redesign.
+# `key` is scoped by the owning OVN logical router (`{"ovnrouter":
+# name}`, named precisely — not the bare "router" — once KernelRouter
+# (types.ts) made "router" ambiguous between an OVN router and a real
+# Linux netns; matches src/protocol.ts's OvnLrpKey/RouteKey, confirmed
+# live 2026-08-12), not by `scope`/host — an ovn.lrp's real container is
+# the router it belongs to, not the physical host (this deployment only
+# has one physical host, but OVN's own NB DB isn't host-partitioned the
+# way addr/route/iptables state is). `scope` is accepted only for
+# calling-convention uniformity with every other reconciler; unused
+# here, same as before this envelope redesign.
 #
 # Still deferred, matching the ADR's own "Consequences" section: only
 # each router's LRPs are reconciled here, not logical switches/ports —
@@ -43,11 +47,11 @@ def reconcile(scope: dict, netns: str | None = None) -> dict[str, dict]:
 
     nodes: dict[str, dict] = {}
     for lrp in list_lrps():
-        id_ = f"router:{lrp['router']}|lrp:{lrp['name']}"
+        id_ = f"ovnrouter:{lrp['router']}|lrp:{lrp['name']}"
         nodes[id_] = {
             "id": id_,
             "kind": "ovn.lrp",
-            "key": {"router": lrp["router"], "name": lrp["name"]},
+            "key": {"ovnrouter": lrp["router"], "name": lrp["name"]},
             "data": {
                 "name": lrp["name"],
                 "mac": lrp["mac"],

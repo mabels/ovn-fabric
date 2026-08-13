@@ -101,23 +101,39 @@ def list_routes(netns: str | None, family: str) -> list[dict]:
     return out
 
 
-def add_addr(addr: str, dev: str, netns: str | None) -> None:
-    run_in_netns(["ip", "addr", "add", addr, "dev", dev], netns)
+def add_addr_argv(addr: str, dev: str) -> list[str]:
+    return ["ip", "addr", "add", addr, "dev", dev]
 
 
-def delete_addr(addr: str, dev: str, netns: str | None) -> None:
-    run_in_netns(["ip", "addr", "del", addr, "dev", dev], netns)
+def delete_addr_argv(addr: str, dev: str) -> list[str]:
+    return ["ip", "addr", "del", addr, "dev", dev]
 
 
-def add_route(prefix: str, dev: str, nexthop: str | None, netns: str | None) -> None:
+def add_route_argv(prefix: str, dev: str, nexthop: str | None) -> list[str]:
     args = ["ip", "route", "add", prefix, "dev", dev]
     if nexthop and nexthop != dev:
         args += ["via", nexthop]
-    run_in_netns(args, netns)
+    return args
+
+
+def delete_route_argv(prefix: str, dev: str) -> list[str]:
+    return ["ip", "route", "del", prefix, "dev", dev]
+
+
+def add_addr(addr: str, dev: str, netns: str | None) -> None:
+    run_in_netns(add_addr_argv(addr, dev), netns)
+
+
+def delete_addr(addr: str, dev: str, netns: str | None) -> None:
+    run_in_netns(delete_addr_argv(addr, dev), netns)
+
+
+def add_route(prefix: str, dev: str, nexthop: str | None, netns: str | None) -> None:
+    run_in_netns(add_route_argv(prefix, dev, nexthop), netns)
 
 
 def delete_route(prefix: str, dev: str, netns: str | None) -> None:
-    run_in_netns(["ip", "route", "del", prefix, "dev", dev], netns)
+    run_in_netns(delete_route_argv(prefix, dev), netns)
 
 
 # ── VLAN sub-interfaces (real-world binding for ovn.ls collision ────
@@ -129,6 +145,14 @@ def delete_route(prefix: str, dev: str, netns: str | None) -> None:
 
 def add_vlan_argv(parent: str, name: str, vlan_id: int) -> list[str]:
     return ["ip", "link", "add", "link", parent, "name", name, "type", "vlan", "id", str(vlan_id)]
+
+
+# A real, addressable stand-in for a KernelRouterSide's own device — see
+# that type's own doc comment (types.ts): no real iface binding yet
+# ("iface mappings into the namespace" is its own next step), so a
+# dummy netdev is what addresses/routes actually attach to for now.
+def add_dummy_argv(name: str) -> list[str]:
+    return ["ip", "link", "add", name, "type", "dummy"]
 
 
 def set_link_up_argv(name: str) -> list[str]:
@@ -151,12 +175,16 @@ def delete_link(name: str, netns: str | None = None) -> None:
     run_in_netns(delete_link_argv(name), netns)
 
 
+def add_if_to_netns_argv(dev: str, netns: str) -> list[str]:
+    return ["ip", "link", "set", dev, "netns", netns]
+
+
 def add_if_to_netns(dev: str, netns: str) -> None:
     """Move `dev` (currently in the global/root namespace) into `netns`
     — `ip link set <dev> netns <netns>`, run from global, since a device
     is only visible to `ip link set` from whichever namespace it's
     currently in."""
-    run_in_netns(["ip", "link", "set", dev, "netns", netns], None)
+    run_in_netns(add_if_to_netns_argv(dev, netns), None)
 
 
 def delete_if_to_netns(dev: str, netns: str) -> None:

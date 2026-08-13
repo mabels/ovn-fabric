@@ -170,6 +170,12 @@ class WriteTest(unittest.TestCase):
             mod.delete_route("default", "ens19", None)
         run.assert_called_once_with(["ip", "route", "del", "default", "dev", "ens19"], None)
 
+    def test_add_if_to_netns_argv(self) -> None:
+        self.assertEqual(
+            mod.add_if_to_netns_argv("dummy-left", "ns-kernel-0"),
+            ["ip", "link", "set", "dummy-left", "netns", "ns-kernel-0"],
+        )
+
     def test_add_if_to_netns_runs_from_global_targeting_the_real_netns(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:
             mod.add_if_to_netns("veth-krn-0", "ns-uplink-voda-avm")
@@ -220,6 +226,14 @@ class VlanWriteTest(unittest.TestCase):
         with mock.patch.object(mod, "run_in_netns") as run:
             mod.delete_link("ens18.128")
         run.assert_called_once_with(["ip", "link", "delete", "ens18.128"], None)
+
+
+class DummyArgvTest(unittest.TestCase):
+    def test_add_dummy_argv_builds_the_real_ip_link_command(self) -> None:
+        self.assertEqual(
+            mod.add_dummy_argv("dummy-left"),
+            ["ip", "link", "add", "dummy-left", "type", "dummy"],
+        )
 
 
 if __name__ == "__main__":

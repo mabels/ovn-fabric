@@ -44,7 +44,6 @@ def _hydrate_ovn_ls(raw: dict) -> pt.OvnLsNode:
         key=pt.OvnLsKey(name=raw["key"]["name"]),
         data=pt.OvnLsData(
             interfaces=[pt.Interface(host=e["host"], iface=e["iface"]) for e in data["interfaces"]],
-            shortIfaceName=data["shortIfaceName"],
         ),
     )
 
@@ -54,7 +53,7 @@ def _hydrate_ovn_lrp(raw: dict) -> pt.OvnLrpNode:
     return pt.OvnLrpNode(
         id=raw["id"],
         kind=raw["kind"],
-        key=pt.OvnLrpKey(router=raw["key"]["router"], side=pt.Side(raw["key"]["side"])),
+        key=pt.OvnLrpKey(ovnrouter=raw["key"]["ovnrouter"], side=pt.Side(raw["key"]["side"])),
         data=pt.OvnLrpData(
             l2Segment=data["l2Segment"],
             addresses=data["addresses"],
@@ -67,7 +66,7 @@ def _hydrate_ovn_lrp(raw: dict) -> pt.OvnLrpNode:
 
 def _route_key_and_data(raw: dict) -> tuple[pt.RouteKey, pt.RouteData]:
     return (
-        pt.RouteKey(router=raw["key"]["router"], prefix=raw["key"]["prefix"]),
+        pt.RouteKey(ovnrouter=raw["key"]["ovnrouter"], prefix=raw["key"]["prefix"]),
         pt.RouteData(
             nexthop=raw["data"]["nexthop"],
             masq=raw["data"]["masq"],
@@ -86,12 +85,34 @@ def _hydrate_ipv6_route(raw: dict) -> pt.Ipv6RouteNode:
     return pt.Ipv6RouteNode(id=raw["id"], kind=raw["kind"], key=key, data=data)
 
 
+def _hydrate_kernel_router(raw: dict) -> pt.KernelRouterNode:
+    data = raw["data"]
+    side = raw["key"].get("side")
+    routes = data.get("routes")
+    return pt.KernelRouterNode(
+        id=raw["id"],
+        kind=raw["kind"],
+        key=pt.KernelRouterKey(
+            name=raw["key"]["name"],
+            side=pt.Side(side) if side is not None else None,
+        ),
+        data=pt.KernelRouterData(
+            host=data["host"],
+            ipaddrs=data.get("ipaddrs"),
+            routes=[pt.Route(dst=r["dst"], via=r["via"]) for r in routes]
+            if routes is not None
+            else None,
+        ),
+    )
+
+
 _HYDRATORS = {
     "infra.host": _hydrate_infra_host,
     "ovn.ls": _hydrate_ovn_ls,
     "ovn.lrp": _hydrate_ovn_lrp,
     "ipv4.route": _hydrate_ipv4_route,
     "ipv6.route": _hydrate_ipv6_route,
+    "kernel.router": _hydrate_kernel_router,
 }
 
 

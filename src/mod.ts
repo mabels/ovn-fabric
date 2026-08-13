@@ -14,3 +14,15 @@ export * from "./define.ts";
 export * from "./factories.ts";
 export * from "./ip.ts";
 export * from "./types.ts";
+// Only transitNetwork() (+ its own TransitEndpoint/TransitNetwork
+// types) from addressing.ts — the rest (transferNet/uplinkNet/
+// macFromV4/macFromVlan/fnv1a32) are internal fold-rule helpers
+// factories.ts/src/ir.ts call themselves; a config author never calls
+// those directly the way they call transitNetwork() itself, e.g. to
+// build the `transit` a router.kernelRouterEndpoint() call needs
+// (define.ts).
+export {
+  type TransitEndpoint,
+  type TransitNetwork,
+  transitNetwork,
+} from "./addressing.ts";

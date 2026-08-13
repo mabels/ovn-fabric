@@ -2,6 +2,7 @@
 // No topology data lives here. This file defines the SHAPE; model.ts
 // declares the FACTS.
 
+import type { TransitNetwork } from "./addressing.ts";
 import type { IPv4, IPv6 } from "./ip.ts";
 
 // ── distinct identity types ──────────────────────────────────────
@@ -390,18 +391,94 @@ export interface OvnRouterEndpoint extends RouterEndpointBase {
   readonly l2Segment: CollisionDomain;
 }
 
-/** The kernel side of a transit link — Meno's own design idea,
- * 2026-08-12 (not yet implemented past this type existing): a netns
- * bridge is basically also a router, whose `left` sits in the OVN world
- * (an OvnRouterEndpoint) and whose `right` sits in the Linux kernel
- * world. Empty for now — inherits everything from RouterEndpointBase
- * as-is; real/host/discovery/nat/backdoor land here once the
- * kernel-side generator design is settled. src/ir.ts's toIR() doesn't
- * know how to emit anything for this kind yet — it throws rather than
- * silently producing nothing, since nothing in this codebase
- * constructs one today. */
+/** The input shape for NetworkBuilder.kernelRouterEndpoint() (define.ts)
+ * — Meno's own design idea, 2026-08-12: describes the real-world
+ * (WAN-facing) side of an OVN<->kernel transit link. `transit` is
+ * always built by calling transitNetwork(ipv4, ipv6) (addressing.ts) in
+ * the topology itself, never assembled by hand. `host`: which real
+ * chassis the netns this eventually creates (KernelRouter, below)
+ * actually runs on — required, since nothing else in scope at a
+ * net.kernelRouterEndpoint() call site supplies it. real/discovery/nat/
+ * backdoor still land here once the kernel-side generator design is
+ * settled further than "create the netns, assign it these addresses"
+ * (see KernelRouter's own doc comment). */
 export interface KernelRouterEndpoint extends RouterEndpointBase {
   readonly kind: "kernel";
+  readonly host: Host;
+  readonly transit: TransitNetwork;
+}
+
+/** One side of a KernelRouter's own netns — an IP assignment, plus
+ * (right side only, in practice — see NetworkBuilder.kernelRouterEndpoint(),
+ * define.ts) whichever RouterEndpointRoute entries the config author
+ * declared for the real-world-facing side. A route with no `via` means
+ * exactly what it means everywhere else RouterEndpointRoute is read
+ * (src/ir.ts's computeRoutes): "this side needs no literal route of its
+ * own for this — handled elsewhere," e.g. IPv6 RA/DHCP on the real
+ * segment, not yet modeled here — src/ir.ts's kernelRouterSideToIR
+ * drops those entirely rather than emitting a route with no nexthop to
+ * apply. No real iface attachment yet (which physical/VLAN/WireGuard
+ * device an address/route actually binds to) — deliberately deferred,
+ * "iface mappings into the namespace" is its own next step (2026-08-12
+ * design discussion): a dummy device stands in for now (deployer/
+ * ir_to_shell.py's own _emit_kernel_router_create). */
+export interface KernelRouterSide {
+  readonly ipaddrs: readonly (IPv4 | IPv6)[];
+  readonly routes?: readonly RouterEndpointRoute[];
+}
+
+/** A router whose two ports are real Linux interfaces inside ONE netns
+ * running on `host` — NOT an OVN Logical_Router at all (contrast
+ * Router, below). Confirmed live, 2026-08-12 (`ip netns exec
+ * ns-uplink-voda-avm ip a`): `left` is the transit-facing side (the
+ * veth pair's own kernel-side leg — veth-krn-0, 10.99.0.2/28 in that
+ * capture, matching transitNetwork()'s `.right`, addressing.ts);
+ * `right` is the real-world-facing side (ens18.1280 in that capture,
+ * the actual WAN interface). Built via
+ * NetworkBuilder.kernelRouterEndpoint() (define.ts), not declared
+ * directly — see that method's own doc comment for why. src/ir.ts's
+ * toIR() emits a `kernel.router` IR node per instance: creates the real
+ * netns and assigns it these addresses — no real iface binding yet,
+ * see KernelRouterSide's own doc comment. */
+export interface KernelRouter {
+  readonly name: string;
+  readonly host: Host;
+  readonly left: KernelRouterSide;
+  readonly right: KernelRouterSide;
+  /** The transit CollisionDomain this KernelRouter's `left` shares with
+   * its OVN twin (kernelRouterEndpoint()'s own transitDomain, define.ts)
+   * — an object reference, not a name, same "no string that could drift
+   * out of sync" reasoning as l2Segment/gatewayChassis elsewhere in this
+   * file. Lets src/ir.ts's toIR() find which Router endpoint is THIS
+   * KernelRouter's other half (matching endpoint.l2Segment === this),
+   * so it can mirror that router's own already-computed routes onto
+   * this KernelRouter's `left` — the kernel netns otherwise has no way
+   * to route back INTO the OVN mesh at all (confirmed live, 2026-08-13:
+   * router-voda-avm-v2 got its own default route via kernel-0's
+   * transit-facing address, but kernel-0 itself had no route back to
+   * home/management's own subnets — nothing told it those exist).
+   * Optional, not required: a KernelRouter declared directly via
+   * net.kernelRouter() (the low-level primitive, no OVN pairing at all)
+   * has no transit domain to name. */
+  readonly transitDomain?: CollisionDomain;
+  /** The OVN twin's OWN address on `transitDomain` (kernelRouterEndpoint()'s
+   * own `ovnSideAddrs`) — the nexthop for every route mirrored onto
+   * `left` per transitDomain's own doc comment above. NOT the same as
+   * `left.ipaddrs` (this KernelRouter's OWN address on that same
+   * domain) — this is the address on the OTHER end of that same wire.
+   * Same "optional, only set by kernelRouterEndpoint()" reasoning as
+   * transitDomain above. */
+  readonly transitPeerAddrs?: readonly (IPv4 | IPv6)[];
+  /** Same field, same meaning as Router.routingDomains below — a
+   * KernelRouter's own routes (KernelRouterSide.routes) only apply if
+   * it's actually a participant of some declared RoutingDomain, same
+   * rule that already gates every OVN-side route (src/ir.ts's
+   * computeRoutes). Set once, at declaration time (NetworkBuilder.
+   * ovnRouter()'s callback sets `router.routingDomains` before calling
+   * `router.kernelRouterEndpoint()`, which reads it straight off the
+   * builder) — never a second, independently-stated copy that could
+   * drift from the owning Router's own routingDomains. */
+  readonly routingDomains?: readonly RoutingDomain[];
 }
 
 export type RouterEndpoint = OvnRouterEndpoint | KernelRouterEndpoint;

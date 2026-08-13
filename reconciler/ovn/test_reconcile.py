@@ -54,8 +54,8 @@ class ReconcileTest(unittest.TestCase):
         # this is the exact case that broke the ADR's literal
         # `router:<scope>|lrp` key (no per-port identity) — router-home
         # really does own two distinct LRPs.
-        a = self.nodes["router:router-home|lrp:lrp-home"]
-        b = self.nodes["router:router-home|lrp:lrp-home-bb"]
+        a = self.nodes["ovnrouter:router-home|lrp:lrp-home"]
+        b = self.nodes["ovnrouter:router-home|lrp:lrp-home-bb"]
         self.assertNotEqual(a["id"], b["id"])
         self.assertNotEqual(a["key"], b["key"])
         self.assertEqual(a["kind"], "ovn.lrp")
@@ -65,11 +65,11 @@ class ReconcileTest(unittest.TestCase):
         # confirms scope (host) is NOT threaded into ovn.lrp's key at
         # all — an ovn.lrp's real container is the OVN logical router it
         # belongs to, unrelated to the passed-in host scope.
-        node = self.nodes["router:router-usa|lrp:lrp-usa"]
-        self.assertEqual(node["key"], {"router": "router-usa", "name": "lrp-usa"})
+        node = self.nodes["ovnrouter:router-usa|lrp:lrp-usa"]
+        self.assertEqual(node["key"], {"ovnrouter": "router-usa", "name": "lrp-usa"})
 
     def test_networks_and_mac_and_gateway_chassis_carried_through(self) -> None:
-        node = self.nodes["router:router-home|lrp:lrp-home"]
+        node = self.nodes["ovnrouter:router-home|lrp:lrp-home"]
         self.assertEqual(node["data"]["mac"], "00:00:c0:a8:80:01")
         self.assertEqual(node["data"]["networks"], ["192.168.128.1/24", "fd00:192:168:128::1/64"])
         self.assertEqual(node["data"]["gatewayChassis"], ["effd37ab-685f-4c33-8c67-43017f4c7c52"])

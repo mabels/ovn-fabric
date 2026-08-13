@@ -35,6 +35,7 @@ import type { IPv4, IPv6 } from "./ip.ts";
 import type {
   CollisionDomain,
   Host,
+  KernelRouter,
   OvnRouterEndpoint,
   Router,
   RouterEndpoint,
@@ -93,6 +94,152 @@ function hostToIR(host: Host): IRNode {
   };
 }
 
+// ── kernel.router ──────────────────────────────────────────────────
+// A KernelRouter's real Linux netns (types.ts) — NOT an OVN kind at
+// all, unlike everything else this module emits (confirmed live,
+// 2026-08-12: `ip netns exec ns-uplink-voda-avm ip a` — a real netns
+// with two real interfaces, no OVN LRP involved). THREE nodes per
+// instance, all `kind: "kernel.router"`: one router-level node (`key:
+// {name}`, no `side`) carrying just the host reference, plus one node
+// PER SIDE (`key: {name, side}`, same shape convention as ovn.lrp —
+// `data` fields flat, not nested under a left/right wrapper). `host` is
+// still repeated on the per-side nodes too (not removed — both sides
+// genuinely do live in the same netns/host, and the router-level node
+// is additive, not a replacement for that).
+function kernelRouterToIR(router: KernelRouter): IRNode {
+  const id = `kernelrouter:${router.name}`;
+  return {
+    id,
+    kind: "kernel.router",
+    key: { name: router.name },
+    data: { host: `host:${router.host.name}` },
+  };
+}
+
+// Which (Router, side) is THIS KernelRouter's own OVN twin — the
+// endpoint whose l2Segment IS this KernelRouter's own transitDomain
+// (types.ts's own doc comment on that field). Undefined for a
+// KernelRouter with no transitDomain at all (net.kernelRouter(), the
+// low-level primitive, used with no OVN pairing) or — shouldn't happen,
+// but not assumed — one whose transitDomain no Router endpoint
+// actually references.
+function transitPeer(
+  kernelRouter: KernelRouter,
+  routers: readonly Router[],
+): { readonly router: Router; readonly side: "left" | "right" } | undefined {
+  if (kernelRouter.transitDomain === undefined) return undefined;
+  for (const router of routers) {
+    for (const side of ["left", "right"] as const) {
+      const endpoint = router[side];
+      if (
+        endpoint.kind === "ovn" &&
+        endpoint.l2Segment.name === kernelRouter.transitDomain.name
+      ) {
+        return { router, side };
+      }
+    }
+  }
+  return undefined;
+}
+
+// The kernel netns's own route BACK into the OVN mesh, for its `left`
+// (transit-facing) side only — everything already computed as a route
+// FOR its OVN twin (computeRoutes/computeInterconnectRoutes above,
+// merged into `routeNodes` by the time toIR() calls this), mirrored
+// with the SAME dst but nexthop = transitPeerAddrs (the OVN twin's own
+// address on the shared transit domain — the only way back into OVN
+// from inside this netns). Without this, the netns has no route to
+// anything but its own directly-connected subnets — confirmed live,
+// 2026-08-13: router-voda-avm-v2 got its own default route via
+// kernel-0's transit-facing address, but kernel-0 itself had no route
+// back to home/management's own subnets at all, nothing told it those
+// exist.
+//
+// Excludes any route whose nexthop is THIS KernelRouter's OWN address
+// (kernelRouterEndpoint()'s via-filled anchor route, see that method's
+// own doc comment) — that one already points AT this kernel router
+// (i.e. it's the reason this function's caller exists at all), mirroring
+// it back onto itself would be circular. Family-matched: an IPv4 dst
+// only ever gets an IPv4 nexthop from transitPeerAddrs, same for IPv6.
+function kernelRouterBackRoutes(
+  kernelRouter: KernelRouter,
+  routers: readonly Router[],
+  routeNodes: readonly IRNode[],
+): Array<{ dst: string; via: string }> {
+  const peer = transitPeer(kernelRouter, routers);
+  if (peer === undefined) return [];
+  // .to_s() (bare, no prefix length), not addrStrings()'s .to_string() —
+  // a route node's own `nexthop` is always stored bare (routeToIR
+  // above: `nexthop: nexthop.to_s()`), so comparing against it needs
+  // the same format or this exclusion silently never matches anything.
+  const ownAddrs = new Set(kernelRouter.left.ipaddrs.map((a) => a.to_s()));
+  const peerAddrs = kernelRouter.transitPeerAddrs ?? [];
+  const routes: Array<{ dst: string; via: string }> = [];
+  for (const node of routeNodes) {
+    if (node.key.ovnrouter !== peer.router.name) continue;
+    const nexthop = node.data.nexthop as string;
+    if (ownAddrs.has(nexthop)) continue;
+    const prefix = node.key.prefix as string;
+    const via = peerAddrs.find((a) => a.is_ipv4() === !prefix.includes(":"));
+    if (via === undefined) continue;
+    routes.push({ dst: prefix, via: via.to_s() });
+  }
+  return routes;
+}
+
+// Addresses are already fully resolved facts (KernelRouterSide.ipaddrs)
+// — no real iface binding yet (deliberately deferred, see
+// KernelRouterSide's own doc comment, types.ts), so a dummy device
+// stands in as the thing addresses/routes actually bind to (deployer/
+// ir_to_shell.py's own _emit_kernel_router_create) — assigning these to
+// a REAL device is its own next step. `routes`: declared entries with a
+// `via` (a route with none means "handled elsewhere," e.g. IPv6 RA/DHCP
+// on the real segment, not yet modeled — same semantic computeRoutes
+// above already uses for a route's own anchor) PLUS, on `left` only,
+// whatever kernelRouterBackRoutes above mirrors — nothing for the
+// deployer to apply otherwise, so those are dropped here rather than
+// emitted as a route with no nexthop. Declared routes are ALSO gated on
+// router.routingDomains being non-empty — a route only takes effect if
+// this KernelRouter is actually a participant of some declared
+// RoutingDomain, the same rule that already gates every OVN-side route
+// (RouterEndpointRoute's own doc comment, types.ts) — `routingDomains`
+// is only ever populated with real, net.routingDomain()-registered
+// references (validated at ovnRouter() call time), so non-empty already
+// implies membership, no separate intersection with
+// network.allRoutingDomains needed. Back-routes need no separate gate:
+// `routeNodes` is already empty for a router with no RoutingDomain
+// membership (computeRoutes/computeInterconnectRoutes are themselves
+// scoped that way), so there's nothing to mirror in that case either.
+function kernelRouterSideToIR(
+  router: KernelRouter,
+  side: "left" | "right",
+  routers: readonly Router[],
+  routeNodes: readonly IRNode[],
+): IRNode {
+  const id = `kernelrouter:${router.name}|side:${side}`;
+  const inDomain = router.routingDomains !== undefined &&
+    router.routingDomains.length > 0;
+  const declaredRoutes = inDomain
+    ? router[side].routes
+      ?.filter((r) => r.via !== undefined)
+      .map((r) => ({ dst: r.dst.to_string(), via: r.via!.to_s() }))
+    : undefined;
+  const backRoutes = side === "left"
+    ? kernelRouterBackRoutes(router, routers, routeNodes)
+    : [];
+  const routes = [...(declaredRoutes ?? []), ...backRoutes];
+  return {
+    id,
+    kind: "kernel.router",
+    key: { name: router.name, side },
+    data: {
+      host: `host:${router.host.name}`,
+      ipaddrs: addrStrings(router[side].ipaddrs),
+      routes: routes.length > 0 ? routes : undefined,
+    },
+  };
+}
+
 // IFNAMSIZ (16) minus the NUL terminator — a real OVS bridge is a real
 // kernel netdev, capped at 15 usable characters. Confirmed live,
 // 2026-08-10: "br-voda-modem-v2" (16 chars) failed with ofproto
@@ -129,14 +276,20 @@ function shortIfaceName(prefix: string, name: string): string {
 // papered over here: relying on RouterEndpoint.ifaces directly sidesteps
 // it rather than pretending it's already reconciled).
 //
-// `shortIfaceName`: the real OVS bridge name this domain binds to on
-// any chassis with a bindable interface (see deployer/ir_to_shell.py's
+// `shortName`: the real OVS bridge name this domain binds to on any
+// chassis with a bindable interface (see deployer/ir_to_shell.py's
 // _emit_iface_bindings_create/_delete) — see shortIfaceName() above.
+// Carried on EACH interface entry, not as its own data field: `iface`
+// is already the one place a real-world-binding fact lives per (host,
+// interface) pair, and every entry for this domain resolves to the
+// same value (deterministic from domain.name), so there's nothing lost
+// repeating it there instead of hoisting it out.
 function collisionDomainToIR(
   domain: CollisionDomain,
   routers: readonly Router[],
 ): IRNode {
   const id = `ls:${domain.name}`;
+  const shortName = shortIfaceName("br-", domain.name);
   const interfaces: Array<{ host: string; iface: unknown }> = [];
   for (const router of routers) {
     for (const endpoint of [router.left, router.right]) {
@@ -144,7 +297,10 @@ function collisionDomainToIR(
         continue;
       }
       for (const hi of endpoint.ifaces ?? []) {
-        interfaces.push({ host: hi.host.name, iface: hi.iface });
+        interfaces.push({
+          host: hi.host.name,
+          iface: { ...hi.iface, shortName },
+        });
       }
     }
   }
@@ -152,7 +308,7 @@ function collisionDomainToIR(
     id,
     kind: "ovn.ls",
     key: { name: domain.name },
-    data: { interfaces, shortIfaceName: shortIfaceName("br-", domain.name) },
+    data: { interfaces },
   };
 }
 
@@ -160,7 +316,7 @@ function collisionDomainToIR(
 // Matches ADR 0002's existing ovn.lrp kind exactly (already produced
 // real, on the reconciler side, from real Logical_Router_Port data —
 // see reconciler/ovn/reconcile.py) — this is the DESIRED-state half of
-// the same fact. Key extends the ADR's `router:<scope>|lrp` with the
+// the same fact. Key extends the ADR's `ovnrouter:<scope>|lrp` with the
 // endpoint's own side (left/right), not a port name the config author
 // chose — Router/RouterEndpoint has no separate per-endpoint name field
 // (see Router, types.ts), so `left`/`right` IS the local identity here,
@@ -238,25 +394,31 @@ function routerEndpointToIR(
   side: "left" | "right",
   endpoint: OvnRouterEndpoint,
 ): IRNode {
-  const scope = `router:${router.name}`;
+  const scope = `ovnrouter:${router.name}`;
   const id = `${scope}|lrp:${side}`;
   const lrp = `lrp-${router.name}-${side}`;
   return {
     id,
     kind: "ovn.lrp",
-    key: { router: router.name, side },
+    key: { ovnrouter: router.name, side },
     data: {
-      l2Segment: endpoint.l2Segment.name,
+      // `ls:<name>`/`host:<name>` — the referenced ovn.ls/infra.host
+      // node's own id (hostToIR/collisionDomainToIR above), not the
+      // bare name, so every cross-node reference in the IR is
+      // consistently an id, not a mix of ids and bare strings.
+      l2Segment: `ls:${endpoint.l2Segment.name}`,
       addresses: addrStrings(endpoint.ipaddrs),
       mac: resolveMac(lrp, endpoint),
-      gatewayChassis: endpoint.gatewayChassis?.name,
+      gatewayChassis: endpoint.gatewayChassis
+        ? `host:${endpoint.gatewayChassis.name}`
+        : undefined,
       ipv6RaConfigs: resolveIpv6RaConfigs(endpoint.services),
     },
   };
 }
 
 // ── ipv4.route / ipv6.route ──────────────────────────────────────────
-// Matches ADR 0002's own node-kind table exactly (`router:<scope>|
+// Matches ADR 0002's own node-kind table exactly (`ovnrouter:<scope>|
 // route:<prefix>`, originally drafted for the legacy Uplink/Segment
 // model — the same shape fits Router/RoutingDomain unchanged).
 //
@@ -366,11 +528,11 @@ function routeToIR(
     );
   }
   const prefix = dst.to_string();
-  const id = `router:${router.name}|route:${prefix}`;
+  const id = `ovnrouter:${router.name}|route:${prefix}`;
   return {
     id,
     kind: dst.is_ipv4() ? "ipv4.route" : "ipv6.route",
-    key: { router: router.name, prefix },
+    key: { ovnrouter: router.name, prefix },
     data: { nexthop: nexthop.to_s(), masq, domain },
   };
 }
@@ -522,12 +684,32 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
   // first, RoutingDomain via-routes second — so if a via-route ever
   // targets the same prefix an interconnect route already computed for
   // the same domain, the explicit via-route wins (last write to
-  // `nodes` on a shared `id` takes it).
+  // `nodes` on a shared `id` takes it). Computed BEFORE the kernel
+  // router loop below (moved 2026-08-13) — kernelRouterSideToIR's own
+  // back-route mirroring needs the FULL, already-deduped route set to
+  // mirror from.
   for (const route of computeInterconnectRoutes(network)) {
     nodes[route.id] = route;
   }
   for (const route of computeRoutes(network)) {
     nodes[route.id] = route;
+  }
+  const routeNodes = Object.values(nodes).filter((n) =>
+    n.kind === "ipv4.route" || n.kind === "ipv6.route"
+  );
+
+  for (const kernelRouter of network.allKernelRouters) {
+    const ownerNode = kernelRouterToIR(kernelRouter);
+    nodes[ownerNode.id] = ownerNode;
+    for (const side of ["left", "right"] as const) {
+      const node = kernelRouterSideToIR(
+        kernelRouter,
+        side,
+        network.allRouters,
+        routeNodes,
+      );
+      nodes[node.id] = node;
+    }
   }
 
   return nodes;

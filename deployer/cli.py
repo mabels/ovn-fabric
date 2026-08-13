@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 from protocol.hydrate import hydrate_nodes
 
@@ -24,7 +25,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "ir_path",
         metavar="IR_JSON",
-        help="path to an IR JSON file (e.g. `deno run src/cli.ts generate-ir config.ts`'s output)",
+        help="path to an IR JSON file (e.g. `deno run src/cli.ts generate-ir config.ts`'s output), "
+        "or - to read from stdin (e.g. piped straight from generate-ir)",
     )
     parser.add_argument(
         "--action",
@@ -34,8 +36,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    with open(args.ir_path) as f:
-        raw_nodes = json.load(f)
+    if args.ir_path == "-":
+        raw_nodes = json.load(sys.stdin)
+    else:
+        with open(args.ir_path) as f:
+            raw_nodes = json.load(f)
     nodes = hydrate_nodes(raw_nodes)
 
     cluster_script, host_scripts = build_scripts(nodes, args.action)

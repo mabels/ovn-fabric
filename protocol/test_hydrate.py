@@ -25,21 +25,28 @@ RAW_OVN_LS = {
     "key": {"name": "home"},
     "data": {
         "interfaces": [
-            {"host": "chassis-1", "iface": {"kind": "vlan", "vlanParent": "eth0", "vlanId": 129}},
+            {
+                "host": "chassis-1",
+                "iface": {
+                    "kind": "vlan",
+                    "vlanParent": "eth0",
+                    "vlanId": 129,
+                    "shortName": "br-home",
+                },
+            },
         ],
-        "shortIfaceName": "br-home",
     },
 }
 
 RAW_OVN_LRP = {
-    "id": "router:router-home|lrp:left",
+    "id": "ovnrouter:router-home|lrp:left",
     "kind": "ovn.lrp",
-    "key": {"router": "router-home", "side": "left"},
+    "key": {"ovnrouter": "router-home", "side": "left"},
     "data": {
-        "l2Segment": "home",
+        "l2Segment": "ls:home",
         "addresses": ["192.168.1.1/24"],
         "mac": "00:00:00:00:01:01",
-        "gatewayChassis": "chassis-1",
+        "gatewayChassis": "host:chassis-1",
     },
 }
 
@@ -71,17 +78,17 @@ class HydrateOvnLsTest(unittest.TestCase):
         # iface itself stays a plain dict — InterfaceKind isn't modeled
         # in the cross-language protocol (see protocol.ts's own header).
         self.assertEqual(node.data.interfaces[0].iface["kind"], "vlan")
-        self.assertEqual(node.data.shortIfaceName, "br-home")
+        self.assertEqual(node.data.interfaces[0].iface["shortName"], "br-home")
 
 
 class HydrateOvnLrpTest(unittest.TestCase):
     def test_produces_the_typed_dataclass(self) -> None:
         node = mod.hydrate_node(RAW_OVN_LRP)
         self.assertIsInstance(node, pt.OvnLrpNode)
-        self.assertEqual(node.key.router, "router-home")
+        self.assertEqual(node.key.ovnrouter, "router-home")
         self.assertEqual(node.key.side, pt.Side.left)
         self.assertEqual(node.data.mac, "00:00:00:00:01:01")
-        self.assertEqual(node.data.gatewayChassis, "chassis-1")
+        self.assertEqual(node.data.gatewayChassis, "host:chassis-1")
 
     def test_missing_mac_raises_instead_of_reaching_the_deployer(self) -> None:
         # The whole point of hydrating at the boundary: a stale IR JSON

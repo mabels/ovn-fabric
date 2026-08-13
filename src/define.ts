@@ -5,14 +5,19 @@
 // the same defineNetwork call).
 
 import type { UplinkBuilder } from "./factories.ts";
+import type { IPv4, IPv6 } from "./ip.ts";
 import {
   CollisionDomain,
   FixedUplink,
   type Host,
   type HostAddress,
+  type KernelRouter,
+  type KernelRouterEndpoint,
+  type KernelRouterSide,
   localHost,
   type OvnClusterOptions,
   type OvnHostConfig,
+  type OvnRouterEndpoint,
   type Router,
   type RouterEndpoint,
   type RoutingDomain,
@@ -40,10 +45,18 @@ export interface NetworkDefinition {
    * OVN's own internal backbone switch (sw-backbone in real captured
    * data), made explicit instead of silently auto-created. */
   readonly backbone?: CollisionDomain;
-  /** Every router declared via net.router() — see Router (types.ts).
+  /** Every router declared via net.ovnRouter() — see Router (types.ts).
    * Does NOT include the routers Uplink/Segment create for themselves
    * today (still implicit, same as allCollisionDomains above). */
   readonly allRouters: readonly Router[];
+  /** Every KernelRouter created by net.kernelRouterEndpoint() (see
+   * KernelRouter, types.ts) — never declared directly, always as a side
+   * effect of that method (define.ts's own NetworkBuilder.
+   * kernelRouterEndpoint()). Real Linux netns instances, not OVN
+   * Logical_Routers — src/ir.ts's toIR() emits three `kernel.router`
+   * nodes per instance (one router-level, carrying the host reference;
+   * one per side). */
+  readonly allKernelRouters: readonly KernelRouter[];
   /** Every named route set declared via net.routingDomain() — see
    * RoutingDomain (types.ts). Referenced by name from Router.
    * routingDomains, resolved into real per-router routes at IR time
@@ -67,6 +80,32 @@ export interface NetworkDefinition {
 type SegmentSpec = Omit<Segment, "name">;
 
 /**
+ * The builder context passed into NetworkBuilder.ovnRouter()'s own
+ * callback (2026-08-12) — same "context object, void callback" idiom as
+ * defineNetwork's own `net`, one level down. `routingDomains`/`left`/
+ * `right` are plain SETTABLE attributes, not a returned object or
+ * separate constructor arguments: kernelRouterEndpoint() needs to read
+ * `routingDomains` at the moment it's called (to stamp a KernelRouter
+ * with the same membership — see KernelRouter.routingDomains, types.ts)
+ * — set `router.routingDomains` before calling
+ * `router.kernelRouterEndpoint()` in the callback body, same
+ * declare-before-use discipline every other builder method in this file
+ * already requires (e.g. a collisionDomain must exist before a router
+ * references it). ovnRouterEndpoint()/kernelRouterEndpoint() are ONLY
+ * reachable through this object now, not as NetworkBuilder methods —
+ * matches ovnRouter()'s own doc comment for why.
+ */
+export interface RouterBuilder {
+  routingDomains?: readonly RoutingDomain[];
+  left?: RouterEndpoint;
+  right?: RouterEndpoint;
+  ovnRouterEndpoint(input: Omit<OvnRouterEndpoint, "kind">): OvnRouterEndpoint;
+  kernelRouterEndpoint(
+    input: Omit<KernelRouterEndpoint, "kind">,
+  ): OvnRouterEndpoint;
+}
+
+/**
  * The builder context passed into defineNetwork's callback. Each method
  * both registers the declared thing and returns a handle to it, so later
  * calls in the same callback can reference earlier ones directly
@@ -85,7 +124,9 @@ export class NetworkBuilder {
   private readonly collisionDomainsByName = new Map<string, CollisionDomain>();
   private backboneDomain: CollisionDomain | undefined;
   private readonly routersByName = new Map<string, Router>();
+  private readonly kernelRoutersByName = new Map<string, KernelRouter>();
   private readonly routingDomainsByName = new Map<string, RoutingDomain>();
+  private nextTransitId = 0;
 
   // Both host-declaring methods route through this — the "at most one
   // central chassis per cluster" check has to live in exactly one
@@ -237,21 +278,53 @@ export class NetworkBuilder {
   }
 
   /** Declare a router connecting exactly two collision domains — see
-   * Router/RouterEndpoint (types.ts) for why exactly two, not N. */
-  router(
-    name: string,
-    endpoints: {
-      readonly left: RouterEndpoint;
-      readonly right: RouterEndpoint;
-      readonly routingDomains?: readonly RoutingDomain[];
-    },
-  ): Router {
+   * Router/RouterEndpoint (types.ts) for why exactly two, not N. Named
+   * ovnRouter(), not router(): kernelRouterEndpoint()/
+   * ovnRouterEndpoint() (only reachable through the RouterBuilder this
+   * passes into `build`, not as their own NetworkBuilder methods
+   * anymore — 2026-08-12) already anticipate a future net.kernelRouter()
+   * sibling — see that session's design discussion on why "OVN router"
+   * needed a name of its own even before the kernel-side counterpart
+   * existed.
+   *
+   * A single void callback, not `{left, right, routingDomains}` — moved
+   * here 2026-08-12: kernelRouterEndpoint() needs to know this router's
+   * OWN routingDomains at the moment it's called (to stamp the SAME
+   * membership onto the KernelRouter it creates, so a kernel-side route
+   * is gated by "is this router actually a participant of some
+   * RoutingDomain" the exact same way an OVN-side route already is —
+   * see KernelRouter.routingDomains, types.ts) — routingDomains can't be
+   * a value returned alongside left/right, since kernelRouterEndpoint()
+   * runs BEFORE that return happens. Setting it as an attribute on the
+   * SAME builder object passed into the callback (`router.routingDomains
+   * = [...]`, read live off `router` by kernelRouterEndpoint() below,
+   * not captured at builder-construction time) — set it before calling
+   * router.kernelRouterEndpoint(), same top-to-bottom declare-before-use
+   * discipline every other builder method in this file already
+   * requires. */
+  ovnRouter(name: string, build: (router: RouterBuilder) => void): Router {
     if (this.routersByName.has(name)) {
       throw new Error(`router "${name}" declared more than once`);
     }
-    this.checkRouterEndpoint(name, endpoints.left);
-    this.checkRouterEndpoint(name, endpoints.right);
-    for (const domain of endpoints.routingDomains ?? []) {
+    const router: RouterBuilder = {
+      routingDomains: undefined,
+      left: undefined,
+      right: undefined,
+      ovnRouterEndpoint: (input) => this.buildOvnRouterEndpoint(input),
+      kernelRouterEndpoint: (input) =>
+        this.buildKernelRouterEndpoint(input, router.routingDomains),
+    };
+    build(router);
+
+    if (router.left === undefined || router.right === undefined) {
+      throw new Error(
+        `router "${name}": both router.left and router.right must be ` +
+          `set inside the ovnRouter() callback`,
+      );
+    }
+    this.checkRouterEndpoint(name, router.left);
+    this.checkRouterEndpoint(name, router.right);
+    for (const domain of router.routingDomains ?? []) {
       if (this.routingDomainsByName.get(domain.name) !== domain) {
         throw new Error(
           `router "${name}" references routing domain "${domain.name}", ` +
@@ -260,14 +333,160 @@ export class NetworkBuilder {
         );
       }
     }
-    const router: Router = {
+    const built: Router = {
       name,
-      left: this.deriveGatewayChassis(endpoints.left),
-      right: this.deriveGatewayChassis(endpoints.right),
-      routingDomains: endpoints.routingDomains,
+      left: this.deriveGatewayChassis(router.left),
+      right: this.deriveGatewayChassis(router.right),
+      routingDomains: router.routingDomains,
     };
-    this.routersByName.set(name, router);
+    this.routersByName.set(name, built);
+    return built;
+  }
+
+  /** Tags a plain input object as the `kind: "ovn"` RouterEndpoint —
+   * no real transformation, just keeps `kind: "ovn"` from ever being
+   * hand-typed at a net.ovnRouter() call site. Private: only reachable
+   * as `router.ovnRouterEndpoint()` inside an ovnRouter() callback
+   * (2026-08-12) — matches kernelRouterEndpoint() below, which
+   * genuinely needs the callback's own RouterBuilder for
+   * routingDomains; this one carries no such need but stays alongside
+   * it for symmetry rather than being reachable a different way. */
+  private buildOvnRouterEndpoint(
+    input: Omit<OvnRouterEndpoint, "kind">,
+  ): OvnRouterEndpoint {
+    return { kind: "ovn", ...input };
+  }
+
+  /** Declare a kernel router — a real Linux netns forwarding between two
+   * real interfaces, not an OVN Logical_Router (see KernelRouter/
+   * KernelRouterSide, types.ts). Never called directly by a config
+   * author — always a side effect of kernelRouterEndpoint() below,
+   * which is the real public entry point; same "register + fail fast
+   * on duplicates" split every other builder method here follows. */
+  kernelRouter(
+    name: string,
+    endpoints: {
+      readonly host: Host;
+      readonly left: KernelRouterSide;
+      readonly right: KernelRouterSide;
+      readonly transitDomain?: CollisionDomain;
+      readonly transitPeerAddrs?: readonly (IPv4 | IPv6)[];
+      readonly routingDomains?: readonly RoutingDomain[];
+    },
+  ): KernelRouter {
+    if (this.kernelRoutersByName.has(name)) {
+      throw new Error(`kernel router "${name}" declared more than once`);
+    }
+    const router: KernelRouter = { name, ...endpoints };
+    this.kernelRoutersByName.set(name, router);
     return router;
+  }
+
+  /** The entry point where an OVN<->kernel transit link actually gets
+   * created ("that was the entrypoint where we created the transit" —
+   * 2026-08-12 design discussion). Creates a fresh, auto-named transit
+   * CollisionDomain AND a matching KernelRouter (same auto-generated id
+   * for both — "transit-3"/"kernel-3" — so the pairing reads directly
+   * off the names; config never picks either, same "don't make the
+   * caller think about it" pattern as uplink()'s slot allocation
+   * below), then returns the OVN side of the transit link as a plain
+   * OvnRouterEndpoint, ready to drop straight into net.ovnRouter()'s
+   * left/right.
+   *
+   * `input.transit` is a TransitNetwork — always built by calling
+   * transitNetwork(ipv4, ipv6) (addressing.ts) in the topology itself,
+   * never assembled by hand, so it's always a valid transit pair here.
+   * `.left` becomes the OVN side's own address (folded into the
+   * returned OvnRouterEndpoint below); `.right` becomes the
+   * KernelRouter's OWN transit-facing side (confirmed live, 2026-08-12:
+   * `ip netns exec ns-uplink-voda-avm ip a` — veth-krn-0, the kernel
+   * side of the SAME veth pair). `input.ipaddrs` becomes the
+   * KernelRouter's real-world-facing side (confirmed live: ens18.1280,
+   * the actual WAN interface in that same capture) — no real iface
+   * binding for either KernelRouter side yet, that's its own next step
+   * (KernelRouterSide, types.ts). No l2Segment on the input at all:
+   * that's a purely OVN concept, and this input describes the KERNEL
+   * side — it has no business naming an OVN domain to bind to.
+   * Everything else (`Omit<KernelRouterEndpoint, "kind">` minus `host`/
+   * `transit`, consumed below — ipaddrs, mac, ifaces, gatewayChassis,
+   * securityGroup, services, routes) carries straight through to the
+   * returned OvnRouterEndpoint, symmetric with ovnRouterEndpoint()
+   * above taking `Omit<OvnRouterEndpoint, "kind">`. `routes` in
+   * particular matters here: the returned endpoint is a real
+   * OvnRouterEndpoint, and it's frequently the RoutingDomain anchor
+   * (e.g. a real ISP default route) despite being kernel-backed, so it
+   * needs the same `.routes` a hand-declared OvnRouterEndpoint would
+   * (RouterEndpointRoute, types.ts) — EXCEPT that a route left with no
+   * `via` here does NOT mean "handled elsewhere" the way it does on a
+   * hand-declared (client-facing) endpoint (RouterEndpointRoute's own
+   * doc comment: "e.g. SLAAC/RA on a client-facing segment... or an
+   * existing less-specific route already covering it there") — there is
+   * no SLAAC/RA on a transit link, so a kernel-backed anchor's own
+   * literal route would simply never be emitted at all (confirmed live,
+   * 2026-08-12: router-voda-avm-v2 got every OTHER router's routes
+   * rewritten to point at it, but no `0.0.0.0/0`/`::/0` of its own —
+   * nowhere for that traffic to go once it arrived). The ONLY way out
+   * via a kernel-backed endpoint is through its own paired KernelRouter,
+   * so a `via`-less route here is filled in with `link.right` (the
+   * KernelRouter's own transit-facing address, matching `route.dst`'s
+   * family) INSTEAD of being left for computeRoutes (src/ir.ts) to skip.
+   *
+
+   * `routingDomains` isn't part of `input` — it's whatever the
+   * enclosing ovnRouter() callback's `router.routingDomains` is set to
+   * AT THE TIME this runs (read live off the RouterBuilder by
+   * ovnRouter() above, not an argument a config author passes here
+   * directly), stamped onto the KernelRouter this creates so its own
+   * routes are gated by the same RoutingDomain-membership rule an
+   * OVN-side route already is (src/ir.ts's kernelRouterSideToIR). */
+  private buildKernelRouterEndpoint(
+    input: Omit<KernelRouterEndpoint, "kind">,
+    routingDomains: readonly RoutingDomain[] | undefined,
+  ): OvnRouterEndpoint {
+    const { transit: link, host, ipaddrs, ...rest } = input;
+    const id = this.nextTransitId++;
+    const transitDomain = this.collisionDomain(`transit-${id}`);
+    const ovnSideAddrs = [link.left.ipv4, link.left.ipv6]
+      .filter((a): a is IPv4 | IPv6 => a !== undefined);
+    const kernelSideAddrs = [link.right.ipv4, link.right.ipv6]
+      .filter((a): a is IPv4 | IPv6 => a !== undefined);
+
+    // `routes` also lands on the KernelRouter's own right side (the
+    // real-world-facing one, see KernelRouterSide's own doc comment) —
+    // it's a physical fact about that real device's own routing table,
+    // not just the OVN logical router's — UNMODIFIED (kernelSideRoutes
+    // below is a separate, via-filled-in copy for the OVN side only;
+    // the kernel netns's own real gateway, e.g. the actual ISP address,
+    // is a different fact that a via-less entry here still doesn't
+    // supply — that's its own separate mechanism, not yet built).
+    const ovnSideRoutes = input.routes?.map((route) => {
+      if (route.via !== undefined) return route;
+      const via = route.dst.is_ipv4() ? link.right.ipv4 : link.right.ipv6;
+      if (via === undefined) {
+        throw new Error(
+          `kernelRouterEndpoint: route to ${route.dst.to_string()} has ` +
+            `no via, and the transit link has no matching-family ` +
+            `kernel-side address to imply one from`,
+        );
+      }
+      return { ...route, via };
+    });
+
+    this.kernelRouter(`kernel-${id}`, {
+      host,
+      left: { ipaddrs: kernelSideAddrs },
+      right: { ipaddrs, routes: input.routes },
+      transitDomain,
+      transitPeerAddrs: ovnSideAddrs,
+      routingDomains,
+    });
+
+    return this.buildOvnRouterEndpoint({
+      ...rest,
+      routes: ovnSideRoutes,
+      l2Segment: transitDomain,
+      ipaddrs: [...ipaddrs, ...ovnSideAddrs],
+    });
   }
 
   uplink(name: string, builder: UplinkBuilder): Uplink {
@@ -296,8 +515,9 @@ export class NetworkBuilder {
 
     const id = spec.addresses[0]?.id();
     if (id !== undefined && this.usedUplinkIds.has(id)) {
-      const existing = [...this.uplinksByName.entries()]
-        .find(([, u]) => u.addresses[0]?.id() === id)?.[0];
+      const existing = [...this.uplinksByName.entries()].find(
+        ([, u]) => u.addresses[0]?.id() === id,
+      )?.[0];
       throw new Error(
         `uplink "${name}" reuses id ${id}, ` +
           `already used by uplink "${existing}"`,
@@ -334,8 +554,9 @@ export class NetworkBuilder {
     }
     const id = spec.addresses[0]?.id();
     if (id !== undefined && this.usedSegmentIds.has(id)) {
-      const existing = [...this.segmentsByName.entries()]
-        .find(([, s]) => s.addresses[0]?.id() === id)?.[0];
+      const existing = [...this.segmentsByName.entries()].find(
+        ([, s]) => s.addresses[0]?.id() === id,
+      )?.[0];
       throw new Error(
         `segment "${name}" reuses id ${id}, ` +
           `already used by segment "${existing}"`,
@@ -348,7 +569,9 @@ export class NetworkBuilder {
     // probe below, which throws on undefined.
     const selector: UplinkSelector | undefined = spec.uplink === undefined
       ? undefined
-      : ("resolve" in spec.uplink ? spec.uplink : new FixedUplink(spec.uplink));
+      : "resolve" in spec.uplink
+      ? spec.uplink
+      : new FixedUplink(spec.uplink);
 
     // fail fast: if an uplink WAS given, it must have been declared via
     // this same builder, not an arbitrary object that happens to match
@@ -380,6 +603,7 @@ export class NetworkBuilder {
       allCollisionDomains: [...this.collisionDomainsByName.values()],
       backbone: this.backboneDomain,
       allRouters: [...this.routersByName.values()],
+      allKernelRouters: [...this.kernelRoutersByName.values()],
       allRoutingDomains: [...this.routingDomainsByName.values()],
       ovnGlobal: this.ovnGlobalOptions,
     };

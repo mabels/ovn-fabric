@@ -7,7 +7,7 @@
 // script's output after the fact.
 
 import { assertEquals, assertThrows } from "jsr:@std/assert@1";
-import { segmentNet } from "./addressing.ts";
+import { segmentNet, transitNetwork } from "./addressing.ts";
 import { IPv4, IPv6 } from "./ip.ts";
 
 Deno.test("segmentNet: suffix only -> both families fold from it", () => {
@@ -92,4 +92,33 @@ Deno.test("segmentNet: id()/vlan() still reflect the segment id, regardless of l
   });
   assertEquals(net.id(), 130);
   assertEquals(net.vlan(), 130);
+});
+
+Deno.test("transitNetwork: /30 IPv4 folds to its two usable host addresses, not network/broadcast", () => {
+  const t = transitNetwork(IPv4.parse("10.99.0.0/30"));
+  assertEquals(t.left.ipv4?.to_string(), "10.99.0.1/30");
+  assertEquals(t.right.ipv4?.to_string(), "10.99.0.2/30");
+});
+
+Deno.test("transitNetwork: IPv6 has no reserved broadcast, first() is the network's own zero-host address", () => {
+  const t = transitNetwork(undefined, IPv6.parse("fd00:10:99::/126"));
+  assertEquals(t.left.ipv6?.to_string(), "fd00:10:99::/126");
+  assertEquals(t.right.ipv6?.to_string(), "fd00:10:99::3/126");
+});
+
+Deno.test("transitNetwork: both families fold independently in one call", () => {
+  const t = transitNetwork(
+    IPv4.parse("10.99.0.0/30"),
+    IPv6.parse("fd00:10:99::/126"),
+  );
+  assertEquals(t.left.ipv4?.to_string(), "10.99.0.1/30");
+  assertEquals(t.left.ipv6?.to_string(), "fd00:10:99::/126");
+  assertEquals(t.right.ipv4?.to_string(), "10.99.0.2/30");
+  assertEquals(t.right.ipv6?.to_string(), "fd00:10:99::3/126");
+});
+
+Deno.test("transitNetwork: omitted family stays undefined on both ends", () => {
+  const t = transitNetwork(IPv4.parse("10.99.0.0/30"));
+  assertEquals(t.left.ipv6, undefined);
+  assertEquals(t.right.ipv6, undefined);
 });

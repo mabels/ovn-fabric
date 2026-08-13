@@ -101,11 +101,33 @@ class RunTest(unittest.TestCase):
 # run for real here (or anywhere in this session) — this project's only
 # real router is live production infrastructure; these are verified by
 # asserting the exact argv built for `mod.run`, not by executing it.
+class NetnsExecArgvTest(unittest.TestCase):
+    def test_global_leaves_argv_unwrapped(self) -> None:
+        argv = ["ip", "link", "add", "dummy-left", "type", "dummy"]
+        self.assertEqual(mod.netns_exec_argv(argv, None), argv)
+
+    def test_real_namespace_is_wrapped_in_ip_netns_exec(self) -> None:
+        self.assertEqual(
+            mod.netns_exec_argv(["ip", "link", "set", "dummy-left", "up"], "ns-kernel-0"),
+            ["ip", "netns", "exec", "ns-kernel-0", "ip", "link", "set", "dummy-left", "up"],
+        )
+
+
 class WriteTest(unittest.TestCase):
+    def test_add_netns_argv(self) -> None:
+        self.assertEqual(
+            mod.add_netns_argv("ns-uplink-test"), ["ip", "netns", "add", "ns-uplink-test"]
+        )
+
     def test_add_netns_builds_the_real_ip_command(self) -> None:
         with mock.patch.object(mod, "run") as run:
             mod.add_netns("ns-uplink-test")
         run.assert_called_once_with(["ip", "netns", "add", "ns-uplink-test"], None)
+
+    def test_delete_netns_argv(self) -> None:
+        self.assertEqual(
+            mod.delete_netns_argv("ns-uplink-test"), ["ip", "netns", "delete", "ns-uplink-test"]
+        )
 
     def test_delete_netns_builds_the_real_ip_command(self) -> None:
         with mock.patch.object(mod, "run") as run:
