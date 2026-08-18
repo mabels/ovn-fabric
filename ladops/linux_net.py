@@ -155,6 +155,15 @@ def add_dummy_argv(name: str) -> list[str]:
     return ["ip", "link", "add", name, "type", "dummy"]
 
 
+# A KernelRouter's own transit veth pair (types.ts's InterfaceKind "veth"
+# variant) — `name` is the ROOT-side leg (later attached to the transit
+# domain's OVS bridge), `peer` the leg moved into the kernel router's
+# netns by deployer/ir_to_shell.py's _emit_kernel_router_create. Run from
+# the root namespace (2026-08-18).
+def add_veth_argv(name: str, peer: str) -> list[str]:
+    return ["ip", "link", "add", name, "type", "veth", "peer", "name", peer]
+
+
 def set_link_up_argv(name: str) -> list[str]:
     return ["ip", "link", "set", name, "up"]
 

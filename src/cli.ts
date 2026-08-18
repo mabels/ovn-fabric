@@ -42,6 +42,8 @@ function describeInterface(ifc: InterfaceKind): string {
       return `physical ${ifc.name}`;
     case "bridge-port":
       return `bridge-port ${ifc.port} on ${ifc.bridge}`;
+    case "veth":
+      return `veth ${ifc.ifaceName} <-> ${ifc.peerName}`;
     case "wireguard":
       return `wireguard ${ifc.ifaceName} -> ${ifc.config.peer.endpoint}`;
     case "zerotier":

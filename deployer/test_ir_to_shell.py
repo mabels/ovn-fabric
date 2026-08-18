@@ -109,6 +109,12 @@ NODES: list[pt.Model] = [
             host="host:chassis-1",
             ipaddrs=["192.168.132.93/24"],
             routes=[pt.Route(dst="0.0.0.0/0", via="192.168.132.1")],
+            ifaces=[
+                pt.Interface(
+                    host="chassis-1",
+                    iface={"kind": "vlan", "vlanParent": "eth0", "vlanId": 2280},
+                ),
+            ],
         ),
     ),
 ]
@@ -116,11 +122,7 @@ NODES: list[pt.Model] = [
 
 def _replace_home_ls(nodes: list[pt.Model], **changes: object) -> list[pt.Model]:
     return [
-        (
-            dataclasses.replace(n, **changes)
-            if n.kind == "ovn.ls" and n.key.name == "home"
-            else n
-        )
+        (dataclasses.replace(n, **changes) if n.kind == "ovn.ls" and n.key.name == "home" else n)
         for n in nodes
     ]
 
@@ -325,40 +327,46 @@ class KernelRouterCreateTest(unittest.TestCase):
         self.assertNotIn("ns-kernel-0", script)
         self.assertNotIn("dummy-", script)
 
-    def test_dummy_device_created_outside_the_netns_then_moved_in(self) -> None:
-        # `ip link add ... type dummy` must run in the global namespace
-        # (a device is only visible to `ip link set <dev> netns <ns>`
-        # from wherever it currently lives), not via `ip netns exec`.
+    def test_devices_created_outside_the_netns_then_moved_in(self) -> None:
+        # The real VLAN (`right`) and the dummy stand-in (`left`) are
+        # both created in the global namespace (a device is only visible
+        # to `ip link set <dev> netns <ns>` from wherever it currently
+        # lives), not via `ip netns exec`.
         script = self.hosts["chassis-1"]
+        self.assertIn("ip link add link eth0 name eth0.2280 type vlan id 2280", script)
+        self.assertNotIn("ip netns exec ns-kernel-0 ip link add link eth0", script)
         self.assertIn("ip link add dummy-left type dummy", script)
         self.assertNotIn("ip netns exec ns-kernel-0 ip link add dummy-left", script)
-        self.assertIn("ip link add dummy-right type dummy", script)
-        self.assertNotIn("ip netns exec ns-kernel-0 ip link add dummy-right", script)
+        self.assertNotIn("ip link add dummy-right type dummy", script)
 
-    def test_dummy_device_moved_into_the_netns_after_it_exists(self) -> None:
+    def test_devices_moved_into_the_netns_after_it_exists(self) -> None:
         script = self.hosts["chassis-1"]
+        self.assertIn("ip link set eth0.2280 netns ns-kernel-0", script)
         self.assertIn("ip link set dummy-left netns ns-kernel-0", script)
-        self.assertIn("ip link set dummy-right netns ns-kernel-0", script)
         self.assertGreater(
-            script.index("ip link add dummy-left type dummy"),
+            script.index("ip link add link eth0 name eth0.2280 type vlan id 2280"),
             script.index("ip netns add ns-kernel-0"),
+        )
+        self.assertGreater(
+            script.index("ip link set eth0.2280 netns ns-kernel-0"),
+            script.index("ip link add link eth0 name eth0.2280 type vlan id 2280"),
         )
         self.assertGreater(
             script.index("ip link set dummy-left netns ns-kernel-0"),
             script.index("ip link add dummy-left type dummy"),
         )
 
-    def test_addresses_assigned_on_the_matching_sides_own_dummy_device(self) -> None:
+    def test_addresses_assigned_on_the_matching_sides_own_device(self) -> None:
         script = self.hosts["chassis-1"]
         self.assertIn("ip netns exec ns-kernel-0 ip addr add 10.99.0.2/28 dev dummy-left", script)
         self.assertIn(
-            "ip netns exec ns-kernel-0 ip addr add 192.168.132.93/24 dev dummy-right", script
+            "ip netns exec ns-kernel-0 ip addr add 192.168.132.93/24 dev eth0.2280", script
         )
 
-    def test_both_dummy_devices_brought_up(self) -> None:
+    def test_both_devices_brought_up(self) -> None:
         script = self.hosts["chassis-1"]
         self.assertIn("ip netns exec ns-kernel-0 ip link set dummy-left up", script)
-        self.assertIn("ip netns exec ns-kernel-0 ip link set dummy-right up", script)
+        self.assertIn("ip netns exec ns-kernel-0 ip link set eth0.2280 up", script)
 
     def test_up_runs_before_address_assignment(self) -> None:
         script = self.hosts["chassis-1"]
@@ -370,7 +378,7 @@ class KernelRouterCreateTest(unittest.TestCase):
     def test_route_with_a_real_nexthop_applied_on_its_own_side(self) -> None:
         script = self.hosts["chassis-1"]
         self.assertIn(
-            "ip netns exec ns-kernel-0 ip route add 0.0.0.0/0 dev dummy-right via 192.168.132.1",
+            "ip netns exec ns-kernel-0 ip route add 0.0.0.0/0 dev eth0.2280 via 192.168.132.1",
             script,
         )
 
@@ -380,6 +388,43 @@ class KernelRouterCreateTest(unittest.TestCase):
         # Exactly the one route declared on the right side, none invented
         # for the left side (which has no `routes` at all in the fixture).
         self.assertEqual(script.count("ip route add"), 1)
+
+    def test_veth_created_for_a_side_with_a_veth_iface(self) -> None:
+        # The transit leg (`left`) is a veth pair: created in the root
+        # namespace (a device is only visible to `ip link set <dev>
+        # netns <ns>` from wherever it currently lives), then the netns-
+        # side leg is moved in and the addresses bind to it.
+        nodes = [
+            (
+                dataclasses.replace(
+                    n,
+                    data=pt.KernelRouterData(
+                        host="host:chassis-1",
+                        ipaddrs=["10.99.0.2/28"],
+                        ifaces=[
+                            pt.Interface(
+                                host="chassis-1",
+                                iface={
+                                    "kind": "veth",
+                                    "ifaceName": "veth-krn-0",
+                                    "peerName": "veth-ovn-0",
+                                },
+                            ),
+                        ],
+                    ),
+                )
+                if n.kind == "kernel.router" and n.key.side == pt.Side.left
+                else n
+            )
+            for n in NODES
+        ]
+        _, hosts = mod.build_scripts(nodes, "create")
+        script = hosts["chassis-1"]
+        self.assertIn("ip link add veth-ovn-0 type veth peer name veth-krn-0", script)
+        self.assertNotIn("ip netns exec ns-kernel-0 ip link add veth-ovn-0", script)
+        self.assertIn("ip link set veth-krn-0 netns ns-kernel-0", script)
+        self.assertIn("ip netns exec ns-kernel-0 ip addr add 10.99.0.2/28 dev veth-krn-0", script)
+        self.assertNotIn("ip link add dummy-left type dummy", script)
 
 
 class KernelRouterDeleteTest(unittest.TestCase):

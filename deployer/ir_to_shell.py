@@ -74,7 +74,7 @@ from protocol import generated as pt
 
 Action = str  # "create" | "delete"
 
-_BINDABLE_IFACE_KINDS = {"vlan", "physical"}
+_BINDABLE_IFACE_KINDS = {"vlan", "physical", "veth"}
 
 
 def _sh(argv: list[str]) -> str:
@@ -84,6 +84,11 @@ def _sh(argv: list[str]) -> str:
 def _iface_real_name(iface: dict) -> str:
     if iface["kind"] == "vlan":
         return iface.get("ifaceName") or f"{iface['vlanParent']}.{iface['vlanId']}"
+    if iface["kind"] == "veth":
+        # The ROOT-side leg — the device the transit domain's bridge
+        # attaches to (the netns-side leg, `ifaceName`, is created/moved
+        # by _emit_kernel_router_create instead).
+        return iface["peerName"]
     return iface["name"]  # "physical"
 
 
@@ -139,11 +144,7 @@ def _domains_with_bindable_interfaces(nodes: list[pt.Model]) -> set[str]:
 
 def _find_central_host(nodes: list[pt.Model]) -> pt.InfraHostNode | None:
     return next(
-        (
-            n
-            for n in nodes
-            if n.kind == "infra.host" and n.data.ovnRole == pt.OvnRole.central
-        ),
+        (n for n in nodes if n.kind == "infra.host" and n.data.ovnRole == pt.OvnRole.central),
         None,
     )
 
@@ -368,24 +369,27 @@ def _kernel_router_sides(name: str, nodes: list[pt.Model]) -> list[pt.KernelRout
 
 
 # One real netns per KernelRouter (types.ts) bound to this host, then —
-# per side — a dummy device standing in for the real interface binding
-# ("iface mappings into the namespace" is its own next step, 2026-08-12
-# design discussion, see KernelRouterSide's own doc comment, types.ts):
-# assign that side's already-resolved addresses to it, and apply
-# whatever routes have a real nexthop (a route with none means "handled
-# elsewhere," e.g. real-world RA/DHCP — src/ir.ts's kernelRouterSideToIR
-# already drops those before they ever reach here).
+# per side — a real interface when the side declares `ifaces`
+# (KernelRouterSide.ifaces, types.ts — populated for `left` by the
+# implicit transit veth and for `right` by buildKernelRouterEndpoint,
+# define.ts, 2026-08-18): create the kernel VLAN sub-interface or the
+# transit veth pair (if any) in the root namespace, move the netns-side
+# device into the netns, and bind that side's already-resolved
+# addresses/routes to it. A side with no `ifaces` keeps the dummy-device
+# stand-in (the pre-2026-08-18 behavior).
 #
-# `ip link add ... type dummy` runs OUTSIDE the netns (a device is only
-# visible to `ip link set <dev> netns <netns>` from whichever namespace
-# it's CURRENTLY in — same reasoning ladops.linux_net.add_if_to_netns
-# already documents, and the same create-in-global/move-in sequence this
-# module already uses for a real host's VLAN sub-interfaces), THEN
-# moved into the netns with that same `ip link set ... netns` call —
-# confirmed live, 2026-08-12. Only after the move does anything run via
-# `ip netns exec`: bring the link up, THEN assign addresses/routes to it
-# — up before addr/route, not after (a route through a device that
-# isn't up yet fails; an address on one is pointless until it is).
+# `ip link add ... type vlan/type veth/type dummy` runs OUTSIDE the netns
+# (a
+# device is only visible to `ip link set <dev> netns <netns>` from
+# whichever namespace it's CURRENTLY in — same reasoning ladops.linux_
+# net.add_if_to_netns already documents, and the same create-in-global/
+# move-in sequence this module already uses for a real host's VLAN
+# sub-interfaces), THEN moved into the netns with that same `ip link
+# set ... netns` call — confirmed live, 2026-08-12. Only after the move
+# does anything run via `ip netns exec`: bring the link up, THEN assign
+# addresses/routes to it — up before addr/route, not after (a route
+# through a device that isn't up yet fails; an address on one is
+# pointless until it is).
 def _emit_kernel_router_create(host_id: str, nodes: list[pt.Model]) -> list[str]:
     lines: list[str] = []
     for owner in _kernel_router_owners(host_id, nodes):
@@ -393,16 +397,49 @@ def _emit_kernel_router_create(host_id: str, nodes: list[pt.Model]) -> list[str]
         lines.append(f"# --- kernel netns: {netns} ({owner.key.name}) ---")
         lines.append(_sh(netns_ops.add_netns_argv(netns)))
         for side_node in _kernel_router_sides(owner.key.name, nodes):
-            dummy = _dummy_name(side_node.key.side)
-            lines.append(f"# --- kernel router side: {owner.key.name} ({side_node.key.side.value}) ---")
-            lines.append(_sh(linux_net_ops.add_dummy_argv(dummy)))
-            lines.append(_sh(linux_net_ops.add_if_to_netns_argv(dummy, netns)))
-            lines.append(_sh(netns_ops.netns_exec_argv(linux_net_ops.set_link_up_argv(dummy), netns)))
+            iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
+            if iface is not None and iface.get("kind") not in _BINDABLE_IFACE_KINDS:
+                lines.append(
+                    f'# unsupported kernel router side interface kind "{iface.get("kind")}" '
+                    f"for {owner.key.name} ({side_node.key.side.value}) — skipped, "
+                    "see deployer/ir_to_shell.py"
+                )
+                continue
+            if iface is not None and iface["kind"] == "veth":
+                # The netns-side leg — `peerName` is the root-side leg
+                # the transit domain's bridge attaches to (see
+                # _emit_iface_bindings_create, which runs after this
+                # block and finds the pair already created here).
+                dev = iface["ifaceName"]
+            else:
+                dev = (
+                    _iface_real_name(iface)
+                    if iface is not None
+                    else _dummy_name(side_node.key.side)
+                )
+            lines.append(
+                f"# --- kernel router side: {owner.key.name} ({side_node.key.side.value}) ---"
+            )
+            if iface is not None:
+                if iface["kind"] == "vlan":
+                    lines.append(
+                        _sh(linux_net_ops.add_vlan_argv(iface["vlanParent"], dev, iface["vlanId"]))
+                    )
+                elif iface["kind"] == "veth":
+                    lines.append(
+                        _sh(linux_net_ops.add_veth_argv(iface["peerName"], iface["ifaceName"]))
+                    )
+                # "physical": the device must already exist in the root
+                # namespace — nothing to create, only the move below.
+            else:
+                lines.append(_sh(linux_net_ops.add_dummy_argv(dev)))
+            lines.append(_sh(linux_net_ops.add_if_to_netns_argv(dev, netns)))
+            lines.append(_sh(netns_ops.netns_exec_argv(linux_net_ops.set_link_up_argv(dev), netns)))
             for addr in side_node.data.ipaddrs or []:
-                argv = linux_net_ops.add_addr_argv(addr, dummy)
+                argv = linux_net_ops.add_addr_argv(addr, dev)
                 lines.append(_sh(netns_ops.netns_exec_argv(argv, netns)))
             for route in side_node.data.routes or []:
-                argv = linux_net_ops.add_route_argv(route.dst, dummy, route.via)
+                argv = linux_net_ops.add_route_argv(route.dst, dev, route.via)
                 lines.append(_sh(netns_ops.netns_exec_argv(argv, netns)))
     if lines:
         lines.append("")

@@ -126,7 +126,6 @@ export class NetworkBuilder {
   private readonly routersByName = new Map<string, Router>();
   private readonly kernelRoutersByName = new Map<string, KernelRouter>();
   private readonly routingDomainsByName = new Map<string, RoutingDomain>();
-  private nextTransitId = 0;
 
   // Both host-declaring methods route through this — the "at most one
   // central chassis per cluster" check has to live in exactly one
@@ -312,7 +311,7 @@ export class NetworkBuilder {
       right: undefined,
       ovnRouterEndpoint: (input) => this.buildOvnRouterEndpoint(input),
       kernelRouterEndpoint: (input) =>
-        this.buildKernelRouterEndpoint(input, router.routingDomains),
+        this.buildKernelRouterEndpoint(input, router.routingDomains, name),
     };
     build(router);
 
@@ -385,11 +384,14 @@ export class NetworkBuilder {
   /** The entry point where an OVN<->kernel transit link actually gets
    * created ("that was the entrypoint where we created the transit" —
    * 2026-08-12 design discussion). Creates a fresh, auto-named transit
-   * CollisionDomain AND a matching KernelRouter (same auto-generated id
-   * for both — "transit-3"/"kernel-3" — so the pairing reads directly
-   * off the names; config never picks either, same "don't make the
-   * caller think about it" pattern as uplink()'s slot allocation
-   * below), then returns the OVN side of the transit link as a plain
+   * CollisionDomain (`transit-<routerName>` — `router-voda-avm-v2` ->
+   * a `ls:transit-router-voda-avm-v2` IR node, whose bridge/bridge-
+   * mapping/localnet-port names the deployer derives from the same
+   * name) AND a KernelRouter named after the enclosing
+   * net.ovnRouter() (a `kernel.router` IR node named
+   * `router-voda-avm-v2`, whose netns the deployer derives as
+   * `ns-router-voda-avm-v2`), then returns the OVN side of the transit
+   * link as a plain
    * OvnRouterEndpoint, ready to drop straight into net.ovnRouter()'s
    * left/right.
    *
@@ -408,10 +410,18 @@ export class NetworkBuilder {
    * that's a purely OVN concept, and this input describes the KERNEL
    * side — it has no business naming an OVN domain to bind to.
    * Everything else (`Omit<KernelRouterEndpoint, "kind">` minus `host`/
-   * `transit`, consumed below — ipaddrs, mac, ifaces, gatewayChassis,
+   * `transit`/`ifaces`, consumed below — ipaddrs, mac, gatewayChassis,
    * securityGroup, services, routes) carries straight through to the
    * returned OvnRouterEndpoint, symmetric with ovnRouterEndpoint()
-   * above taking `Omit<OvnRouterEndpoint, "kind">`. `routes` in
+   * above taking `Omit<OvnRouterEndpoint, "kind">`. `ifaces` is the
+   * exception that lands in BOTH places (2026-08-18): it also goes
+   * onto the paired KernelRouter's `right` (KernelRouterSide.ifaces,
+   * types.ts), where the deployer creates/moves that interface into the
+   * netns instead of a dummy stand-in — WITHOUT being removed from the
+   * returned OVN-side endpoint, which keeps its own copy so the transit
+   * domain still gets its localnet port, gateway-chassis pin, bridge
+   * binding and ovn-bridge-mappings entry ("get the half done thing
+   * back", 2026-08-18). `routes` in
    * particular matters here: the returned endpoint is a real
    * OvnRouterEndpoint, and it's frequently the RoutingDomain anchor
    * (e.g. a real ISP default route) despite being kernel-backed, so it
@@ -442,10 +452,10 @@ export class NetworkBuilder {
   private buildKernelRouterEndpoint(
     input: Omit<KernelRouterEndpoint, "kind">,
     routingDomains: readonly RoutingDomain[] | undefined,
+    routerName: string,
   ): OvnRouterEndpoint {
     const { transit: link, host, ipaddrs, ...rest } = input;
-    const id = this.nextTransitId++;
-    const transitDomain = this.collisionDomain(`transit-${id}`);
+    const transitDomain = this.collisionDomain(`transit-${routerName}`);
     const ovnSideAddrs = [link.left.ipv4, link.left.ipv6]
       .filter((a): a is IPv4 | IPv6 => a !== undefined);
     const kernelSideAddrs = [link.right.ipv4, link.right.ipv6]
@@ -472,10 +482,28 @@ export class NetworkBuilder {
       return { ...route, via };
     });
 
-    this.kernelRouter(`kernel-${id}`, {
+    this.kernelRouter(routerName, {
       host,
-      left: { ipaddrs: kernelSideAddrs },
-      right: { ipaddrs, routes: input.routes },
+      left: {
+        ipaddrs: kernelSideAddrs,
+        // The transit link's own veth pair, constructed implicitly from
+        // the enclosing ovnRouter()'s name — no config surface for it
+        // (2026-08-18). `ifaceName` is the leg that lives in this
+        // kernel router's netns (addresses/routes bind to it),
+        // `peerName` the root-side leg the transit domain's bridge
+        // attaches to. Long names here on purpose — the IFNAMSIZ-safe
+        // shortening is the lower layers' job (src/ir.ts, same as
+        // bridges' shortName).
+        ifaces: [{
+          host,
+          iface: {
+            kind: "veth",
+            ifaceName: `veth-krn-${routerName}`,
+            peerName: `veth-ovn-${routerName}`,
+          },
+        }],
+      },
+      right: { ipaddrs, routes: input.routes, ifaces: input.ifaces },
       transitDomain,
       transitPeerAddrs: ovnSideAddrs,
       routingDomains,

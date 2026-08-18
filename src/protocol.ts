@@ -162,6 +162,15 @@ export const KernelRouterData = type({
   host: "string",
   "ipaddrs?": "string[]",
   "routes?": KernelRouterRoute.array(),
+  // Real physical attachment(s) for this side — same {host, iface}
+  // shape as OvnLsInterface (iface stays `unknown`, structurally
+  // unmodeled — src/ir.ts's kernelRouterSideToIR emits the raw
+  // InterfaceKind object; see OvnLsInterface's own comment above).
+  // Present on the `right` side node today (2026-08-18 — the OVN-side
+  // endpoint keeps its own copy so the transit domain's bridge binding
+  // survives, see buildKernelRouterEndpoint); absent = bind to a dummy
+  // device.
+  "ifaces?": OvnLsInterface.array(),
 });
 export const KernelRouterNode = type({
   id: "string",

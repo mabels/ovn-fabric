@@ -99,6 +99,49 @@ class HydrateOvnLrpTest(unittest.TestCase):
             mod.hydrate_node(raw)
 
 
+class HydrateKernelRouterTest(unittest.TestCase):
+    RAW_KERNEL_ROUTER_RIGHT = {
+        "id": "kernelrouter:kernel-0|side:right",
+        "kind": "kernel.router",
+        "key": {"name": "kernel-0", "side": "right"},
+        "data": {
+            "host": "host:chassis-1",
+            "ipaddrs": ["192.168.132.93/24"],
+            "routes": [{"dst": "0.0.0.0/0", "via": "192.168.132.1"}],
+            "ifaces": [
+                {
+                    "host": "chassis-1",
+                    "iface": {"kind": "vlan", "vlanParent": "eth0", "vlanId": 2280},
+                },
+            ],
+        },
+    }
+
+    def test_right_side_ifaces_become_typed_interface_entries(self) -> None:
+        node = mod.hydrate_node(self.RAW_KERNEL_ROUTER_RIGHT)
+        self.assertIsInstance(node, pt.KernelRouterNode)
+        self.assertEqual(node.key.name, "kernel-0")
+        self.assertEqual(node.key.side, pt.Side.right)
+        self.assertEqual(len(node.data.ifaces or []), 1)
+        iface = node.data.ifaces[0]  # type: ignore[index]
+        self.assertIsInstance(iface, pt.Interface)
+        self.assertEqual(iface.host, "chassis-1")
+        # iface itself stays a plain dict — InterfaceKind isn't modeled
+        # in the cross-language protocol (see protocol.ts's own header).
+        self.assertEqual(iface.iface["kind"], "vlan")
+        self.assertEqual(iface.iface["vlanId"], 2280)
+
+    def test_ifaces_default_to_none_when_absent(self) -> None:
+        raw = {
+            **self.RAW_KERNEL_ROUTER_RIGHT,
+            "data": {
+                k: v for k, v in self.RAW_KERNEL_ROUTER_RIGHT["data"].items() if k != "ifaces"
+            },
+        }
+        node = mod.hydrate_node(raw)
+        self.assertIsNone(node.data.ifaces)
+
+
 class HydrateUnknownKindTest(unittest.TestCase):
     def test_an_unrecognized_kind_raises_a_clear_error(self) -> None:
         raw = {"id": "x:1", "kind": "net.segment", "key": {}, "data": {}}

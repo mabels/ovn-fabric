@@ -159,8 +159,14 @@ function transitPeer(
 // (kernelRouterEndpoint()'s via-filled anchor route, see that method's
 // own doc comment) — that one already points AT this kernel router
 // (i.e. it's the reason this function's caller exists at all), mirroring
-// it back onto itself would be circular. Family-matched: an IPv4 dst
-// only ever gets an IPv4 nexthop from transitPeerAddrs, same for IPv6.
+// it back onto itself would be circular. Also excludes any dst the
+// kernel router's OWN `right` side already applies (KernelRouterSide.
+// routes with a `via` — the real-world-facing routes, e.g. the WAN's
+// default) — applying a route on both sides would give the netns two
+// conflicting default routes (2026-08-18: the mirrored
+// `0.0.0.0/0 via <transit-peer>` next to the right side's real
+// `0.0.0.0/0 via <ISP>`). Family-matched: an IPv4 dst only ever gets an
+// IPv4 nexthop from transitPeerAddrs, same for IPv6.
 function kernelRouterBackRoutes(
   kernelRouter: KernelRouter,
   routers: readonly Router[],
@@ -174,12 +180,18 @@ function kernelRouterBackRoutes(
   // the same format or this exclusion silently never matches anything.
   const ownAddrs = new Set(kernelRouter.left.ipaddrs.map((a) => a.to_s()));
   const peerAddrs = kernelRouter.transitPeerAddrs ?? [];
+  const rightApplied = new Set(
+    (kernelRouter.right.routes ?? [])
+      .filter((r) => r.via !== undefined)
+      .map((r) => r.dst.to_string()),
+  );
   const routes: Array<{ dst: string; via: string }> = [];
   for (const node of routeNodes) {
     if (node.key.ovnrouter !== peer.router.name) continue;
     const nexthop = node.data.nexthop as string;
     if (ownAddrs.has(nexthop)) continue;
     const prefix = node.key.prefix as string;
+    if (rightApplied.has(prefix)) continue;
     const via = peerAddrs.find((a) => a.is_ipv4() === !prefix.includes(":"));
     if (via === undefined) continue;
     routes.push({ dst: prefix, via: via.to_s() });
@@ -210,6 +222,15 @@ function kernelRouterBackRoutes(
 // `routeNodes` is already empty for a router with no RoutingDomain
 // membership (computeRoutes/computeInterconnectRoutes are themselves
 // scoped that way), so there's nothing to mirror in that case either.
+//
+// `ifaces` — KernelRouterSide.ifaces, populated for `right` by
+// buildKernelRouterEndpoint (define.ts, 2026-08-18) — is carried onto
+// the side node so the deployer creates/moves the real interface into
+// the netns and binds addresses/routes to IT instead of a dummy stand-
+// in; a side with no `ifaces` still gets the dummy (deployer/
+// ir_to_shell.py's own _emit_kernel_router_create). `iface` stays
+// structurally unmodeled in the cross-language protocol, same as
+// ovn.ls's own entries (see protocol.ts's OvnLsInterface).
 function kernelRouterSideToIR(
   router: KernelRouter,
   side: "left" | "right",
@@ -228,6 +249,10 @@ function kernelRouterSideToIR(
     ? kernelRouterBackRoutes(router, routers, routeNodes)
     : [];
   const routes = [...(declaredRoutes ?? []), ...backRoutes];
+  const ifaces = router[side].ifaces?.map((hi) => ({
+    host: hi.host.name,
+    iface: hi.iface,
+  }));
   return {
     id,
     kind: "kernel.router",
@@ -236,6 +261,7 @@ function kernelRouterSideToIR(
       host: `host:${router.host.name}`,
       ipaddrs: addrStrings(router[side].ipaddrs),
       routes: routes.length > 0 ? routes : undefined,
+      ifaces: ifaces !== undefined && ifaces.length > 0 ? ifaces : undefined,
     },
   };
 }

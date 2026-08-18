@@ -89,6 +89,7 @@ def _hydrate_kernel_router(raw: dict) -> pt.KernelRouterNode:
     data = raw["data"]
     side = raw["key"].get("side")
     routes = data.get("routes")
+    ifaces = data.get("ifaces")
     return pt.KernelRouterNode(
         id=raw["id"],
         kind=raw["kind"],
@@ -99,9 +100,16 @@ def _hydrate_kernel_router(raw: dict) -> pt.KernelRouterNode:
         data=pt.KernelRouterData(
             host=data["host"],
             ipaddrs=data.get("ipaddrs"),
-            routes=[pt.Route(dst=r["dst"], via=r["via"]) for r in routes]
-            if routes is not None
-            else None,
+            routes=(
+                [pt.Route(dst=r["dst"], via=r["via"]) for r in routes]
+                if routes is not None
+                else None
+            ),
+            ifaces=(
+                [pt.Interface(host=e["host"], iface=e["iface"]) for e in ifaces]
+                if ifaces is not None
+                else None
+            ),
         ),
     )
 

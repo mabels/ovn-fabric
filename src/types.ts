@@ -417,14 +417,28 @@ export interface KernelRouterEndpoint extends RouterEndpointBase {
  * own for this — handled elsewhere," e.g. IPv6 RA/DHCP on the real
  * segment, not yet modeled here — src/ir.ts's kernelRouterSideToIR
  * drops those entirely rather than emitting a route with no nexthop to
- * apply. No real iface attachment yet (which physical/VLAN/WireGuard
- * device an address/route actually binds to) — deliberately deferred,
- * "iface mappings into the namespace" is its own next step (2026-08-12
- * design discussion): a dummy device stands in for now (deployer/
- * ir_to_shell.py's own _emit_kernel_router_create). */
+ * apply. `ifaces` carries the real physical attachment(s) this side's
+ * addresses/routes actually bind to (same shape as RouterEndpointBase.
+ * ifaces — see its own doc comment above) — the deployer creates/moves
+ * the interface into the netns instead of a dummy stand-in
+ * (deployer/ir_to_shell.py's own _emit_kernel_router_create). Only
+ * populated for `right` today (via NetworkBuilder.kernelRouterEndpoint(),
+ * which copies the kernelRouterEndpoint() input's `ifaces` onto this
+ * side in ADDITION to the OVN-side endpoint's own copy, 2026-08-18 —
+ * the endpoint keeps its ifaces so the transit domain still gets its
+ * localnet port/bridge binding/bridge-mapping); the `left` side's real
+ * iface binding is still its own next step. */
 export interface KernelRouterSide {
   readonly ipaddrs: readonly (IPv4 | IPv6)[];
   readonly routes?: readonly RouterEndpointRoute[];
+  /** Real physical/tunnel attachment(s) for this side — mirrors
+   * RouterEndpointBase.ifaces (types.ts): `host` is the chassis the
+   * interface actually exists on (the KernelRouter's own host in
+   * practice), `iface` is the InterfaceKind to create/move into this
+   * router's netns. A side with no `ifaces` still gets a dummy device
+   * from the deployer so its addresses/routes have something to bind
+   * to. */
+  readonly ifaces?: readonly HostInterface[];
 }
 
 /** A router whose two ports are real Linux interfaces inside ONE netns
@@ -755,7 +769,21 @@ export type InterfaceKind =
    * dummyIface()), the same IFNAMSIZ-safe convention already used for
    * every other uplink-owned kernel interface (veth-ovn-N, veth-krn-N,
    * br-up-N). See WireGuard design discussion, 2026-07-06. */
-  | { kind: "dummy" };
+  | { kind: "dummy" }
+  /** A veth pair owned by a KernelRouter's netns — the real wiring of an
+   * OVN<->kernel transit link (2026-08-18): `ifaceName` is the netns-
+   * side leg (created in root, then moved into the kernel router's
+   * netns, where that side's addresses/routes bind to it), `peerName`
+   * is the root-side leg (attached to the transit domain's OVS bridge).
+   * Constructed implicitly by NetworkBuilder.kernelRouterEndpoint()
+   * (define.ts) from the enclosing ovnRouter()'s LONG name — the
+   * IFNAMSIZ-safe shortening is the lower layers' job (src/ir.ts, same
+   * as bridges' shortName) — never declared by config authors. */
+  | {
+    kind: "veth";
+    ifaceName: string;
+    peerName: string;
+  };
 
 // ── NAT ────────────────────────────────────────────────────────────
 // Per-stack, since a segment/uplink might need v4 masquerade but not
