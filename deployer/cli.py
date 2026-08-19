@@ -14,6 +14,7 @@ import sys
 
 from protocol.hydrate import hydrate_nodes
 
+from .ir_to_python import generate_python_deployer
 from .ir_to_shell import build_scripts
 
 
@@ -34,6 +35,14 @@ def main(argv: list[str] | None = None) -> int:
         default="create",
         help="create (default, plain adds) or delete (--if-exists, cascading — see ladops/ovn.py).",
     )
+    parser.add_argument(
+        "--emit",
+        choices=["scripts", "python"],
+        default="scripts",
+        help="scripts (default): the current cluster + per-host shell-script text; "
+        "python: the all-in-one generated Python deployer (runs every pass, "
+        "pick with --action/--cluster/--host at runtime)",
+    )
     args = parser.parse_args(argv)
 
     if args.ir_path == "-":
@@ -42,6 +51,10 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.ir_path) as f:
             raw_nodes = json.load(f)
     nodes = hydrate_nodes(raw_nodes)
+
+    if args.emit == "python":
+        print(generate_python_deployer(nodes))
+        return 0
 
     cluster_script, host_scripts = build_scripts(nodes, args.action)
 

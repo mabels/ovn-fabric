@@ -18,9 +18,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import importlib
+import io
 import unittest
+from unittest import mock
 
 from protocol import generated as pt
 
@@ -535,6 +538,20 @@ class KernelRouterDeleteTest(unittest.TestCase):
             script.index("ip netns delete ns-kernel-0"),
         )
 
+    def test_moved_in_vlan_removed_from_inside_the_netns_before_teardown(self) -> None:
+        # The moved-in WAN vlan must be `ip link del`'d from INSIDE the
+        # netns BEFORE `ip netns delete` — netns teardown alone leaks a
+        # stale 8021q registration on the parent, so recreating the same
+        # vlan afterwards fails with "VLAN device already exists" (hit
+        # live 2026-08-19 on an LXC).
+        _, hosts = mod.build_scripts(NODES, "delete")
+        script = hosts["chassis-1"]
+        self.assertIn("ip netns exec ns-kernel-0 ip link delete eth0.2280", script)
+        self.assertLess(
+            script.index("ip netns exec ns-kernel-0 ip link delete eth0.2280"),
+            script.index("ip netns delete ns-kernel-0"),
+        )
+
 
 class UnsupportedIfaceKindTest(unittest.TestCase):
     def test_unsupported_kind_is_skipped_with_a_comment_not_crashed_on(self) -> None:
@@ -565,6 +582,83 @@ class InvalidActionTest(unittest.TestCase):
     def test_rejects_an_unknown_action(self) -> None:
         with self.assertRaises(ValueError):
             mod.build_scripts(NODES, "destroy")
+
+
+class GeneratePythonDeployerTest(unittest.TestCase):
+    def test_generated_file_is_valid_python(self) -> None:
+        compile(mod.generate_python_deployer(NODES), "<generated>", "exec")
+
+    def test_embedded_blocks_equal_the_shell_generator_output(self) -> None:
+        src = mod.generate_python_deployer(NODES)
+        ns: dict = {}
+        exec(src, ns)
+        create_cluster, create_hosts = mod.build_scripts(NODES, "create")
+        delete_cluster, delete_hosts = mod.build_scripts(NODES, "delete")
+        self.assertEqual(ns["CLUSTER_CREATE"], create_cluster)
+        self.assertEqual(ns["CLUSTER_DELETE"], delete_cluster)
+        self.assertEqual(ns["HOSTS"]["chassis-1"]["create"], create_hosts["chassis-1"])
+        self.assertEqual(ns["HOSTS"]["chassis-1"]["delete"], delete_hosts["chassis-1"])
+
+    def test_runtime_exposes_the_cli_selectors(self) -> None:
+        src = mod.generate_python_deployer(NODES)
+        for marker in (
+            "--action",
+            "--cluster",
+            "--host",
+            "--verbose",
+            "def run_block",
+            "argparse.ArgumentParser",
+            'choices=["create", "delete"]',
+        ):
+            self.assertIn(marker, src)
+
+    def test_run_block_warns_for_delete_and_aborts_for_create(self) -> None:
+        ns: dict = {}
+        exec(mod.generate_python_deployer(NODES), ns)
+        run_block = ns["run_block"]
+        stderr = io.StringIO()
+        # delete: a failing command warns and the pass continues.
+        with contextlib.redirect_stderr(stderr):
+            run_block("host", "# comment\nfalse\n", False, False)
+        self.assertIn("warning: failed in host", stderr.getvalue())
+        # create: the same command aborts the pass.
+        with self.assertRaises(SystemExit) as ctx:
+            with contextlib.redirect_stderr(stderr):
+                run_block("host", "# comment\nfalse\n", False, True)
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("error: failed in host", stderr.getvalue())
+
+    def test_run_block_skips_comments_and_the_set_envelope(self) -> None:
+        ns: dict = {}
+        exec(mod.generate_python_deployer(NODES), ns)
+        stderr = io.StringIO()
+        # "set -eu"/"set -u" are the block's own envelope, not commands
+        # for a subprocess (no `set` binary) — skipped like comments.
+        with contextlib.redirect_stderr(stderr):
+            ns["run_block"]("host", "#!/bin/sh\nset -eu\n# --- comment ---\n", False, False)
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_run_block_verbose_echoes_every_command(self) -> None:
+        ns: dict = {}
+        exec(mod.generate_python_deployer(NODES), ns)
+        stdout = io.StringIO()
+        with contextlib.redirect_stdout(stdout):
+            ns["run_block"]("host", "# c\ntrue\nfalse\n", True, False)
+        self.assertIn("host$ true", stdout.getvalue())
+        self.assertIn("host$ false", stdout.getvalue())
+        self.assertNotIn("host$ # c", stdout.getvalue())
+
+    def test_run_block_missing_binary_warns_not_crashes(self) -> None:
+        ns: dict = {}
+        exec(mod.generate_python_deployer(NODES), ns)
+        stderr = io.StringIO()
+        with mock.patch(
+            "subprocess.run",
+            side_effect=FileNotFoundError(2, "No such file or directory", "ovn-nbctl"),
+        ):
+            with contextlib.redirect_stderr(stderr):
+                ns["run_block"]("host", "ovn-nbctl ls-add home\n", False, False)
+        self.assertIn("warning: cannot run in host", stderr.getvalue())
 
 
 if __name__ == "__main__":
