@@ -301,7 +301,11 @@ def _emit_cluster_script(nodes: list[pt.Model], action: Action) -> str:
         "# this action (i.e. diffing against live state) is the",
         "# reconciler's job, not this script's — this is one blunt",
         f"# {action}-everything pass.",
-        "set -eu",
+        # A delete pass runs against whatever state IS there — a
+        # missing object is expected, not fatal — so it drops `-e` and
+        # keeps going past any failing command (2026-08-18). Create
+        # keeps `set -eu`: a failed create really is an error.
+        "set -u" if action == "delete" else "set -eu",
         "",
     ]
 
@@ -396,6 +400,26 @@ def _emit_kernel_router_create(host_id: str, nodes: list[pt.Model]) -> list[str]
         netns = _netns_name(owner.key.name)
         lines.append(f"# --- kernel netns: {netns} ({owner.key.name}) ---")
         lines.append(_sh(netns_ops.add_netns_argv(netns)))
+        # A kernel router IS a router: Linux won't forward between its
+        # two sides until the netns's own forwarding knobs say so, per
+        # family (2026-08-19).
+        lines.append("# kernel router: enable IPv4/IPv6 forwarding in the netns")
+        lines.append(
+            _sh(
+                netns_ops.netns_exec_argv(
+                    linux_net_ops.set_sysctl_argv("net.ipv4.ip_forward", "1"),
+                    netns,
+                )
+            )
+        )
+        lines.append(
+            _sh(
+                netns_ops.netns_exec_argv(
+                    linux_net_ops.set_sysctl_argv("net.ipv6.conf.all.forwarding", "1"),
+                    netns,
+                )
+            )
+        )
         for side_node in _kernel_router_sides(owner.key.name, nodes):
             iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
             if iface is not None and iface.get("kind") not in _BINDABLE_IFACE_KINDS:
@@ -409,14 +433,19 @@ def _emit_kernel_router_create(host_id: str, nodes: list[pt.Model]) -> list[str]
                 # The netns-side leg — `peerName` is the root-side leg
                 # the transit domain's bridge attaches to (see
                 # _emit_iface_bindings_create, which runs after this
-                # block and finds the pair already created here).
-                dev = iface["ifaceName"]
+                # block and finds the pair already created here). The
+                # real device names come from the IFNAMSIZ-safe
+                # `shortName` (src/ir.ts's kernelRouterSideToIR), not
+                # the long `ifaceName`/`peerName` the model carries.
+                dev = f"veth-krn-{iface['shortName']}"
+                peer = f"veth-ovn-{iface['shortName']}"
             else:
                 dev = (
                     _iface_real_name(iface)
                     if iface is not None
                     else _dummy_name(side_node.key.side)
                 )
+                peer = None
             lines.append(
                 f"# --- kernel router side: {owner.key.name} ({side_node.key.side.value}) ---"
             )
@@ -426,9 +455,7 @@ def _emit_kernel_router_create(host_id: str, nodes: list[pt.Model]) -> list[str]
                         _sh(linux_net_ops.add_vlan_argv(iface["vlanParent"], dev, iface["vlanId"]))
                     )
                 elif iface["kind"] == "veth":
-                    lines.append(
-                        _sh(linux_net_ops.add_veth_argv(iface["peerName"], iface["ifaceName"]))
-                    )
+                    lines.append(_sh(linux_net_ops.add_veth_argv(peer, dev)))
                 # "physical": the device must already exist in the root
                 # namespace — nothing to create, only the move below.
             else:
@@ -446,19 +473,27 @@ def _emit_kernel_router_create(host_id: str, nodes: list[pt.Model]) -> list[str]
     return lines
 
 
-# Deletion stays just "delete the netns" — every dummy device/address/
-# route created above lives INSIDE it by the time this runs (moved in,
-# not left in global) and is destroyed along with it — `ip netns
+# Deletion is "delete the netns, then the transit veth's ROOT-side leg":
+# every device the create block placed INSIDE the netns (moved-in vlan,
+# the veth's netns-side leg) is destroyed along with it — `ip netns
 # delete` tears down every device currently inside a namespace
 # regardless of whether it was created there or moved in later, same
-# reasoning ovn-nbctl's own cascading
-# del- commands already rely on elsewhere in this module.
+# reasoning ovn-nbctl's own cascading del- commands already rely on
+# elsewhere in this module. The veth's ROOT-side leg lives in the global
+# namespace, so it is removed explicitly (2026-08-19: create adds it,
+# delete must remove it).
 def _emit_kernel_router_delete(host_id: str, nodes: list[pt.Model]) -> list[str]:
     lines: list[str] = []
     for owner in _kernel_router_owners(host_id, nodes):
         netns = _netns_name(owner.key.name)
         lines.append(f"# --- kernel netns: {netns} ({owner.key.name}) ---")
         lines.append(_sh(netns_ops.delete_netns_argv(netns)))
+        for side_node in _kernel_router_sides(owner.key.name, nodes):
+            iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
+            if iface is not None and iface["kind"] == "veth":
+                root_leg = f"veth-ovn-{iface['shortName']}"
+                lines.append(f"# --- kernel router transit veth: remove root leg {root_leg} ---")
+                lines.append(_sh(linux_net_ops.delete_link_argv(root_leg)))
     if lines:
         lines.append("")
     return lines
@@ -488,6 +523,14 @@ def _emit_iface_bindings_create(host_name: str, nodes: list[pt.Model]) -> list[s
             lines.append(
                 _sh(linux_net_ops.add_vlan_argv(iface["vlanParent"], real_name, iface["vlanId"]))
             )
+            lines.append(_sh(linux_net_ops.set_link_up_argv(real_name)))
+        elif iface["kind"] == "veth":
+            # The ROOT-side leg of the kernel router's transit veth — the
+            # kernel router block brings the netns-side leg up, but the
+            # peer stays DOWN in root until told otherwise (confirmed
+            # live, 2026-08-19: `ip l | grep 9adb1d` showed state DOWN
+            # until `ip l set dev veth-ovn-... up`), so bring it up
+            # before it becomes the bridge's port.
             lines.append(_sh(linux_net_ops.set_link_up_argv(real_name)))
         lines.append(_sh(ovs_ops.add_br_argv(bridge)))
         lines.append(_sh(ovs_ops.set_bridge_fail_mode_argv(bridge)))
@@ -579,8 +622,14 @@ def _emit_host_delete(host_node: pt.InfraHostNode, nodes: list[pt.Model]) -> lis
         lines.append(_sh(ovs_ops.remove_external_id_argv("ovn-cms-options")))
 
     lines.append("")
-    lines.extend(_emit_iface_bindings_delete(host_name, nodes))
+    # The kernel router's netns is removed FIRST — every device it owns
+    # (the transit veth's netns leg, the moved-in WAN vlan) lives inside
+    # it and dies with it; only then do the root-namespace bindings
+    # (bridges, host-level vlan subinterfaces) get torn down. Deleting
+    # the other way round would `ip link delete` a device that's still
+    # in the netns (2026-08-18).
     lines.extend(_emit_kernel_router_delete(host_node.id, nodes))
+    lines.extend(_emit_iface_bindings_delete(host_name, nodes))
 
     return lines
 
@@ -598,7 +647,9 @@ def _emit_host_script(host_node: pt.InfraHostNode, nodes: list[pt.Model], action
         f"# (action={action}) — run ON this host directly, not against",
         "# the cluster script's target. Generated by",
         "# deployer/ir_to_shell.py.",
-        "set -eu",
+        # Same delete-vs-create rule as _emit_cluster_script: a delete
+        # pass must not abort on a missing object (2026-08-18).
+        "set -u" if action == "delete" else "set -eu",
         "",
         *body,
     ]

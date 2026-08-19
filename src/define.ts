@@ -11,6 +11,7 @@ import {
   FixedUplink,
   type Host,
   type HostAddress,
+  type InterfaceKind,
   type KernelRouter,
   type KernelRouterEndpoint,
   type KernelRouterSide,
@@ -414,14 +415,12 @@ export class NetworkBuilder {
    * securityGroup, services, routes) carries straight through to the
    * returned OvnRouterEndpoint, symmetric with ovnRouterEndpoint()
    * above taking `Omit<OvnRouterEndpoint, "kind">`. `ifaces` is the
-   * exception that lands in BOTH places (2026-08-18): it also goes
-   * onto the paired KernelRouter's `right` (KernelRouterSide.ifaces,
-   * types.ts), where the deployer creates/moves that interface into the
-   * netns instead of a dummy stand-in — WITHOUT being removed from the
-   * returned OVN-side endpoint, which keeps its own copy so the transit
-   * domain still gets its localnet port, gateway-chassis pin, bridge
-   * binding and ovn-bridge-mappings entry ("get the half done thing
-   * back", 2026-08-18). `routes` in
+   * exception that lands ONLY on the paired KernelRouter's `right`
+   * (KernelRouterSide.ifaces, types.ts — the real-world-facing
+   * interface the deployer moves into the netns). The transit domain
+   * still gets its localnet port/gateway-chassis pin/bridge binding/
+   * bridge-mapping from the returned OVN endpoint's OWN ifaces, which
+   * are the transit veth (constructed explicitly here, 2026-08-18). `routes` in
    * particular matters here: the returned endpoint is a real
    * OvnRouterEndpoint, and it's frequently the RoutingDomain anchor
    * (e.g. a real ISP default route) despite being kernel-backed, so it
@@ -454,7 +453,7 @@ export class NetworkBuilder {
     routingDomains: readonly RoutingDomain[] | undefined,
     routerName: string,
   ): OvnRouterEndpoint {
-    const { transit: link, host, ipaddrs, ...rest } = input;
+    const { transit: link, host, ipaddrs, ifaces, ...rest } = input;
     const transitDomain = this.collisionDomain(`transit-${routerName}`);
     const ovnSideAddrs = [link.left.ipv4, link.left.ipv6]
       .filter((a): a is IPv4 | IPv6 => a !== undefined);
@@ -482,6 +481,20 @@ export class NetworkBuilder {
       return { ...route, via };
     });
 
+    // The transit link's own veth pair — the OVN-side endpoint on the
+    // transit network (.first() side) carries it EXPLICITLY, so the
+    // transit ovn.ls keeps its bridge binding (localnet port, gateway
+    // chassis, ovn-bridge-mappings) from the endpoint's ifaces, the
+    // same source every other domain uses — no ir.ts backfill (2026-08-
+    // 18). LONG names here on purpose — the IFNAMSIZ-safe shortening is
+    // the lower layers' job (src/ir.ts's kernelRouterSideToIR and
+    // collisionDomainToIR, same as bridges' shortName).
+    const transitVeth: InterfaceKind = {
+      kind: "veth",
+      ifaceName: `veth-krn-${routerName}`,
+      peerName: `veth-ovn-${routerName}`,
+    };
+
     this.kernelRouter(routerName, {
       host,
       left: {
@@ -491,19 +504,10 @@ export class NetworkBuilder {
         // (2026-08-18). `ifaceName` is the leg that lives in this
         // kernel router's netns (addresses/routes bind to it),
         // `peerName` the root-side leg the transit domain's bridge
-        // attaches to. Long names here on purpose — the IFNAMSIZ-safe
-        // shortening is the lower layers' job (src/ir.ts, same as
-        // bridges' shortName).
-        ifaces: [{
-          host,
-          iface: {
-            kind: "veth",
-            ifaceName: `veth-krn-${routerName}`,
-            peerName: `veth-ovn-${routerName}`,
-          },
-        }],
+        // attaches to.
+        ifaces: [{ host, iface: transitVeth }],
       },
-      right: { ipaddrs, routes: input.routes, ifaces: input.ifaces },
+      right: { ipaddrs, routes: input.routes, ifaces },
       transitDomain,
       transitPeerAddrs: ovnSideAddrs,
       routingDomains,
@@ -514,6 +518,7 @@ export class NetworkBuilder {
       routes: ovnSideRoutes,
       l2Segment: transitDomain,
       ipaddrs: [...ipaddrs, ...ovnSideAddrs],
+      ifaces: [{ host, iface: transitVeth }],
     });
   }
 

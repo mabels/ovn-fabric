@@ -248,6 +248,40 @@ class IfaceBindingCreateTest(unittest.TestCase):
         self.assertIn("ovs-vsctl set bridge br-home fail-mode=standalone", script)
         self.assertIn("ovs-vsctl add-port br-home eth0.129", script)
 
+    def test_veth_root_leg_brought_up_before_joining_the_bridge(self) -> None:
+        # A transit domain's ovn.ls carries the veth pair; the kernel
+        # router block brings the netns-side leg up, but the ROOT leg
+        # stays DOWN until told otherwise (confirmed live, 2026-08-19) —
+        # so the binding block brings it up before it becomes a bridge
+        # port.
+        nodes = NODES + [
+            pt.OvnLsNode(
+                id="ls:transit-router-wan",
+                kind="ovn.ls",
+                key=pt.OvnLsKey(name="transit-router-wan"),
+                data=pt.OvnLsData(
+                    interfaces=[
+                        pt.Interface(
+                            host="chassis-1",
+                            iface={
+                                "kind": "veth",
+                                "ifaceName": "veth-krn-9adb1d",
+                                "peerName": "veth-ovn-9adb1d",
+                                "shortName": "br-1f5b95ad",
+                            },
+                        ),
+                    ],
+                ),
+            ),
+        ]
+        _, hosts = mod.build_scripts(nodes, "create")
+        script = hosts["chassis-1"]
+        self.assertIn("ip link set veth-ovn-9adb1d up", script)
+        self.assertLess(
+            script.index("ip link set veth-ovn-9adb1d up"),
+            script.index("ovs-vsctl add-port br-1f5b95ad veth-ovn-9adb1d"),
+        )
+
     def test_bridge_mapping_set_on_the_owning_host(self) -> None:
         self.assertIn("external-ids:ovn-bridge-mappings=net-home:br-home", self.hosts["chassis-1"])
 
@@ -321,6 +355,21 @@ class KernelRouterCreateTest(unittest.TestCase):
     def test_netns_created_once_on_the_owning_host(self) -> None:
         script = self.hosts["chassis-1"]
         self.assertEqual(script.count("ip netns add ns-kernel-0"), 1)
+
+    def test_ipv4_and_ipv6_forwarding_enabled_in_the_netns(self) -> None:
+        # A kernel router IS a router — the netns's own forwarding knobs
+        # are what make Linux actually forward between its two sides
+        # (2026-08-19).
+        script = self.hosts["chassis-1"]
+        self.assertIn("ip netns exec ns-kernel-0 sysctl -w net.ipv4.ip_forward=1", script)
+        self.assertIn(
+            "ip netns exec ns-kernel-0 sysctl -w net.ipv6.conf.all.forwarding=1",
+            script,
+        )
+        self.assertLess(
+            script.index("ip netns exec ns-kernel-0 sysctl -w net.ipv4.ip_forward=1"),
+            script.index("ip link add dummy-left type dummy"),
+        )
 
     def test_no_kernel_router_content_on_a_different_host(self) -> None:
         script = self.hosts["central-1"]
@@ -408,6 +457,7 @@ class KernelRouterCreateTest(unittest.TestCase):
                                     "kind": "veth",
                                     "ifaceName": "veth-krn-0",
                                     "peerName": "veth-ovn-0",
+                                    "shortName": "0",
                                 },
                             ),
                         ],
@@ -435,6 +485,55 @@ class KernelRouterDeleteTest(unittest.TestCase):
         self.assertNotIn("dummy-", script)
         self.assertNotIn("ip addr", script)
         self.assertNotIn("ip route", script)
+
+    def test_netns_removed_before_the_root_interface_bindings(self) -> None:
+        # The netns owns the kernel router's devices (moved-in vlan/veth
+        # legs), so it is torn down BEFORE the root-namespace binding
+        # deletes run — otherwise `ip link delete` would target a device
+        # still living inside the netns (2026-08-18).
+        _, hosts = mod.build_scripts(NODES, "delete")
+        script = hosts["chassis-1"]
+        self.assertGreater(
+            script.index("ip link delete eth0.129"),
+            script.index("ip netns delete ns-kernel-0"),
+        )
+
+    def test_veth_root_leg_removed_in_delete(self) -> None:
+        # create adds the transit veth's ROOT-side leg in the global
+        # namespace; delete must remove it explicitly, after the netns
+        # (which destroyed the netns-side leg) is gone (2026-08-19).
+        nodes = [
+            (
+                dataclasses.replace(
+                    n,
+                    data=pt.KernelRouterData(
+                        host="host:chassis-1",
+                        ipaddrs=["10.99.0.2/28"],
+                        ifaces=[
+                            pt.Interface(
+                                host="chassis-1",
+                                iface={
+                                    "kind": "veth",
+                                    "ifaceName": "veth-krn-0",
+                                    "peerName": "veth-ovn-0",
+                                    "shortName": "0",
+                                },
+                            ),
+                        ],
+                    ),
+                )
+                if n.kind == "kernel.router" and n.key.side == pt.Side.left
+                else n
+            )
+            for n in NODES
+        ]
+        _, hosts = mod.build_scripts(nodes, "delete")
+        script = hosts["chassis-1"]
+        self.assertIn("ip link delete veth-ovn-0", script)
+        self.assertGreater(
+            script.index("ip link delete veth-ovn-0"),
+            script.index("ip netns delete ns-kernel-0"),
+        )
 
 
 class UnsupportedIfaceKindTest(unittest.TestCase):

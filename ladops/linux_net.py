@@ -168,6 +168,15 @@ def set_link_up_argv(name: str) -> list[str]:
     return ["ip", "link", "set", name, "up"]
 
 
+# Set a sysctl knob in place — used to enable IPv4/IPv6 forwarding inside
+# a KernelRouter's netns (deployer/ir_to_shell.py's _emit_kernel_router_
+# create): a kernel router IS a router, and Linux won't forward between
+# its two sides until `net.ipv4.ip_forward`/`net.ipv6.conf.all.forwarding`
+# say so (2026-08-19).
+def set_sysctl_argv(key: str, value: str) -> list[str]:
+    return ["sysctl", "-w", f"{key}={value}"]
+
+
 def delete_link_argv(name: str) -> list[str]:
     return ["ip", "link", "delete", name]
 

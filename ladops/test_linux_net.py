@@ -235,6 +235,12 @@ class DummyArgvTest(unittest.TestCase):
             ["ip", "link", "add", "dummy-left", "type", "dummy"],
         )
 
+    def test_set_sysctl_argv_builds_the_real_sysctl_command(self) -> None:
+        self.assertEqual(
+            mod.set_sysctl_argv("net.ipv4.ip_forward", "1"),
+            ["sysctl", "-w", "net.ipv4.ip_forward=1"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

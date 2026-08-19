@@ -249,10 +249,24 @@ function kernelRouterSideToIR(
     ? kernelRouterBackRoutes(router, routers, routeNodes)
     : [];
   const routes = [...(declaredRoutes ?? []), ...backRoutes];
-  const ifaces = router[side].ifaces?.map((hi) => ({
-    host: hi.host.name,
-    iface: hi.iface,
-  }));
+  // `ifaces` — KernelRouterSide.ifaces — mirrored to the side node. A
+  // "veth" entry additionally carries a `shortName` (the same
+  // convention every other interface's `iface` uses, e.g. ovn.ls's
+  // bridges): buildKernelRouterEndpoint emits LONG leg names
+  // (`veth-krn-<routerName>`), which exceed IFNAMSIZ for a real
+  // device name, so the readable-when-it-fits/else-deterministic-hash
+  // suffix is resolved HERE and the deployer builds the real pair
+  // (`veth-krn-<shortName>`/`veth-ovn-<shortName>`) from it
+  // (deployer/ir_to_shell.py's _emit_kernel_router_create) — same
+  // "generator computes the final name" boundary as shortIfaceName.
+  const ifaces = router[side].ifaces?.map((hi) => {
+    const iface = hi.iface;
+    if (iface.kind !== "veth") return { host: hi.host.name, iface };
+    return {
+      host: hi.host.name,
+      iface: { ...iface, shortName: vethShortId(iface.ifaceName) },
+    };
+  });
   return {
     id,
     kind: "kernel.router",
@@ -272,6 +286,21 @@ function kernelRouterSideToIR(
 // "Invalid argument" on a real container while "br-voda-avm-v2" (14
 // chars) right next to it succeeded.
 const IFNAMSIZ_MAX = 15;
+
+// The IFNAMSIZ-safe suffix for a veth pair's legs, resolved HERE (the
+// generator layer — deliberately NOT in define.ts, 2026-08-18): readable
+// when the long `veth-krn-<name>` leg fits, else a deterministic 6-hex
+// fnv1a32 of the name. The same id feeds both legs so the pair stays
+// matched, and it's shared by kernelRouterSideToIR (the netns-side
+// copy, via `shortName`) and collisionDomainToIR (the transit ovn.ls
+// copy, which renames the legs directly so the bridge binding attaches
+// the actual created devices).
+function vethShortId(ifaceName: string): string {
+  const name = ifaceName.replace(/^veth-krn-/, "");
+  return ifaceName.length <= IFNAMSIZ_MAX
+    ? name
+    : fnv1a32(name).toString(16).padStart(8, "0").slice(0, 6);
+}
 
 // Readable (`${prefix}${name}`) whenever it fits; only falls back to a
 // short deterministic hash (fnv1a32, addressing.ts) when it doesn't.
@@ -323,9 +352,28 @@ function collisionDomainToIR(
         continue;
       }
       for (const hi of endpoint.ifaces ?? []) {
+        if (hi.iface.kind !== "veth") {
+          interfaces.push({
+            host: hi.host.name,
+            iface: { ...hi.iface, shortName },
+          });
+          continue;
+        }
+        // A veth on a transit domain: buildKernelRouterEndpoint stamps
+        // LONG leg names on the endpoint; the deployer's binding
+        // emitter attaches `peerName` to the bridge, so the legs are
+        // shortened HERE to the same id kernelRouterSideToIR resolves
+        // for the netns-side pair (vethShortId above) — otherwise the
+        // bridge would be given a >IFNAMSIZ device name (2026-08-18).
+        const id = vethShortId(hi.iface.ifaceName);
         interfaces.push({
           host: hi.host.name,
-          iface: { ...hi.iface, shortName },
+          iface: {
+            ...hi.iface,
+            ifaceName: `veth-krn-${id}`,
+            peerName: `veth-ovn-${id}`,
+            shortName,
+          },
         });
       }
     }
