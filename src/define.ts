@@ -425,20 +425,25 @@ export class NetworkBuilder {
    * OvnRouterEndpoint, and it's frequently the RoutingDomain anchor
    * (e.g. a real ISP default route) despite being kernel-backed, so it
    * needs the same `.routes` a hand-declared OvnRouterEndpoint would
-   * (RouterEndpointRoute, types.ts) — EXCEPT that a route left with no
-   * `via` here does NOT mean "handled elsewhere" the way it does on a
-   * hand-declared (client-facing) endpoint (RouterEndpointRoute's own
-   * doc comment: "e.g. SLAAC/RA on a client-facing segment... or an
-   * existing less-specific route already covering it there") — there is
-   * no SLAAC/RA on a transit link, so a kernel-backed anchor's own
-   * literal route would simply never be emitted at all (confirmed live,
-   * 2026-08-12: router-voda-avm-v2 got every OTHER router's routes
-   * rewritten to point at it, but no `0.0.0.0/0`/`::/0` of its own —
-   * nowhere for that traffic to go once it arrived). The ONLY way out
-   * via a kernel-backed endpoint is through its own paired KernelRouter,
-   * so a `via`-less route here is filled in with `link.right` (the
-   * KernelRouter's own transit-facing address, matching `route.dst`'s
-   * family) INSTEAD of being left for computeRoutes (src/ir.ts) to skip.
+   * (RouterEndpointRoute, types.ts) — EXCEPT that a route's `via` is
+   * ALWAYS rewritten to the paired KernelRouter's transit-facing
+   * address here, regardless of whether the config author declared one.
+   * The OVN side of a transit link has exactly ONE reachable peer — the
+   * paired KernelRouter — so a literal `via` (e.g. the real ISP gateway
+   * 192.168.132.1 in the voda-avm config) is a fact about the kernel
+   * netns's WAN side, not about anything OVN can ARP on the transit
+   * link: keeping it made the OVN logical router believe
+   * 192.168.132.0/24 was directly connected on the transit port and
+   * emit ARP requests for its WAN gateway out the transit veth
+   * (confirmed live, 2026-08-21). This also supersedes the "via-less
+   * means handled elsewhere" reading a client-facing endpoint gives a
+   * route (RouterEndpointRoute's own doc comment: "e.g. SLAAC/RA on a
+   * client-facing segment... or an existing less-specific route already
+   * covering it there") — there is no SLAAC/RA on a transit link, so no
+   * route declared here may be left for computeRoutes (src/ir.ts) to
+   * skip. The literal `via` is NOT lost: `input.routes` lands
+   * unmodified on the KernelRouter's own `right` side (below), where
+   * the kernel netns applies it as its own real default gateway.
    *
 
    * `routingDomains` isn't part of `input` — it's whatever the
@@ -463,19 +468,27 @@ export class NetworkBuilder {
     // `routes` also lands on the KernelRouter's own right side (the
     // real-world-facing one, see KernelRouterSide's own doc comment) —
     // it's a physical fact about that real device's own routing table,
-    // not just the OVN logical router's — UNMODIFIED (kernelSideRoutes
-    // below is a separate, via-filled-in copy for the OVN side only;
+    // not just the OVN logical router's — UNMODIFIED (ovnSideRoutes
+    // above is a separate, via-rewritten copy for the OVN side only;
     // the kernel netns's own real gateway, e.g. the actual ISP address,
-    // is a different fact that a via-less entry here still doesn't
-    // supply — that's its own separate mechanism, not yet built).
+    // is a different fact that belongs on the kernel side of the
+    // transit link, exactly where the unmodified copy keeps it).
     const ovnSideRoutes = input.routes?.map((route) => {
-      if (route.via !== undefined) return route;
+      // The OVN side of a transit link has exactly ONE reachable peer —
+      // the paired KernelRouter — so every route declared on this
+      // endpoint is rewritten to point at the kernel router's OWN
+      // transit-facing address, regardless of whether the config author
+      // declared a literal `via` (e.g. the real ISP gateway). A literal
+      // `via` is a fact about the kernel netns's WAN side, not about
+      // anything OVN can reach on the transit link (confirmed live,
+      // 2026-08-21: keeping 192.168.132.1 made the OVN logical router
+      // ARP for its WAN gateway out the transit veth).
       const via = route.dst.is_ipv4() ? link.right.ipv4 : link.right.ipv6;
       if (via === undefined) {
         throw new Error(
           `kernelRouterEndpoint: route to ${route.dst.to_string()} has ` +
-            `no via, and the transit link has no matching-family ` +
-            `kernel-side address to imply one from`,
+            `no matching-family kernel-side address on the transit link ` +
+            `to route via`,
         );
       }
       return { ...route, via };
@@ -517,7 +530,14 @@ export class NetworkBuilder {
       ...rest,
       routes: ovnSideRoutes,
       l2Segment: transitDomain,
-      ipaddrs: [...ipaddrs, ...ovnSideAddrs],
+      // Only the transit-side addresses live on the OVN port: `ipaddrs`
+      // (the real-world-facing ones, e.g. 192.168.132.93/24) belong to
+      // the kernel netns's OWN interface (KernelRouterSide.right above),
+      // not to the OVN side of the transit link. Putting them here made
+      // OVN treat the WAN subnet as directly connected on the transit
+      // port and ARP for the WAN gateway out the transit veth
+      // (confirmed live, 2026-08-21).
+      ipaddrs: ovnSideAddrs,
       ifaces: [{ host, iface: transitVeth }],
     });
   }

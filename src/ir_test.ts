@@ -157,3 +157,63 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
     },
   ]);
 });
+
+// buildKernelRouterEndpoint must NOT put the WAN-facing `ipaddrs` on the
+// OVN side of the transit link (they belong on the KernelRouter's own
+// `right`, the kernel netns's real interface), and it must rewrite every
+// declared route's `via` to the paired KernelRouter's transit-side
+// address — a literal `via` (e.g. the real ISP gateway) is only
+// reachable from the kernel netns, never from OVN's side of the transit
+// link (confirmed live, 2026-08-21: keeping 192.168.132.1 on the OVN
+// router made it ARP for its WAN gateway out the transit veth).
+Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes via the kernel router", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const backbone = net.collisionDomain("backbone");
+    const domain = net.routingDomain("test-domain");
+    net.ovnRouter("router-wan", (router) => {
+      router.routingDomains = [domain];
+      router.left = router.kernelRouterEndpoint({
+        host,
+        transit: transitNetwork(
+          IPv4.parse("10.12.80.1/28"),
+          IPv6.parse("fd00::10:12:80:1/124"),
+        ),
+        ipaddrs: [IPv4.parse("192.168.132.93/24")],
+        routes: [
+          { dst: IPv4.parse("0.0.0.0/0"), via: IPv4.parse("192.168.132.1") },
+          { dst: IPv6.parse("::/0") },
+        ],
+        ifaces: [
+          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
+        ],
+      });
+      router.right = router.ovnRouterEndpoint({
+        l2Segment: backbone,
+        ipaddrs: [IPv4.parse("172.22.12.80/16")],
+      });
+    });
+  });
+
+  const nodes = toIR(network);
+
+  // OVN side of the transit link: transit addresses only — the WAN
+  // 192.168.132.93/24 must not be here, it lives on the kernel router's
+  // own `right` (asserted by the sibling test above).
+  const leftLrp = nodes["ovnrouter:router-wan|lrp:left"];
+  assertEquals(leftLrp.data.addresses, [
+    "10.12.80.1/28",
+    "fd00::10:12:80:1/124",
+  ]);
+
+  // Both default routes point at the kernel router's transit side, even
+  // though the v4 one was declared with a literal ISP `via`.
+  assertEquals(
+    nodes["ovnrouter:router-wan|route:0.0.0.0/0"].data.nexthop,
+    "10.12.80.14",
+  );
+  assertEquals(
+    nodes["ovnrouter:router-wan|route:::/0"].data.nexthop,
+    "fd00::10:12:80:f",
+  );
+});
