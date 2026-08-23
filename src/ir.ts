@@ -42,8 +42,8 @@ import type {
   KernelRouter,
   OvnRouterEndpoint,
   Router,
-  RouterEndpoint,
   RouterEndpointService,
+  RoutingDomain,
   SecurityGroup,
 } from "./types.ts";
 import type { NetworkDefinition } from "./define.ts";
@@ -59,7 +59,7 @@ export interface IRNode {
 // address — not NetId[] (see RouterEndpoint, types.ts: a router
 // endpoint has no segment/uplink id for NetId's id()/vlan() to report).
 // to_string() (not to_s()) is the one that includes the prefix length.
-function addrStrings(ipaddrs: RouterEndpoint["ipaddrs"]): string[] {
+function addrStrings(ipaddrs: OvnRouterEndpoint["ipaddrs"]): string[] {
   return ipaddrs.map((addr) => addr.to_string());
 }
 
@@ -185,6 +185,16 @@ function kernelRouterBackRoutes(
   // the same format or this exclusion silently never matches anything.
   const ownAddrs = new Set(kernelRouter.left.ipaddrs.map((a) => a.to_s()));
   const peerAddrs = kernelRouter.transitPeerAddrs ?? [];
+  // Scope the mirrored routes to the KernelRouter's OWN RoutingDomains
+  // (the domain its left endpoint anchors — e.g. a tunnelRouterEndpoint's
+  // Neighbor-defaultRoute). Every route node carries `data.domain`, so
+  // this keeps each tunnel's netns knowing only ITS OWN segment's
+  // subnets (mullvad-de -> 192.168.130.0/24, mullvad-us -> 192.168.131.0/24)
+  // instead of the whole mesh — the whole point of having two separate
+  // domains (2026-08-23).
+  const ownDomains = new Set(
+    (kernelRouter.routingDomains ?? []).map((d) => d.name),
+  );
   const rightApplied = new Set(
     (kernelRouter.right.routes ?? [])
       .filter((r) => r.via !== undefined)
@@ -193,6 +203,7 @@ function kernelRouterBackRoutes(
   const routes: Array<{ dst: string; via: string }> = [];
   for (const node of routeNodes) {
     if (node.key.ovnrouter !== peer.router.name) continue;
+    if (!ownDomains.has(node.data.domain as string)) continue;
     const nexthop = node.data.nexthop as string;
     if (ownAddrs.has(nexthop)) continue;
     const prefix = node.key.prefix as string;
@@ -281,6 +292,16 @@ function kernelRouterSideToIR(
       ipaddrs: addrStrings(router[side].ipaddrs),
       routes: routes.length > 0 ? routes : undefined,
       ifaces: ifaces !== undefined && ifaces.length > 0 ? ifaces : undefined,
+      // The tunnel router's UPSTREAM peer address (tunnelRouterEndpoint(),
+      // define.ts) — the OTHER end of the upstream veth (right side only):
+      // the deployer brings that peer leg UP and assigns it this address
+      // in the root namespace (the tunnel netns's default route points at
+      // it via the right side's routes; without a live peer the leg stays
+      // LOWERLAYERDOWN and the default is `linkdown`, confirmed live
+      // 2026-08-23).
+      upstreamPeerAddrs: side === "right"
+        ? addrStrings(router.upstreamPeerAddrs ?? [])
+        : undefined,
       // The security group attached to THIS side's interface (right
       // side only in practice — set by buildKernelRouterEndpoint,
       // define.ts). Carried here as the generic `security.group` node's
@@ -293,7 +314,17 @@ function kernelRouterSideToIR(
       // services resolved in buildKernelRouterEndpoint, define.ts). The
       // deployer turns each into its `ip netns exec` service script,
       // and stops/releases it on delete.
-      apps: router[side].apps,
+      apps: router[side].apps?.map((app) => {
+        // The docker app's veth pair needs SHORT, collision-free device
+        // names (IFNAMSIZ ≤ 15): `ve-<hash>` / `ve-<hash>-c` derived
+        // from the container name — same rule shortIfaceName applies
+        // everywhere else in this file.
+        if (app.kind === "docker") {
+          const hash = fnv1a32(app.name).toString(16).padStart(8, "0");
+          return { ...app, vethName: `ve-${hash}` };
+        }
+        return app;
+      }),
     },
   };
 }
@@ -446,7 +477,7 @@ function collisionDomainToIR(
 // (types.ts): explicit override wins outright, else fold the first
 // IPv4 in ipaddrs — required to exist as one or the other, since an
 // LRP with no mac at all can't be created.
-function resolveMac(lrp: string, endpoint: RouterEndpoint): string {
+function resolveMac(lrp: string, endpoint: OvnRouterEndpoint): string {
   if (endpoint.mac !== undefined) return endpoint.mac;
   const v4 = endpoint.ipaddrs.find((addr): addr is IPv4 => addr.is_ipv4());
   if (v4 === undefined) {
@@ -611,7 +642,7 @@ function isSameFamily(a: IPv4 | IPv6, b: IPv4 | IPv6): boolean {
 // computeRoutes/computeInterconnectRoutes are all OVN-world concepts
 // today; a kernel endpoint's own reachability, once built, will need
 // its own mechanism, not this one).
-function sharesL2Segment(a: RouterEndpoint, b: RouterEndpoint): boolean {
+function sharesL2Segment(a: OvnRouterEndpoint, b: OvnRouterEndpoint): boolean {
   return a.kind === "ovn" && b.kind === "ovn" &&
     a.l2Segment.name === b.l2Segment.name;
 }
@@ -675,35 +706,53 @@ function routeToIR(
   };
 }
 
+// A router participates in `domain` if its router-level membership names
+// it OR any of its endpoints does (per-endpoint routingDomains,
+// 2026-08-23 — a tunnelRouterEndpoint participates in Neighbor-defaultRoute
+// via its LEFT and Voda-defaultRoute via its RIGHT, neither on the
+// router itself).
+function isDomainParticipant(router: Router, domain: RoutingDomain): boolean {
+  return router.routingDomains?.includes(domain) === true ||
+    router.left.routingDomains?.includes(domain) === true ||
+    router.right.routingDomains?.includes(domain) === true;
+}
+
 function computeRoutes(network: NetworkDefinition): IRNode[] {
   const nodes: IRNode[] = [];
-  for (const domain of network.allRoutingDomains) {
-    const participants = network.allRouters.filter((r) =>
-      r.routingDomains?.includes(domain)
-    );
-    // The anchor router must ITSELF be a participant of the domain its
-    // routes are meant to propagate through — a route declared on an
-    // endpoint whose own router isn't in this domain simply never gets
-    // picked up by this domain's iteration (it might still be picked up
-    // by a DIFFERENT domain the router does belong to).
-    for (const anchorRouter of participants) {
-      for (const side of ["left", "right"] as const) {
-        const anchor: Anchor = { router: anchorRouter, side };
-        for (const route of anchorRouter[side].routes ?? []) {
+  // Anchor-outer (2026-08-23): routing-domain membership is PER ENDPOINT
+  // now — an endpoint's declared routes participate in its OWN
+  // routingDomains (falling back to the router-level ones), so a router
+  // can anchor one domain from its left and participate in another from
+  // its right (a tunnelRouterEndpoint does exactly that: the left's
+  // via-less default stays inside Neighbor-defaultRoute, the right joins
+  // Voda-defaultRoute).
+  for (const anchorRouter of network.allRouters) {
+    for (const side of ["left", "right"] as const) {
+      const anchor: Anchor = { router: anchorRouter, side };
+      const routes = anchorRouter[side].routes ?? [];
+      if (routes.length === 0) continue;
+      const endpointDomains = anchorRouter[side].routingDomains ??
+        anchorRouter.routingDomains ??
+        [];
+      for (const domain of endpointDomains) {
+        // A router is a participant of `domain` if the router-level
+        // membership names it OR any of its endpoints does.
+        const participants = network.allRouters.filter((r) =>
+          isDomainParticipant(r, domain)
+        );
+        for (const route of routes) {
           const masq = route.with === "masq";
           for (const router of participants) {
             if (router.name === anchorRouter.name) {
               // No `via` here means "the anchor needs no literal route
               // of its own for this — handled elsewhere on its own
-              // side" (e.g. SLAAC/RA, or its own less-specific default
-              // already covers it). That's a statement about the
-              // ANCHOR only, not about whether OTHER participants
-              // should still learn to route toward it — they always
-              // should (confirmed live, 2026-08-12: "you need to add
-              // that route to all hops so that all packets will be
-              // transmitted to left side of router-voda-avm-v2"), so
-              // this `continue` is scoped to the anchor's own branch,
-              // not the whole route entry.
+              // side" (e.g. SLAAC/RA, a less-specific default, or the
+              // tunnel egress inside a tunnelRouterEndpoint's netns).
+              // That's a statement about the ANCHOR only, not about
+              // whether OTHER participants should still learn to route
+              // toward it — they always should (confirmed live,
+              // 2026-08-12), so this `continue` is scoped to the
+              // anchor's own branch, not the whole route entry.
               if (route.via === undefined) continue;
               nodes.push(
                 routeToIR(router, route.dst, route.via, masq, domain.name),
@@ -755,7 +804,7 @@ function computeInterconnectRoutes(network: NetworkDefinition): IRNode[] {
   const nodes: IRNode[] = [];
   for (const domain of network.allRoutingDomains) {
     const participants = network.allRouters.filter((r) =>
-      r.routingDomains?.includes(domain)
+      isDomainParticipant(r, domain)
     );
     for (const r1 of participants) {
       for (const r2 of participants) {

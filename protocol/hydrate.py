@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+from . import AppDhcpClient, AppDocker, AppWireguard, AppZerotier
 from . import generated as pt
 
 
@@ -112,12 +113,50 @@ def _hydrate_kernel_router(raw: dict) -> pt.KernelRouterNode:
                 else None
             ),
             securityGroup=data.get("securityGroup"),
-            apps=(
-                [pt.App(kind=a["kind"], style=pt.Style(a["style"])) for a in apps]
-                if apps is not None
-                else None
-            ),
+            upstreamPeerAddrs=data.get("upstreamPeerAddrs"),
+            apps=([_hydrate_app(a) for a in apps] if apps is not None else None),
         ),
+    )
+
+
+def _hydrate_app(raw: dict):
+    kind = raw["kind"]
+    if kind == "dhcp-client":
+        return AppDhcpClient(kind="dhcp-client", style=pt.Style(raw["style"]))
+    if kind == "wireguard":
+        config = raw["config"]
+        return AppWireguard(
+            kind=kind,
+            ifaceName=raw["ifaceName"],
+            config=pt.Config(
+                privateKey=config["privateKey"],
+                address=config["address"],
+                listenPort=config.get("listenPort"),
+                dns=config.get("dns"),
+                peer=pt.Peer(
+                    publicKey=config["peer"]["publicKey"],
+                    endpoint=config["peer"]["endpoint"],
+                    allowedIps=config["peer"]["allowedIps"],
+                    persistentKeepalive=config["peer"].get("persistentKeepalive"),
+                ),
+            ),
+            masq=[pt.MasqEnum(m) for m in raw["masq"]],
+        )
+    if kind == "zerotier":
+        return AppZerotier(
+            kind="zerotier",
+            networkId=raw["networkId"],
+            instanceDir=raw["instanceDir"],
+            masq=[pt.MasqEnum(m) for m in raw["masq"]],
+        )
+    return AppDocker(
+        kind="docker",
+        image=raw["image"],
+        name=raw["name"],
+        cmd=raw.get("cmd"),
+        ip=raw.get("ip"),
+        routerIp=raw.get("routerIp"),
+        vethName=raw.get("vethName"),
     )
 
 

@@ -75,12 +75,14 @@
 
 from __future__ import annotations
 
+import hashlib
 import shlex
 
 from ladops import linux_net as linux_net_ops
 from ladops import netns as netns_ops
 from ladops import ovn as ovn_ops
 from ladops import ovs as ovs_ops
+from protocol import KernelApp
 from protocol import generated as pt
 
 Action = str  # "create" | "delete"
@@ -475,86 +477,415 @@ def _emit_security_group_rules(
 
 # A kernel router's apps (KernelApp, types.ts — resolved from the
 # `kernel.app.*` services by buildKernelRouterEndpoint, define.ts) run
-# INSIDE the netns on the side's real interface, supervised by a real
-# systemd unit (Restart=always) — the deployer INSTALLS that unit and
-# starts it on create, and stops/disables/removes it on delete (the
-# design intent from generate-netns.ts, 2026-08-23: an app daemon holds
-# its netns alive past `ip netns delete` and keeps its lease, so the
-# delete pass must bring it down explicitly BEFORE the netns teardown).
+# supervised by a real systemd unit (Restart=always) — the deployer
+# INSTALLS that unit and starts it on create, and
+# stops/disables/removes it on delete (the design intent from
+# generate-netns.ts, 2026-08-23: an app daemon holds its netns alive
+# past `ip netns delete` and keeps its lease, so the delete pass must
+# bring it down explicitly BEFORE the netns teardown).
 #
-# The unit file is written via a `cat > ... << 'EOF'` heredoc — the ONE
-# construct in the block the shell generator renders as-is and the
-# generated Python deployer handles natively (its runtime recognizes the
-# `cat > PATH << 'DELIM'` line and writes the file directly, since it
-# executes commands via shlex.split and cannot do shell redirection).
+# The unit file is written via the emitter's `append(path, content)`
+# operation (the shell front-end renders it as a `cat > ... << 'EOF'`
+# heredoc, the Python front-end as a write_file() call — see
+# deployer/ir_common.py's Emitter doc comment).
 #
-# The client is forced to the FOREGROUND inside the unit (`-d` for
-# dhclient, `-B` for dhcpcd) so systemd's Type=simple actually has a
-# process to supervise — a daemonizing client would exit the unit's main
-# process immediately and Restart=always would respawn it in a loop.
-# Unknown kinds/styles are skipped loudly with a comment, never silently
+# The app's main process is forced to the FOREGROUND inside the unit so
+# systemd's Type=simple actually has a process to supervise — a
+# daemonizing client would exit the unit's main process immediately and
+# Restart=always would respawn it in a loop:
+#   - dhcp-client: `-d` for dhclient, `-B` for dhcpcd;
+#   - docker: `docker run` without `-d` (with `--rm`, so the container
+#     is removed on stop and delete needs no orphan cleanup beyond the
+#     belt-and-suspenders `docker rm -f`).
+# Unknown kinds are skipped loudly with a comment, never silently
 # dropped — same philosophy as the security-group rules.
 def _kernel_app_unit_name(router: str, kind: str) -> str:
     return f"ovn-kernel-{router}-{kind}.service"
 
 
+# The shared systemd-unit deployment every kernel app uses: CREATE writes
+# the unit (Restart=always, supervising the process inside the netns on
+# the side's real interface) and enables+starts it; DELETE stops,
+# disables and removes it — BEFORE `ip netns delete`, since an app
+# daemon holds its netns alive past deletion. `extra_delete` carries
+# per-app teardown that must run BEFORE the unit's own stop (e.g. the
+# authoritative `docker rm -f` — systemd's SIGTERM through `ip netns
+# exec` does NOT reliably kill a docker container, confirmed live
+# 2026-08-23). `exec_stop` is the unit's ExecStop (e.g. `docker stop`)
+# so ANY systemctl stop shuts the app down cleanly, not just the
+# deployer's delete pass.
+def _emit_kernel_app_unit(
+    router: str,
+    kind: str,
+    netns: str,
+    dev: str,
+    description: str,
+    exec_start: str,
+    exec_stop: str | None,
+    extra_delete: list[list[str]] | None,
+    emit: Emitter,
+) -> None:
+    unit = _kernel_app_unit_name(router, kind)
+    unit_path = f"/etc/systemd/system/{unit}"
+    emit.comment(f"# --- kernel app: {kind} in {netns} on {dev} (systemd unit {unit}) ---")
+    if emit.action == "delete":
+        # Per-app teardown FIRST — authoritative and independent of the
+        # unit: `docker rm -f` force-stops and removes the container via
+        # the daemon even if the systemctl stop below fails or hangs.
+        if extra_delete:
+            for argv in extra_delete:
+                emit.sh(argv)
+        emit.sh(["systemctl", "disable", "--now", unit])
+        emit.sh(["rm", "-f", unit_path])
+        emit.sh(["systemctl", "daemon-reload"])
+        return
+    unit_lines: list[str] = [
+        "[Unit]",
+        f"Description={description}",
+        "After=network-pre.target",
+        "Wants=network-pre.target",
+        "",
+        "[Service]",
+        "Type=simple",
+        f"ExecStart={exec_start}",
+    ]
+    if exec_stop is not None:
+        unit_lines.append(f"ExecStop={exec_stop}")
+        unit_lines.append("TimeoutStopSec=30")
+    unit_lines.extend(
+        [
+            "Restart=always",
+            "RestartSec=5",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+        ]
+    )
+    emit.append(unit_path, "\n".join(unit_lines))
+    emit.sh(["systemctl", "daemon-reload"])
+    emit.sh(["systemctl", "enable", "--now", unit])
+
+
+def _docker_wire_script(app: KernelApp, router: str, netns: str) -> str:
+    """The wire script for one docker app: run the container with
+    `--network none`, then inject one veth into the router netns
+    (CNI/Multus-style) — the container's eth0 gets `app.ip`, the router
+    end `app.routerIp` (the subnet's first host, resolved in
+    define.ts), and the container's default route is via the router.
+    Ends in `exec docker wait <container>` so systemd's Type=simple has
+    a main process to supervise and Restart=always re-wires a fresh
+    container on crash."""
+    container = app.name or f"{router}-docker"
+    veth = app.vethName or ("ve-" + hashlib.md5(container.encode()).hexdigest()[:8])
+    gateway = app.routerIp.split("/")[0]
+    cmd_tokens = " ".join(shlex.quote(t) for t in (app.cmd or []))
+    return "\n".join(
+        [
+            "#!/bin/sh",
+            f"# ovn-fabric kernel app docker: {container} in {netns} — one veth",
+            "# injected into the router netns (CNI/Multus-style interface",
+            "# injection, 2026-08-23). Supervised by systemd via docker wait.",
+            "set -eu",
+            f'container="{container}"',
+            f'netns="{netns}"',
+            f'veth="{veth}"',
+            'peer="${veth}-c"',
+            f'image="{app.image}"',
+            f'router_ip="{app.routerIp}"',
+            f'container_ip="{app.ip}"',
+            f'gateway="{gateway}"',
+            "",
+            '/usr/bin/docker rm -f "$container" 2>/dev/null || true',
+            '/usr/bin/docker run -d --network none --name "$container" "$image"'
+            + (f" {cmd_tokens}" if cmd_tokens else ""),
+            "pid=$(/usr/bin/docker inspect -f '{{.State.Pid}}' \"$container\")",
+            "mkdir -p /var/run/netns",
+            'ln -sf "/proc/$pid/ns/net" "/var/run/netns/$container"',
+            'ip link add "$veth" type veth peer name "$peer"',
+            'ip link set "$peer" netns "$container"',
+            'ip link set "$veth" netns "$netns"',
+            'ip netns exec "$netns" ip link set "$veth" up',
+            'ip netns exec "$netns" ip addr add "$router_ip" dev "$veth"',
+            'ip netns exec "$container" ip link set "$peer" name eth0',
+            'ip netns exec "$container" ip link set eth0 up',
+            'ip netns exec "$container" ip addr add "$container_ip" dev eth0',
+            'ip netns exec "$container" ip route add default via "$gateway" dev eth0',
+            'exec /usr/bin/docker wait "$container"',
+        ]
+    )
+
+
+def _wg_conf_lines(app: KernelApp) -> list[str]:
+    """The wg-quick conf body for a wireguard app — mirrors
+    generate-netns.ts's emitWireguardInterface byte-for-byte."""
+    cfg = app.config
+    lines = [
+        "[Interface]",
+        f"PrivateKey = {cfg.privateKey}",
+        f"Address = {cfg.address}",
+    ]
+    if cfg.listenPort is not None:
+        lines.append(f"ListenPort = {cfg.listenPort:g}")
+    if cfg.dns is not None:
+        lines.append(f"DNS = {cfg.dns}")
+    lines.extend(
+        [
+            "[Peer]",
+            f"PublicKey = {cfg.peer.publicKey}",
+            f"AllowedIPs = {cfg.peer.allowedIps}",
+            f"Endpoint = {cfg.peer.endpoint}",
+        ]
+    )
+    if cfg.peer.persistentKeepalive is not None:
+        lines.append(f"PersistentKeepalive = {cfg.peer.persistentKeepalive:g}")
+    return lines
+
+
+def _zerotier_wire_script(app: KernelApp, netns: str) -> str:
+    """The zerotier app's up/down script — mirrors generate-netns.ts's
+    emitZerotierInterface: start zerotier-one (its OWN instanceDir, so it
+    never collides with a host-level daemon), wait for its control
+    socket, join the network, then wait for ZeroTier to name the real
+    interface (`portDeviceName` — the name is ONLY known at runtime) and
+    bring it up + MASQUERADE the declared families out it. The daemon is
+    persistent, so the unit is Type=oneshot + RemainAfterExit; down
+    leaves the network and kills the daemon BEFORE the netns teardown
+    (a running daemon holds its netns alive, 2026-08-23)."""
+    network = app.networkId or ""
+    home = app.instanceDir or ""
+    masq_lines: list[str] = []
+    for family in app.masq or []:
+        iptables = "iptables" if family == pt.MasqEnum.ipv4 else "ip6tables"
+        masq_lines.append(
+            f'ip netns exec "$netns" {iptables} -t nat -A POSTROUTING -o "$var" -j MASQUERADE'
+        )
+    return "\n".join(
+        [
+            "#!/bin/sh",
+            f"# ovn-fabric kernel app zerotier: {network} in {netns} (home {home})",
+            "set -eu",
+            'action="${1:-up}"',
+            f'netns="{netns}"',
+            f'home="{home}"',
+            f'network="{network}"',
+            'case "$action" in',
+            "  up)",
+            '    mkdir -p "$home"',
+            '    ip netns exec "$netns" pgrep -f "zerotier-one -d $home" >/dev/null 2>&1 || \\',
+            '      ip netns exec "$netns" zerotier-one -d "$home"',
+            "    for i in $(seq 1 10); do",
+            '      ip netns exec "$netns" zerotier-cli -D"$home" info >/dev/null 2>&1 && break',
+            "      sleep 1",
+            "    done",
+            '    ip netns exec "$netns" zerotier-cli -D"$home" join "$network"',
+            "    for i in $(seq 1 30); do",
+            '      var=$(ip netns exec "$netns" zerotier-cli -D"$home" -j listnetworks '
+            '2>/dev/null | jq -r ".[] | select(.nwid==\\"$network\\") | .portDeviceName")',
+            '      [ -n "$var" ] && [ "$var" != "null" ] && break',
+            "      sleep 1",
+            "    done",
+            '    ip netns exec "$netns" ip link set "$var" up',
+            *masq_lines,
+            "    ;;",
+            "  down)",
+            '    ip netns exec "$netns" zerotier-cli -D"$home" leave "$network" || true',
+            '    ip netns exec "$netns" pkill -f "zerotier-one -d $home" || true',
+            "    ;;",
+            "esac",
+        ]
+    )
+
+
 def _emit_kernel_app_rules(
-    apps: list[pt.App], router: str, netns: str, dev: str, emit: Emitter
+    apps: list[KernelApp], router: str, netns: str, dev: str, emit: Emitter
 ) -> None:
     for app in apps:
-        if app.kind != "dhcp-client":
+        if app.kind == "dhcp-client":
+            if app.style == pt.Style.dhclient:
+                client_argv = ["/usr/sbin/dhclient", "-d", dev]
+                stop_argv = ["/usr/sbin/dhclient", "-r", dev]
+                client = "dhclient"
+            elif app.style == pt.Style.dhcpcd:
+                client_argv = ["/usr/sbin/dhcpcd", "-B", dev]
+                stop_argv = ["/usr/sbin/dhcpcd", "-k", dev]
+                client = "dhcpcd"
+            else:
+                emit.comment(
+                    f'# unsupported dhcp-client style "{app.style}" on {dev} in {netns} — '
+                    "skipped, see deployer/ir_to_shell.py"
+                )
+                continue
+            _emit_kernel_app_unit(
+                router,
+                "dhcp-client",
+                netns,
+                dev,
+                f"ovn-fabric kernel app dhcp-client ({client}) for {router} in {netns} on {dev}",
+                _sh(["/usr/bin/ip", "netns", "exec", netns, *client_argv]),
+                # ExecStop releases the lease explicitly — SIGTERM through
+                # `ip netns exec` is not a reliable dhclient shutdown.
+                _sh(["/usr/bin/ip", "netns", "exec", netns, *stop_argv]),
+                None,
+                emit,
+            )
+        elif app.kind == "docker":
+            # The container gets ONE veth injected INTO the router netns
+            # (CNI/Multus-style interface injection — the same primitive
+            # a k8s pod + Multus uses, 2026-08-23). `--network host`
+            # would share the docker DAEMON's netns (root), not the
+            # router's, so the container runs `--network none` and a
+            # wire script attaches it: docker run (none) -> get its PID
+            # -> veth pair -> one end into the container's netns (eth0),
+            # the other into the router netns with `router_ip`; the
+            # container's default route is via the router. The script
+            # is a single `/bin/sh <script>` argv, so it survives both
+            # front-ends (shell substitutions are not argv-safe).
+            #
+            # The unit's main process is the script, which ends in
+            # `exec docker wait <container>` — systemd supervises the
+            # container lifecycle, and Restart=always re-runs the whole
+            # wire (fresh container, fresh veth) on crash.
+            container = app.name or f"{router}-docker"
+            script_path = f"/usr/local/sbin/ovn-kernel-{router}-docker-wire.sh"
+            if app.ip is None or app.routerIp is None:
+                raise ValueError(
+                    f'kernel app docker "{container}": the veth injection needs an `ip` '
+                    "(the container's address on the router's services segment)"
+                )
+            emit.append(script_path, _docker_wire_script(app, router, netns))
+            _emit_kernel_app_unit(
+                router,
+                "docker",
+                netns,
+                dev,
+                f"ovn-fabric kernel app docker ({container}) for {router} in {netns} on {dev}",
+                _sh(["/bin/sh", script_path]),
+                _sh(["/usr/bin/docker", "rm", "-f", container]),
+                [
+                    # Stopping a docker container is done THE HARD WAY —
+                    # an explicit `docker rm -f` via the daemon first:
+                    # SIGTERM through the unit is not a reliable
+                    # container shutdown (confirmed live 2026-08-23).
+                    ["/usr/bin/docker", "rm", "-f", container],
+                    ["rm", "-f", script_path],
+                    ["rm", "-f", f"/var/run/netns/{container}"],
+                ],
+                emit,
+            )
+        elif app.kind == "wireguard":
+            # A WireGuard tunnel inside the netns (the tunnelRouterEndpoint's
+            # middle leg): write the conf (PrivateKey included — the
+            # documented deliberate credential-in-git exception), `wg-quick
+            # up` inside the netns (wg is in-kernel, no daemon to
+            # supervise, so NO systemd unit — the create/delete passes own
+            # it), and MASQUERADE the declared families out the TUNNEL
+            # iface (not the upstream veth — the tunnel is the egress,
+            # 2026-08-23). Delete brings it down and removes the rules
+            # before `ip netns delete`.
+            if app.ifaceName is None or app.config is None:
+                raise ValueError(
+                    f"kernel app wireguard on {dev} in {netns}: missing ifaceName/config"
+                )
+            conf_path = f"/etc/wireguard/{app.ifaceName}.conf"
+            emit.comment(f"# --- kernel app: wireguard ({app.ifaceName}) in {netns} ---")
+            if emit.action == "delete":
+                emit.sh(netns_ops.netns_exec_argv(["wg-quick", "down", conf_path], netns))
+                for family in app.masq or []:
+                    iptables = "iptables" if family == pt.MasqEnum.ipv4 else "ip6tables"
+                    emit.sh(
+                        netns_ops.netns_exec_argv(
+                            [
+                                iptables,
+                                "-t",
+                                "nat",
+                                "-D",
+                                "POSTROUTING",
+                                "-o",
+                                app.ifaceName,
+                                "-j",
+                                "MASQUERADE",
+                            ],
+                            netns,
+                        )
+                    )
+                continue
+            emit.sh(["mkdir", "-p", "/etc/wireguard"])
+            emit.append(conf_path, "\n".join(_wg_conf_lines(app)))
+            emit.sh(["chmod", "600", conf_path])
+            emit.sh(netns_ops.netns_exec_argv(["wg-quick", "up", conf_path], netns))
+            for family in app.masq or []:
+                iptables = "iptables" if family == pt.MasqEnum.ipv4 else "ip6tables"
+                emit.sh(
+                    netns_ops.netns_exec_argv(
+                        [
+                            iptables,
+                            "-t",
+                            "nat",
+                            "-A",
+                            "POSTROUTING",
+                            "-o",
+                            app.ifaceName,
+                            "-j",
+                            "MASQUERADE",
+                        ],
+                        netns,
+                    )
+                )
+        elif app.kind == "zerotier":
+            # A ZeroTier tunnel inside the netns (the tunnelRouterEndpoint's
+            # middle leg): the zerotier-one daemon runs confined to the
+            # netns with its OWN instanceDir, joins the network, and the
+            # real interface name is captured at RUNTIME (ZeroTier names
+            # it itself) — so the wiring is a script (like docker),
+            # supervised by a Type=oneshot + RemainAfterExit unit (the
+            # daemon persists after the script completes). Delete leaves
+            # the network and kills the daemon BEFORE `ip netns delete`
+            # (a running daemon holds its netns alive, 2026-08-23).
+            if app.networkId is None or app.instanceDir is None:
+                raise ValueError(
+                    f"kernel app zerotier on {dev} in {netns}: missing networkId/instanceDir"
+                )
+            script_path = f"/usr/local/sbin/ovn-kernel-{router}-zerotier-wire.sh"
+            unit = _kernel_app_unit_name(router, "zerotier")
+            unit_path = f"/etc/systemd/system/{unit}"
+            emit.comment(f"# --- kernel app: zerotier in {netns} ---")
+            if emit.action == "delete":
+                emit.sh(["systemctl", "disable", "--now", unit])
+                emit.sh(["rm", "-f", script_path])
+                emit.sh(["rm", "-f", unit_path])
+                emit.sh(["systemctl", "daemon-reload"])
+                continue
+            emit.append(script_path, _zerotier_wire_script(app, netns))
+            emit.append(
+                unit_path,
+                "\n".join(
+                    [
+                        "[Unit]",
+                        f"Description=ovn-fabric kernel app zerotier "
+                        f"({app.networkId}) for {router} in {netns}",
+                        "After=network-pre.target",
+                        "Wants=network-pre.target",
+                        "",
+                        "[Service]",
+                        "Type=oneshot",
+                        f"ExecStart=/bin/sh {script_path} up",
+                        f"ExecStop=/bin/sh {script_path} down",
+                        "RemainAfterExit=yes",
+                        "TimeoutStopSec=60",
+                        "",
+                        "[Install]",
+                        "WantedBy=multi-user.target",
+                    ]
+                ),
+            )
+            emit.sh(["systemctl", "daemon-reload"])
+            emit.sh(["systemctl", "enable", "--now", unit])
+        else:
             emit.comment(
                 f'# unsupported kernel app kind "{app.kind}" on {dev} in {netns} — '
                 "skipped, see deployer/ir_to_shell.py"
             )
             continue
-        if app.style == pt.Style.dhclient:
-            client_argv = ["/usr/sbin/dhclient", "-d", dev]
-            client = "dhclient"
-        elif app.style == pt.Style.dhcpcd:
-            client_argv = ["/usr/sbin/dhcpcd", "-B", dev]
-            client = "dhcpcd"
-        else:
-            emit.comment(
-                f'# unsupported dhcp-client style "{app.style}" on {dev} in {netns} — '
-                "skipped, see deployer/ir_to_shell.py"
-            )
-            continue
-        unit = _kernel_app_unit_name(router, app.kind)
-        unit_path = f"/etc/systemd/system/{unit}"
-        exec_start = _sh(["/usr/bin/ip", "netns", "exec", netns, *client_argv])
-        emit.comment(
-            f"# --- kernel app: {app.kind} ({app.style.value}) in {netns} on {dev} "
-            f"(systemd unit {unit}) ---"
-        )
-        if emit.action == "delete":
-            emit.sh(["systemctl", "disable", "--now", unit])
-            emit.sh(["rm", "-f", unit_path])
-            emit.sh(["systemctl", "daemon-reload"])
-            continue
-        emit.append(
-            unit_path,
-            "\n".join(
-                [
-                    "[Unit]",
-                    f"Description=ovn-fabric kernel app {app.kind} ({client}) for "
-                    f"{router} in {netns} on {dev}",
-                    "After=network-pre.target",
-                    "Wants=network-pre.target",
-                    "",
-                    "[Service]",
-                    "Type=simple",
-                    f"ExecStart={exec_start}",
-                    "Restart=always",
-                    "RestartSec=5",
-                    "",
-                    "[Install]",
-                    "WantedBy=multi-user.target",
-                ]
-            ),
-        )
-        emit.sh(["systemctl", "daemon-reload"])
-        emit.sh(["systemctl", "enable", "--now", unit])
 
 
 # One real netns per KernelRouter (types.ts) bound to this host, then —

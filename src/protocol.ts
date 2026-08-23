@@ -159,13 +159,52 @@ export const KernelRouterKey = type({
 });
 export const KernelRouterRoute = type({ dst: "string", via: "string" });
 // KernelApp — a fully-resolved kernel-netns application (types.ts): the
-// `kernel.app.*` service kinds resolved at declaration time. `kind` is
-// the app (`dhcp-client` today), `style` the concrete client binary the
-// deployer must invoke (`dhclient`/`dhcpcd`).
-export const KernelApp = type({
+// `kernel.app.*` service kinds resolved at declaration time. An `or`
+// union DISCRIMINATED on `kind` (2026-08-23) — each variant carries
+// exactly its own fields, so a docker app can't accidentally gain a
+// `style` and a dhcp-client can't carry `image` (the flat-schema shape
+// before this couldn't express that).
+export const WireguardPeerConfig = type({
+  publicKey: "string",
+  endpoint: "string",
+  allowedIps: "string",
+  "persistentKeepalive?": "number",
+});
+export const WireguardAppConfig = type({
+  privateKey: "string",
+  address: "string",
+  "listenPort?": "number",
+  "dns?": "string",
+  peer: WireguardPeerConfig,
+});
+export const DhcpClientApp = type({
   kind: "'dhcp-client'",
   style: "'dhclient'|'dhcpcd'",
 });
+export const WireguardApp = type({
+  kind: "'wireguard'",
+  ifaceName: "string",
+  config: WireguardAppConfig,
+  masq: "('ipv4'|'ipv6')[]",
+});
+export const ZerotierApp = type({
+  kind: "'zerotier'",
+  networkId: "string",
+  instanceDir: "string",
+  masq: "('ipv4'|'ipv6')[]",
+});
+export const DockerApp = type({
+  kind: "'docker'",
+  image: "string",
+  name: "string",
+  "cmd?": "string[]",
+  "ip?": "string",
+  "routerIp?": "string",
+  "vethName?": "string",
+});
+export const KernelApp = DhcpClientApp.or(WireguardApp).or(ZerotierApp).or(
+  DockerApp,
+);
 export const KernelRouterData = type({
   host: "string",
   "ipaddrs?": "string[]",
@@ -184,6 +223,12 @@ export const KernelRouterData = type({
   // practice) — the attachment point for the rules that group carries;
   // see SecurityGroupKey below.
   "securityGroup?": "string",
+  // The tunnel router's UPSTREAM peer address(es) — the OTHER end of the
+  // upstream veth (right side only; tunnelRouterEndpoint, define.ts). The
+  // deployer brings that root-side peer leg up and assigns it these
+  // addresses so the netns's default route (via the peer) has a live
+  // gateway (2026-08-23).
+  "upstreamPeerAddrs?": "string[]",
   // Applications running inside the netns on this side's real interface
   // (right side only in practice — src/ir.ts's kernelRouterSideToIR,
   // from KernelApp, types.ts). The deployer turns each into its

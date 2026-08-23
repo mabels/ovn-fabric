@@ -385,3 +385,206 @@ Deno.test("kernelRouterEndpoint: kernel.app services resolve to app descriptors 
     undefined,
   );
 });
+
+// `kernel.app.docker` resolves with the router name PREFIXED onto the
+// container name (`<router>-<name>`, default `<router>-docker`), the
+// `cmd` string split into `docker run` trailing args, the veth
+// injection addresses (`ip` = the container's end, `routerIp` = the
+// subnet's first host) — and the deployer's veth names are stamped in
+// IR (`ve-<hash>`).
+Deno.test("kernelRouterEndpoint: kernel.app.docker resolves router-prefixed name and veth addressing", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const backbone = net.collisionDomain("backbone");
+    net.ovnRouter("router-wan", (router) => {
+      router.left = router.kernelRouterEndpoint({
+        host,
+        transit: transitNetwork(
+          IPv4.parse("10.12.80.1/28"),
+          IPv6.parse("fd00::10:12:80:1/124"),
+        ),
+        ipaddrs: [],
+        services: [
+          {
+            kind: "kernel.app.docker",
+            name: "test-docker",
+            image: "ubuntu",
+            cmd: "sleep 86400",
+            ip: "10.200.0.2/24",
+          },
+        ],
+        ifaces: [
+          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
+        ],
+      });
+      router.right = router.ovnRouterEndpoint({
+        l2Segment: backbone,
+        ipaddrs: [IPv4.parse("172.22.12.80/16")],
+      });
+    });
+  });
+
+  const nodes = toIR(network);
+  // The veth prefix is a short `ve-<hash>` derived from the container
+  // name (same fnv1a32 rule shortIfaceName applies).
+  assertEquals(nodes["kernelrouter:router-wan|side:right"].data.apps, [
+    {
+      kind: "docker",
+      image: "ubuntu",
+      name: "router-wan-test-docker",
+      cmd: ["sleep", "86400"],
+      ip: "10.200.0.2/24",
+      routerIp: "10.200.0.1/24",
+      vethName: `ve-${
+        fnv1a32("router-wan-test-docker").toString(16).padStart(8, "0")
+      }`,
+    },
+  ]);
+});
+
+// A docker service without `ip` gets a deterministic per-router slot
+// (10.200.<fnv1a32(routerName) % 256>.2/24) so the config stays concise.
+Deno.test("kernelRouterEndpoint: kernel.app.docker without ip gets a deterministic default slot", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const backbone = net.collisionDomain("backbone");
+    net.ovnRouter("router-wan", (router) => {
+      router.left = router.kernelRouterEndpoint({
+        host,
+        transit: transitNetwork(
+          IPv4.parse("10.12.80.1/28"),
+          IPv6.parse("fd00::10:12:80:1/124"),
+        ),
+        ipaddrs: [],
+        services: [{ kind: "kernel.app.docker", image: "ubuntu" }],
+        ifaces: [
+          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
+        ],
+      });
+      router.right = router.ovnRouterEndpoint({
+        l2Segment: backbone,
+        ipaddrs: [IPv4.parse("172.22.12.80/16")],
+      });
+    });
+  });
+
+  const nodes = toIR(network);
+  assertEquals(nodes["kernelrouter:router-wan|side:right"].data.apps, [
+    {
+      kind: "docker",
+      image: "ubuntu",
+      name: "router-wan-docker",
+      ip: `10.200.${fnv1a32("router-wan") % 256}.2/24`,
+      routerIp: `10.200.${fnv1a32("router-wan") % 256}.1/24`,
+      vethName: `ve-${
+        fnv1a32("router-wan-docker").toString(16).padStart(8, "0")
+      }`,
+    },
+  ]);
+});
+
+// Per-endpoint routingDomains (2026-08-23): a router can anchor one
+// domain from its LEFT and participate in another from its RIGHT — the
+// left's via-less default stays inside its own domain, while the right
+// joins a different one as a plain participant (the tunnelRouterEndpoint
+// pattern).
+Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's default in its own domain", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const backbone = net.collisionDomain("backbone");
+    const neighborRoute = net.routingDomain("Neighbor-defaultRoute");
+    const vodaRoute = net.routingDomain("Voda-defaultRoute");
+    net.ovnRouter("router-mullvad-de", (router) => {
+      router.left = router.tunnelRouterEndpoint({
+        routingDomains: [neighborRoute],
+        host,
+        transit: transitNetwork(
+          IPv4.parse("10.12.81.1/28"),
+          IPv6.parse("fd00::10:12:81:1/124"),
+        ),
+        upstream: transitNetwork(
+          IPv4.parse("10.12.82.1/28"),
+          IPv6.parse("fd00::10:12:82:1/124"),
+        ),
+        tunnel: {
+          kind: "wireguard",
+          ifaceName: "mullvad-de",
+          config: {
+            privateKey: "k",
+            address: "10.64.56.207/32",
+            peer: {
+              publicKey: "p",
+              allowedIps: "0.0.0.0/0",
+              endpoint: "1.2.3.4:51820",
+            },
+          },
+        },
+        routes: [{ dst: IPv4.parse("0.0.0.0/0") }],
+        services: [{ kind: "kernel.ipv4.masq" }, { kind: "kernel.ipv6.masq" }],
+        upstreamBackbone: {
+          l2Segment: backbone,
+          ipaddrs: [IPv4.parse("172.22.0.150/16")],
+        },
+      });
+      router.right = router.ovnRouterEndpoint({
+        routingDomains: [vodaRoute],
+        l2Segment: backbone,
+        ipaddrs: [IPv4.parse("172.22.0.140/16")],
+      });
+    });
+    // A neighbor participant on the backbone, in the neighbor domain.
+    net.ovnRouter("router-neighbor", (router) => {
+      router.routingDomains = [neighborRoute];
+      router.left = router.ovnRouterEndpoint({
+        l2Segment: net.collisionDomain("neighbor"),
+        ipaddrs: [IPv4.parse("192.168.130.1/24")],
+      });
+      router.right = router.ovnRouterEndpoint({
+        l2Segment: backbone,
+        ipaddrs: [IPv4.parse("172.22.0.130/16")],
+      });
+    });
+    // A voda participant on the backbone (so the tunnel's right side
+    // learns the voda default; the tunnel's left default must NOT leak).
+    net.ovnRouter("router-voda", (router) => {
+      router.routingDomains = [vodaRoute];
+      router.left = router.ovnRouterEndpoint({
+        l2Segment: net.collisionDomain("voda"),
+        ipaddrs: [IPv4.parse("192.168.132.1/24")],
+        routes: [
+          { dst: IPv4.parse("0.0.0.0/0"), via: IPv4.parse("192.168.132.1") },
+        ],
+      });
+      router.right = router.ovnRouterEndpoint({
+        l2Segment: backbone,
+        ipaddrs: [IPv4.parse("172.22.12.80/16")],
+      });
+    });
+  });
+
+  const nodes = toIR(network);
+  // neighbor defaults out the tunnel (rewritten to its backbone addr).
+  assertEquals(
+    nodes["ovnrouter:router-neighbor|route:0.0.0.0/0"].data,
+    { nexthop: "172.22.0.140", masq: false, domain: "Neighbor-defaultRoute" },
+  );
+  // No leakage: the tunnel default stays inside Neighbor-defaultRoute,
+  // so voda (only in Voda-defaultRoute) keeps its OWN literal default,
+  // and the tunnel router (participating in Voda via its right side)
+  // LEARNS the voda default rewritten to voda's backbone.
+  assertEquals(
+    nodes["ovnrouter:router-voda|route:0.0.0.0/0"].data,
+    { nexthop: "192.168.132.1", masq: false, domain: "Voda-defaultRoute" },
+  );
+  assertEquals(
+    nodes["ovnrouter:router-mullvad-de|route:0.0.0.0/0"].data,
+    { nexthop: "172.22.12.80", masq: false, domain: "Voda-defaultRoute" },
+  );
+  // The netns backroutes are scoped to the tunnel router's OWN domain:
+  // only the neighbor subnet comes back into the netns (no home/voda
+  // leakage) — the whole point of the separate domains.
+  assertEquals(
+    nodes["kernelrouter:router-mullvad-de|side:left"].data.routes,
+    [{ dst: "192.168.130.0/24", via: "10.12.81.1" }],
+  );
+});

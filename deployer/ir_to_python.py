@@ -35,7 +35,14 @@ from .ir_common import Action, Emitter, _emit_cluster_body, _emit_host_script
 
 def _py_str(s: str) -> str:
     """Embed `s` verbatim as a triple-quoted Python string literal."""
-    return '"""' + s.replace("\\", "\\\\").replace('"""', '\\"\\"\\"') + '"""'
+    escaped = s.replace("\\", "\\\\").replace('"""', '\\"\\"\\"')
+    # Guard the closing `"""` against merging with a trailing quote in
+    # the content (e.g. a wire script ending in `"$container"`) — a real
+    # trailing newline keeps the delimiter unambiguous, and write_file()
+    # already writes exactly one trailing newline either way.
+    if escaped.endswith('"'):
+        escaped += "\n"
+    return '"""' + escaped + '"""'
 
 
 class PythonEmitter(Emitter):

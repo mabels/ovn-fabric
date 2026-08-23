@@ -28,6 +28,7 @@ import tempfile
 import unittest
 from unittest import mock
 
+from protocol import AppDhcpClient, AppDocker, AppWireguard
 from protocol import generated as pt
 
 mod = importlib.import_module("deployer.ir_to_shell")
@@ -550,7 +551,12 @@ class KernelRouterCreateTest(unittest.TestCase):
                         n,
                         data=dataclasses.replace(
                             n.data,
-                            apps=[pt.App(kind="dhcp-client", style=pt.Style(style))],
+                            apps=[
+                                AppDhcpClient(
+                                    kind="dhcp-client",
+                                    style=pt.Style(style),
+                                )
+                            ],
                         ),
                     )
                     if n.kind == "kernel.router" and n.key.side == pt.Side.right
@@ -560,9 +566,9 @@ class KernelRouterCreateTest(unittest.TestCase):
             ]
 
         unit = "ovn-kernel-kernel-0-dhcp-client.service"
-        for style, exec_client in [
-            ("dhclient", "/usr/sbin/dhclient -d eth0.2280"),
-            ("dhcpcd", "/usr/sbin/dhcpcd -B eth0.2280"),
+        for style, exec_client, exec_stop in [
+            ("dhclient", "/usr/sbin/dhclient -d eth0.2280", "/usr/sbin/dhclient -r eth0.2280"),
+            ("dhcpcd", "/usr/sbin/dhcpcd -B eth0.2280", "/usr/sbin/dhcpcd -k eth0.2280"),
         ]:
             with self.subTest(style=style):
                 _, create_hosts = mod.build_scripts(with_app(style), "create")
@@ -571,6 +577,12 @@ class KernelRouterCreateTest(unittest.TestCase):
                 self.assertIn(f"cat > /etc/systemd/system/{unit} << 'OVN'", create_script)
                 self.assertIn(
                     f"ExecStart=/usr/bin/ip netns exec ns-kernel-0 {exec_client}",
+                    create_script,
+                )
+                # ExecStop releases the lease explicitly — SIGTERM through
+                # `ip netns exec` is not a reliable dhclient shutdown.
+                self.assertIn(
+                    f"ExecStop=/usr/bin/ip netns exec ns-kernel-0 {exec_stop}",
                     create_script,
                 )
                 self.assertIn("Restart=always", create_script)
@@ -598,6 +610,199 @@ class KernelRouterCreateTest(unittest.TestCase):
         script = hosts["chassis-1"]
         self.assertNotIn("dhclient", script)
         self.assertNotIn("dhcpcd", script)
+
+    def test_upstream_peer_leg_binds_to_the_backdoor_bridge(self) -> None:
+        # A tunnel router's upstream leg (right side veth): the pair is
+        # created, the netns leg moves into the tunnel netns with the
+        # default via the backdoor peer — and the ROOT-side peer is NOT
+        # addressed in root (it binds to the backdoor bridge via the
+        # backdoor ovn.ls's localnet instead; the peer's address lives on
+        # the internal upstream-peer router's backdoor LRP, 2026-08-23).
+        nodes = [
+            (
+                dataclasses.replace(
+                    n,
+                    data=pt.KernelRouterData(
+                        host="host:chassis-1",
+                        ipaddrs=["10.12.82.14/28"],
+                        routes=[
+                            pt.Route(dst="0.0.0.0/0", via="10.12.82.1"),
+                        ],
+                        ifaces=[
+                            pt.Interface(
+                                host="chassis-1",
+                                iface={
+                                    "kind": "veth",
+                                    "ifaceName": "veth-up-kernel-0",
+                                    "peerName": "veth-up-kernel-0-peer",
+                                    "shortName": "0",
+                                },
+                            ),
+                        ],
+                        upstreamPeerAddrs=["10.12.82.1/28"],
+                    ),
+                )
+                if n.kind == "kernel.router" and n.key.side == pt.Side.right
+                else n
+            )
+            for n in NODES
+        ]
+        _, hosts = mod.build_scripts(nodes, "create")
+        script = hosts["chassis-1"]
+        self.assertIn("ip link add veth-ovn-0 type veth peer name veth-krn-0", script)
+        self.assertIn("ip link set veth-krn-0 netns ns-kernel-0", script)
+        self.assertIn(
+            "ip netns exec ns-kernel-0 ip route add 0.0.0.0/0 dev veth-krn-0 via 10.12.82.1",
+            script,
+        )
+        # The peer is NOT brought up/addressed in root — the backdoor
+        # bridge binding (from the backdoor ovn.ls) owns it.
+        self.assertNotIn("ip addr add 10.12.82.1/28 dev veth-ovn-0", script)
+
+    def test_kernel_app_docker_injects_a_veth_into_the_router_netns(self) -> None:
+        # `kernel.app.docker` resolves to a KernelApp descriptor (name
+        # prefixed with the router at resolve time — define.ts) and the
+        # deployer supervises a container whose ONE interface is a veth
+        # injected INTO the router netns (CNI/Multus-style, 2026-08-23):
+        # the unit runs a wire script (`docker run --network none`, then
+        # moves the pair into the container netns and the router netns,
+        # with `docker rm -f` the hard way on delete).
+
+        def with_docker() -> list[pt.Model]:
+            return [
+                (
+                    dataclasses.replace(
+                        n,
+                        data=dataclasses.replace(
+                            n.data,
+                            apps=[
+                                AppDocker(
+                                    kind="docker",
+                                    image="ubuntu",
+                                    name="kernel-0-test-docker",
+                                    cmd=["sleep", "86400"],
+                                    ip="10.200.0.2/24",
+                                    routerIp="10.200.0.1/24",
+                                    vethName="ve-12345678",
+                                )
+                            ],
+                        ),
+                    )
+                    if n.kind == "kernel.router" and n.key.side == pt.Side.right
+                    else n
+                )
+                for n in NODES
+            ]
+
+        unit = "ovn-kernel-kernel-0-docker.service"
+        wire = "/usr/local/sbin/ovn-kernel-kernel-0-docker-wire.sh"
+        _, create_hosts = mod.build_scripts(with_docker(), "create")
+        create_script = create_hosts["chassis-1"]
+        # The wire script is written, then the unit runs it.
+        self.assertIn(f"cat > {wire} << 'OVN'", create_script)
+        self.assertIn(
+            'docker run -d --network none --name "$container" "$image" sleep 86400',
+            create_script,
+        )
+        self.assertIn(
+            'ip link add "$veth" type veth peer name "$peer"',
+            create_script,
+        )
+        self.assertIn(
+            'ip netns exec "$netns" ip addr add "$router_ip" dev "$veth"',
+            create_script,
+        )
+        self.assertIn(
+            'ip netns exec "$container" ip addr add "$container_ip" dev eth0',
+            create_script,
+        )
+        self.assertIn(
+            'ip netns exec "$container" ip route add default via "$gateway" dev eth0',
+            create_script,
+        )
+        self.assertIn('exec /usr/bin/docker wait "$container"', create_script)
+        self.assertIn(f"cat > /etc/systemd/system/{unit} << 'OVN'", create_script)
+        self.assertIn(f"ExecStart=/bin/sh {wire}", create_script)
+        self.assertIn("ExecStop=/usr/bin/docker rm -f kernel-0-test-docker", create_script)
+        self.assertIn("Restart=always", create_script)
+        _, delete_hosts = mod.build_scripts(with_docker(), "delete")
+        delete_script = delete_hosts["chassis-1"]
+        # The hard stop runs FIRST in the delete pass — before the unit
+        # teardown, so the container is gone even if systemctl fails.
+        self.assertLess(
+            delete_script.index("/usr/bin/docker rm -f kernel-0-test-docker"),
+            delete_script.index(f"systemctl disable --now {unit}"),
+        )
+        self.assertLess(
+            delete_script.index(f"systemctl disable --now {unit}"),
+            delete_script.index("ip netns delete ns-kernel-0"),
+        )
+        # The wire script and the container-netns symlink are cleaned up.
+        self.assertIn(f"rm -f {wire}", delete_script)
+        self.assertIn("rm -f /var/run/netns/kernel-0-test-docker", delete_script)
+
+    def test_kernel_app_wireguard_emits_conf_wgquick_and_masq_out_the_tunnel(self) -> None:
+        # `kernel.app.wireguard` (the tunnelRouterEndpoint's middle leg):
+        # write /etc/wireguard/<iface>.conf verbatim, `wg-quick up` inside
+        # the netns, and MASQUERADE the declared families out the TUNNEL
+        # iface (`-o mullvad-de`) — not the upstream veth. Delete brings
+        # it down and removes the rules (2026-08-23).
+
+        def with_wireguard() -> list[pt.Model]:
+            return [
+                (
+                    dataclasses.replace(
+                        n,
+                        data=dataclasses.replace(
+                            n.data,
+                            apps=[
+                                AppWireguard(
+                                    kind="wireguard",
+                                    ifaceName="mullvad-de",
+                                    config=pt.Config(
+                                        privateKey="k",
+                                        address="10.64.56.207/32",
+                                        peer=pt.Peer(
+                                            publicKey="p",
+                                            allowedIps="0.0.0.0/0",
+                                            endpoint="146.70.117.130:51820",
+                                        ),
+                                    ),
+                                    masq=[pt.MasqEnum.ipv4, pt.MasqEnum.ipv6],
+                                )
+                            ],
+                        ),
+                    )
+                    if n.kind == "kernel.router" and n.key.side == pt.Side.right
+                    else n
+                )
+                for n in NODES
+            ]
+
+        _, create_hosts = mod.build_scripts(with_wireguard(), "create")
+        create_script = create_hosts["chassis-1"]
+        self.assertIn("cat > /etc/wireguard/mullvad-de.conf << 'OVN'", create_script)
+        self.assertIn("PrivateKey = k", create_script)
+        self.assertIn("AllowedIPs = 0.0.0.0/0", create_script)
+        self.assertIn(
+            "ip netns exec ns-kernel-0 wg-quick up /etc/wireguard/mullvad-de.conf",
+            create_script,
+        )
+        self.assertIn(
+            "ip netns exec ns-kernel-0 iptables -t nat -A POSTROUTING -o mullvad-de -j MASQUERADE",
+            create_script,
+        )
+        self.assertIn(
+            "ip netns exec ns-kernel-0 ip6tables -t nat -A POSTROUTING -o mullvad-de -j MASQUERADE",
+            create_script,
+        )
+        _, delete_hosts = mod.build_scripts(with_wireguard(), "delete")
+        delete_script = delete_hosts["chassis-1"]
+        self.assertIn("wg-quick down /etc/wireguard/mullvad-de.conf", delete_script)
+        self.assertIn(
+            "ip netns exec ns-kernel-0 iptables -t nat -D POSTROUTING -o mullvad-de -j MASQUERADE",
+            delete_script,
+        )
 
 
 class KernelRouterDeleteTest(unittest.TestCase):
@@ -712,6 +917,37 @@ class GeneratePythonDeployerTest(unittest.TestCase):
 
     def test_generated_file_is_valid_python(self) -> None:
         compile(mod.generate_python_deployer(NODES), "<generated>", "exec")
+
+    def test_generated_file_compiles_with_a_docker_veth_app(self) -> None:
+        # The docker app embeds a wire script that ENDS in a `"` (the
+        # `exec docker wait "$container"` line) — a regression guard for
+        # the triple-quote boundary in the Python emitter's write_file
+        # (2026-08-23): the generated file must still be valid Python.
+        nodes = [
+            (
+                dataclasses.replace(
+                    n,
+                    data=dataclasses.replace(
+                        n.data,
+                        apps=[
+                            AppDocker(
+                                kind="docker",
+                                image="ubuntu",
+                                name="kernel-0-test-docker",
+                                cmd=["sleep", "86400"],
+                                ip="10.200.0.2/24",
+                                routerIp="10.200.0.1/24",
+                                vethName="ve-12345678",
+                            )
+                        ],
+                    ),
+                )
+                if n.kind == "kernel.router" and n.key.side == pt.Side.right
+                else n
+            )
+            for n in NODES
+        ]
+        compile(mod.generate_python_deployer(nodes), "<generated>", "exec")
 
     def test_generated_host_function_issues_the_same_commands_as_the_shell(self) -> None:
         # The Emitter refactor's core guarantee (2026-08-23): the Python

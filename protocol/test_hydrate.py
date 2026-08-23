@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib
 import unittest
 
+from . import AppDhcpClient, AppDocker
 from . import generated as pt
 
 mod = importlib.import_module("protocol.hydrate")
@@ -171,9 +172,69 @@ class HydrateKernelRouterTest(unittest.TestCase):
         node = mod.hydrate_node(raw)
         self.assertEqual(len(node.data.apps or []), 1)
         app = node.data.apps[0]  # type: ignore[index]
-        self.assertIsInstance(app, pt.App)
+        self.assertIsInstance(app, AppDhcpClient)
         self.assertEqual(app.kind, "dhcp-client")
         self.assertEqual(app.style, pt.Style.dhclient)
+
+    def test_docker_app_hydrates_with_image_name_and_cmd(self) -> None:
+        raw = {
+            **self.RAW_KERNEL_ROUTER_RIGHT,
+            "data": {
+                **self.RAW_KERNEL_ROUTER_RIGHT["data"],
+                "apps": [
+                    {
+                        "kind": "docker",
+                        "image": "ubuntu",
+                        "name": "kernel-0-test-docker",
+                        "cmd": ["sleep", "86400"],
+                        "ip": "10.200.0.2/24",
+                        "routerIp": "10.200.0.1/24",
+                        "vethName": "ve-12345678",
+                    }
+                ],
+            },
+        }
+        node = mod.hydrate_node(raw)
+        app = node.data.apps[0]  # type: ignore[index]
+        self.assertIsInstance(app, AppDocker)
+        self.assertEqual(app.kind, "docker")
+        self.assertEqual(app.image, "ubuntu")
+        self.assertEqual(app.name, "kernel-0-test-docker")
+        self.assertEqual(app.cmd, ["sleep", "86400"])
+        self.assertEqual(app.ip, "10.200.0.2/24")
+        self.assertEqual(app.routerIp, "10.200.0.1/24")
+        self.assertEqual(app.vethName, "ve-12345678")
+
+    def test_wireguard_app_hydrates_with_config_and_masq(self) -> None:
+        raw = {
+            **self.RAW_KERNEL_ROUTER_RIGHT,
+            "data": {
+                **self.RAW_KERNEL_ROUTER_RIGHT["data"],
+                "apps": [
+                    {
+                        "kind": "wireguard",
+                        "ifaceName": "mullvad-de",
+                        "config": {
+                            "privateKey": "k",
+                            "address": "10.64.56.207/32",
+                            "peer": {
+                                "publicKey": "p",
+                                "allowedIps": "0.0.0.0/0",
+                                "endpoint": "146.70.117.130:51820",
+                            },
+                        },
+                        "masq": ["ipv4", "ipv6"],
+                    }
+                ],
+            },
+        }
+        node = mod.hydrate_node(raw)
+        app = node.data.apps[0]  # type: ignore[index]
+        self.assertEqual(app.kind, "wireguard")
+        self.assertEqual(app.ifaceName, "mullvad-de")
+        self.assertEqual(app.config.privateKey, "k")
+        self.assertEqual(app.config.peer.allowedIps, "0.0.0.0/0")
+        self.assertEqual(app.masq, [pt.MasqEnum.ipv4, pt.MasqEnum.ipv6])
 
 
 class HydrateSecurityGroupTest(unittest.TestCase):

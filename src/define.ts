@@ -5,7 +5,8 @@
 // the same defineNetwork call).
 
 import type { UplinkBuilder } from "./factories.ts";
-import type { IPv4, IPv6 } from "./ip.ts";
+import { fnv1a32 } from "./addressing.ts";
+import { IPv4, IPv6 } from "./ip.ts";
 import {
   CollisionDomain,
   FixedUplink,
@@ -21,12 +22,13 @@ import {
   type OvnHostConfig,
   type OvnRouterEndpoint,
   type Router,
-  type RouterEndpoint,
+  type RouterEndpointRoute,
   type RoutingDomain,
   type SecurityGroup,
   type SecurityGroupRule,
   type Segment,
   sshHost,
+  type TunnelRouterEndpoint,
   type Uplink,
   type UplinkSelector,
 } from "./types.ts";
@@ -109,11 +111,17 @@ type SegmentSpec = Omit<Segment, "name">;
  */
 export interface RouterBuilder {
   routingDomains?: readonly RoutingDomain[];
-  left?: RouterEndpoint;
-  right?: RouterEndpoint;
+  // Always the OVN side — every endpoint builder (ovn/kernel/tunnel)
+  // returns a plain OvnRouterEndpoint; the KernelRouterEndpoint and
+  // TunnelRouterEndpoint shapes are INPUT types, never stored here.
+  left?: OvnRouterEndpoint;
+  right?: OvnRouterEndpoint;
   ovnRouterEndpoint(input: Omit<OvnRouterEndpoint, "kind">): OvnRouterEndpoint;
   kernelRouterEndpoint(
     input: Omit<KernelRouterEndpoint, "kind">,
+  ): OvnRouterEndpoint;
+  tunnelRouterEndpoint(
+    input: Omit<TunnelRouterEndpoint, "kind">,
   ): OvnRouterEndpoint;
 }
 
@@ -225,10 +233,9 @@ export class NetworkBuilder {
   // check and segment()'s uplink check.
   private checkRouterEndpoint(
     routerName: string,
-    endpoint: RouterEndpoint,
+    endpoint: OvnRouterEndpoint,
   ): void {
     if (
-      endpoint.kind === "ovn" &&
       !this.collisionDomainsByName.has(endpoint.l2Segment.name)
     ) {
       throw new Error(
@@ -266,7 +273,7 @@ export class NetworkBuilder {
   // objects" reasoning as macFromV4 (ir.ts). Ambiguous (0 or 2+ hosts
   // on ifaces) leaves gatewayChassis unset, same as an explicit
   // omission — this only fills in the unambiguous case.
-  private deriveGatewayChassis(endpoint: RouterEndpoint): RouterEndpoint {
+  private deriveGatewayChassis(endpoint: OvnRouterEndpoint): OvnRouterEndpoint {
     if (endpoint.gatewayChassis !== undefined) return endpoint;
     const hosts = new Set((endpoint.ifaces ?? []).map((hi) => hi.host));
     if (hosts.size !== 1) return endpoint;
@@ -352,6 +359,8 @@ export class NetworkBuilder {
       ovnRouterEndpoint: (input) => this.buildOvnRouterEndpoint(input),
       kernelRouterEndpoint: (input) =>
         this.buildKernelRouterEndpoint(input, router.routingDomains, name),
+      tunnelRouterEndpoint: (input) =>
+        this.buildTunnelRouterEndpoint(input, name),
     };
     build(router);
 
@@ -410,6 +419,7 @@ export class NetworkBuilder {
       readonly right: KernelRouterSide;
       readonly transitDomain?: CollisionDomain;
       readonly transitPeerAddrs?: readonly (IPv4 | IPv6)[];
+      readonly upstreamPeerAddrs?: readonly (IPv4 | IPv6)[];
       readonly routingDomains?: readonly RoutingDomain[];
     },
   ): KernelRouter {
@@ -569,6 +579,34 @@ export class NetworkBuilder {
     for (const s of appServices) {
       if (s.kind === "kernel.app.dhcp-client") {
         apps.push({ kind: "dhcp-client", style: s.style });
+      } else if (s.kind === "kernel.app.docker") {
+        // The container name is resolved HERE — the service's `name`
+        // PREFIXED with the router name (so it's globally unique and
+        // delete can `docker rm -f` exactly what create started), the
+        // `cmd` string split into `docker run` trailing args, and the
+        // container's veth addresses resolved: the container gets
+        // `ip`, the router end of the veth is the subnet's first host.
+        // `ip` is OPTIONAL — when omitted, a deterministic per-router
+        // slot is derived (10.200.<fnv1a32(routerName) % 256>.2/24) so
+        // the config stays concise, same "derived at declaration time,
+        // never at runtime" reasoning as every other address here.
+        const cmd = typeof s.cmd === "string"
+          ? s.cmd.trim().split(/\s+/).filter((t) => t.length > 0)
+          : s.cmd;
+        const containerIp = s.ip !== undefined
+          ? IPv4.parse(s.ip)
+          : IPv4.parse(`10.200.${fnv1a32(routerName) % 256}.2/24`);
+        const routerIp = containerIp.network().first();
+        apps.push({
+          kind: "docker",
+          image: s.image,
+          name: s.name !== undefined
+            ? `${routerName}-${s.name}`
+            : `${routerName}-docker`,
+          ...(cmd !== undefined && cmd.length > 0 ? { cmd } : {}),
+          ip: containerIp.to_string(),
+          routerIp: routerIp.to_string(),
+        });
       }
     }
 
@@ -636,7 +674,10 @@ export class NetworkBuilder {
       },
       transitDomain,
       transitPeerAddrs: ovnSideAddrs,
-      routingDomains,
+      // The endpoint's OWN per-endpoint routingDomains override the
+      // router-level ones stamped by ovnRouter() (2026-08-23) — an
+      // endpoint-level membership gates only THIS side's routes.
+      routingDomains: input.routingDomains ?? routingDomains,
     });
 
     return this.buildOvnRouterEndpoint({
@@ -653,6 +694,167 @@ export class NetworkBuilder {
       // OVN treat the WAN subnet as directly connected on the transit
       // port and ARP for the WAN gateway out the transit veth
       // (confirmed live, 2026-08-21).
+      ipaddrs: ovnSideAddrs,
+      ifaces: [{ host, iface: transitVeth }],
+    });
+  }
+
+  /** The generic "ANY TUNNEL" router (2026-08-23 design discussion) —
+   * WireGuard today, ZeroTier later: a kernel netns with a MESH transit
+   * on one side (left — same mechanics as kernelRouterEndpoint()'s
+   * `transit`), an UPSTREAM transit on the other (right — the tunnel's
+   * own endpoint UDP reaches the real internet via this leg, never
+   * through the tunnel itself), and the tunnel interface in the middle
+   * (created by the `kernel.app.wireguard` service). The tunnel egress
+   * is the ANCHOR's default: `routes` carries the via-less
+   * `0.0.0.0/0`/`::/0` that computeRoutes rewrites to the domain's
+   * other participants (each learns `0.0.0.0/0 via <this router's
+   * backbone address>`); the netns's OWN default route goes out the
+   * upstream leg, via the upstream peer.
+   *
+   * Per-endpoint routingDomains (2026-08-23): the returned OVN endpoint
+   * and the KernelRouter are both stamped from `input.routingDomains`
+   * — a tunnel router anchors one domain from its LEFT (the tunnel's
+   * default) and participates in another from its RIGHT (e.g.
+   * Voda-defaultRoute on the backbone side). */
+  private buildTunnelRouterEndpoint(
+    input: Omit<TunnelRouterEndpoint, "kind">,
+    routerName: string,
+  ): OvnRouterEndpoint {
+    const {
+      transit: meshLink,
+      upstream: upLink,
+      upstreamBackbone,
+      upstreamDomains,
+      host,
+      tunnel,
+      services,
+      routes,
+      routingDomains,
+      ...rest
+    } = input;
+    const transitDomain = this.collisionDomain(`transit-${routerName}`);
+    const backdoorDomain = this.collisionDomain(`backdoor-${routerName}`);
+    const ovnSideAddrs = [meshLink.left.ipv4, meshLink.left.ipv6]
+      .filter((a): a is IPv4 | IPv6 => a !== undefined);
+    const kernelSideAddrs = [meshLink.right.ipv4, meshLink.right.ipv6]
+      .filter((a): a is IPv4 | IPv6 => a !== undefined);
+    const upstreamKernelAddrs = [upLink.right.ipv4, upLink.right.ipv6]
+      .filter((a): a is IPv4 | IPv6 => a !== undefined);
+    const upstreamPeerAddrs = [upLink.left.ipv4, upLink.left.ipv6]
+      .filter((a): a is IPv4 | IPv6 => a !== undefined);
+
+    // The tunnel's egress masq belongs to the tunnel IFACE (the
+    // wireguard app emits it), NOT to the security-group shortcut —
+    // that would target the right side's real iface (the upstream
+    // veth), which is the tunnel ENDPOINT's path, not the egress.
+    const masqKinds = (services ?? []).filter((s) =>
+      s.kind === "kernel.ipv4.masq" || s.kind === "kernel.ipv6.masq"
+    );
+    const ovnServices = services?.filter((s) => !s.kind.startsWith("kernel."));
+    const masq = masqKinds.map((s) =>
+      s.kind === "kernel.ipv4.masq" ? "ipv4" : "ipv6"
+    );
+    const apps: KernelApp[] = [
+      tunnel.kind === "wireguard"
+        ? {
+          kind: "wireguard",
+          ifaceName: tunnel.ifaceName,
+          config: tunnel.config,
+          masq,
+        }
+        : {
+          kind: "zerotier",
+          networkId: tunnel.networkId,
+          instanceDir: tunnel.instanceDir,
+          masq,
+        },
+    ];
+
+    // The OVN side keeps the anchor's via-less routes UNCHANGED — the
+    // tunnel egress is "handled elsewhere" (inside the netns), so no
+    // literal OVN route is rewritten (unlike buildKernelRouterEndpoint,
+    // where the via ALWAYS points at the paired kernel router).
+    const ovnSideRoutes = routes;
+
+    // The netns's OWN default route goes out the upstream leg, via the
+    // upstream peer — that's how the tunnel's endpoint UDP escapes
+    // (wg-quick's fwmark policy routing keeps it out of the tunnel).
+    const upstreamRoutes: RouterEndpointRoute[] = [];
+    if (upLink.left.ipv4 !== undefined) {
+      upstreamRoutes.push({
+        dst: IPv4.parse("0.0.0.0/0"),
+        via: upLink.left.ipv4,
+      });
+    }
+    if (upLink.left.ipv6 !== undefined) {
+      upstreamRoutes.push({
+        dst: IPv6.parse("::/0"),
+        via: upLink.left.ipv6,
+      });
+    }
+
+    const transitVeth: InterfaceKind = {
+      kind: "veth",
+      ifaceName: `veth-krn-${routerName}`,
+      peerName: `veth-ovn-${routerName}`,
+    };
+    const upstreamVeth: InterfaceKind = {
+      kind: "veth",
+      ifaceName: `veth-up-${routerName}`,
+      peerName: `veth-up-${routerName}-peer`,
+    };
+
+    // The SECOND router the tunnel needs (2026-08-23, "defaultendpoint-to-
+    // wg, backbone-leg"): an OVN router `<router>-upstream` that
+    // terminates the tunnel's upstream/backdoor leg (the backdoor LRP,
+    // the netns's default gateway) and carries a backbone leg out to the
+    // mesh — whose default routes the tunnel's endpoint UDP on to the
+    // physical WAN (e.g. voda-avm). The tunnel netns's upstream veth
+    // binds to the backdoor domain's localnet bridge, and the internal
+    // router's backdoor port carries that same veth for the bridge
+    // binding (mirror of how the mesh transit binds its own veth).
+    this.ovnRouter(`${routerName}-upstream`, (peer) => {
+      peer.routingDomains = upstreamDomains;
+      peer.left = this.buildOvnRouterEndpoint({
+        l2Segment: backdoorDomain,
+        ipaddrs: upstreamPeerAddrs,
+        ifaces: [{ host, iface: upstreamVeth }],
+      });
+      peer.right = this.buildOvnRouterEndpoint({
+        l2Segment: upstreamBackbone.l2Segment,
+        ipaddrs: upstreamBackbone.ipaddrs,
+      });
+    });
+
+    this.kernelRouter(routerName, {
+      host,
+      left: {
+        ipaddrs: kernelSideAddrs,
+        ifaces: [{ host, iface: transitVeth }],
+      },
+      right: {
+        ipaddrs: upstreamKernelAddrs,
+        routes: upstreamRoutes.length > 0 ? upstreamRoutes : undefined,
+        ifaces: [{ host, iface: upstreamVeth }],
+        apps: apps.length > 0 ? apps : undefined,
+      },
+      transitDomain,
+      transitPeerAddrs: ovnSideAddrs,
+      upstreamPeerAddrs: upstreamPeerAddrs.length > 0
+        ? upstreamPeerAddrs
+        : undefined,
+      routingDomains,
+    });
+
+    return this.buildOvnRouterEndpoint({
+      ...rest,
+      routes: ovnSideRoutes,
+      routingDomains,
+      l2Segment: transitDomain,
+      services: ovnServices !== undefined && ovnServices.length > 0
+        ? ovnServices
+        : undefined,
       ipaddrs: ovnSideAddrs,
       ifaces: [{ host, iface: transitVeth }],
     });

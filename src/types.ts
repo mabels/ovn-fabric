@@ -323,14 +323,65 @@ export interface SecurityGroup {
  * declaration time (buildKernelRouterEndpoint, define.ts), into the
  * descriptor the deployer turns into the actual service script. The
  * `kernel.app.` prefix is dropped here (`kernel.app.dhcp-client` ->
- * `kind: "dhcp-client"`); `style` is the concrete client binary the
- * deployer must invoke. A running app daemon holds its netns alive
- * past `ip netns delete`, so the deployer's delete pass MUST stop or
- * release it first (the dhcp-client does `dhclient -r`/`dhcpcd -k`). */
-export type KernelApp = {
-  readonly kind: "dhcp-client";
-  readonly style: "dhclient" | "dhcpcd";
-};
+ * `kind: "dhcp-client"`). Every app runs as a systemd unit
+ * (Restart=always) supervising the process inside the netns; a running
+ * app daemon holds its netns alive past `ip netns delete`, so the
+ * deployer's delete pass MUST stop or release it first. */
+export type KernelApp =
+  | { readonly kind: "dhcp-client"; readonly style: "dhclient" | "dhcpcd" }
+  | {
+    readonly kind: "wireguard";
+    /** The real kernel interface name AND the .conf's basename
+     * (mirrors the `kernel.app.wireguard` service's `ifaceName`). */
+    readonly ifaceName: string;
+    /** The full wg-quick conf content, written verbatim. */
+    readonly config: WireguardInterfaceConfig;
+    /** The address families to MASQUERADE out the tunnel interface —
+     * resolved from the tunnelRouterEndpoint's `kernel.*.masq` services.
+     * Masq belongs to the TUNNEL iface here, NOT to the upstream leg
+     * (the security-group shortcut targets the side's real iface, which
+     * would be wrong for a tunnel router). */
+    readonly masq: readonly ("ipv4" | "ipv6")[];
+  }
+  | {
+    readonly kind: "zerotier";
+    /** The ZeroTier network ID to join (mirrors the
+     * `kernel.app.zerotier` service's `networkId`). */
+    readonly networkId: string;
+    /** This tunnel's OWN dedicated ZeroTier home directory. */
+    readonly instanceDir: string;
+    /** The address families to MASQUERADE out the tunnel interface —
+     * the real iface name is only known at RUNTIME (ZeroTier names it),
+     * so the wire script adds/removes these rules on the captured
+     * interface. */
+    readonly masq: readonly ("ipv4" | "ipv6")[];
+  }
+  | {
+    readonly kind: "docker";
+    /** The image to run (the service's own resolved copy — the
+     * `image` field of the `kernel.app.docker` service). */
+    readonly image: string;
+    /** The container name — always resolved by
+     * buildKernelRouterEndpoint (the service's `name` prefixed with the
+     * router name, `<router>-<name>`, default `<router>-docker`), so
+     * delete can `docker rm -f` exactly what create started. */
+    readonly name: string;
+    /** The container's command — trailing args of `docker run`, split
+     * into tokens by buildKernelRouterEndpoint from the service's
+     * `cmd` string. */
+    readonly cmd?: readonly string[];
+    /** The container's interface address, e.g. "10.200.0.2/24" — the
+     * container's end of the veth injected into the router netns. */
+    readonly ip?: string;
+    /** The router end of that veth — the subnet's first host, e.g.
+     * "10.200.0.1/24", resolved by buildKernelRouterEndpoint. */
+    readonly routerIp?: string;
+    /** The SHORT veth prefix for this app's veth pair, computed from
+     * the container name (`ve-<hash>`, src/ir.ts's kernelRouterSideToIR)
+     * — the router-netns end is `veth-<vethName>`-free, the pair is
+     * `ve-<hash>` / `ve-<hash>-c`, both ≤ IFNAMSIZ. */
+    readonly vethName?: string;
+  };
 
 // ── Router: connects exactly two collision domains ──────────────────
 // The L3 primitive underneath Uplink/Segment (which are becoming a
@@ -423,6 +474,15 @@ interface RouterEndpointBase {
    * route declared here with no domain membership on this router
    * reaches no one but this router itself. */
   readonly routes?: readonly RouterEndpointRoute[];
+  /** The RoutingDomains this endpoint's DECLARED ROUTES participate in
+   * (2026-08-23) — per-endpoint membership that OVERRIDES the router-
+   * level Router.routingDomains for THIS endpoint when set. A router can
+   * legitimately anchor one domain from its left and participate in
+   * another from its right (a tunnelRouterEndpoint does exactly that:
+   * the left anchors Neighbor-defaultRoute, the right joins
+   * Voda-defaultRoute). Undefined = inherit the router's own
+   * routingDomains (the pre-2026-08-23 behavior). */
+  readonly routingDomains?: readonly RoutingDomain[];
 }
 
 /** Today's ONLY concrete shape — adds the one field that's actually
@@ -457,6 +517,66 @@ export interface KernelRouterEndpoint extends RouterEndpointBase {
    * `masq-<router>` implicitly. Must have been declared via
    * net.securityGroup() in the same defineNetwork call. */
   readonly securityGroup?: SecurityGroup;
+}
+
+/** The input shape for NetworkBuilder.tunnelRouterEndpoint() (define.ts)
+ * — the generic "ANY TUNNEL" pattern (WireGuard today, ZeroTier later;
+ * see InterfaceKind's "wireguard"/"zerotier" variants): a kernel netns
+ * with a MESH transit on one side (left — same as
+ * kernelRouterEndpoint()'s `transit`, connecting the netns to the OVN
+ * mesh), an UPSTREAM transit on the other (right — the tunnel's own
+ * endpoint handshake/keepalive UDP must reach the real internet via a
+ * mundane path, never through the tunnel itself, so the netns's default
+ * route goes out this leg), and the tunnel interface in the middle. The
+ * tunnel egress is the ANCHOR's default: the `routes` field carries the
+ * via-less `0.0.0.0/0`/`::/0` the routing domain rewrites to other
+ * participants.
+ *
+ * Deliberately NOT extending RouterEndpointBase: this endpoint has no
+ * `ipaddrs` of its own (every address is derived from the two transits
+ * at build time), and it's consumed immediately by
+ * tunnelRouterEndpoint() into a plain OvnRouterEndpoint — the tunnel
+ * itself is never an IR endpoint, only the netns + wireguard app it
+ * builds. */
+export interface TunnelRouterEndpoint {
+  readonly kind: "tunnel";
+  readonly host: Host;
+  /** The mesh-side transit (left, veth-krn-* style) — same mechanics as
+   * kernelRouterEndpoint()'s `transit`. */
+  readonly transit: TransitNetwork;
+  /** The upstream-side transit (right, veth-bdk-* style) — back toward
+   * the physical path the tunnel endpoint is reached through. */
+  readonly upstream: TransitNetwork;
+  /** The tunnel interface itself (wireguard or zerotier) — created by
+   * the `kernel.app.<kind>` service inside the netns. */
+  readonly tunnel: Extract<InterfaceKind, { kind: "wireguard" | "zerotier" }>;
+  /** The upstream-peer router's BACKBONE-facing port (2026-08-23): the
+   * tunnel netns's upstream/backdoor leg terminates on an OVN router
+   * (`<router>-upstream`) that tunnelRouterEndpoint defines INTERNALLY —
+   * it carries the backdoor LRP on `upstream` AND this backbone port, so
+   * the tunnel's endpoint traffic enters the mesh (whose default routes
+   * it on to the physical WAN, e.g. via voda-avm) instead of dying in
+   * the root namespace. */
+  readonly upstreamBackbone: {
+    readonly l2Segment: CollisionDomain;
+    readonly ipaddrs: readonly (IPv4 | IPv6)[];
+  };
+  /** The RoutingDomains the INTERNAL upstream-peer router joins
+   * (2026-08-23) — it needs the mesh's default route (learned via the
+   * domain anchor rewrite) to forward the tunnel's endpoint traffic out
+   * its backbone leg to the physical WAN (e.g. Voda-defaultRoute →
+   * voda-avm). Typically the same domain as the enclosing router's
+   * backbone/right side. */
+  readonly upstreamDomains?: readonly RoutingDomain[];
+  /** The anchor's default route(s) — via-less, so computeRoutes rewrites
+   * them to the domain's other participants. */
+  readonly routes?: readonly RouterEndpointRoute[];
+  /** Per-endpoint routing domain membership (2026-08-23) — stamped onto
+   * the returned OVN endpoint AND the KernelRouter. */
+  readonly routingDomains?: readonly RoutingDomain[];
+  /** The OVN-side services (ipv6.*) and the kernel masq services (whose
+   * families the wireguard app masquerades out the tunnel). */
+  readonly services?: readonly RouterEndpointService[];
 }
 
 /** One side of a KernelRouter's own netns — an IP assignment, plus
@@ -553,6 +673,14 @@ export interface KernelRouter {
    * Same "optional, only set by kernelRouterEndpoint()" reasoning as
    * transitDomain above. */
   readonly transitPeerAddrs?: readonly (IPv4 | IPv6)[];
+  /** The tunnel router's UPSTREAM transit peer (tunnelRouterEndpoint(),
+   * define.ts) — the OTHER end of the upstream wire (e.g. the physical-
+   * path router the tunnel netns borrows egress from): the nexthop for
+   * the netns's default route out the upstream leg, which is how the
+   * tunnel's own endpoint UDP reaches the real internet (wg-quick's
+   * fwmark policy routing keeps it out of the tunnel). Set only by
+   * tunnelRouterEndpoint(). */
+  readonly upstreamPeerAddrs?: readonly (IPv4 | IPv6)[];
   /** Same field, same meaning as Router.routingDomains below — a
    * KernelRouter's own routes (KernelRouterSide.routes) only apply if
    * it's actually a participant of some declared RoutingDomain, same
@@ -565,7 +693,10 @@ export interface KernelRouter {
   readonly routingDomains?: readonly RoutingDomain[];
 }
 
-export type RouterEndpoint = OvnRouterEndpoint | KernelRouterEndpoint;
+export type RouterEndpoint =
+  | OvnRouterEndpoint
+  | KernelRouterEndpoint
+  | TunnelRouterEndpoint;
 
 // ── RouterEndpoint services: IPv6 RA/SLAAC + kernel-side services ──
 // The Router/RouterEndpoint equivalent of the legacy Segment.slaac
@@ -619,6 +750,46 @@ export type RouterEndpointService =
   | {
     readonly kind: "kernel.app.dhcp-client";
     readonly style: "dhclient" | "dhcpcd";
+  }
+  | {
+    readonly kind: "kernel.app.wireguard";
+    /** The real kernel interface name AND the .conf's basename on disk
+     * (/etc/wireguard/<ifaceName>.conf) — see InterfaceKind's
+     * "wireguard" variant, whose config this mirrors. */
+    readonly ifaceName: string;
+    /** The full wg-quick conf content (privateKey/address/peer) —
+     * written verbatim, PrivateKey included, per the documented
+     * deliberate exception to this project's credential policy. */
+    readonly config: WireguardInterfaceConfig;
+  }
+  | {
+    readonly kind: "kernel.app.zerotier";
+    /** The ZeroTier network ID to join (16 hex chars) — see
+     * InterfaceKind's "zerotier" variant. */
+    readonly networkId: string;
+    /** This tunnel's OWN dedicated ZeroTier home directory (identity/
+     * per-network state) — see InterfaceKind's "zerotier" variant. */
+    readonly instanceDir: string;
+  }
+  | {
+    readonly kind: "kernel.app.docker";
+    /** The image to run, e.g. "ubuntu". */
+    readonly image: string;
+    /** The container name — PREFIXED with the router name at resolve
+     * time (`<router>-<name>`), so it's globally unique and delete can
+     * `docker rm -f` exactly what create started. Defaults to
+     * `<router>-docker` when omitted. */
+    readonly name?: string;
+    /** The command the container runs, e.g. "sleep 86400" or
+     * ["sleep", "86400"] — the trailing args of `docker run`
+     * (normalized to tokens at resolve time). */
+    readonly cmd?: string | readonly string[];
+    /** The container's interface address on the router's services
+     * segment, e.g. "10.200.0.2/24" — the container gets ONE veth into
+     * the kernel router's netns (the CNI/Multus-style interface
+     * injection), and this is the address on its end. The router end is
+     * the subnet's first host (`.1`). */
+    readonly ip?: string;
   };
 
 /** One route entry declared directly on the RouterEndpoint that IS the
@@ -680,8 +851,12 @@ export interface RoutingDomain {
 
 export interface Router {
   readonly name: string;
-  readonly left: RouterEndpoint;
-  readonly right: RouterEndpoint;
+  // Always the OVN side — even a kernelRouterEndpoint()/tunnelRouterEndpoint()
+  // input is consumed into a plain OvnRouterEndpoint by its builder (the
+  // KernelRouter/TunnelRouterEndpoint shapes are INPUT types, never a
+  // stored Router's own endpoint).
+  readonly left: OvnRouterEndpoint;
+  readonly right: OvnRouterEndpoint;
   /** RoutingDomains (net.routingDomain()) this router participates in
    * — object references, not names, matching every other cross-
    * reference in this file (l2Segment, gatewayChassis, ...), not a
