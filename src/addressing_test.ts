@@ -100,9 +100,12 @@ Deno.test("transitNetwork: /30 IPv4 folds to its two usable host addresses, not 
   assertEquals(t.right.ipv4?.to_string(), "10.99.0.2/30");
 });
 
-Deno.test("transitNetwork: IPv6 has no reserved broadcast, first() is the network's own zero-host address", () => {
+Deno.test("transitNetwork: IPv6 folds its network address as the reserved low end, first() yields the first usable host", () => {
+  // jsr:@adviser/ipaddress 0.2.11 reserves the all-zeros host as the
+  // network address (like IPv4), so a /126's `first()` is ::1, not ::
+  // — the OVN side of a transit link lands on that first usable host.
   const t = transitNetwork(undefined, IPv6.parse("fd00:10:99::/126"));
-  assertEquals(t.left.ipv6?.to_string(), "fd00:10:99::/126");
+  assertEquals(t.left.ipv6?.to_string(), "fd00:10:99::1/126");
   assertEquals(t.right.ipv6?.to_string(), "fd00:10:99::3/126");
 });
 
@@ -112,7 +115,7 @@ Deno.test("transitNetwork: both families fold independently in one call", () => 
     IPv6.parse("fd00:10:99::/126"),
   );
   assertEquals(t.left.ipv4?.to_string(), "10.99.0.1/30");
-  assertEquals(t.left.ipv6?.to_string(), "fd00:10:99::/126");
+  assertEquals(t.left.ipv6?.to_string(), "fd00:10:99::1/126");
   assertEquals(t.right.ipv4?.to_string(), "10.99.0.2/30");
   assertEquals(t.right.ipv6?.to_string(), "fd00:10:99::3/126");
 });

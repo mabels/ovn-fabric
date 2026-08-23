@@ -41,7 +41,7 @@
 // address ALLOCATION exists (segments/uplinks carved out of a shared
 // supernet automatically) rather than layered onto this wrapper now.
 
-import { IPAddress } from "npm:ipaddress@0.2.6";
+import { IPAddress } from "jsr:@adviser/ipaddress@0.2.11";
 
 export class IPv4 extends IPAddress {
   private constructor(source: IPAddress) {
@@ -50,7 +50,7 @@ export class IPv4 extends IPAddress {
 
   static override parse(input: string): IPv4 {
     const addr = IPAddress.parse(input);
-    if (!addr.is_ipv4()) {
+    if (!addr?.is_ipv4()) {
       throw new Error(`IPv4.parse: "${input}" is not a valid IPv4 address`);
     }
     return new IPv4(addr);
@@ -88,7 +88,7 @@ export class IPv6 extends IPAddress {
 
   static override parse(input: string): IPv6 {
     const addr = IPAddress.parse(input);
-    if (!addr.is_ipv6()) {
+    if (!addr?.is_ipv6()) {
       throw new Error(`IPv6.parse: "${input}" is not a valid IPv6 address`);
     }
     return new IPv6(addr);
