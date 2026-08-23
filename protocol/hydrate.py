@@ -110,6 +110,19 @@ def _hydrate_kernel_router(raw: dict) -> pt.KernelRouterNode:
                 if ifaces is not None
                 else None
             ),
+            securityGroup=data.get("securityGroup"),
+        ),
+    )
+
+
+def _hydrate_security_group(raw: dict) -> pt.SecurityGroupNode:
+    data = raw["data"]
+    return pt.SecurityGroupNode(
+        id=raw["id"],
+        kind=raw["kind"],
+        key=pt.SecurityGroupKey(name=raw["key"]["name"]),
+        data=pt.SecurityGroupData(
+            rules=[pt.Rule(family=pt.Family(r["family"]), kind=r["kind"]) for r in data["rules"]],
         ),
     )
 
@@ -121,6 +134,7 @@ _HYDRATORS = {
     "ipv4.route": _hydrate_ipv4_route,
     "ipv6.route": _hydrate_ipv6_route,
     "kernel.router": _hydrate_kernel_router,
+    "security.group": _hydrate_security_group,
 }
 
 

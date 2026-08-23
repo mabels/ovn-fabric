@@ -171,6 +171,10 @@ export const KernelRouterData = type({
   // survives, see buildKernelRouterEndpoint); absent = bind to a dummy
   // device.
   "ifaces?": OvnLsInterface.array(),
+  // The `security.group` node's name (`sg-<router>`) attached to THIS
+  // side's interface (right side only in practice) — the attachment
+  // point for the rules that group carries; see SecurityGroupKey below.
+  "securityGroup?": "string",
 });
 export const KernelRouterNode = type({
   id: "string",
@@ -179,12 +183,39 @@ export const KernelRouterNode = type({
   data: KernelRouterData,
 });
 
+// security.group: an IMPLEMENTATION-ABSTRACT named set of rules
+// (src/ir.ts's securityGroupToIR, from KernelRouterSide.services/
+// securityGroup, types.ts). The name is just a label (derived from the
+// owning router today, `sg-<router>`, in buildKernelRouterEndpoint,
+// define.ts — never author-chosen); the ATTACHMENT lives on whichever
+// node carries a `securityGroup` reference (today a kernel.router side
+// node, later an ovn.lrp or anything else). Rules use a generic
+// vocabulary (kind `masq` = masquerade, family = address family) that
+// each implementation maps to its own concrete command; future kernel
+// services (docker containers, wireguard) extend this same rules list.
+export const SecurityGroupRule = type({
+  family: "'ipv4'|'ipv6'",
+  kind: "'masq'",
+});
+export const SecurityGroupKey = type({ name: "string" });
+export const SecurityGroupData = type({
+  rules: SecurityGroupRule.array(),
+});
+export const SecurityGroupNode = type({
+  id: "string",
+  kind: "'security.group'",
+  key: SecurityGroupKey,
+  data: SecurityGroupData,
+});
+
 export const IRNode = InfraHostNode.or(OvnLsNode).or(OvnLrpNode).or(
   Ipv4RouteNode,
 ).or(
   Ipv6RouteNode,
 ).or(
   KernelRouterNode,
+).or(
+  SecurityGroupNode,
 );
 
 // Every node kind's envelope has the exact same shape (id: string,
@@ -228,6 +259,13 @@ export function buildJsonSchema(): Record<string, unknown> {
       "KernelRouterKey",
       "KernelRouterData",
     ),
+    SecurityGroupKey: SecurityGroupKey.toJsonSchema(),
+    SecurityGroupData: SecurityGroupData.toJsonSchema(),
+    SecurityGroupNode: nodeSchema(
+      "security.group",
+      "SecurityGroupKey",
+      "SecurityGroupData",
+    ),
   };
   return {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -239,6 +277,7 @@ export function buildJsonSchema(): Record<string, unknown> {
       "Ipv4RouteNode",
       "Ipv6RouteNode",
       "KernelRouterNode",
+      "SecurityGroupNode",
     ].map((
       name,
     ) => ({

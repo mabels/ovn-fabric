@@ -184,6 +184,10 @@ Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes 
           { dst: IPv4.parse("0.0.0.0/0"), via: IPv4.parse("192.168.132.1") },
           { dst: IPv6.parse("::/0") },
         ],
+        services: [
+          { kind: "kernel.ipv4.masq" },
+          { kind: "kernel.ipv6.masq" },
+        ],
         ifaces: [
           { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
         ],
@@ -199,12 +203,15 @@ Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes 
 
   // OVN side of the transit link: transit addresses only — the WAN
   // 192.168.132.93/24 must not be here, it lives on the kernel router's
-  // own `right` (asserted by the sibling test above).
+  // own `right` (asserted by the sibling test above). And no ipv6_ra
+  // configs: the kernel.* services were split off, never reaching the
+  // OVN endpoint's RA handling.
   const leftLrp = nodes["ovnrouter:router-wan|lrp:left"];
   assertEquals(leftLrp.data.addresses, [
     "10.12.80.1/28",
     "fd00::10:12:80:1/124",
   ]);
+  assertEquals(leftLrp.data.ipv6RaConfigs, undefined);
 
   // Both default routes point at the kernel router's transit side, even
   // though the v4 one was declared with a literal ISP `via`.
@@ -216,4 +223,126 @@ Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes 
     nodes["ovnrouter:router-wan|route:::/0"].data.nexthop,
     "fd00::10:12:80:f",
   );
+
+  // The kernel.* masq services are a SHORTCUT that expands (via
+  // net.securityGroup()) to a group named `masq-<router>` attached to
+  // the kernel router's RIGHT (WAN) side, emitted as an
+  // implementation-abstract `security.group` node carrying the rules.
+  const right = nodes["kernelrouter:router-wan|side:right"];
+  assertEquals(right.data.securityGroup, "masq-router-wan");
+  const left = nodes["kernelrouter:router-wan|side:left"];
+  assertEquals(left.data.securityGroup, undefined);
+  assertEquals(nodes["securitygroup:masq-router-wan"].data.rules, [
+    { family: "ipv4", kind: "masq" },
+    { family: "ipv6", kind: "masq" },
+  ]);
+});
+
+// An explicit securityGroup on a kernelRouterEndpoint() WINS — the
+// `kernel.*.masq` services are then IGNORED (no rules derived from
+// them), and the side attaches the explicitly-declared group instead.
+Deno.test("kernelRouterEndpoint: explicit security group wins, masq services are ignored", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const backbone = net.collisionDomain("backbone");
+    const out = net.securityGroup("wan-out", (g) => g.masq("ipv4"));
+    net.ovnRouter("router-wan", (router) => {
+      router.left = router.kernelRouterEndpoint({
+        host,
+        transit: transitNetwork(
+          IPv4.parse("10.12.80.1/28"),
+          IPv6.parse("fd00::10:12:80:1/124"),
+        ),
+        ipaddrs: [IPv4.parse("192.168.132.93/24")],
+        services: [
+          { kind: "kernel.ipv4.masq" },
+          { kind: "kernel.ipv6.masq" },
+        ],
+        securityGroup: out,
+        ifaces: [
+          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
+        ],
+      });
+      router.right = router.ovnRouterEndpoint({
+        l2Segment: backbone,
+        ipaddrs: [IPv4.parse("172.22.12.80/16")],
+      });
+    });
+  });
+
+  const nodes = toIR(network);
+  // The explicit group is attached, exactly as built (ipv4-only masq);
+  // the services' ipv6 masq never made it in.
+  assertEquals(
+    nodes["kernelrouter:router-wan|side:right"].data.securityGroup,
+    "wan-out",
+  );
+  assertEquals(nodes["securitygroup:wan-out"].data.rules, [
+    { family: "ipv4", kind: "masq" },
+  ]);
+  assertEquals(nodes["securitygroup:masq-router-wan"], undefined);
+});
+
+// An unregistered group (never returned by net.securityGroup()) fails
+// fast instead of silently attaching something no other object can
+// resolve. Same register + fail-fast split every other builder uses.
+Deno.test("kernelRouterEndpoint: unregistered security group is rejected", () => {
+  const foreign = {
+    name: "wan-out",
+    rules: [{ family: "ipv4" as const, kind: "masq" as const }],
+  };
+  let threw = false;
+  try {
+    defineNetwork("test-net", (net) => {
+      const host = net.localHost("chassis-1");
+      const backbone = net.collisionDomain("backbone");
+      net.ovnRouter("router-wan", (router) => {
+        router.left = router.kernelRouterEndpoint({
+          host,
+          transit: transitNetwork(
+            IPv4.parse("10.12.80.1/28"),
+            IPv6.parse("fd00::10:12:80:1/124"),
+          ),
+          ipaddrs: [IPv4.parse("192.168.132.93/24")],
+          securityGroup: foreign,
+          ifaces: [
+            { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
+          ],
+        });
+        router.right = router.ovnRouterEndpoint({
+          l2Segment: backbone,
+          ipaddrs: [IPv4.parse("172.22.12.80/16")],
+        });
+      });
+    });
+  } catch {
+    threw = true;
+  }
+  assertEquals(threw, true);
+});
+
+// net.securityGroup() itself: the builder accumulates masq()/rule()
+// entries into the resolved SecurityGroup, registers it on the network,
+// and rejects a duplicate name — same register + fail-fast split as
+// routingDomain()/collisionDomain().
+Deno.test("securityGroup builder: accumulates rules, registers once, rejects duplicates", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const g = net.securityGroup("g1", (group) => {
+      group.masq("ipv4").masq("ipv6").rule({ family: "ipv6", kind: "masq" });
+    });
+    assertEquals(g.rules, [
+      { family: "ipv4", kind: "masq" },
+      { family: "ipv6", kind: "masq" },
+      { family: "ipv6", kind: "masq" },
+    ]);
+    let threw = false;
+    try {
+      net.securityGroup("g1", (group) => group.masq("ipv4"));
+    } catch {
+      threw = true;
+    }
+    assertEquals(threw, true);
+  });
+  assertEquals(network.allSecurityGroups.length, 1);
+  assertEquals(network.allSecurityGroups[0].name, "g1");
 });

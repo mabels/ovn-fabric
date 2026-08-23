@@ -290,6 +290,34 @@ export interface SecurityGroupRef {
   readonly name: string;
 }
 
+/** One rule inside a security group — generic vocabulary, deliberately
+ * implementation-abstract (see SecurityGroup's own doc comment): a rule
+ * is expressed in terms any backend can translate to its own concrete
+ * command, not in iptables/nft/OVN-ACL syntax. Today the only kind is
+ * `masq` (masquerade egress from the attached interface, per address
+ * family); future kernel services (docker containers, wireguard, ...)
+ * extend this same union. */
+export type SecurityGroupRule = {
+  readonly family: "ipv4" | "ipv6";
+  readonly kind: "masq";
+};
+
+/** A fully-resolved security group — name plus its rules. Built via
+ * net.securityGroup(name, build) (define.ts — see SecurityGroupBuilder,
+ * same file), never assembled by hand: the builder is the one place a
+ * rule's abstract shape gets turned into the concrete SecurityGroupRule
+ * this type carries. Serialized straight into the implementation-
+ * abstract `security.group` IR node (src/ir.ts's securityGroupToIR).
+ * The `.masq` kernel services are a SHORTCUT that expands to one of
+ * these: an explicit `securityGroup` on a kernelRouterEndpoint() wins
+ * outright (and the masq services are ignored), otherwise the shortcut
+ * builds `{ name: "masq-<router>", rules: [<one per masq family>] }`
+ * through the very same builder. */
+export interface SecurityGroup {
+  readonly name: string;
+  readonly rules: readonly SecurityGroupRule[];
+}
+
 // ── Router: connects exactly two collision domains ──────────────────
 // The L3 primitive underneath Uplink/Segment (which are becoming a
 // superset built on top of this + CollisionDomain, see ADR 0003) — one
@@ -406,6 +434,15 @@ export interface KernelRouterEndpoint extends RouterEndpointBase {
   readonly kind: "kernel";
   readonly host: Host;
   readonly transit: TransitNetwork;
+  /** An EXPLICIT, fully-built security group (net.securityGroup(),
+   * define.ts) to attach to this endpoint's real-world-facing
+   * interface — overrides the base `SecurityGroupRef` shape, since a
+   * kernel endpoint carries the whole group, not a bare ref. When set,
+   * the `kernel.*.masq` services are IGNORED (the author owns the
+   * group's content); when absent, the masq shortcut builds
+   * `masq-<router>` implicitly. Must have been declared via
+   * net.securityGroup() in the same defineNetwork call. */
+  readonly securityGroup?: SecurityGroup;
 }
 
 /** One side of a KernelRouter's own netns — an IP assignment, plus
@@ -439,6 +476,17 @@ export interface KernelRouterSide {
    * from the deployer so its addresses/routes have something to bind
    * to. */
   readonly ifaces?: readonly HostInterface[];
+  /** The FULLY-RESOLVED security group attached to this side's real
+   * interface (right side only in practice) — an object reference, same
+   * "no string that could drift" discipline as l2Segment/routingDomains.
+   * Computed once, in buildKernelRouterEndpoint (define.ts): an explicit
+   * `securityGroup` on the kernelRouterEndpoint() input wins outright
+   * (the `kernel.*.masq` services are then IGNORED), otherwise the masq
+   * shortcut builds `{ name: "masq-<router>", rules: [...] }` through
+   * net.securityGroup() — see SecurityGroup, types.ts. Serialized into
+   * the implementation-abstract `security.group` IR node (src/ir.ts's
+   * securityGroupToIR); this side node is the ATTACHMENT point. */
+  readonly securityGroup?: SecurityGroup;
 }
 
 /** A router whose two ports are real Linux interfaces inside ONE netns
@@ -497,7 +545,7 @@ export interface KernelRouter {
 
 export type RouterEndpoint = OvnRouterEndpoint | KernelRouterEndpoint;
 
-// ── RouterEndpoint services: IPv6 RA/SLAAC ──────────────────────────
+// ── RouterEndpoint services: IPv6 RA/SLAAC + kernel-side services ──
 // The Router/RouterEndpoint equivalent of the legacy Segment.slaac
 // boolean (generate-ovn.ts) — but split into its two REAL, independently
 // meaningful OVN behaviors instead of one flag toggling both together,
@@ -517,6 +565,18 @@ export type RouterEndpoint = OvnRouterEndpoint | KernelRouterEndpoint;
 // independently useful (e.g. "ipv6.slaac" alone for solicited-only, no
 // periodic chatter), so RouterEndpoint models them as two composable
 // services instead of reintroducing one boolean that can't express that.
+//
+// The `kernel.*` kinds are the OPPOSITE world — services that apply
+// INSIDE a KernelRouter's netns, never to an OVN LRP: a
+// `kernelRouterEndpoint()` whose services include a `kernel.ipv4.masq`/
+// `kernel.ipv6.masq` implicitly generates a `kernel.securitygroup` IR
+// node (name derived from the router, `sg-<router>`, in
+// buildKernelRouterEndpoint, define.ts) carrying the matching
+// POSTROUTING MASQUERADE rules for the netns's real-world-facing
+// interface. Future kernel-side services (docker containers, wireguard)
+// extend the same list. Split off from the OVN `ipv6.*` kinds in
+// buildKernelRouterEndpoint so the OVN endpoint never sees them —
+// resolveIpv6RaConfigs (src/ir.ts) throws on a kind it doesn't know.
 export type RouterEndpointService =
   | { readonly kind: "ipv6.slaac" }
   | {
@@ -525,7 +585,9 @@ export type RouterEndpointService =
     readonly minInterval?: number;
     /** Seconds. Omit for OVN's own RFC 4861 default. */
     readonly maxInterval?: number;
-  };
+  }
+  | { readonly kind: "kernel.ipv4.masq" }
+  | { readonly kind: "kernel.ipv6.masq" };
 
 /** One route entry declared directly on the RouterEndpoint that IS the
  * anchor for it — `dst` reachable via `via`, optionally NAT'd. Moved

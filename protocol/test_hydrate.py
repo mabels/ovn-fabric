@@ -141,6 +141,43 @@ class HydrateKernelRouterTest(unittest.TestCase):
         node = mod.hydrate_node(raw)
         self.assertIsNone(node.data.ifaces)
 
+    def test_security_group_ref_defaults_to_none_when_absent(self) -> None:
+        node = mod.hydrate_node(self.RAW_KERNEL_ROUTER_RIGHT)
+        self.assertIsNone(node.data.securityGroup)
+
+    def test_security_group_ref_hydrates_when_present(self) -> None:
+        raw = {
+            **self.RAW_KERNEL_ROUTER_RIGHT,
+            "data": {
+                **self.RAW_KERNEL_ROUTER_RIGHT["data"],
+                "securityGroup": "sg-kernel-0",
+            },
+        }
+        node = mod.hydrate_node(raw)
+        self.assertEqual(node.data.securityGroup, "sg-kernel-0")
+
+
+class HydrateSecurityGroupTest(unittest.TestCase):
+    def test_produces_the_typed_dataclass_with_typed_rules(self) -> None:
+        raw = {
+            "id": "securitygroup:sg-kernel-0",
+            "kind": "security.group",
+            "key": {"name": "sg-kernel-0"},
+            "data": {
+                "rules": [
+                    {"family": "ipv4", "kind": "masq"},
+                    {"family": "ipv6", "kind": "masq"},
+                ],
+            },
+        }
+        node = mod.hydrate_node(raw)
+        self.assertIsInstance(node, pt.SecurityGroupNode)
+        self.assertEqual(node.key.name, "sg-kernel-0")
+        self.assertEqual(
+            [(r.family, r.kind) for r in node.data.rules],
+            [(pt.Family.ipv4, "masq"), (pt.Family.ipv6, "masq")],
+        )
+
 
 class HydrateUnknownKindTest(unittest.TestCase):
     def test_an_unrecognized_kind_raises_a_clear_error(self) -> None:

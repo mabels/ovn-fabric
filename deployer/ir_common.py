@@ -399,6 +399,53 @@ def _kernel_router_sides(name: str, nodes: list[pt.Model]) -> list[pt.KernelRout
     ]
 
 
+# A `security.group` node (implementation-abstract — src/ir.ts's
+# securityGroupToIR), by name. Found by the name a kernel.router side
+# node carries in `data.securityGroup`: the side node is the ATTACHMENT
+# point, the group node carries the rules.
+def _security_group_by_name(name: str, nodes: list[pt.Model]) -> pt.SecurityGroupNode | None:
+    return next(
+        (n for n in nodes if n.kind == "security.group" and n.key.name == name),
+        None,
+    )
+
+
+# A security group's rules, applied INSIDE a kernel router's netns on a
+# specific real interface (the `right` side's WAN iface, by
+# construction). This is the services emit function for `security.group`
+# (see src/ir.ts's securityGroupToIR): today it only knows how to turn
+# the two masq rule shapes into iptables/ip6tables commands, and
+# anything else is skipped loudly with a comment rather than silently
+# dropped — future rule kinds (docker containers, wireguard, ...) extend
+# the same if-chain without touching anything else.
+#
+# Plain `-A` add, same as every other create emitter in this module:
+# iptables has no --may-exist, but a `-C ... || -A` conditional must NOT
+# be emitted here — the generated Python deployer executes each line via
+# shlex.split() as argv, so `2>/dev/null`/`||` would be handed to
+# iptables as literal arguments (confirmed live, 2026-08-23: "Bad
+# argument `2>/dev/null'"). Diffing against live state is the
+# reconciler's job, not a shell conditional's.
+#
+# No delete branch: a `security.group` is pure netfilter state INSIDE
+# the netns, and `ip netns delete` (the kernel router's own delete path
+# in _emit_kernel_router) destroys the whole netns, its rules included —
+# nothing left to tear down separately.
+def _emit_security_group_rules(group: pt.SecurityGroupNode, netns: str, dev: str) -> list[str]:
+    lines = [f"# --- security group: {group.key.name} in {netns} on {dev} ---"]
+    for rule in group.data.rules:
+        if rule.kind != "masq":
+            lines.append(
+                f'# unsupported security group rule kind "{rule.kind}" for '
+                f"{group.key.name} on {dev} — skipped, see deployer/ir_to_shell.py"
+            )
+            continue
+        iptables = "iptables" if rule.family == pt.Family.ipv4 else "ip6tables"
+        argv = [iptables, "-t", "nat", "-A", "POSTROUTING", "-o", dev, "-j", "MASQUERADE"]
+        lines.append(_sh(netns_ops.netns_exec_argv(argv, netns)))
+    return lines
+
+
 # One real netns per KernelRouter (types.ts) bound to this host, then —
 # per side — a real interface when the side declares `ifaces`
 # (KernelRouterSide.ifaces, types.ts — populated for `left` by the
@@ -538,6 +585,19 @@ def _emit_kernel_router(host_id: str, nodes: list[pt.Model], action: Action) -> 
             for route in side_node.data.routes or []:
                 argv = linux_net_ops.add_route_argv(route.dst, dev, route.via)
                 lines.append(_sh(netns_ops.netns_exec_argv(argv, netns)))
+            # The side's attached security group (right side in practice)
+            # applies its rules to this real interface, inside the netns.
+            # The `security.group` node is implementation-abstract; the
+            # side node is where it's ATTACHED (2026-08-22).
+            if side_node.data.securityGroup is not None:
+                group = _security_group_by_name(side_node.data.securityGroup, nodes)
+                if group is None:
+                    raise ValueError(
+                        f"kernel router {owner.key.name} ({side_node.key.side.value}) "
+                        f'references security group "{side_node.data.securityGroup}" '
+                        f"but no such security.group node"
+                    )
+                lines.extend(_emit_security_group_rules(group, netns, dev))
     if lines:
         lines.append("")
     return lines

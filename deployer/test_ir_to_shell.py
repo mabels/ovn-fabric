@@ -479,6 +479,59 @@ class KernelRouterCreateTest(unittest.TestCase):
         self.assertIn("ip netns exec ns-kernel-0 ip addr add 10.99.0.2/28 dev veth-krn-0", script)
         self.assertNotIn("ip link add dummy-left type dummy", script)
 
+    def test_masq_services_emit_security_group_rules_on_the_wan_iface(self) -> None:
+        # A kernelRouterEndpoint's kernel.* masq services (define.ts)
+        # implicitly generate an implementation-abstract `security.group`
+        # node, attached to the kernel router's right (WAN) side via
+        # data.securityGroup. The deployer applies those rules INSIDE the
+        # netns on that side's real interface — a plain `-A` add, same as
+        # every other create emitter (no `-C || -A` shell conditional:
+        # the generated Python deployer executes lines via shlex.split()
+        # as argv, so `2>/dev/null`/`||` would reach iptables as literal
+        # arguments — confirmed live 2026-08-23).
+        nodes = [
+            pt.SecurityGroupNode(
+                id="securitygroup:sg-kernel-0",
+                kind="security.group",
+                key=pt.SecurityGroupKey(name="sg-kernel-0"),
+                data=pt.SecurityGroupData(
+                    rules=[
+                        pt.Rule(family=pt.Family.ipv4, kind="masq"),
+                        pt.Rule(family=pt.Family.ipv6, kind="masq"),
+                    ]
+                ),
+            ),
+            *[
+                (
+                    dataclasses.replace(
+                        n,
+                        data=dataclasses.replace(n.data, securityGroup="sg-kernel-0"),
+                    )
+                    if n.kind == "kernel.router" and n.key.side == pt.Side.right
+                    else n
+                )
+                for n in NODES
+            ],
+        ]
+        _, hosts = mod.build_scripts(nodes, "create")
+        script = hosts["chassis-1"]
+        self.assertIn(
+            "ip netns exec ns-kernel-0 iptables -t nat -A POSTROUTING -o eth0.2280 -j MASQUERADE",
+            script,
+        )
+        self.assertIn(
+            "ip netns exec ns-kernel-0 ip6tables -t nat -A POSTROUTING -o eth0.2280 -j MASQUERADE",
+            script,
+        )
+
+    def test_no_security_group_attached_emits_no_nat_commands(self) -> None:
+        # The base fixture has no security.group attached — a side must
+        # opt in via data.securityGroup, nothing is emitted by default.
+        _, hosts = mod.build_scripts(NODES, "create")
+        script = hosts["chassis-1"]
+        self.assertNotIn("MASQUERADE", script)
+        self.assertNotIn("iptables", script)
+
 
 class KernelRouterDeleteTest(unittest.TestCase):
     def test_delete_only_removes_the_netns_not_the_devices_inside_it(self) -> None:

@@ -19,8 +19,12 @@
 //
 // Scope, deliberately: only what the CURRENT primitives (CollisionDomain,
 // Router/RouterEndpoint, Host — see types.ts) can produce a DESIRED-state
-// fact for. NAT, backdoors, and uplink discovery (DHCP/static) have no
-// home in the new shape at all yet (see topology.cluster-draft.ts's own
+// fact for. Kernel-side NAT is covered as of 2026-08-22: a kernel
+// router's `kernel.*.masq` services (RouterEndpointService, types.ts)
+// become an IMPLEMENTATION-ABSTRACT `security.group` node
+// (securityGroupToIR below) carrying the POSTROUTING MASQUERADE rules
+// for its real-world-facing interface. Backdoors and uplink discovery (DHCP/static) still have no
+// home in the new shape yet (see topology.cluster-draft.ts's own
 // comments, written while designing this) — none of those are
 // attempted here, not because they're forgotten, but because there's
 // nothing yet to extract them FROM. Static routes (RoutingDomain, see
@@ -40,6 +44,7 @@ import type {
   Router,
   RouterEndpoint,
   RouterEndpointService,
+  SecurityGroup,
 } from "./types.ts";
 import type { NetworkDefinition } from "./define.ts";
 
@@ -276,7 +281,38 @@ function kernelRouterSideToIR(
       ipaddrs: addrStrings(router[side].ipaddrs),
       routes: routes.length > 0 ? routes : undefined,
       ifaces: ifaces !== undefined && ifaces.length > 0 ? ifaces : undefined,
+      // The security group attached to THIS side's interface (right
+      // side only in practice — set by buildKernelRouterEndpoint,
+      // define.ts). Carried here as the generic `security.group` node's
+      // name (`masq-<router>` for the masq shortcut): the attachment
+      // point lives on the side node, the rules live in the group node
+      // itself.
+      securityGroup: router[side].securityGroup?.name,
     },
+  };
+}
+
+// ── security.group ───────────────────────────────────────────────────
+// The IR counterpart of a security group (SecurityGroup, types.ts) —
+// deliberately IMPLEMENTATION-ABSTRACT: a named set of rules that some
+// object (today a KernelRouterSide, later an ovn.lrp, a docker
+// container, ...) attaches to via its own `securityGroup` reference.
+// Nothing about this node is kernel- or OVN-specific: the name is just
+// a label, and the rules are the FINAL resolved facts in a generic
+// vocabulary (`kind: "masq"` = masquerade, `family` = which address
+// family), which each implementation maps to its own concrete command
+// (the deployer turns `masq` into an iptables MASQUERADE inside a
+// kernel netns; an OVN backend would translate the same rule to its own
+// NAT/ACL). The group is BUILT once, at declaration time
+// (net.securityGroup(), define.ts — including the implicit `masq-<router>`
+// shortcut expansion); this function is pure serialization, it derives
+// nothing.
+function securityGroupToIR(group: SecurityGroup): IRNode {
+  return {
+    id: `securitygroup:${group.name}`,
+    kind: "security.group",
+    key: { name: group.name },
+    data: { rules: group.rules },
   };
 }
 
@@ -447,14 +483,25 @@ function resolveIpv6RaConfigs(
     }
     // Exhaustive on purpose, not "anything that isn't slaac must be
     // ra" — confirmed live, 2026-08-12: a services entry with a kind
-    // outside RouterEndpointService's declared union (e.g. a config
-    // author's own in-progress sketch toward kernel-side NAT service
-    // kinds, still unimplemented) silently got treated as "ipv6.ra"
-    // and set send_periodic=true on an endpoint that never asked for
-    // it — TypeScript's own exhaustiveness checking doesn't help here
-    // if the config author's object literal reaches this function
-    // without ever being checked (e.g. `deno run` without a preceding
-    // `deno check`). A real runtime throw catches it instead.
+    // outside the OVN `ipv6.*` pair (e.g. a config author's in-progress
+    // sketch toward kernel-side NAT service kinds) silently got treated
+    // as "ipv6.ra" and set send_periodic=true on an endpoint that never
+    // asked for it — TypeScript's own exhaustiveness checking doesn't
+    // help here if the config author's object literal reaches this
+    // function without ever being checked (e.g. `deno run` without a
+    // preceding `deno check`). A real runtime throw catches it instead.
+    // The `kernel.*` kinds should never arrive here (they're split off
+    // in buildKernelRouterEndpoint, define.ts, before the OVN endpoint
+    // is built) — if one does, that's exactly the bug this throws for.
+    if (
+      service.kind === "kernel.ipv4.masq" || service.kind === "kernel.ipv6.masq"
+    ) {
+      throw new Error(
+        `resolveIpv6RaConfigs: kernel-side service "${service.kind}" reached ` +
+          `an OVN endpoint — buildKernelRouterEndpoint should have split ` +
+          `it off onto the KernelRouter's own side`,
+      );
+    }
     const unknownKind: never = service;
     throw new Error(
       `unknown RouterEndpointService kind: ${JSON.stringify(unknownKind)}`,
@@ -784,6 +831,16 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
       );
       nodes[node.id] = node;
     }
+  }
+
+  // Every security group built via net.securityGroup() (define.ts) —
+  // including the implicit `masq-<router>` shortcut expansions — becomes
+  // one implementation-abstract `security.group` node. The ATTACHMENT
+  // (which side/interface carries it) lives on the kernel.router side
+  // nodes via `data.securityGroup`, not here.
+  for (const group of network.allSecurityGroups) {
+    const node = securityGroupToIR(group);
+    nodes[node.id] = node;
   }
 
   return nodes;

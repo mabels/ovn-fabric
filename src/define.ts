@@ -22,6 +22,8 @@ import {
   type Router,
   type RouterEndpoint,
   type RoutingDomain,
+  type SecurityGroup,
+  type SecurityGroupRule,
   type Segment,
   sshHost,
   type Uplink,
@@ -63,6 +65,14 @@ export interface NetworkDefinition {
    * routingDomains, resolved into real per-router routes at IR time
    * (src/ir.ts's computeRoutes), not here. */
   readonly allRoutingDomains: readonly RoutingDomain[];
+  /** Every security group built via net.securityGroup() — see
+   * SecurityGroup (types.ts). Includes the ones the `kernel.*.masq`
+   * shortcut builds implicitly (masq-<router>) — same "never declared
+   * directly, always as a side effect of kernelRouterEndpoint()"
+   * reasoning as allKernelRouters. Serialized to one implementation-
+   * abstract `security.group` IR node each (src/ir.ts's
+   * securityGroupToIR). */
+  readonly allSecurityGroups: readonly SecurityGroup[];
   /** Cluster-wide OVN settings (NB_Global) — see ovnGlobal() below.
    * Undefined means "OVN defaults for everything," not "no OVN
    * cluster" (that's whether any Host has an `ovn` role at all). */
@@ -127,6 +137,7 @@ export class NetworkBuilder {
   private readonly routersByName = new Map<string, Router>();
   private readonly kernelRoutersByName = new Map<string, KernelRouter>();
   private readonly routingDomainsByName = new Map<string, RoutingDomain>();
+  private readonly securityGroupsByName = new Map<string, SecurityGroup>();
 
   // Both host-declaring methods route through this — the "at most one
   // central chassis per cluster" check has to live in exactly one
@@ -277,6 +288,33 @@ export class NetworkBuilder {
     return domain;
   }
 
+  /** Declare a named security group — the ONE way a security group gets
+   * built (see SecurityGroupBuilder for the per-call rule API; the
+   * returned SecurityGroup is the fully-resolved name+rules object, not
+   * a lazily-resolved reference). Any kernelRouterEndpoint() can then
+   * attach it to its real-world-facing interface via its `securityGroup`
+   * input — and the `kernel.*.masq` service shortcut builds one through
+   * THIS same method (name `masq-<router>`), so implicit and explicit
+   * groups are structurally identical by construction.
+   *
+   * Same "register + fail fast on duplicates, resolve later" split as
+   * every other builder method here. The object returned is immutable
+   * (a frozen copy of the builder's accumulation) — a caller can pass it
+   * around by reference, like every other NetworkBuilder handle. */
+  securityGroup(
+    name: string,
+    build: (group: SecurityGroupBuilder) => void,
+  ): SecurityGroup {
+    if (this.securityGroupsByName.has(name)) {
+      throw new Error(`security group "${name}" declared more than once`);
+    }
+    const builder = new SecurityGroupBuilder(name);
+    build(builder);
+    const group = builder.build();
+    this.securityGroupsByName.set(name, group);
+    return group;
+  }
+
   /** Declare a router connecting exactly two collision domains — see
    * Router/RouterEndpoint (types.ts) for why exactly two, not N. Named
    * ovnRouter(), not router(): kernelRouterEndpoint()/
@@ -414,8 +452,12 @@ export class NetworkBuilder {
    * `transit`/`ifaces`, consumed below — ipaddrs, mac, gatewayChassis,
    * securityGroup, services, routes) carries straight through to the
    * returned OvnRouterEndpoint, symmetric with ovnRouterEndpoint()
-   * above taking `Omit<OvnRouterEndpoint, "kind">`. `ifaces` is the
-   * exception that lands ONLY on the paired KernelRouter's `right`
+   * above taking `Omit<OvnRouterEndpoint, "kind">` — EXCEPT `services`
+   * (split: the `kernel.*` kinds are consumed here into the
+   * KernelRouter's security group, only the `ipv6.*` kinds reach the
+   * OVN endpoint) and `securityGroup` (consumed here — attached to the
+   * KernelRouter's `right`, masq shortcut expansion, see below). `ifaces`
+   * is the exception that lands ONLY on the paired KernelRouter's `right`
    * (KernelRouterSide.ifaces, types.ts — the real-world-facing
    * interface the deployer moves into the netns). The transit domain
    * still gets its localnet port/gateway-chassis pin/bridge binding/
@@ -458,12 +500,63 @@ export class NetworkBuilder {
     routingDomains: readonly RoutingDomain[] | undefined,
     routerName: string,
   ): OvnRouterEndpoint {
-    const { transit: link, host, ipaddrs, ifaces, ...rest } = input;
+    const {
+      transit: link,
+      host,
+      ipaddrs,
+      ifaces,
+      services,
+      securityGroup,
+      ...rest
+    } = input;
     const transitDomain = this.collisionDomain(`transit-${routerName}`);
     const ovnSideAddrs = [link.left.ipv4, link.left.ipv6]
       .filter((a): a is IPv4 | IPv6 => a !== undefined);
     const kernelSideAddrs = [link.right.ipv4, link.right.ipv6]
       .filter((a): a is IPv4 | IPv6 => a !== undefined);
+
+    // Kernel-side services (the `kernel.*` kinds of RouterEndpointService
+    // — today `kernel.ipv4.masq`/`kernel.ipv6.masq`, later docker/
+    // wireguard...) apply INSIDE the KernelRouter's netns, never to the
+    // OVN twin's LRP — so they're split off here before `...rest`
+    // reaches buildOvnRouterEndpoint, where resolveIpv6RaConfigs
+    // (src/ir.ts) would throw on a kind it doesn't know. The OVN
+    // endpoint keeps only the `ipv6.*` services.
+    const kernelServices = services?.filter((s) =>
+      s.kind.startsWith("kernel.")
+    );
+    const ovnServices = services?.filter((s) => !s.kind.startsWith("kernel."));
+    // `.masq` is a SHORTCUT for a self-defined security group: it
+    // expands (through net.securityGroup() — the SAME builder a config
+    // author would call explicitly) to a group named `masq-<router>`
+    // containing one MASQUERADE rule per declared masq family. An
+    // EXPLICIT `securityGroup` on the endpoint wins outright — masq is
+    // then IGNORED (the author takes responsibility for the group's own
+    // content, so no rules are derived from the services) — and must
+    // have been declared via net.securityGroup() in this same
+    // defineNetwork call, same "register + fail fast" split as every
+    // other cross-reference here.
+    if (
+      securityGroup !== undefined &&
+      this.securityGroupsByName.get(securityGroup.name) !== securityGroup
+    ) {
+      throw new Error(
+        `kernelRouterEndpoint: security group "${securityGroup.name}" was ` +
+          `not declared via net.securityGroup() in this defineNetwork call`,
+      );
+    }
+    const masqKinds = (kernelServices ?? []).filter((s) =>
+      s.kind === "kernel.ipv4.masq" || s.kind === "kernel.ipv6.masq"
+    );
+    const securityGroupDef = securityGroup !== undefined
+      ? securityGroup
+      : masqKinds.length > 0
+      ? this.securityGroup(`masq-${routerName}`, (group) => {
+        for (const s of masqKinds) {
+          group.masq(s.kind === "kernel.ipv4.masq" ? "ipv4" : "ipv6");
+        }
+      })
+      : undefined;
 
     // `routes` also lands on the KernelRouter's own right side (the
     // real-world-facing one, see KernelRouterSide's own doc comment) —
@@ -520,7 +613,12 @@ export class NetworkBuilder {
         // attaches to.
         ifaces: [{ host, iface: transitVeth }],
       },
-      right: { ipaddrs, routes: input.routes, ifaces },
+      right: {
+        ipaddrs,
+        routes: input.routes,
+        ifaces,
+        securityGroup: securityGroupDef,
+      },
       transitDomain,
       transitPeerAddrs: ovnSideAddrs,
       routingDomains,
@@ -530,6 +628,9 @@ export class NetworkBuilder {
       ...rest,
       routes: ovnSideRoutes,
       l2Segment: transitDomain,
+      services: ovnServices !== undefined && ovnServices.length > 0
+        ? ovnServices
+        : undefined,
       // Only the transit-side addresses live on the OVN port: `ipaddrs`
       // (the real-world-facing ones, e.g. 192.168.132.93/24) belong to
       // the kernel netns's OWN interface (KernelRouterSide.right above),
@@ -658,6 +759,7 @@ export class NetworkBuilder {
       allRouters: [...this.routersByName.values()],
       allKernelRouters: [...this.kernelRoutersByName.values()],
       allRoutingDomains: [...this.routingDomainsByName.values()],
+      allSecurityGroups: [...this.securityGroupsByName.values()],
       ovnGlobal: this.ovnGlobalOptions,
     };
   }
@@ -670,4 +772,37 @@ export function defineNetwork(
   const builder = new NetworkBuilder();
   build(builder);
   return builder.build(name);
+}
+
+/** The per-declaration rule API handed to net.securityGroup()'s build
+ * callback (define.ts) — the ONE place a rule's abstract shape gets
+ * turned into the concrete SecurityGroupRule a SecurityGroup carries.
+ * Today it only knows `masq(family)`; future kernel services (docker
+ * containers, wireguard, ...) add their own methods here, and the
+ * implementation-abstract IR/deployer side consumes them unchanged. */
+export class SecurityGroupBuilder {
+  private readonly rules: SecurityGroupRule[] = [];
+
+  constructor(private readonly name: string) {}
+
+  /** Add a masquerade rule for one address family — the expansion of the
+   * `kernel.ipv4.masq`/`kernel.ipv6.masq` service shortcut (see
+   * buildKernelRouterEndpoint). Chainable. */
+  masq(family: "ipv4" | "ipv6"): this {
+    this.rules.push({ family, kind: "masq" });
+    return this;
+  }
+
+  /** Add an already-fully-shaped rule — for the day a service isn't a
+   * simple masq. Chainable. */
+  rule(rule: SecurityGroupRule): this {
+    this.rules.push(rule);
+    return this;
+  }
+
+  /** The resolved, immutable group — name + a snapshot of the rules
+   * accumulated so far. */
+  build(): SecurityGroup {
+    return { name: this.name, rules: [...this.rules] };
+  }
 }
