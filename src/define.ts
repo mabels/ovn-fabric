@@ -12,6 +12,7 @@ import {
   type Host,
   type HostAddress,
   type InterfaceKind,
+  type KernelApp,
   type KernelRouter,
   type KernelRouterEndpoint,
   type KernelRouterSide,
@@ -557,6 +558,19 @@ export class NetworkBuilder {
         }
       })
       : undefined;
+    // `kernel.app.*` services resolve into app descriptors running INSIDE
+    // the netns on the right side's real interface — independent of the
+    // security-group shortcut above (an explicit `securityGroup` does
+    // NOT suppress them; only the masq services it overrides).
+    const appServices = (kernelServices ?? []).filter((s) =>
+      s.kind.startsWith("kernel.app.")
+    );
+    const apps: KernelApp[] = [];
+    for (const s of appServices) {
+      if (s.kind === "kernel.app.dhcp-client") {
+        apps.push({ kind: "dhcp-client", style: s.style });
+      }
+    }
 
     // `routes` also lands on the KernelRouter's own right side (the
     // real-world-facing one, see KernelRouterSide's own doc comment) —
@@ -617,6 +631,7 @@ export class NetworkBuilder {
         ipaddrs,
         routes: input.routes,
         ifaces,
+        apps: apps.length > 0 ? apps : undefined,
         securityGroup: securityGroupDef,
       },
       transitDomain,

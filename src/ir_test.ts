@@ -346,3 +346,42 @@ Deno.test("securityGroup builder: accumulates rules, registers once, rejects dup
   assertEquals(network.allSecurityGroups.length, 1);
   assertEquals(network.allSecurityGroups[0].name, "g1");
 });
+
+// `kernel.app.*` services resolve to KernelApp descriptors carried on
+// the kernel router's right (WAN) side — independent of the security-
+// group shortcut — and never reach the OVN endpoint's RA handling.
+Deno.test("kernelRouterEndpoint: kernel.app services resolve to app descriptors on the right side", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const backbone = net.collisionDomain("backbone");
+    net.ovnRouter("router-wan", (router) => {
+      router.left = router.kernelRouterEndpoint({
+        host,
+        transit: transitNetwork(
+          IPv4.parse("10.12.80.1/28"),
+          IPv6.parse("fd00::10:12:80:1/124"),
+        ),
+        ipaddrs: [],
+        services: [{ kind: "kernel.app.dhcp-client", style: "dhcpcd" }],
+        ifaces: [
+          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
+        ],
+      });
+      router.right = router.ovnRouterEndpoint({
+        l2Segment: backbone,
+        ipaddrs: [IPv4.parse("172.22.12.80/16")],
+      });
+    });
+  });
+
+  const nodes = toIR(network);
+  assertEquals(nodes["kernelrouter:router-wan|side:right"].data.apps, [
+    { kind: "dhcp-client", style: "dhcpcd" },
+  ]);
+  assertEquals(nodes["kernelrouter:router-wan|side:left"].data.apps, undefined);
+  // The kernel.app service was split off, never becoming an RA config.
+  assertEquals(
+    nodes["ovnrouter:router-wan|lrp:left"].data.ipv6RaConfigs,
+    undefined,
+  );
+});

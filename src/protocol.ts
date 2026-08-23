@@ -158,6 +158,14 @@ export const KernelRouterKey = type({
   "side?": "'left'|'right'",
 });
 export const KernelRouterRoute = type({ dst: "string", via: "string" });
+// KernelApp — a fully-resolved kernel-netns application (types.ts): the
+// `kernel.app.*` service kinds resolved at declaration time. `kind` is
+// the app (`dhcp-client` today), `style` the concrete client binary the
+// deployer must invoke (`dhclient`/`dhcpcd`).
+export const KernelApp = type({
+  kind: "'dhcp-client'",
+  style: "'dhclient'|'dhcpcd'",
+});
 export const KernelRouterData = type({
   host: "string",
   "ipaddrs?": "string[]",
@@ -171,10 +179,16 @@ export const KernelRouterData = type({
   // survives, see buildKernelRouterEndpoint); absent = bind to a dummy
   // device.
   "ifaces?": OvnLsInterface.array(),
-  // The `security.group` node's name (`sg-<router>`) attached to THIS
-  // side's interface (right side only in practice) — the attachment
-  // point for the rules that group carries; see SecurityGroupKey below.
+  // The `security.group` node's name (`masq-<router>` for the masq
+  // shortcut) attached to THIS side's interface (right side only in
+  // practice) — the attachment point for the rules that group carries;
+  // see SecurityGroupKey below.
   "securityGroup?": "string",
+  // Applications running inside the netns on this side's real interface
+  // (right side only in practice — src/ir.ts's kernelRouterSideToIR,
+  // from KernelApp, types.ts). The deployer turns each into its
+  // `ip netns exec` service script and MUST stop/release it on delete.
+  "apps?": KernelApp.array(),
 });
 export const KernelRouterNode = type({
   id: "string",

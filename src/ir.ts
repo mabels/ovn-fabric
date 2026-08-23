@@ -288,6 +288,12 @@ function kernelRouterSideToIR(
       // point lives on the side node, the rules live in the group node
       // itself.
       securityGroup: router[side].securityGroup?.name,
+      // Applications running inside the netns on this side's real
+      // interface (right side only in practice — the `kernel.app.*`
+      // services resolved in buildKernelRouterEndpoint, define.ts). The
+      // deployer turns each into its `ip netns exec` service script,
+      // and stops/releases it on delete.
+      apps: router[side].apps,
     },
   };
 }
@@ -461,6 +467,19 @@ function resolveMac(lrp: string, endpoint: RouterEndpoint): string {
 // options syntax." Undefined (not an empty object) when no service is
 // declared, so the deployer can tell "nothing to set" apart from "set
 // zero keys" without inspecting emptiness itself.
+// A RouterEndpointService is a kernel-side one (`kernel.*`) iff its
+// `kind` says so — used as a type predicate so the exhaustive-throw
+// branch below can narrow the union all the way to `never` (a plain
+// `kind.startsWith()` can't).
+function isKernelService(
+  service: RouterEndpointService,
+): service is Extract<
+  RouterEndpointService,
+  { readonly kind: `kernel.${string}` }
+> {
+  return service.kind.startsWith("kernel.");
+}
+
 function resolveIpv6RaConfigs(
   services: readonly RouterEndpointService[] | undefined,
 ): Record<string, string> | undefined {
@@ -493,9 +512,7 @@ function resolveIpv6RaConfigs(
     // The `kernel.*` kinds should never arrive here (they're split off
     // in buildKernelRouterEndpoint, define.ts, before the OVN endpoint
     // is built) — if one does, that's exactly the bug this throws for.
-    if (
-      service.kind === "kernel.ipv4.masq" || service.kind === "kernel.ipv6.masq"
-    ) {
+    if (isKernelService(service)) {
       throw new Error(
         `resolveIpv6RaConfigs: kernel-side service "${service.kind}" reached ` +
           `an OVN endpoint — buildKernelRouterEndpoint should have split ` +

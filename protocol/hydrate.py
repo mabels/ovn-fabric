@@ -90,6 +90,7 @@ def _hydrate_kernel_router(raw: dict) -> pt.KernelRouterNode:
     side = raw["key"].get("side")
     routes = data.get("routes")
     ifaces = data.get("ifaces")
+    apps = data.get("apps")
     return pt.KernelRouterNode(
         id=raw["id"],
         kind=raw["kind"],
@@ -111,6 +112,11 @@ def _hydrate_kernel_router(raw: dict) -> pt.KernelRouterNode:
                 else None
             ),
             securityGroup=data.get("securityGroup"),
+            apps=(
+                [pt.App(kind=a["kind"], style=pt.Style(a["style"])) for a in apps]
+                if apps is not None
+                else None
+            ),
         ),
     )
 

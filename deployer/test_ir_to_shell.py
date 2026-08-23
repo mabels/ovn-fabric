@@ -22,6 +22,9 @@ import contextlib
 import dataclasses
 import importlib
 import io
+import os
+import shlex
+import tempfile
 import unittest
 from unittest import mock
 
@@ -532,6 +535,70 @@ class KernelRouterCreateTest(unittest.TestCase):
         self.assertNotIn("MASQUERADE", script)
         self.assertNotIn("iptables", script)
 
+    def test_kernel_app_dhcp_client_deploys_systemd_unit_on_create_and_delete(self) -> None:
+        # `kernel.app.dhcp-client` resolves to a KernelApp descriptor on
+        # the right side (define.ts). The deployer turns it into a real
+        # systemd unit (Restart=always) supervising the client inside the
+        # netns — installed + started on create; stopped/disabled/removed
+        # on delete, BEFORE `ip netns delete`, since an app daemon holds
+        # its netns alive past deletion (2026-08-23).
+
+        def with_app(style: str) -> list[pt.Model]:
+            return [
+                (
+                    dataclasses.replace(
+                        n,
+                        data=dataclasses.replace(
+                            n.data,
+                            apps=[pt.App(kind="dhcp-client", style=pt.Style(style))],
+                        ),
+                    )
+                    if n.kind == "kernel.router" and n.key.side == pt.Side.right
+                    else n
+                )
+                for n in NODES
+            ]
+
+        unit = "ovn-kernel-kernel-0-dhcp-client.service"
+        for style, exec_client in [
+            ("dhclient", "/usr/sbin/dhclient -d eth0.2280"),
+            ("dhcpcd", "/usr/sbin/dhcpcd -B eth0.2280"),
+        ]:
+            with self.subTest(style=style):
+                _, create_hosts = mod.build_scripts(with_app(style), "create")
+                create_script = create_hosts["chassis-1"]
+                # Unit written via heredoc, then enabled+started.
+                self.assertIn(f"cat > /etc/systemd/system/{unit} << 'OVN'", create_script)
+                self.assertIn(
+                    f"ExecStart=/usr/bin/ip netns exec ns-kernel-0 {exec_client}",
+                    create_script,
+                )
+                self.assertIn("Restart=always", create_script)
+                self.assertIn(f"systemctl enable --now {unit}", create_script)
+                self.assertGreater(
+                    create_script.index(f"systemctl enable --now {unit}"),
+                    create_script.index(f"cat > /etc/systemd/system/{unit} << 'OVN'"),
+                )
+                _, delete_hosts = mod.build_scripts(with_app(style), "delete")
+                delete_script = delete_hosts["chassis-1"]
+                self.assertIn(f"systemctl disable --now {unit}", delete_script)
+                self.assertIn(
+                    f"rm -f /etc/systemd/system/{unit}",
+                    delete_script,
+                )
+                # The unit is stopped before the netns is torn down.
+                self.assertLess(
+                    delete_script.index(f"systemctl disable --now {unit}"),
+                    delete_script.index("ip netns delete ns-kernel-0"),
+                )
+
+    def test_no_apps_emits_no_dhcp_client_commands(self) -> None:
+        # The base fixture has no apps — nothing is started by default.
+        _, hosts = mod.build_scripts(NODES, "create")
+        script = hosts["chassis-1"]
+        self.assertNotIn("dhclient", script)
+        self.assertNotIn("dhcpcd", script)
+
 
 class KernelRouterDeleteTest(unittest.TestCase):
     def test_delete_only_removes_the_netns_not_the_devices_inside_it(self) -> None:
@@ -638,19 +705,35 @@ class InvalidActionTest(unittest.TestCase):
 
 
 class GeneratePythonDeployerTest(unittest.TestCase):
+    def _exec_runtime(self) -> dict:
+        ns: dict = {}
+        exec(mod.generate_python_deployer(NODES), ns)
+        return ns
+
     def test_generated_file_is_valid_python(self) -> None:
         compile(mod.generate_python_deployer(NODES), "<generated>", "exec")
 
-    def test_embedded_blocks_equal_the_shell_generator_output(self) -> None:
-        src = mod.generate_python_deployer(NODES)
-        ns: dict = {}
-        exec(src, ns)
-        create_cluster, create_hosts = mod.build_scripts(NODES, "create")
-        delete_cluster, delete_hosts = mod.build_scripts(NODES, "delete")
-        self.assertEqual(ns["CLUSTER_CREATE"], create_cluster)
-        self.assertEqual(ns["CLUSTER_DELETE"], delete_cluster)
-        self.assertEqual(ns["HOSTS"]["chassis-1"]["create"], create_hosts["chassis-1"])
-        self.assertEqual(ns["HOSTS"]["chassis-1"]["delete"], delete_hosts["chassis-1"])
+    def test_generated_host_function_issues_the_same_commands_as_the_shell(self) -> None:
+        # The Emitter refactor's core guarantee (2026-08-23): the Python
+        # front-end and the shell front-end render the SAME emitter
+        # operations, so running a generated host function must issue
+        # exactly the argv the shell generator prints as commands.
+        ns = self._exec_runtime()
+        _, create_hosts = mod.build_scripts(NODES, "create")
+        shell_commands = [
+            shlex.split(line)
+            for line in create_hosts["chassis-1"].splitlines()
+            if line
+            and not line.startswith("#")
+            and not line.startswith("set ")
+            and line not in ("OVN",)
+        ]
+        argv_seen: list[list[str]] = []
+        with mock.patch("subprocess.run") as run:
+            run.return_value.returncode = 0
+            ns["_host_chassis_1_create"](False, True)
+            argv_seen = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(shell_commands, argv_seen)
 
     def test_runtime_exposes_the_cli_selectors(self) -> None:
         src = mod.generate_python_deployer(NODES)
@@ -659,59 +742,55 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             "--cluster",
             "--host",
             "--verbose",
-            "def run_block",
+            "def run_cmd",
+            "def write_file",
             "argparse.ArgumentParser",
             'choices=["create", "delete"]',
         ):
             self.assertIn(marker, src)
 
-    def test_run_block_warns_for_delete_and_aborts_for_create(self) -> None:
-        ns: dict = {}
-        exec(mod.generate_python_deployer(NODES), ns)
-        run_block = ns["run_block"]
+    def test_run_cmd_warns_for_delete_and_aborts_for_create(self) -> None:
+        ns = self._exec_runtime()
         stderr = io.StringIO()
         # delete: a failing command warns and the pass continues.
         with contextlib.redirect_stderr(stderr):
-            run_block("host", "# comment\nfalse\n", False, False)
+            ns["run_cmd"]("host", "false", False, False)
         self.assertIn("warning: failed in host", stderr.getvalue())
         # create: the same command aborts the pass.
         with self.assertRaises(SystemExit) as ctx:
             with contextlib.redirect_stderr(stderr):
-                run_block("host", "# comment\nfalse\n", False, True)
+                ns["run_cmd"]("host", "false", False, True)
         self.assertEqual(ctx.exception.code, 1)
         self.assertIn("error: failed in host", stderr.getvalue())
 
-    def test_run_block_skips_comments_and_the_set_envelope(self) -> None:
-        ns: dict = {}
-        exec(mod.generate_python_deployer(NODES), ns)
-        stderr = io.StringIO()
-        # "set -eu"/"set -u" are the block's own envelope, not commands
-        # for a subprocess (no `set` binary) — skipped like comments.
-        with contextlib.redirect_stderr(stderr):
-            ns["run_block"]("host", "#!/bin/sh\nset -eu\n# --- comment ---\n", False, False)
-        self.assertEqual(stderr.getvalue(), "")
-
-    def test_run_block_verbose_echoes_every_command(self) -> None:
-        ns: dict = {}
-        exec(mod.generate_python_deployer(NODES), ns)
+    def test_run_cmd_verbose_echoes_every_command(self) -> None:
+        ns = self._exec_runtime()
         stdout = io.StringIO()
         with contextlib.redirect_stdout(stdout):
-            ns["run_block"]("host", "# c\ntrue\nfalse\n", True, False)
+            ns["run_cmd"]("host", "true", True, False)
         self.assertIn("host$ true", stdout.getvalue())
-        self.assertIn("host$ false", stdout.getvalue())
-        self.assertNotIn("host$ # c", stdout.getvalue())
 
-    def test_run_block_missing_binary_warns_not_crashes(self) -> None:
-        ns: dict = {}
-        exec(mod.generate_python_deployer(NODES), ns)
+    def test_run_cmd_missing_binary_warns_not_crashes(self) -> None:
+        ns = self._exec_runtime()
         stderr = io.StringIO()
         with mock.patch(
             "subprocess.run",
             side_effect=FileNotFoundError(2, "No such file or directory", "ovn-nbctl"),
         ):
             with contextlib.redirect_stderr(stderr):
-                ns["run_block"]("host", "ovn-nbctl ls-add home\n", False, False)
+                ns["run_cmd"]("host", "ovn-nbctl ls-add home", False, False)
         self.assertIn("warning: cannot run in host", stderr.getvalue())
+
+    def test_write_file_writes_content_with_a_trailing_newline(self) -> None:
+        # The append() emitter operation at runtime must produce the same
+        # file the shell front-end's heredoc would — content plus a
+        # single trailing newline (2026-08-23).
+        ns = self._exec_runtime()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "unit.service")
+            ns["write_file"]("host", path, "[Unit]\nDescription=x", False, False)
+            with open(path, encoding="utf-8") as out:
+                self.assertEqual(out.read(), "[Unit]\nDescription=x\n")
 
 
 if __name__ == "__main__":

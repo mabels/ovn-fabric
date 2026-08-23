@@ -156,6 +156,25 @@ class HydrateKernelRouterTest(unittest.TestCase):
         node = mod.hydrate_node(raw)
         self.assertEqual(node.data.securityGroup, "sg-kernel-0")
 
+    def test_apps_default_to_none_when_absent(self) -> None:
+        node = mod.hydrate_node(self.RAW_KERNEL_ROUTER_RIGHT)
+        self.assertIsNone(node.data.apps)
+
+    def test_apps_hydrate_to_typed_app_entries(self) -> None:
+        raw = {
+            **self.RAW_KERNEL_ROUTER_RIGHT,
+            "data": {
+                **self.RAW_KERNEL_ROUTER_RIGHT["data"],
+                "apps": [{"kind": "dhcp-client", "style": "dhclient"}],
+            },
+        }
+        node = mod.hydrate_node(raw)
+        self.assertEqual(len(node.data.apps or []), 1)
+        app = node.data.apps[0]  # type: ignore[index]
+        self.assertIsInstance(app, pt.App)
+        self.assertEqual(app.kind, "dhcp-client")
+        self.assertEqual(app.style, pt.Style.dhclient)
+
 
 class HydrateSecurityGroupTest(unittest.TestCase):
     def test_produces_the_typed_dataclass_with_typed_rules(self) -> None:

@@ -318,6 +318,20 @@ export interface SecurityGroup {
   readonly rules: readonly SecurityGroupRule[];
 }
 
+/** A fully-resolved kernel-netns APPLICATION — the `kernel.app.*`
+ * service kinds (RouterEndpointService, types.ts) resolved once, at
+ * declaration time (buildKernelRouterEndpoint, define.ts), into the
+ * descriptor the deployer turns into the actual service script. The
+ * `kernel.app.` prefix is dropped here (`kernel.app.dhcp-client` ->
+ * `kind: "dhcp-client"`); `style` is the concrete client binary the
+ * deployer must invoke. A running app daemon holds its netns alive
+ * past `ip netns delete`, so the deployer's delete pass MUST stop or
+ * release it first (the dhcp-client does `dhclient -r`/`dhcpcd -k`). */
+export type KernelApp = {
+  readonly kind: "dhcp-client";
+  readonly style: "dhclient" | "dhcpcd";
+};
+
 // ── Router: connects exactly two collision domains ──────────────────
 // The L3 primitive underneath Uplink/Segment (which are becoming a
 // superset built on top of this + CollisionDomain, see ADR 0003) — one
@@ -476,6 +490,14 @@ export interface KernelRouterSide {
    * from the deployer so its addresses/routes have something to bind
    * to. */
   readonly ifaces?: readonly HostInterface[];
+  /** An APPLICATION running inside this side's netns, on this side's
+   * real interface (right side only in practice — set by
+   * buildKernelRouterEndpoint, define.ts, from the `kernel.app.*`
+   * service kinds; see KernelApp). Resolved once at declaration time;
+   * the deployer turns each into the actual `ip netns exec` service
+   * script — and MUST stop/release it on delete, since a running app
+   * daemon holds the netns alive past `ip netns delete`. */
+  readonly apps?: readonly KernelApp[];
   /** The FULLY-RESOLVED security group attached to this side's real
    * interface (right side only in practice) — an object reference, same
    * "no string that could drift" discipline as l2Segment/routingDomains.
@@ -567,16 +589,22 @@ export type RouterEndpoint = OvnRouterEndpoint | KernelRouterEndpoint;
 // services instead of reintroducing one boolean that can't express that.
 //
 // The `kernel.*` kinds are the OPPOSITE world — services that apply
-// INSIDE a KernelRouter's netns, never to an OVN LRP: a
-// `kernelRouterEndpoint()` whose services include a `kernel.ipv4.masq`/
-// `kernel.ipv6.masq` implicitly generates a `kernel.securitygroup` IR
-// node (name derived from the router, `sg-<router>`, in
-// buildKernelRouterEndpoint, define.ts) carrying the matching
-// POSTROUTING MASQUERADE rules for the netns's real-world-facing
-// interface. Future kernel-side services (docker containers, wireguard)
-// extend the same list. Split off from the OVN `ipv6.*` kinds in
-// buildKernelRouterEndpoint so the OVN endpoint never sees them —
-// resolveIpv6RaConfigs (src/ir.ts) throws on a kind it doesn't know.
+// INSIDE a KernelRouter's netns, never to an OVN LRP. Two families:
+//   - `kernel.ipv4.masq`/`kernel.ipv6.masq`: a SHORTCUT that expands
+//     (through net.securityGroup(), define.ts) to a security group named
+//     `masq-<router>` carrying the matching POSTROUTING MASQUERADE rules
+//     for the netns's real-world-facing interface.
+//   - `kernel.app.*`: an APPLICATION running inside the netns on that
+//     interface — a DHCP client (`kernel.app.dhcp-client`) today, docker
+//     containers/wireguard later. Resolved into a KernelApp descriptor
+//     (same file) in buildKernelRouterEndpoint, carried on the
+//     KernelRouterSide that runs it, and turned into the actual
+//     `ip netns exec` service script by the deployer — including the
+//     release/kill on delete (a DHCP client is a daemon that holds the
+//     netns alive, so it MUST be stopped before `ip netns delete`).
+// Split off from the OVN `ipv6.*` kinds in buildKernelRouterEndpoint so
+// the OVN endpoint never sees them — resolveIpv6RaConfigs (src/ir.ts)
+// throws on a kind it doesn't know.
 export type RouterEndpointService =
   | { readonly kind: "ipv6.slaac" }
   | {
@@ -587,7 +615,11 @@ export type RouterEndpointService =
     readonly maxInterval?: number;
   }
   | { readonly kind: "kernel.ipv4.masq" }
-  | { readonly kind: "kernel.ipv6.masq" };
+  | { readonly kind: "kernel.ipv6.masq" }
+  | {
+    readonly kind: "kernel.app.dhcp-client";
+    readonly style: "dhclient" | "dhcpcd";
+  };
 
 /** One route entry declared directly on the RouterEndpoint that IS the
  * anchor for it — `dst` reachable via `via`, optionally NAT'd. Moved
