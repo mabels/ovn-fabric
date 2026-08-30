@@ -146,6 +146,18 @@ export interface HostMonitoring {
   readonly ipfix?: IpfixExport;
 }
 
+/** The OS a Host runs (2026-08-23) — what the deployer needs to install
+ * the topology's dependencies in the right package form: OVS/OVN for a
+ * chassis, iproute2/iptables for a kernel router's netns, dhcpcd or
+ * isc-dhcp-client for a dhcp-client app, wireguard-tools, the zerotier
+ * curl installer, docker. `name` is the distro, `version` its release
+ * ("24.04" for Ubuntu, "12" for Debian). Required to know HOW to
+ * install; no deinstall ever happens (2026-08-23). */
+export interface HostOs {
+  readonly name: "ubuntu" | "debian";
+  readonly version: string;
+}
+
 export interface Host {
   readonly name: string;
   readonly address: HostAddress;
@@ -154,6 +166,10 @@ export interface Host {
    * ad hoc everywhere a connection string is needed. */
   readonly connectAddress: string;
   readonly access: AccessMethod;
+  /** The distro/version the deployer installs dependencies for — see
+   * HostOs. Undefined = no dependencies can be installed (the host's
+   * own setup is the operator's responsibility). */
+  readonly os?: HostOs;
   readonly monitoring?: HostMonitoring;
   /** Undefined means this Host is not part of the OVN cluster at all
    * (e.g. a pure bastion/management host with no chassis role) — no
@@ -165,6 +181,7 @@ export function sshHost(
   name: string,
   address: HostAddress,
   user: string,
+  os?: HostOs,
   ovn?: OvnHostConfig,
   monitoring?: HostMonitoring,
 ): Host {
@@ -173,6 +190,7 @@ export function sshHost(
     address,
     connectAddress: primaryHostAddress(address),
     access: { method: "ssh", user },
+    os,
     ovn,
     monitoring,
   };
@@ -180,6 +198,7 @@ export function sshHost(
 
 export function localHost(
   name: string,
+  os?: HostOs,
   ovn?: OvnHostConfig,
   monitoring?: HostMonitoring,
 ): Host {
@@ -188,6 +207,7 @@ export function localHost(
     address: { fqdn: "localhost" },
     connectAddress: "127.0.0.1",
     access: { method: "local" },
+    os,
     ovn,
     monitoring,
   };

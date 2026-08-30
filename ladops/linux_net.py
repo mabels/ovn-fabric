@@ -177,6 +177,16 @@ def set_sysctl_argv(key: str, value: str) -> list[str]:
     return ["sysctl", "-w", f"{key}={value}"]
 
 
+def set_sysctl_file_argv(path: str, value: str) -> list[str]:
+    """Write a sysctl value by writing the proc file DIRECTLY — sysctl's
+    own key parsing splits on EVERY dot (and slash), so an interface name
+    like `eth0.2280` can never be a sysctl key component (the dotted key
+    `net.ipv6.conf.eth0.2280.accept_ra` becomes the path
+    `.../eth0/2280/accept_ra`). Writing `/proc/sys/net/ipv6/conf/eth0.2280/
+    accept_ra` keeps the dotted name intact (2026-08-30)."""
+    return ["sh", "-c", f"echo {value} > {path}"]
+
+
 def delete_link_argv(name: str) -> list[str]:
     return ["ip", "link", "delete", name]
 

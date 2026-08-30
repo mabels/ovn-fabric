@@ -46,10 +46,18 @@
 import { type } from "arktype";
 
 export const InfraHostKey = type({ host: "string" });
+export const HostOs = type({ name: "string", version: "string" });
 export const InfraHostData = type({
   connectAddress: "string",
   "ovnRole?": "'central'|'chassis'",
   "encapIp?": "string",
+  // Always resolved (assume Ubuntu when the config leaves it unset,
+  // 2026-08-23) — the deployer installs the dependencies in this OS's
+  // package form. No deinstall ever.
+  os: HostOs,
+  // The OS packages/requirements this host needs (ovs/ovn, iproute2/
+  // iptables, dhcpcd/dhclient, wireguard-tools, zerotier, docker).
+  "dependencies?": "string[]",
 });
 export const InfraHostNode = type({
   id: "string",

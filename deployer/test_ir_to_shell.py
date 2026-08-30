@@ -39,7 +39,10 @@ NODES: list[pt.Model] = [
         kind="infra.host",
         key=pt.InfraHostKey(host="central-1"),
         data=pt.InfraHostData(
-            connectAddress="10.0.0.1", ovnRole=pt.OvnRole.central, encapIp="10.0.0.1"
+            connectAddress="10.0.0.1",
+            ovnRole=pt.OvnRole.central,
+            encapIp="10.0.0.1",
+            os=pt.Os(name="ubuntu", version="26.04"),
         ),
     ),
     pt.InfraHostNode(
@@ -47,7 +50,10 @@ NODES: list[pt.Model] = [
         kind="infra.host",
         key=pt.InfraHostKey(host="chassis-1"),
         data=pt.InfraHostData(
-            connectAddress="10.0.0.2", ovnRole=pt.OvnRole.chassis, encapIp="10.0.0.2"
+            connectAddress="10.0.0.2",
+            ovnRole=pt.OvnRole.chassis,
+            encapIp="10.0.0.2",
+            os=pt.Os(name="ubuntu", version="26.04"),
         ),
     ),
     pt.OvnLsNode(
@@ -567,7 +573,7 @@ class KernelRouterCreateTest(unittest.TestCase):
 
         unit = "ovn-kernel-kernel-0-dhcp-client.service"
         for style, exec_client, exec_stop in [
-            ("dhclient", "/usr/sbin/dhclient -d eth0.2280", "/usr/sbin/dhclient -r eth0.2280"),
+            ("dhclient", "/usr/sbin/dhclient -lf /var/lib/dhcp/dhclient.kernel-0.leases -d eth0.2280", "/usr/sbin/dhclient -lf /var/lib/dhcp/dhclient.kernel-0.leases -r eth0.2280"),
             ("dhcpcd", "/usr/sbin/dhcpcd -B eth0.2280", "/usr/sbin/dhcpcd -k eth0.2280"),
         ]:
             with self.subTest(style=style):
@@ -603,6 +609,50 @@ class KernelRouterCreateTest(unittest.TestCase):
                     delete_script.index(f"systemctl disable --now {unit}"),
                     delete_script.index("ip netns delete ns-kernel-0"),
                 )
+
+    def test_os_dependencies_are_installed_at_the_start_of_create(self) -> None:
+        # The IR's ABSTRACT dependencies (ovn/ovs/ip/iptables/dhclient/
+        # zerotier...) are installed at the very START of the create pass,
+        # mapped to the host OS's package form (Ubuntu/Debian apt +
+        # ovn-host for a chassis role); zerotier is its curl installer.
+        # No deinstall ever (2026-08-23).
+        nodes = [
+            (
+                dataclasses.replace(
+                    n,
+                    data=dataclasses.replace(
+                        n.data,
+                        dependencies=[
+                            "ovn",
+                            "ovs",
+                            "ip",
+                            "iptables",
+                            "dhclient",
+                            "zerotier",
+                        ],
+                    ),
+                )
+                if n.kind == "infra.host" and n.key.host == "chassis-1"
+                else n
+            )
+            for n in NODES
+        ]
+        _, hosts = mod.build_scripts(nodes, "create")
+        script = hosts["chassis-1"]
+        self.assertIn("apt-get update", script)
+        self.assertIn("apt-get install -y ovn-host", script)
+        self.assertIn("apt-get install -y openvswitch-switch", script)
+        self.assertIn("apt-get install -y iproute2", script)
+        self.assertIn("apt-get install -y iptables", script)
+        self.assertIn("apt-get install -y isc-dhcp-client", script)
+        # zerotier's curl installer runs via sh -c so the pipe is argv-safe.
+        self.assertIn("sh -c 'curl -s https://install.zerotier.com | bash'", script)
+        # dependencies come before any OVS/OVN work.
+        self.assertLess(script.index("apt-get update"), script.index("ovs-vsctl"))
+        # delete never uninstalls.
+        _, delete_hosts = mod.build_scripts(nodes, "delete")
+        delete_script = delete_hosts["chassis-1"]
+        self.assertNotIn("apt-get install", delete_script)
 
     def test_no_apps_emits_no_dhcp_client_commands(self) -> None:
         # The base fixture has no apps — nothing is started by default.

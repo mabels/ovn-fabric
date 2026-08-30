@@ -702,8 +702,13 @@ def _emit_kernel_app_rules(
     for app in apps:
         if app.kind == "dhcp-client":
             if app.style == pt.Style.dhclient:
-                client_argv = ["/usr/sbin/dhclient", "-d", dev]
-                stop_argv = ["/usr/sbin/dhclient", "-r", dev]
+                # `-lf` gives each router's dhclient its OWN lease database
+                # (per-router path, not the host's shared
+                # /var/lib/dhcp/dhclient.leases) — runtime-configurable,
+                # nothing compiled in (2026-08-30).
+                lease = f"/var/lib/dhcp/dhclient.{router}.leases"
+                client_argv = ["/usr/sbin/dhclient", "-lf", lease, "-d", dev]
+                stop_argv = ["/usr/sbin/dhclient", "-lf", lease, "-r", dev]
                 client = "dhclient"
             elif app.style == pt.Style.dhcpcd:
                 client_argv = ["/usr/sbin/dhcpcd", "-B", dev]
@@ -715,6 +720,8 @@ def _emit_kernel_app_rules(
                     "skipped, see deployer/ir_to_shell.py"
                 )
                 continue
+            if emit.action == "create":
+                emit.sh(netns_ops.netns_exec_argv(["mkdir", "-p", "/var/lib/dhcp"], netns))
             _emit_kernel_app_unit(
                 router,
                 "dhcp-client",
@@ -879,7 +886,12 @@ def _emit_kernel_app_rules(
                 ),
             )
             emit.sh(["systemctl", "daemon-reload"])
-            emit.sh(["systemctl", "enable", "--now", unit])
+            # The zerotier oneshot's ExecStart waits for the daemon's
+            # control socket and then for ZeroTier to name the real
+            # interface (up to ~40s), so START it in the background —
+            # create/boot must not stall on it; the unit still enables +
+            # joins on its own (2026-08-30).
+            emit.sh(["sh", "-c", f"systemctl enable --now {unit} >/dev/null 2>&1 &"])
         else:
             emit.comment(
                 f'# unsupported kernel app kind "{app.kind}" on {dev} in {netns} — '
@@ -977,6 +989,9 @@ def _emit_kernel_router(host_id: str, nodes: list[pt.Model], emit: Emitter) -> N
             continue
 
         emit.sh(netns_ops.add_netns_argv(netns))
+        # A fresh netns starts with lo DOWN; bring it up so loopback works
+        # inside (2026-08-30).
+        emit.sh(netns_ops.netns_exec_argv(linux_net_ops.set_link_up_argv("lo"), netns))
         # A kernel router IS a router: Linux won't forward between its
         # two sides until the netns's own forwarding knobs say so, per
         # family (2026-08-19).
@@ -1033,6 +1048,25 @@ def _emit_kernel_router(host_id: str, nodes: list[pt.Model], emit: Emitter) -> N
                 emit.sh(linux_net_ops.add_dummy_argv(dev))
             emit.sh(linux_net_ops.add_if_to_netns_argv(dev, netns))
             emit.sh(netns_ops.netns_exec_argv(linux_net_ops.set_link_up_argv(dev), netns))
+            # A kernel router's REAL-WORLD side (right) learns its IPv6 via
+            # RA/SLAAC — the config's via-less `::/0` means exactly that.
+            # `accept_ra=2` forces it to keep accepting RAs even though the
+            # netns has forwarding on (which would otherwise force
+            # accept_ra=0) — without it the WAN leg never gets an IPv6
+            # default/address and clients' v6 dies at the kernel router
+            # (confirmed live, 2026-08-30). Written to the proc file
+            # directly: `sysctl` splits its key on every dot, so a vlan
+            # iface name (`eth0.2280`) can't be a sysctl key component
+            # ("cannot stat .../eth0/2280/accept_ra").
+            if side_node.key.side == pt.Side.right:
+                emit.sh(
+                    netns_ops.netns_exec_argv(
+                        linux_net_ops.set_sysctl_file_argv(
+                            f"/proc/sys/net/ipv6/conf/{dev}/accept_ra", "2"
+                        ),
+                        netns,
+                    )
+                )
             for addr in side_node.data.ipaddrs or []:
                 argv = linux_net_ops.add_addr_argv(addr, dev)
                 emit.sh(netns_ops.netns_exec_argv(argv, netns))
@@ -1130,6 +1164,53 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
         emit.blank()
 
 
+# Abstract dependency -> concrete distro package (Ubuntu/Debian apt
+# names). `ovn` is role-dependent (ovn-central vs ovn-host) and
+# `zerotier` is its curl installer — both handled specially below.
+_PACKAGE_BY_DEP = {
+    "ovs": "openvswitch-switch",
+    "ip": "iproute2",
+    "iptables": "iptables",
+    "dhclient": "isc-dhcp-client",
+    "dhcpcd": "dhcpcd",
+    "wireguard": "wireguard-tools",
+    "docker": "docker.io",
+}
+
+
+def _emit_os_dependencies(host_node: pt.InfraHostNode, emit: Emitter) -> None:
+    """Install the host's ABSTRACT dependencies (the IR's `dependencies`
+    list, computed by src/ir.ts's hostDependencies — `ovn`/`ovs`/`ip`/
+    `iptables`/`dhclient`/`dhcpcd`/`wireguard`/`zerotier`/`docker`,
+    deliberately not distro packages) at the very START of the create
+    pass, mapped to the host OS's install form. Always resolved to a
+    concrete OS (assume Ubuntu when the config leaves it unset,
+    2026-08-23); no deinstall ever happens."""
+    deps = host_node.data.dependencies or []
+    if not deps:
+        return
+    os_name = host_node.data.os.name
+    emit.comment(f"# --- OS dependencies ({os_name} {host_node.data.os.version}) ---")
+    if os_name in ("ubuntu", "debian"):
+        emit.sh(["apt-get", "update"])
+        for dep in deps:
+            if dep == "zerotier":
+                # the zerotier install script — run via `sh -c` so the
+                # pipe survives both front-ends (argv-safe).
+                emit.sh(["sh", "-c", "curl -s https://install.zerotier.com | bash"])
+                continue
+            pkg = _PACKAGE_BY_DEP.get(dep)
+            if dep == "ovn":
+                pkg = "ovn-central" if host_node.data.ovnRole == pt.OvnRole.central else "ovn-host"
+            if pkg is None:
+                emit.comment(f'# unknown dependency "{dep}" — skipped')
+                continue
+            emit.sh(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", pkg])
+    else:
+        emit.comment(f"# unknown OS {os_name!r} — cannot install dependencies, skipping")
+    emit.blank()
+
+
 def _emit_host(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter) -> None:
     host_name = host_node.key.host
     data = host_node.data
@@ -1159,6 +1240,9 @@ def _emit_host(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter
         _emit_iface_bindings(host_name, nodes, emit)
         return
 
+    # Dependencies FIRST — nothing below (OVS/OVN, netns, services)
+    # works without them; no deinstall ever (2026-08-23).
+    _emit_os_dependencies(host_node, emit)
     _emit_kernel_router(host_node.id, nodes, emit)
     _emit_iface_bindings(host_name, nodes, emit)
 

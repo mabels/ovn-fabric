@@ -85,7 +85,46 @@ function resolveEncapIp(host: Host): string | undefined {
   return (host.ovn?.encapIp ?? host.address.ipv4 ?? host.address.ipv6)?.to_s();
 }
 
-function hostToIR(host: Host): IRNode {
+// The ABSTRACT dependencies this Host needs (2026-08-23), derived from
+// what the topology puts on it — ABSTRACT names, deliberately not
+// distro package names, so the IR stays OS-agnostic: an OVN-cluster
+// host needs `ovn`+`ovs`, any kernel router's netns needs `ip`+
+// `iptables`, and the apps need their own (dhclient/dhcpcd,
+// wireguard, zerotier, docker). The deployer maps each abstract
+// dependency to the host OS's concrete package/install form; there is
+// deliberately NO deinstall.
+function hostDependencies(host: Host, network: NetworkDefinition): string[] {
+  const deps = new Set<string>();
+  if (host.ovn !== undefined) {
+    deps.add("ovn");
+    deps.add("ovs");
+  }
+  const kernelRouters = network.allKernelRouters.filter(
+    (kr) => kr.host.name === host.name,
+  );
+  if (kernelRouters.length > 0) {
+    deps.add("ip");
+    deps.add("iptables");
+    for (const kr of kernelRouters) {
+      for (const side of [kr.left, kr.right]) {
+        for (const app of side.apps ?? []) {
+          if (app.kind === "dhcp-client") {
+            deps.add(app.style);
+          } else if (app.kind === "wireguard") {
+            deps.add("wireguard");
+          } else if (app.kind === "zerotier") {
+            deps.add("zerotier");
+          } else if (app.kind === "docker") {
+            deps.add("docker");
+          }
+        }
+      }
+    }
+  }
+  return [...deps];
+}
+
+function hostToIR(host: Host, dependencies: readonly string[]): IRNode {
   const id = `host:${host.name}`;
   return {
     id,
@@ -95,6 +134,11 @@ function hostToIR(host: Host): IRNode {
       connectAddress: host.connectAddress,
       ovnRole: host.ovn?.role.kind,
       encapIp: resolveEncapIp(host),
+      // OS always resolved — when the config leaves it unset, assume
+      // Ubuntu (2026-08-23), so the deployer always knows the install
+      // form; `...host.os` lets a partial override win field by field.
+      os: { name: "ubuntu", version: "26.04", ...host.os },
+      dependencies: dependencies.length > 0 ? dependencies : undefined,
     },
   };
 }
@@ -839,7 +883,7 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
   const nodes: Record<string, IRNode> = {};
 
   for (const host of network.allHosts) {
-    const node = hostToIR(host);
+    const node = hostToIR(host, hostDependencies(host, network));
     nodes[node.id] = node;
   }
 

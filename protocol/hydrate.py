@@ -33,6 +33,8 @@ def _hydrate_infra_host(raw: dict) -> pt.InfraHostNode:
             connectAddress=data["connectAddress"],
             encapIp=data.get("encapIp"),
             ovnRole=pt.OvnRole(data["ovnRole"]) if data.get("ovnRole") is not None else None,
+            os=pt.Os(name=data["os"]["name"], version=data["os"]["version"]),
+            dependencies=data.get("dependencies"),
         ),
     )
 

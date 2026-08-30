@@ -588,3 +588,50 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
     [{ dst: "192.168.130.0/24", via: "10.12.81.1" }],
   );
 });
+
+// hostToIR carries the host's ABSTRACT OS dependencies (ovn/ovs for an
+// OVN-cluster host, ip/iptables for a kernel router, plus the app-level
+// ones) and the resolved OS (assume Ubuntu when unset) — the deployer
+// maps each abstract dep to the distro's package form (2026-08-23).
+Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost(
+      "chassis-1",
+      undefined,
+      { role: { kind: "chassis" } },
+    );
+    const backbone = net.collisionDomain("backbone");
+    net.ovnRouter("router-wan", (router) => {
+      router.left = router.kernelRouterEndpoint({
+        host,
+        transit: transitNetwork(
+          IPv4.parse("10.12.80.1/28"),
+          IPv6.parse("fd00::10:12:80:1/124"),
+        ),
+        ipaddrs: [IPv4.parse("192.168.132.93/24")],
+        services: [
+          { kind: "kernel.app.dhcp-client", style: "dhclient" },
+        ],
+        ifaces: [
+          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
+        ],
+      });
+      router.right = router.ovnRouterEndpoint({
+        l2Segment: backbone,
+        ipaddrs: [IPv4.parse("172.22.12.80/16")],
+      });
+    });
+  });
+
+  const nodes = toIR(network);
+  const hostNode = nodes["host:chassis-1"];
+  assertEquals(hostNode.data.dependencies, [
+    "ovn",
+    "ovs",
+    "ip",
+    "iptables",
+    "dhclient",
+  ]);
+  // os not set -> assume Ubuntu (2026-08-23).
+  assertEquals(hostNode.data.os, { name: "ubuntu", version: "26.04" });
+});

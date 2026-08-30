@@ -12,6 +12,7 @@ import {
   FixedUplink,
   type Host,
   type HostAddress,
+  type HostOs,
   type InterfaceKind,
   type KernelApp,
   type KernelRouter,
@@ -178,14 +179,15 @@ export class NetworkBuilder {
     name: string,
     address: HostAddress,
     user: string,
+    os?: HostOs,
     ovn?: OvnHostConfig,
   ): Host {
-    return this.registerHost(sshHost(name, address, user, ovn));
+    return this.registerHost(sshHost(name, address, user, os, ovn));
   }
 
   /** Declare the generator's own host — no SSH needed. */
-  localHost(name: string, ovn?: OvnHostConfig): Host {
-    return this.registerHost(localHost(name, ovn));
+  localHost(name: string, os?: HostOs, ovn?: OvnHostConfig): Host {
+    return this.registerHost(localHost(name, os, ovn));
   }
 
   /** Cluster-wide OVN settings (NB_Global) — see OvnClusterOptions,
