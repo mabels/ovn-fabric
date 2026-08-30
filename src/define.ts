@@ -768,16 +768,46 @@ export class NetworkBuilder {
         : {
           kind: "zerotier",
           networkId: tunnel.networkId,
-          instanceDir: tunnel.instanceDir,
+          // `instanceDir` is optional on the tunnel — derived from the
+          // router name when omitted (types.ts), so a config author only
+          // sets it when the default location is wrong.
+          instanceDir: tunnel.instanceDir ??
+            `/var/lib/zerotier-one-${routerName}`,
           masq,
+          // The tunnel's via-less declared routes (e.g. the ztnet mesh
+          // supernet 192.168.0.0/16) are the routes the zerotier netns
+          // must push OUT the tunnel once ZeroTier names the interface —
+          // carried here (not on the kernel router's own routes, which
+          // would target the upstream veth) so the wire script applies
+          // them over the runtime interface (2026-08-30).
+          routes: (routes ?? [])
+            .filter((r) => r.via === undefined)
+            .map((r) => ({ dst: r.dst.to_string() })),
         },
     ];
 
-    // The OVN side keeps the anchor's via-less routes UNCHANGED — the
-    // tunnel egress is "handled elsewhere" (inside the netns), so no
-    // literal OVN route is rewritten (unlike buildKernelRouterEndpoint,
-    // where the via ALWAYS points at the paired kernel router).
-    const ovnSideRoutes = routes;
+    // The OVN side: rewrite each via-less route (the tunnel's egress
+    // supernet, e.g. 192.168.0.0/16) to point at the KERNEL side of the
+    // mesh transit (`meshLink.right` — the address the kernel netns's
+    // veth owns on the transit L2). The OVN logical router (R2) ARPs for
+    // that address on the transit and forwards the supernet INTO the
+    // netns, which then egresses it over the tunnel. Without it R2 has
+    // no route for the supernet at all — computeRoutes drops via-less
+    // routes for the anchor (confirmed missing live, 2026-08-30). Via
+    // routes are left as the author declared them.
+    const ovnSideRoutes = (routes ?? []).map((route) => {
+      if (route.via !== undefined) return route;
+      const via = route.dst.is_ipv4()
+        ? meshLink.right.ipv4
+        : meshLink.right.ipv6;
+      if (via === undefined) {
+        throw new Error(
+          `tunnelRouterEndpoint: via-less route to ${route.dst.to_string()} has no ` +
+            `matching-family kernel-side transit address to forward into the netns`,
+        );
+      }
+      return { ...route, via };
+    });
 
     // The netns's OWN default route goes out the upstream leg, via the
     // upstream peer — that's how the tunnel's endpoint UDP escapes

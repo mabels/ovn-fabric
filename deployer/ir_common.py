@@ -123,7 +123,7 @@ class Emitter:
         backend has no envelope and never calls this."""
         self.lines.append(text)
 
-    def sh(self, argv: list[str]) -> None:
+    def sh(self, argv: list[str], background: bool = False) -> None:
         raise NotImplementedError
 
     def append(self, path: str, content: str) -> None:
@@ -134,6 +134,27 @@ class Emitter:
 
     def blank(self) -> None:
         self.lines.append("")
+
+
+class _ShellBody(Emitter):
+    """A nested SHELL-ONLY emitter used to build a kernel router's
+    up/down script body. The router script is a literal shell file no
+    matter which outer front-end (shell or Python) installed it, so this
+    renders shlex-joined command lines (with an optional trailing ` &` to
+    background a long-running/daemon app inside the netns) and heredoc
+    appends, never Python. `background=True` is only meaningful here —
+    the outer front-ends ignore it."""
+    def sh(self, argv: list[str], background: bool = False) -> None:
+        self.lines.append(shlex.join(argv) + (" &" if background else ""))
+
+    def append(self, path: str, content: str) -> None:
+        # A delimiter distinct from the outer front-ends' `OVN`, so the
+        # router script (itself written via an outer heredoc) can nest
+        # these app/conf heredocs without the outer heredoc terminating
+        # on the first inner `OVN` line.
+        self.lines.append(f"cat > {path} << 'OVNKERNEL'")
+        self.lines.append(content)
+        self.lines.append("OVNKERNEL")
 
 
 def _iface_real_name(iface: dict) -> str:
@@ -475,106 +496,15 @@ def _emit_security_group_rules(
         emit.sh(netns_ops.netns_exec_argv(argv, netns))
 
 
-# A kernel router's apps (KernelApp, types.ts — resolved from the
-# `kernel.app.*` services by buildKernelRouterEndpoint, define.ts) run
-# supervised by a real systemd unit (Restart=always) — the deployer
-# INSTALLS that unit and starts it on create, and
-# stops/disables/removes it on delete (the design intent from
-# generate-netns.ts, 2026-08-23: an app daemon holds its netns alive
-# past `ip netns delete` and keeps its lease, so the delete pass must
-# bring it down explicitly BEFORE the netns teardown).
-#
-# The unit file is written via the emitter's `append(path, content)`
-# operation (the shell front-end renders it as a `cat > ... << 'EOF'`
-# heredoc, the Python front-end as a write_file() call — see
-# deployer/ir_common.py's Emitter doc comment).
-#
-# The app's main process is forced to the FOREGROUND inside the unit so
-# systemd's Type=simple actually has a process to supervise — a
-# daemonizing client would exit the unit's main process immediately and
-# Restart=always would respawn it in a loop:
-#   - dhcp-client: `-d` for dhclient, `-B` for dhcpcd;
-#   - docker: `docker run` without `-d` (with `--rm`, so the container
-#     is removed on stop and delete needs no orphan cleanup beyond the
-#     belt-and-suspenders `docker rm -f`).
-# Unknown kinds are skipped loudly with a comment, never silently
-# dropped — same philosophy as the security-group rules.
-def _kernel_app_unit_name(router: str, kind: str) -> str:
-    return f"ovn-kernel-{router}-{kind}.service"
-
-
-# The shared systemd-unit deployment every kernel app uses: CREATE writes
-# the unit (Restart=always, supervising the process inside the netns on
-# the side's real interface) and enables+starts it; DELETE stops,
-# disables and removes it — BEFORE `ip netns delete`, since an app
-# daemon holds its netns alive past deletion. `extra_delete` carries
-# per-app teardown that must run BEFORE the unit's own stop (e.g. the
-# authoritative `docker rm -f` — systemd's SIGTERM through `ip netns
-# exec` does NOT reliably kill a docker container, confirmed live
-# 2026-08-23). `exec_stop` is the unit's ExecStop (e.g. `docker stop`)
-# so ANY systemctl stop shuts the app down cleanly, not just the
-# deployer's delete pass.
-def _emit_kernel_app_unit(
-    router: str,
-    kind: str,
-    netns: str,
-    dev: str,
-    description: str,
-    exec_start: str,
-    exec_stop: str | None,
-    extra_delete: list[list[str]] | None,
-    emit: Emitter,
-) -> None:
-    unit = _kernel_app_unit_name(router, kind)
-    unit_path = f"/etc/systemd/system/{unit}"
-    emit.comment(f"# --- kernel app: {kind} in {netns} on {dev} (systemd unit {unit}) ---")
-    if emit.action == "delete":
-        # Per-app teardown FIRST — authoritative and independent of the
-        # unit: `docker rm -f` force-stops and removes the container via
-        # the daemon even if the systemctl stop below fails or hangs.
-        if extra_delete:
-            for argv in extra_delete:
-                emit.sh(argv)
-        emit.sh(["systemctl", "disable", "--now", unit])
-        emit.sh(["rm", "-f", unit_path])
-        emit.sh(["systemctl", "daemon-reload"])
-        return
-    unit_lines: list[str] = [
-        "[Unit]",
-        f"Description={description}",
-        "After=network-pre.target",
-        "Wants=network-pre.target",
-        "",
-        "[Service]",
-        "Type=simple",
-        f"ExecStart={exec_start}",
-    ]
-    if exec_stop is not None:
-        unit_lines.append(f"ExecStop={exec_stop}")
-        unit_lines.append("TimeoutStopSec=30")
-    unit_lines.extend(
-        [
-            "Restart=always",
-            "RestartSec=5",
-            "",
-            "[Install]",
-            "WantedBy=multi-user.target",
-        ]
-    )
-    emit.append(unit_path, "\n".join(unit_lines))
-    emit.sh(["systemctl", "daemon-reload"])
-    emit.sh(["systemctl", "enable", "--now", unit])
-
-
 def _docker_wire_script(app: KernelApp, router: str, netns: str) -> str:
     """The wire script for one docker app: run the container with
     `--network none`, then inject one veth into the router netns
     (CNI/Multus-style) — the container's eth0 gets `app.ip`, the router
     end `app.routerIp` (the subnet's first host, resolved in
     define.ts), and the container's default route is via the router.
-    Ends in `exec docker wait <container>` so systemd's Type=simple has
-    a main process to supervise and Restart=always re-wires a fresh
-    container on crash."""
+    Ends in `exec docker wait <container>` — the router `up` backgrounds
+    the script (the wait keeps the container's netns symlink live), and
+    the router `down` tears it down with `docker rm -f`."""
     container = app.name or f"{router}-docker"
     veth = app.vethName or ("ve-" + hashlib.md5(container.encode()).hexdigest()[:8])
     gateway = app.routerIp.split("/")[0]
@@ -584,7 +514,7 @@ def _docker_wire_script(app: KernelApp, router: str, netns: str) -> str:
             "#!/bin/sh",
             f"# ovn-fabric kernel app docker: {container} in {netns} — one veth",
             "# injected into the router netns (CNI/Multus-style interface",
-            "# injection, 2026-08-23). Supervised by systemd via docker wait.",
+            "# injection, 2026-08-23). Backgrounded by the router up.",
             "set -eu",
             f'container="{container}"',
             f'netns="{netns}"',
@@ -647,10 +577,12 @@ def _zerotier_wire_script(app: KernelApp, netns: str) -> str:
     never collides with a host-level daemon), wait for its control
     socket, join the network, then wait for ZeroTier to name the real
     interface (`portDeviceName` — the name is ONLY known at runtime) and
-    bring it up + MASQUERADE the declared families out it. The daemon is
-    persistent, so the unit is Type=oneshot + RemainAfterExit; down
-    leaves the network and kills the daemon BEFORE the netns teardown
-    (a running daemon holds its netns alive, 2026-08-23)."""
+    bring it up + MASQUERADE the declared families out it, and push the
+    tunnel's via-less routes (`app.routes` — e.g. the ztnet mesh supernet
+    192.168.0.0/16) out it as `ip route add <dst> dev "$var"`. The daemon
+     is persistent, so the router `up` backgrounds the script; down just
+     kills the daemon (no `zerotier-cli leave`) BEFORE the netns teardown
+     (a running daemon holds its netns alive, 2026-08-23)."""
     network = app.networkId or ""
     home = app.instanceDir or ""
     masq_lines: list[str] = []
@@ -658,6 +590,11 @@ def _zerotier_wire_script(app: KernelApp, netns: str) -> str:
         iptables = "iptables" if family == pt.MasqEnum.ipv4 else "ip6tables"
         masq_lines.append(
             f'ip netns exec "$netns" {iptables} -t nat -A POSTROUTING -o "$var" -j MASQUERADE'
+        )
+    route_lines: list[str] = []
+    for route in app.routes or []:
+        route_lines.append(
+            f'ip netns exec "$netns" ip route add {route.dst} dev "$var"'
         )
     return "\n".join(
         [
@@ -686,9 +623,11 @@ def _zerotier_wire_script(app: KernelApp, netns: str) -> str:
             "    done",
             '    ip netns exec "$netns" ip link set "$var" up',
             *masq_lines,
+            *route_lines,
             "    ;;",
             "  down)",
-            '    ip netns exec "$netns" zerotier-cli -D"$home" leave "$network" || true',
+            # Just kill the daemon — no `zerotier-cli leave`, the mesh
+            # membership is irrelevant once the daemon is gone (2026-08-30).
             '    ip netns exec "$netns" pkill -f "zerotier-one -d $home" || true',
             "    ;;",
             "esac",
@@ -699,6 +638,18 @@ def _zerotier_wire_script(app: KernelApp, netns: str) -> str:
 def _emit_kernel_app_rules(
     apps: list[KernelApp], router: str, netns: str, dev: str, emit: Emitter
 ) -> None:
+    """Start (create) / stop (delete) the apps attached to one side of a
+    kernel router, INSIDE the router's netns — no per-app systemd units.
+    The router service (one unit per router, _emit_kernel_router) owns
+    them: its `up` starts them, its `down` stops them. Starts that are
+    daemons or block (dhclient -d, the docker wire script which ends in
+    `docker wait`, the zerotier `up` that waits ~40s for the interface)
+    are backgrounded with `&` so the router `up`/`enable --now` returns
+    as soon as the netns + veths exist (the transit veth must be present
+    before _emit_iface_bindings binds it); wg-quick is in-kernel and
+    returns immediately, so it stays in the foreground. Delete stops the
+    apps BEFORE `ip netns delete` — a running app daemon holds its netns
+    alive (2026-08-23)."""
     for app in apps:
         if app.kind == "dhcp-client":
             if app.style == pt.Style.dhclient:
@@ -720,21 +671,15 @@ def _emit_kernel_app_rules(
                     "skipped, see deployer/ir_to_shell.py"
                 )
                 continue
+            emit.comment(f"# --- kernel app: dhcp-client ({client}) on {dev} in {netns} ---")
             if emit.action == "create":
+                # `-d` runs dhclient as a foreground daemon, so background it.
                 emit.sh(netns_ops.netns_exec_argv(["mkdir", "-p", "/var/lib/dhcp"], netns))
-            _emit_kernel_app_unit(
-                router,
-                "dhcp-client",
-                netns,
-                dev,
-                f"ovn-fabric kernel app dhcp-client ({client}) for {router} in {netns} on {dev}",
-                _sh(["/usr/bin/ip", "netns", "exec", netns, *client_argv]),
-                # ExecStop releases the lease explicitly — SIGTERM through
+                emit.sh(netns_ops.netns_exec_argv(client_argv, netns), background=True)
+            else:
+                # Release the lease explicitly — SIGTERM through
                 # `ip netns exec` is not a reliable dhclient shutdown.
-                _sh(["/usr/bin/ip", "netns", "exec", netns, *stop_argv]),
-                None,
-                emit,
-            )
+                emit.sh(netns_ops.netns_exec_argv(stop_argv, netns))
         elif app.kind == "docker":
             # The container gets ONE veth injected INTO the router netns
             # (CNI/Multus-style interface injection — the same primitive
@@ -746,12 +691,10 @@ def _emit_kernel_app_rules(
             # the other into the router netns with `router_ip`; the
             # container's default route is via the router. The script
             # is a single `/bin/sh <script>` argv, so it survives both
-            # front-ends (shell substitutions are not argv-safe).
-            #
-            # The unit's main process is the script, which ends in
-            # `exec docker wait <container>` — systemd supervises the
-            # container lifecycle, and Restart=always re-runs the whole
-            # wire (fresh container, fresh veth) on crash.
+            # front-ends (shell substitutions are not argv-safe). It ends
+            # in `exec docker wait <container>`, so the router `up`
+            # backgroundS it (the wait keeps the container's netns live,
+            # but `up` must not block on it).
             container = app.name or f"{router}-docker"
             script_path = f"/usr/local/sbin/ovn-kernel-{router}-docker-wire.sh"
             if app.ip is None or app.routerIp is None:
@@ -759,36 +702,27 @@ def _emit_kernel_app_rules(
                     f'kernel app docker "{container}": the veth injection needs an `ip` '
                     "(the container's address on the router's services segment)"
                 )
-            emit.append(script_path, _docker_wire_script(app, router, netns))
-            _emit_kernel_app_unit(
-                router,
-                "docker",
-                netns,
-                dev,
-                f"ovn-fabric kernel app docker ({container}) for {router} in {netns} on {dev}",
-                _sh(["/bin/sh", script_path]),
-                _sh(["/usr/bin/docker", "rm", "-f", container]),
-                [
-                    # Stopping a docker container is done THE HARD WAY —
-                    # an explicit `docker rm -f` via the daemon first:
-                    # SIGTERM through the unit is not a reliable
-                    # container shutdown (confirmed live 2026-08-23).
-                    ["/usr/bin/docker", "rm", "-f", container],
-                    ["rm", "-f", script_path],
-                    ["rm", "-f", f"/var/run/netns/{container}"],
-                ],
-                emit,
-            )
+            emit.comment(f"# --- kernel app: docker ({container}) on {dev} in {netns} ---")
+            if emit.action == "create":
+                emit.append(script_path, _docker_wire_script(app, router, netns))
+                emit.sh(["/bin/sh", script_path], background=True)
+            else:
+                # Stopping a docker container is done THE HARD WAY — an
+                # explicit `docker rm -f` via the daemon (SIGTERM through
+                # the router's ExecStop is not a reliable container
+                # shutdown, confirmed live 2026-08-23).
+                emit.sh(["/usr/bin/docker", "rm", "-f", container])
+                emit.sh(["rm", "-f", script_path])
+                emit.sh(["rm", "-f", f"/var/run/netns/{container}"])
         elif app.kind == "wireguard":
             # A WireGuard tunnel inside the netns (the tunnelRouterEndpoint's
             # middle leg): write the conf (PrivateKey included — the
             # documented deliberate credential-in-git exception), `wg-quick
-            # up` inside the netns (wg is in-kernel, no daemon to
-            # supervise, so NO systemd unit — the create/delete passes own
-            # it), and MASQUERADE the declared families out the TUNNEL
-            # iface (not the upstream veth — the tunnel is the egress,
-            # 2026-08-23). Delete brings it down and removes the rules
-            # before `ip netns delete`.
+            # up` inside the netns (wg is in-kernel, returns immediately, no
+            # daemon to supervise — so no backgrounding), and MASQUERADE the
+            # declared families out the TUNNEL iface (not the upstream veth
+            # — the tunnel is the egress, 2026-08-23). Down brings it down
+            # and removes the rules before `ip netns delete`.
             if app.ifaceName is None or app.config is None:
                 raise ValueError(
                     f"kernel app wireguard on {dev} in {netns}: missing ifaceName/config"
@@ -843,55 +777,25 @@ def _emit_kernel_app_rules(
             # middle leg): the zerotier-one daemon runs confined to the
             # netns with its OWN instanceDir, joins the network, and the
             # real interface name is captured at RUNTIME (ZeroTier names
-            # it itself) — so the wiring is a script (like docker),
-            # supervised by a Type=oneshot + RemainAfterExit unit (the
-            # daemon persists after the script completes). Delete leaves
-            # the network and kills the daemon BEFORE `ip netns delete`
-            # (a running daemon holds its netns alive, 2026-08-23).
+            # it itself) — so the wiring is the script (like docker). The
+            # router `up` runs it in the background (its up waits up to
+            # ~40s for ZeroTier to name the interface, so it must not
+            # block `enable --now`); the router `down` runs it with `down`
+            # to kill the daemon (no `zerotier-cli leave`) BEFORE `ip
+            # netns delete` (a running daemon holds its netns alive,
+            # 2026-08-23).
             if app.networkId is None or app.instanceDir is None:
                 raise ValueError(
                     f"kernel app zerotier on {dev} in {netns}: missing networkId/instanceDir"
                 )
             script_path = f"/usr/local/sbin/ovn-kernel-{router}-zerotier-wire.sh"
-            unit = _kernel_app_unit_name(router, "zerotier")
-            unit_path = f"/etc/systemd/system/{unit}"
             emit.comment(f"# --- kernel app: zerotier in {netns} ---")
             if emit.action == "delete":
-                emit.sh(["systemctl", "disable", "--now", unit])
+                emit.sh(["/bin/sh", script_path, "down"])
                 emit.sh(["rm", "-f", script_path])
-                emit.sh(["rm", "-f", unit_path])
-                emit.sh(["systemctl", "daemon-reload"])
                 continue
             emit.append(script_path, _zerotier_wire_script(app, netns))
-            emit.append(
-                unit_path,
-                "\n".join(
-                    [
-                        "[Unit]",
-                        f"Description=ovn-fabric kernel app zerotier "
-                        f"({app.networkId}) for {router} in {netns}",
-                        "After=network-pre.target",
-                        "Wants=network-pre.target",
-                        "",
-                        "[Service]",
-                        "Type=oneshot",
-                        f"ExecStart=/bin/sh {script_path} up",
-                        f"ExecStop=/bin/sh {script_path} down",
-                        "RemainAfterExit=yes",
-                        "TimeoutStopSec=60",
-                        "",
-                        "[Install]",
-                        "WantedBy=multi-user.target",
-                    ]
-                ),
-            )
-            emit.sh(["systemctl", "daemon-reload"])
-            # The zerotier oneshot's ExecStart waits for the daemon's
-            # control socket and then for ZeroTier to name the real
-            # interface (up to ~40s), so START it in the background —
-            # create/boot must not stall on it; the unit still enables +
-            # joins on its own (2026-08-30).
-            emit.sh(["sh", "-c", f"systemctl enable --now {unit} >/dev/null 2>&1 &"])
+            emit.sh(["/bin/sh", script_path, "up"], background=True)
         else:
             emit.comment(
                 f'# unsupported kernel app kind "{app.kind}" on {dev} in {netns} — '
@@ -904,11 +808,11 @@ def _emit_kernel_app_rules(
 # per side — a real interface when the side declares `ifaces`
 # (KernelRouterSide.ifaces, types.ts — populated for `left` by the
 # implicit transit veth and for `right` by buildKernelRouterEndpoint,
-# define.ts, 2026-08-18): CREATE creates the kernel VLAN sub-interface
+# define.ts, 2026-08-18): `up` creates the kernel VLAN sub-interface
 # or the transit veth pair (if any) in the root namespace, moves the
 # netns-side device into the netns, and binds that side's
 # already-resolved addresses/routes to it. A side with no `ifaces` keeps
-# the dummy-device stand-in (the pre-2026-08-18 behavior). DELETE removes
+# the dummy-device stand-in (the pre-2026-08-18 behavior). `down` removes
 # the moved-in vlans from INSIDE the netns first (an explicit `ip link
 # del` from inside cleans the parent's 8021q registry, while `ip netns
 # delete` alone leaks a stale entry — hit live 2026-08-19 on an LXC),
@@ -928,169 +832,37 @@ def _emit_kernel_app_rules(
 # addresses/routes to it — up before addr/route, not after (a route
 # through a device that isn't up yet fails; an address on one is
 # pointless until it is).
-def _emit_kernel_router(host_id: str, nodes: list[pt.Model], emit: Emitter) -> None:
-    before = len(emit.lines)
-    action = emit.action
-    for owner in _kernel_router_owners(host_id, nodes):
-        netns = _netns_name(owner.key.name)
-        emit.comment(f"# --- kernel netns: {netns} ({owner.key.name}) ---")
-        if action == "delete":
-            # Delete the moved-in vlans from INSIDE the netns FIRST —
-            # `ip netns delete` alone destroys the netdev but leaks a
-            # stale 8021q registration on the parent (hit live 2026-08-19
-            # on an LXC: recreating the same vlan afterwards failed with
-            # "VLAN device already exists" until a host reboot), while an
-            # explicit `ip link del` from inside the netns goes through
-            # the normal unregister path and cleans the registry up.
-            for side_node in _kernel_router_sides(owner.key.name, nodes):
-                iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
-                # Stop the side's apps BEFORE `ip netns delete` — an app
-                # daemon holds its netns alive past deletion and keeps its
-                # lease, so it must be released from inside explicitly
-                # (2026-08-23).
-                if side_node.data.apps:
-                    dev = (
-                        f"veth-krn-{iface['shortName']}"
-                        if iface is not None and iface["kind"] == "veth"
-                        else (
-                            _iface_real_name(iface)
-                            if iface is not None
-                            else _dummy_name(side_node.key.side)
-                        )
-                    )
-                    _emit_kernel_app_rules(
-                        side_node.data.apps,
-                        owner.key.name,
-                        netns,
-                        dev,
-                        emit,
-                    )
-                if iface is not None and iface["kind"] == "vlan":
-                    real_name = _iface_real_name(iface)
-                    emit.comment(
-                        f"# --- kernel router vlan: remove {real_name} from inside the netns ---"
-                    )
-                    emit.sh(
-                        netns_ops.netns_exec_argv(linux_net_ops.delete_link_argv(real_name), netns)
-                    )
-            # `ip netns delete` tears down every remaining device inside
-            # a namespace regardless of whether it was created there or
-            # moved in later, same reasoning ovn-nbctl's own cascading
-            # del- commands already rely on elsewhere in this module.
-            emit.sh(netns_ops.delete_netns_argv(netns))
-            for side_node in _kernel_router_sides(owner.key.name, nodes):
-                iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
-                if iface is not None and iface["kind"] == "veth":
-                    root_leg = f"veth-ovn-{iface['shortName']}"
-                    emit.comment(
-                        f"# --- kernel router transit veth: remove root leg {root_leg} ---"
-                    )
-                    emit.sh(linux_net_ops.delete_link_argv(root_leg))
-            continue
-
-        emit.sh(netns_ops.add_netns_argv(netns))
-        # A fresh netns starts with lo DOWN; bring it up so loopback works
-        # inside (2026-08-30).
-        emit.sh(netns_ops.netns_exec_argv(linux_net_ops.set_link_up_argv("lo"), netns))
-        # A kernel router IS a router: Linux won't forward between its
-        # two sides until the netns's own forwarding knobs say so, per
-        # family (2026-08-19).
-        emit.comment("# kernel router: enable IPv4/IPv6 forwarding in the netns")
-        emit.sh(
-            netns_ops.netns_exec_argv(
-                linux_net_ops.set_sysctl_argv("net.ipv4.ip_forward", "1"),
-                netns,
-            )
-        )
-        emit.sh(
-            netns_ops.netns_exec_argv(
-                linux_net_ops.set_sysctl_argv("net.ipv6.conf.all.forwarding", "1"),
-                netns,
-            )
-        )
+def _emit_kernel_router_owner(
+    owner: pt.KernelRouterNode, netns: str, nodes: list[pt.Model], action: Action, emit: Emitter
+) -> None:
+    """One kernel router's up (create) or down (stop/teardown) body, emitted
+    into the router script's body emitter (always a _ShellBody — the router
+    script is shell regardless of the outer front-end). See the module doc
+    block above for the netns/side semantics."""
+    if action == "delete":
+        # Delete the moved-in vlans from INSIDE the netns FIRST —
+        # `ip netns delete` alone destroys the netdev but leaks a
+        # stale 8021q registration on the parent (hit live 2026-08-19
+        # on an LXC: recreating the same vlan afterwards failed with
+        # "VLAN device already exists" until a host reboot), while an
+        # explicit `ip link del` from inside the netns goes through
+        # the normal unregister path and cleans the registry up.
         for side_node in _kernel_router_sides(owner.key.name, nodes):
             iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
-            if iface is not None and iface.get("kind") not in _BINDABLE_IFACE_KINDS:
-                emit.comment(
-                    f'# unsupported kernel router side interface kind "{iface.get("kind")}" '
-                    f"for {owner.key.name} ({side_node.key.side.value}) — skipped, "
-                    "see deployer/ir_to_shell.py"
-                )
-                continue
-            if iface is not None and iface["kind"] == "veth":
-                # The netns-side leg — `peerName` is the root-side leg
-                # the transit domain's bridge attaches to (see
-                # _emit_iface_bindings, which runs after this
-                # block and finds the pair already created here). The
-                # real device names come from the IFNAMSIZ-safe
-                # `shortName` (src/ir.ts's kernelRouterSideToIR), not
-                # the long `ifaceName`/`peerName` the model carries.
-                dev = f"veth-krn-{iface['shortName']}"
-                peer = f"veth-ovn-{iface['shortName']}"
-            else:
-                dev = (
-                    _iface_real_name(iface)
-                    if iface is not None
-                    else _dummy_name(side_node.key.side)
-                )
-                peer = None
-            emit.comment(
-                f"# --- kernel router side: {owner.key.name} ({side_node.key.side.value}) ---"
-            )
-            if iface is not None:
-                if iface["kind"] == "vlan":
-                    emit.sh(linux_net_ops.add_vlan_argv(iface["vlanParent"], dev, iface["vlanId"]))
-                elif iface["kind"] == "veth":
-                    emit.sh(linux_net_ops.add_veth_argv(peer, dev))
-                # "physical": the device must already exist in the root
-                # namespace — nothing to create, only the move below.
-            else:
-                emit.sh(linux_net_ops.add_dummy_argv(dev))
-            emit.sh(linux_net_ops.add_if_to_netns_argv(dev, netns))
-            emit.sh(netns_ops.netns_exec_argv(linux_net_ops.set_link_up_argv(dev), netns))
-            # A kernel router's REAL-WORLD side (right) learns its IPv6 via
-            # RA/SLAAC — the config's via-less `::/0` means exactly that.
-            # `accept_ra=2` forces it to keep accepting RAs even though the
-            # netns has forwarding on (which would otherwise force
-            # accept_ra=0) — without it the WAN leg never gets an IPv6
-            # default/address and clients' v6 dies at the kernel router
-            # (confirmed live, 2026-08-30). Written to the proc file
-            # directly: `sysctl` splits its key on every dot, so a vlan
-            # iface name (`eth0.2280`) can't be a sysctl key component
-            # ("cannot stat .../eth0/2280/accept_ra").
-            if side_node.key.side == pt.Side.right:
-                emit.sh(
-                    netns_ops.netns_exec_argv(
-                        linux_net_ops.set_sysctl_file_argv(
-                            f"/proc/sys/net/ipv6/conf/{dev}/accept_ra", "2"
-                        ),
-                        netns,
-                    )
-                )
-            for addr in side_node.data.ipaddrs or []:
-                argv = linux_net_ops.add_addr_argv(addr, dev)
-                emit.sh(netns_ops.netns_exec_argv(argv, netns))
-            for route in side_node.data.routes or []:
-                argv = linux_net_ops.add_route_argv(route.dst, dev, route.via)
-                emit.sh(netns_ops.netns_exec_argv(argv, netns))
-            # The side's attached security group (right side in practice)
-            # applies its rules to this real interface, inside the netns.
-            # The `security.group` node is implementation-abstract; the
-            # side node is where it's ATTACHED (2026-08-22).
-            if side_node.data.securityGroup is not None:
-                group = _security_group_by_name(side_node.data.securityGroup, nodes)
-                if group is None:
-                    raise ValueError(
-                        f"kernel router {owner.key.name} ({side_node.key.side.value}) "
-                        f'references security group "{side_node.data.securityGroup}" '
-                        f"but no such security.group node"
-                    )
-                _emit_security_group_rules(group, netns, dev, emit)
-            # The side's apps (right side in practice) run inside the
-            # netns on this interface — started after the interface is up
-            # and bound, so the DHCP client can immediately acquire a
-            # lease on a ready device.
+            # Stop the side's apps BEFORE `ip netns delete` — an app
+            # daemon holds its netns alive past deletion and keeps its
+            # lease, so it must be released from inside explicitly
+            # (2026-08-23).
             if side_node.data.apps:
+                dev = (
+                    f"veth-krn-{iface['shortName']}"
+                    if iface is not None and iface["kind"] == "veth"
+                    else (
+                        _iface_real_name(iface)
+                        if iface is not None
+                        else _dummy_name(side_node.key.side)
+                    )
+                )
                 _emit_kernel_app_rules(
                     side_node.data.apps,
                     owner.key.name,
@@ -1098,6 +870,229 @@ def _emit_kernel_router(host_id: str, nodes: list[pt.Model], emit: Emitter) -> N
                     dev,
                     emit,
                 )
+            if iface is not None and iface["kind"] == "vlan":
+                real_name = _iface_real_name(iface)
+                emit.comment(
+                    f"# --- kernel router vlan: remove {real_name} from inside the netns ---"
+                )
+                emit.sh(
+                    netns_ops.netns_exec_argv(linux_net_ops.delete_link_argv(real_name), netns)
+                )
+        # `ip netns delete` tears down every remaining device inside
+        # a namespace regardless of whether it was created there or
+        # moved in later, same reasoning ovn-nbctl's own cascading
+        # del- commands already rely on elsewhere in this module.
+        emit.sh(netns_ops.delete_netns_argv(netns))
+        for side_node in _kernel_router_sides(owner.key.name, nodes):
+            iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
+            if iface is not None and iface["kind"] == "veth":
+                root_leg = f"veth-ovn-{iface['shortName']}"
+                emit.comment(
+                    f"# --- kernel router transit veth: remove root leg {root_leg} ---"
+                )
+                emit.sh(linux_net_ops.delete_link_argv(root_leg))
+        return
+
+    emit.sh(netns_ops.add_netns_argv(netns))
+    # A fresh netns starts with lo DOWN; bring it up so loopback works
+    # inside (2026-08-30).
+    emit.sh(netns_ops.netns_exec_argv(linux_net_ops.set_link_up_argv("lo"), netns))
+    # A kernel router IS a router: Linux won't forward between its
+    # two sides until the netns's own forwarding knobs say so, per
+    # family (2026-08-19).
+    emit.comment("# kernel router: enable IPv4/IPv6 forwarding in the netns")
+    emit.sh(
+        netns_ops.netns_exec_argv(
+            linux_net_ops.set_sysctl_argv("net.ipv4.ip_forward", "1"),
+            netns,
+        )
+    )
+    emit.sh(
+        netns_ops.netns_exec_argv(
+            linux_net_ops.set_sysctl_argv("net.ipv6.conf.all.forwarding", "1"),
+            netns,
+        )
+    )
+    for side_node in _kernel_router_sides(owner.key.name, nodes):
+        iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
+        if iface is not None and iface.get("kind") not in _BINDABLE_IFACE_KINDS:
+            emit.comment(
+                f'# unsupported kernel router side interface kind "{iface.get("kind")}" '
+                f"for {owner.key.name} ({side_node.key.side.value}) — skipped, "
+                "see deployer/ir_to_shell.py"
+            )
+            continue
+        if iface is not None and iface["kind"] == "veth":
+            # The netns-side leg — `peerName` is the root-side leg
+            # the transit domain's bridge attaches to (see
+            # _emit_iface_bindings, which runs after this
+            # block and finds the pair already created here). The
+            # real device names come from the IFNAMSIZ-safe
+            # `shortName` (src/ir.ts's kernelRouterSideToIR), not
+            # the long `ifaceName`/`peerName` the model carries.
+            dev = f"veth-krn-{iface['shortName']}"
+            peer = f"veth-ovn-{iface['shortName']}"
+        else:
+            dev = (
+                _iface_real_name(iface)
+                if iface is not None
+                else _dummy_name(side_node.key.side)
+            )
+            peer = None
+        emit.comment(
+            f"# --- kernel router side: {owner.key.name} ({side_node.key.side.value}) ---"
+        )
+        if iface is not None:
+            if iface["kind"] == "vlan":
+                emit.sh(linux_net_ops.add_vlan_argv(iface["vlanParent"], dev, iface["vlanId"]))
+            elif iface["kind"] == "veth":
+                emit.sh(linux_net_ops.add_veth_argv(peer, dev))
+            # "physical": the device must already exist in the root
+            # namespace — nothing to create, only the move below.
+        else:
+            emit.sh(linux_net_ops.add_dummy_argv(dev))
+        emit.sh(linux_net_ops.add_if_to_netns_argv(dev, netns))
+        emit.sh(netns_ops.netns_exec_argv(linux_net_ops.set_link_up_argv(dev), netns))
+        # A kernel router's REAL-WORLD side (right) learns its IPv6 via
+        # RA/SLAAC — the config's via-less `::/0` means exactly that.
+        # `accept_ra=2` forces it to keep accepting RAs even though the
+        # netns has forwarding on (which would otherwise force
+        # accept_ra=0) — without it the WAN leg never gets an IPv6
+        # default/address and clients' v6 dies at the kernel router
+        # (confirmed live, 2026-08-30). Written to the proc file
+        # directly: `sysctl` splits its key on every dot, so a vlan
+        # iface name (`eth0.2280`) can't be a sysctl key component
+        # ("cannot stat .../eth0/2280/accept_ra").
+        if side_node.key.side == pt.Side.right:
+            emit.sh(
+                netns_ops.netns_exec_argv(
+                    linux_net_ops.set_sysctl_file_argv(
+                        f"/proc/sys/net/ipv6/conf/{dev}/accept_ra", "2"
+                    ),
+                    netns,
+                )
+            )
+        for addr in side_node.data.ipaddrs or []:
+            argv = linux_net_ops.add_addr_argv(addr, dev)
+            emit.sh(netns_ops.netns_exec_argv(argv, netns))
+        for route in side_node.data.routes or []:
+            argv = linux_net_ops.add_route_argv(route.dst, dev, route.via)
+            emit.sh(netns_ops.netns_exec_argv(argv, netns))
+        # The side's attached security group (right side in practice)
+        # applies its rules to this real interface, inside the netns.
+        # The `security.group` node is implementation-abstract; the
+        # side node is where it's ATTACHED (2026-08-22).
+        if side_node.data.securityGroup is not None:
+            group = _security_group_by_name(side_node.data.securityGroup, nodes)
+            if group is None:
+                raise ValueError(
+                    f"kernel router {owner.key.name} ({side_node.key.side.value}) "
+                    f'references security group "{side_node.data.securityGroup}" '
+                    f"but no such security.group node"
+                )
+            _emit_security_group_rules(group, netns, dev, emit)
+        # The side's apps (right side in practice) run inside the
+        # netns on this interface — started after the interface is up
+        # and bound, so the DHCP client can immediately acquire a
+        # lease on a ready device.
+        if side_node.data.apps:
+            _emit_kernel_app_rules(
+                side_node.data.apps,
+                owner.key.name,
+                netns,
+                dev,
+                emit,
+            )
+
+
+def _kernel_router_script(router: str, up_lines: list[str], down_lines: list[str]) -> str:
+    """One self-contained per-router script: `up` (create) and `down`
+    (stop/teardown). The case labels and bodies sit at column 0 so the
+    up/down bodies' own heredocs (the app wire scripts) keep their bodies
+    and delimiters unindented. `down` runs with `set -u` only (a stop
+    runs against whatever state is there and must not abort on a missing
+    object); `up` re-enables `set -e` (a failed create really is an
+    error). systemd calls this as `ExecStart=<script> up` and
+    `ExecStop=<script> down`."""
+    lines = [
+        "#!/bin/sh",
+        f"# ovn-fabric kernel router {router}: 'up' creates the netns, its",
+        "# veths/vlans, security-group rules and apps; 'down' stops the apps",
+        "# then tears the netns and the transit veth's root leg down. One",
+        "# service per router; systemd runs ExecStart=<script> up and",
+        "# ExecStop=<script> down. Generated by deployer/ir_to_shell.py.",
+        "set -u",
+        'action="${1:-up}"',
+        'case "$action" in',
+        "up)",
+        "set -e",
+    ]
+    lines += up_lines
+    lines += [";;", "down)"]
+    lines += down_lines
+    lines += [";;", "esac"]
+    return "\n".join(lines)
+
+
+def _kernel_router_unit(router: str, script_path: str) -> str:
+    return "\n".join(
+        [
+            "[Unit]",
+            f"Description=ovn-fabric kernel router {router}",
+            "After=network-pre.target",
+            "Wants=network-pre.target",
+            "",
+            "[Service]",
+            "Type=oneshot",
+            f"ExecStart={script_path} up",
+            f"ExecStop={script_path} down",
+            "RemainAfterExit=yes",
+            "TimeoutStopSec=60",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+        ]
+    )
+
+
+def _emit_kernel_router(host_id: str, nodes: list[pt.Model], emit: Emitter) -> None:
+    """Deploy one systemd unit PER kernel router this host owns: CREATE
+    writes the router's up/down script and unit, then `systemctl enable
+    --now` runs `up` — which creates the netns + veths and backgrounds
+    the apps, so the transit veth exists when _emit_iface_bindings binds
+    it right after this block. DELETE does `systemctl disable --now`,
+    which runs `down` — stopping the apps and tearing the netns + transit
+    veth down FIRST, before _emit_iface_bindings removes the root-side
+    bridges (2026-08-18 ordering: the netns owns the moved-in WAN vlan
+    and the veth's netns leg, so it must die before the bridges/root legs
+    below it)."""
+    before = len(emit.lines)
+    action = emit.action
+    for owner in _kernel_router_owners(host_id, nodes):
+        netns = _netns_name(owner.key.name)
+        router = owner.key.name
+        script_path = f"/usr/local/sbin/ovn-kernel-{router}.sh"
+        unit = f"ovn-kernel-{router}.service"
+        unit_path = f"/etc/systemd/system/{unit}"
+        emit.comment(f"# --- kernel netns service: {netns} ({router}) ---")
+        if action == "delete":
+            emit.sh(["systemctl", "disable", "--now", unit])
+            emit.sh(["rm", "-f", script_path])
+            emit.sh(["rm", "-f", unit_path])
+            emit.sh(["systemctl", "daemon-reload"])
+            continue
+        up = _ShellBody("create")
+        down = _ShellBody("delete")
+        _emit_kernel_router_owner(owner, netns, nodes, "create", up)
+        _emit_kernel_router_owner(owner, netns, nodes, "delete", down)
+        emit.append(script_path, _kernel_router_script(router, up.lines, down.lines))
+        # The heredoc/write_file leaves the script non-executable, but
+        # ExecStart runs it directly — chmod +x or systemd aborts with
+        # 203/EXEC "Permission denied" (hit live 2026-08-30).
+        emit.sh(["chmod", "+x", script_path])
+        emit.append(unit_path, _kernel_router_unit(router, script_path))
+        emit.sh(["systemctl", "daemon-reload"])
+        emit.sh(["systemctl", "enable", "--now", unit])
     if len(emit.lines) > before:
         emit.blank()
 

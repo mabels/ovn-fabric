@@ -375,6 +375,15 @@ export type KernelApp =
      * so the wire script adds/removes these rules on the captured
      * interface. */
     readonly masq: readonly ("ipv4" | "ipv6")[];
+    /** Via-less routes the tunnel carries out the mesh — the tunnel
+     * endpoint's declared `routes` (e.g. the ztnet supernet
+     * 192.168.0.0/16). The interface name is only known at RUNTIME, so
+     * the wire script adds each as `ip route add <dst> dev "$var"` once
+     * ZeroTier names it (2026-08-30). */
+    readonly routes?: readonly {
+      readonly dst: string;
+      readonly via?: string;
+    }[];
   }
   | {
     readonly kind: "docker";
@@ -1042,10 +1051,12 @@ export type InterfaceKind =
      * losing this node's ZT identity, which means losing its
      * controller authorization too (see the "moving a ZeroTier
      * installation" discussion, this session — identity.secret is the
-     * one truly load-bearing file). Defaults to
-     * `/var/lib/zerotier-one-uplink-<uplink name>` — see
-     * uplinkZerotier, factories.ts. */
-    instanceDir: string;
+     * one truly load-bearing file). OPTIONAL — when omitted,
+     * buildTunnelRouterEndpoint (define.ts) derives
+     * `/var/lib/zerotier-one-<router name>` from the enclosing router's
+     * name (the legacy uplink default is `/var/lib/zerotier-one-uplink-
+     * <uplink name>`, factories.ts). */
+    instanceDir?: string;
   }
   /** A placeholder Linux dummy interface — no real backing device, no
    * real-world connectivity. Stands in for an uplink whose real

@@ -59,7 +59,9 @@ class PythonEmitter(Emitter):
         self.label = label
         super().__init__(action)
 
-    def sh(self, argv: list[str]) -> None:
+    def sh(self, argv: list[str], background: bool = False) -> None:
+        # `background` is only meaningful in the nested shell router-body
+        # emitter (_ShellBody) — the Python runtime has no `&` notion.
         self.lines.append(f"run_cmd({self.label!r}, _sh({argv!r}), verbose, abort_on_error)")
 
     def append(self, path: str, content: str) -> None:

@@ -569,16 +569,17 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
     { nexthop: "172.22.0.140", masq: false, domain: "Neighbor-defaultRoute" },
   );
   // No leakage: the tunnel default stays inside Neighbor-defaultRoute,
-  // so voda (only in Voda-defaultRoute) keeps its OWN literal default,
-  // and the tunnel router (participating in Voda via its right side)
-  // LEARNS the voda default rewritten to voda's backbone.
+  // so voda (only in Voda-defaultRoute) keeps its OWN literal default.
+  // The tunnel router, although it participates in Voda via its right
+  // side, keeps its OWN tunnel egress (0.0.0.0/0 -> its netns) instead
+  // of overwriting it with voda's learned default (2026-08-30).
   assertEquals(
     nodes["ovnrouter:router-voda|route:0.0.0.0/0"].data,
     { nexthop: "192.168.132.1", masq: false, domain: "Voda-defaultRoute" },
   );
   assertEquals(
     nodes["ovnrouter:router-mullvad-de|route:0.0.0.0/0"].data,
-    { nexthop: "172.22.12.80", masq: false, domain: "Voda-defaultRoute" },
+    { nexthop: "10.12.81.14", masq: false, domain: "Neighbor-defaultRoute" },
   );
   // The netns backroutes are scoped to the tunnel router's OWN domain:
   // only the neighbor subnet comes back into the netns (no home/voda
@@ -587,6 +588,93 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
     nodes["kernelrouter:router-mullvad-de|side:left"].data.routes,
     [{ dst: "192.168.130.0/24", via: "10.12.81.1" }],
   );
+});
+
+// A zerotier tunnel's via-less declared routes (the ztnet mesh supernet)
+// ride on the zerotier app so the deployer's wire script can push them
+// out the RUNTIME-named interface — NOT on the kernel router's own
+// routes, which target the upstream veth (2026-08-30).
+Deno.test("tunnelRouterEndpoint: zerotier carries via-less tunnel routes onto its app", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const backbone = net.collisionDomain("backbone");
+    const zt = net.routingDomain("Zerotier-route");
+    net.ovnRouter("router-zerotier", (router) => {
+      router.left = router.tunnelRouterEndpoint({
+        routingDomains: [zt],
+        host,
+        transit: transitNetwork(
+          IPv4.parse("10.12.85.1/28"),
+          IPv6.parse("fd00::10:12:85:1/124"),
+        ),
+        upstream: transitNetwork(
+          IPv4.parse("10.12.86.1/28"),
+          IPv6.parse("fd00::10:12:86:1/124"),
+        ),
+        tunnel: {
+          kind: "zerotier",
+          networkId: "02cfbec15c2319ff",
+          instanceDir: "/var/lib/zerotier-one-uplink-zerotier",
+        },
+        routes: [{ dst: IPv4.parse("192.168.0.0/16") }],
+        upstreamBackbone: {
+          l2Segment: backbone,
+          ipaddrs: [IPv4.parse("172.22.0.152/16")],
+        },
+      });
+      router.right = router.ovnRouterEndpoint({
+        l2Segment: backbone,
+        ipaddrs: [IPv4.parse("172.22.0.142/16")],
+      });
+    });
+  });
+  const nodes = toIR(network);
+  // The netns wire script gets the via-less supernet to egress the tunnel.
+  const right = nodes["kernelrouter:router-zerotier|side:right"].data as {
+    apps?: Array<{ kind: string; routes?: Array<{ dst: string }> }>;
+  };
+  const app = right.apps?.find((a) => a.kind === "zerotier");
+  assertEquals(app?.routes, [{ dst: "192.168.0.0/16" }]);
+  // R2 (the OVN logical router) ALSO gets a route to forward the supernet
+  // INTO its netns via the kernel-side transit address (10.12.85.14) —
+  // otherwise it has no way to send ztnet traffic to the tunnel
+  // (2026-08-30).
+  assertEquals(
+    nodes["ovnrouter:router-zerotier|route:192.168.0.0/16"].data,
+    { nexthop: "10.12.85.14", masq: false, domain: "Zerotier-route" },
+  );
+});
+
+// instanceDir on a zerotier tunnel is OPTIONAL — when omitted it's
+// derived from the router name (/var/lib/zerotier-one-<router>) so a
+// config author only sets it when the default is wrong (2026-08-30).
+Deno.test("tunnelRouterEndpoint: zerotier instanceDir is derived from the router name when omitted", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const backbone = net.collisionDomain("backbone");
+    net.ovnRouter("router-zt", (router) => {
+      router.left = router.tunnelRouterEndpoint({
+        host,
+        transit: transitNetwork(IPv4.parse("10.12.85.1/28")),
+        upstream: transitNetwork(IPv4.parse("10.12.86.1/28")),
+        tunnel: { kind: "zerotier", networkId: "02cfbec15c2319ff" },
+        upstreamBackbone: {
+          l2Segment: backbone,
+          ipaddrs: [IPv4.parse("172.22.0.152/16")],
+        },
+      });
+      router.right = router.ovnRouterEndpoint({
+        l2Segment: backbone,
+        ipaddrs: [IPv4.parse("172.22.0.142/16")],
+      });
+    });
+  });
+  const nodes = toIR(network);
+  const right = nodes["kernelrouter:router-zt|side:right"].data as {
+    apps?: Array<{ kind: string; instanceDir?: string }>;
+  };
+  const app = right.apps?.find((a) => a.kind === "zerotier");
+  assertEquals(app?.instanceDir, "/var/lib/zerotier-one-router-zt");
 });
 
 // hostToIR carries the host's ABSTRACT OS dependencies (ovn/ovs for an

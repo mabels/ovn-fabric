@@ -165,7 +165,7 @@ export const KernelRouterKey = type({
   name: "string",
   "side?": "'left'|'right'",
 });
-export const KernelRouterRoute = type({ dst: "string", via: "string" });
+export const KernelRouterRoute = type({ dst: "string", "via?": "string" });
 // KernelApp — a fully-resolved kernel-netns application (types.ts): the
 // `kernel.app.*` service kinds resolved at declaration time. An `or`
 // union DISCRIMINATED on `kind` (2026-08-23) — each variant carries
@@ -200,6 +200,10 @@ export const ZerotierApp = type({
   networkId: "string",
   instanceDir: "string",
   masq: "('ipv4'|'ipv6')[]",
+  // Via-less routes the tunnel carries out the mesh — applied over the
+  // runtime-named interface by the wire script (types.ts). Carried as
+  // plain {dst} objects; the deployer adds `ip route add <dst> dev <var>`.
+  "routes?": KernelRouterRoute.array(),
 });
 export const DockerApp = type({
   kind: "'docker'",

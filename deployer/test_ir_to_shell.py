@@ -28,7 +28,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from protocol import AppDhcpClient, AppDocker, AppWireguard
+from protocol import AppDhcpClient, AppDocker, AppWireguard, AppZerotier
 from protocol import generated as pt
 
 mod = importlib.import_module("deployer.ir_to_shell")
@@ -138,6 +138,52 @@ def _replace_home_ls(nodes: list[pt.Model], **changes: object) -> list[pt.Model]
         (dataclasses.replace(n, **changes) if n.kind == "ovn.ls" and n.key.name == "home" else n)
         for n in nodes
     ]
+
+
+# The one per-router up/down script body (the literal shell file the host
+# create pass writes via `cat > /usr/local/sbin/ovn-kernel-<router>.sh <<
+# 'OVN'`). The host create script embeds BOTH branches, so its content is
+# the single source of truth for what `systemctl start` (up) and
+# `systemctl stop` (down) will do. Ends at the first line exactly `OVN`;
+# the router script's own nested app heredocs use the distinct `OVNKERNEL`
+# delimiter, so they never trip this scan.
+def _router_script(host_script: str, router: str = "kernel-0") -> str:
+    lines = host_script.splitlines()
+    marker = f"cat > /usr/local/sbin/ovn-kernel-{router}.sh << 'OVN'"
+    start = next(i for i, l in enumerate(lines) if l == marker)
+    end = next(i for i in range(start + 1, len(lines)) if lines[i] == "OVN")
+    return "\n".join(lines[start + 1 : end])
+
+
+# Split a router script body into its `up)` and `down)` branch bodies.
+def _router_branches(router_script: str) -> tuple[str, str]:
+    lines = router_script.splitlines()
+    up_start = lines.index("up)")
+    up_end = lines.index(";;", up_start)
+    down_start = lines.index("down)", up_end)
+    down_end = lines.index(";;", down_start)
+    return "\n".join(lines[up_start + 1 : up_end]), "\n".join(lines[down_start + 1 : down_end])
+
+
+# The command lines a host script RUNS directly, excluding every file it
+# writes (heredocs: `cat > path << 'DELIM'` through the closing `DELIM`)
+# and the `#`/`set ` envelope — the Python front-end's run_cmd() argv
+# must match exactly these (file writes are write_file(), not commands).
+def _shell_command_lines(script: str) -> list[list[str]]:
+    commands: list[list[str]] = []
+    in_heredoc: str | None = None
+    for line in script.splitlines():
+        if in_heredoc is not None:
+            if line == in_heredoc:
+                in_heredoc = None
+            continue
+        stripped = line.strip()
+        if stripped.startswith("cat > "):
+            in_heredoc = stripped.split("'")[1]
+            continue
+        if line and not line.startswith("#") and not line.startswith("set "):
+            commands.append(shlex.split(line))
+    return commands
 
 
 class ClusterScriptCreateTest(unittest.TestCase):
@@ -369,6 +415,18 @@ class KernelRouterCreateTest(unittest.TestCase):
         script = self.hosts["chassis-1"]
         self.assertEqual(script.count("ip netns add ns-kernel-0"), 1)
 
+    def test_router_script_chmodded_executable_before_enable(self) -> None:
+        # The router script is written via heredoc (non-executable), but
+        # the unit's ExecStart runs it directly — without `chmod +x`
+        # systemd aborts with 203/EXEC "Permission denied" (hit live
+        # 2026-08-30).
+        script = self.hosts["chassis-1"]
+        self.assertIn("chmod +x /usr/local/sbin/ovn-kernel-kernel-0.sh", script)
+        self.assertLess(
+            script.index("chmod +x /usr/local/sbin/ovn-kernel-kernel-0.sh"),
+            script.index("systemctl enable --now ovn-kernel-kernel-0.service"),
+        )
+
     def test_ipv4_and_ipv6_forwarding_enabled_in_the_netns(self) -> None:
         # A kernel router IS a router — the netns's own forwarding knobs
         # are what make Linux actually forward between its two sides
@@ -571,7 +629,6 @@ class KernelRouterCreateTest(unittest.TestCase):
                 for n in NODES
             ]
 
-        unit = "ovn-kernel-kernel-0-dhcp-client.service"
         for style, exec_client, exec_stop in [
             ("dhclient", "/usr/sbin/dhclient -lf /var/lib/dhcp/dhclient.kernel-0.leases -d eth0.2280", "/usr/sbin/dhclient -lf /var/lib/dhcp/dhclient.kernel-0.leases -r eth0.2280"),
             ("dhcpcd", "/usr/sbin/dhcpcd -B eth0.2280", "/usr/sbin/dhcpcd -k eth0.2280"),
@@ -579,35 +636,37 @@ class KernelRouterCreateTest(unittest.TestCase):
             with self.subTest(style=style):
                 _, create_hosts = mod.build_scripts(with_app(style), "create")
                 create_script = create_hosts["chassis-1"]
-                # Unit written via heredoc, then enabled+started.
-                self.assertIn(f"cat > /etc/systemd/system/{unit} << 'OVN'", create_script)
+                # The one router service is installed + started.
                 self.assertIn(
-                    f"ExecStart=/usr/bin/ip netns exec ns-kernel-0 {exec_client}",
+                    "cat > /etc/systemd/system/ovn-kernel-kernel-0.service << 'OVN'",
                     create_script,
                 )
-                # ExecStop releases the lease explicitly — SIGTERM through
-                # `ip netns exec` is not a reliable dhclient shutdown.
                 self.assertIn(
-                    f"ExecStop=/usr/bin/ip netns exec ns-kernel-0 {exec_stop}",
+                    "systemctl enable --now ovn-kernel-kernel-0.service",
                     create_script,
                 )
-                self.assertIn("Restart=always", create_script)
-                self.assertIn(f"systemctl enable --now {unit}", create_script)
-                self.assertGreater(
-                    create_script.index(f"systemctl enable --now {unit}"),
-                    create_script.index(f"cat > /etc/systemd/system/{unit} << 'OVN'"),
+                # The client lives in the router's up/down script (no
+                # per-app unit). The up backgroundS the foreground daemon
+                # so `enable --now` returns once the netns/veths exist.
+                router = _router_script(create_script)
+                up, down = _router_branches(router)
+                self.assertIn(
+                    f"ip netns exec ns-kernel-0 {exec_client} &",
+                    up,
                 )
+                # ExecStop (the down branch) releases the lease explicitly —
+                # SIGTERM through `ip netns exec` is not reliable dhclient
+                # shutdown.
+                self.assertIn(
+                    f"ip netns exec ns-kernel-0 {exec_stop}",
+                    down,
+                )
+                self.assertNotIn("ovn-kernel-kernel-0-dhcp-client", create_script)
                 _, delete_hosts = mod.build_scripts(with_app(style), "delete")
                 delete_script = delete_hosts["chassis-1"]
-                self.assertIn(f"systemctl disable --now {unit}", delete_script)
                 self.assertIn(
-                    f"rm -f /etc/systemd/system/{unit}",
+                    "systemctl disable --now ovn-kernel-kernel-0.service",
                     delete_script,
-                )
-                # The unit is stopped before the netns is torn down.
-                self.assertLess(
-                    delete_script.index(f"systemctl disable --now {unit}"),
-                    delete_script.index("ip netns delete ns-kernel-0"),
                 )
 
     def test_os_dependencies_are_installed_at_the_start_of_create(self) -> None:
@@ -744,52 +803,53 @@ class KernelRouterCreateTest(unittest.TestCase):
                 for n in NODES
             ]
 
-        unit = "ovn-kernel-kernel-0-docker.service"
         wire = "/usr/local/sbin/ovn-kernel-kernel-0-docker-wire.sh"
         _, create_hosts = mod.build_scripts(with_docker(), "create")
         create_script = create_hosts["chassis-1"]
-        # The wire script is written, then the unit runs it.
-        self.assertIn(f"cat > {wire} << 'OVN'", create_script)
+        # The container's wire script lives inside the router's up script
+        # (a nested OVNKERNEL heredoc), and the router up runs it in the
+        # background (it ends in `docker wait`). No per-app docker unit.
+        router = _router_script(create_script)
+        up, down = _router_branches(router)
+        self.assertIn(f"cat > {wire} << 'OVNKERNEL'", up)
         self.assertIn(
             'docker run -d --network none --name "$container" "$image" sleep 86400',
-            create_script,
+            up,
         )
         self.assertIn(
             'ip link add "$veth" type veth peer name "$peer"',
-            create_script,
+            up,
         )
         self.assertIn(
             'ip netns exec "$netns" ip addr add "$router_ip" dev "$veth"',
-            create_script,
+            up,
         )
         self.assertIn(
             'ip netns exec "$container" ip addr add "$container_ip" dev eth0',
-            create_script,
+            up,
         )
         self.assertIn(
             'ip netns exec "$container" ip route add default via "$gateway" dev eth0',
-            create_script,
+            up,
         )
-        self.assertIn('exec /usr/bin/docker wait "$container"', create_script)
-        self.assertIn(f"cat > /etc/systemd/system/{unit} << 'OVN'", create_script)
-        self.assertIn(f"ExecStart=/bin/sh {wire}", create_script)
-        self.assertIn("ExecStop=/usr/bin/docker rm -f kernel-0-test-docker", create_script)
-        self.assertIn("Restart=always", create_script)
+        self.assertIn('exec /usr/bin/docker wait "$container"', up)
+        self.assertIn(f"/bin/sh {wire} &", up)
+        # The hard stop (docker rm -f via the daemon) is the router down.
+        self.assertIn("/usr/bin/docker rm -f kernel-0-test-docker", down)
+        self.assertIn(f"rm -f {wire}", down)
+        self.assertIn("rm -f /var/run/netns/kernel-0-test-docker", down)
+        self.assertNotIn("ovn-kernel-kernel-0-docker.service", create_script)
+        # The down branch stops the container before the netns is deleted.
+        self.assertLess(
+            down.index("/usr/bin/docker rm -f kernel-0-test-docker"),
+            down.index("ip netns delete ns-kernel-0"),
+        )
         _, delete_hosts = mod.build_scripts(with_docker(), "delete")
         delete_script = delete_hosts["chassis-1"]
-        # The hard stop runs FIRST in the delete pass — before the unit
-        # teardown, so the container is gone even if systemctl fails.
-        self.assertLess(
-            delete_script.index("/usr/bin/docker rm -f kernel-0-test-docker"),
-            delete_script.index(f"systemctl disable --now {unit}"),
+        self.assertIn(
+            "systemctl disable --now ovn-kernel-kernel-0.service",
+            delete_script,
         )
-        self.assertLess(
-            delete_script.index(f"systemctl disable --now {unit}"),
-            delete_script.index("ip netns delete ns-kernel-0"),
-        )
-        # The wire script and the container-netns symlink are cleaned up.
-        self.assertIn(f"rm -f {wire}", delete_script)
-        self.assertIn("rm -f /var/run/netns/kernel-0-test-docker", delete_script)
 
     def test_kernel_app_wireguard_emits_conf_wgquick_and_masq_out_the_tunnel(self) -> None:
         # `kernel.app.wireguard` (the tunnelRouterEndpoint's middle leg):
@@ -831,55 +891,128 @@ class KernelRouterCreateTest(unittest.TestCase):
 
         _, create_hosts = mod.build_scripts(with_wireguard(), "create")
         create_script = create_hosts["chassis-1"]
-        self.assertIn("cat > /etc/wireguard/mullvad-de.conf << 'OVN'", create_script)
-        self.assertIn("PrivateKey = k", create_script)
-        self.assertIn("AllowedIPs = 0.0.0.0/0", create_script)
+        router = _router_script(create_script)
+        up, down = _router_branches(router)
+        self.assertIn("cat > /etc/wireguard/mullvad-de.conf << 'OVNKERNEL'", up)
+        self.assertIn("PrivateKey = k", up)
+        self.assertIn("AllowedIPs = 0.0.0.0/0", up)
         self.assertIn(
             "ip netns exec ns-kernel-0 wg-quick up /etc/wireguard/mullvad-de.conf",
-            create_script,
+            up,
         )
         self.assertIn(
             "ip netns exec ns-kernel-0 iptables -t nat -A POSTROUTING -o mullvad-de -j MASQUERADE",
-            create_script,
+            up,
         )
         self.assertIn(
             "ip netns exec ns-kernel-0 ip6tables -t nat -A POSTROUTING -o mullvad-de -j MASQUERADE",
-            create_script,
+            up,
+        )
+        # wg-quick is in-kernel (returns immediately) — it stays in the
+        # foreground, NOT backgrounded.
+        self.assertNotIn(
+            "ip netns exec ns-kernel-0 wg-quick up /etc/wireguard/mullvad-de.conf &",
+            up,
+        )
+        self.assertIn(
+            "ip netns exec ns-kernel-0 wg-quick down /etc/wireguard/mullvad-de.conf",
+            down,
+        )
+        self.assertIn(
+            "ip netns exec ns-kernel-0 iptables -t nat -D POSTROUTING -o mullvad-de -j MASQUERADE",
+            down,
         )
         _, delete_hosts = mod.build_scripts(with_wireguard(), "delete")
         delete_script = delete_hosts["chassis-1"]
-        self.assertIn("wg-quick down /etc/wireguard/mullvad-de.conf", delete_script)
         self.assertIn(
-            "ip netns exec ns-kernel-0 iptables -t nat -D POSTROUTING -o mullvad-de -j MASQUERADE",
+            "systemctl disable --now ovn-kernel-kernel-0.service",
             delete_script,
+        )
+
+    def test_kernel_app_zerotier_applies_tunnel_egress_routes_over_the_runtime_iface(
+        self,
+    ) -> None:
+        # The zerotier tunnel's via-less declared routes (the ztnet mesh
+        # supernet 192.168.0.0/16) ride on the app and are applied as
+        # `ip route add <dst> dev "$var"` once ZeroTier names the real
+        # interface — NOT on the upstream veth (2026-08-30).
+        def with_zerotier() -> list[pt.Model]:
+            return [
+                (
+                    dataclasses.replace(
+                        n,
+                        data=dataclasses.replace(
+                            n.data,
+                            apps=[
+                                AppZerotier(
+                                    kind="zerotier",
+                                    networkId="02cfbec15c2319ff",
+                                    instanceDir="/var/lib/zerotier-one-uplink-zerotier",
+                                    masq=[pt.MasqEnum.ipv4],
+                                    routes=[pt.Route(dst="192.168.0.0/16")],
+                                )
+                            ],
+                        ),
+                    )
+                    if n.kind == "kernel.router" and n.key.side == pt.Side.right
+                    else n
+                )
+                for n in NODES
+            ]
+        _, create_hosts = mod.build_scripts(with_zerotier(), "create")
+        router = _router_script(create_hosts["chassis-1"])
+        up, _ = _router_branches(router)
+        wire = "/usr/local/sbin/ovn-kernel-kernel-0-zerotier-wire.sh"
+        self.assertIn(f"cat > {wire} << 'OVNKERNEL'", up)
+        # The supernet is pushed over the runtime-named tunnel interface.
+        self.assertIn(
+            'ip netns exec "$netns" ip route add 192.168.0.0/16 dev "$var"',
+            up,
+        )
+        self.assertIn(
+            'ip netns exec "$netns" ip link set "$var" up',
+            up,
         )
 
 
 class KernelRouterDeleteTest(unittest.TestCase):
     def test_delete_only_removes_the_netns_not_the_devices_inside_it(self) -> None:
+        # The host delete pass stops the router service (which runs its
+        # `down`: stop apps, then `ip netns delete`, then remove the root
+        # veth leg). The devices INSIDE the netns are never individually
+        # addressed — the netns teardown destroys them.
         _, hosts = mod.build_scripts(NODES, "delete")
         script = hosts["chassis-1"]
-        self.assertIn("ip netns delete ns-kernel-0", script)
+        self.assertIn(
+            "systemctl disable --now ovn-kernel-kernel-0.service",
+            script,
+        )
+        self.assertNotIn("ip netns delete", script)
         self.assertNotIn("dummy-", script)
         self.assertNotIn("ip addr", script)
         self.assertNotIn("ip route", script)
+        _, create_hosts = mod.build_scripts(NODES, "create")
+        _, down = _router_branches(_router_script(create_hosts["chassis-1"]))
+        self.assertIn("ip netns delete ns-kernel-0", down)
 
     def test_netns_removed_before_the_root_interface_bindings(self) -> None:
         # The netns owns the kernel router's devices (moved-in vlan/veth
         # legs), so it is torn down BEFORE the root-namespace binding
         # deletes run — otherwise `ip link delete` would target a device
-        # still living inside the netns (2026-08-18).
+        # still living inside the netns (2026-08-18). The netns teardown
+        # now happens inside the router service's `down` (run by
+        # `systemctl disable --now`), so that must precede the bindings.
         _, hosts = mod.build_scripts(NODES, "delete")
         script = hosts["chassis-1"]
         self.assertGreater(
             script.index("ip link delete eth0.129"),
-            script.index("ip netns delete ns-kernel-0"),
+            script.index("systemctl disable --now ovn-kernel-kernel-0.service"),
         )
 
     def test_veth_root_leg_removed_in_delete(self) -> None:
         # create adds the transit veth's ROOT-side leg in the global
-        # namespace; delete must remove it explicitly, after the netns
-        # (which destroyed the netns-side leg) is gone (2026-08-19).
+        # namespace; the router `down` removes it explicitly, after the
+        # netns (which destroyed the netns-side leg) is gone (2026-08-19).
         nodes = [
             (
                 dataclasses.replace(
@@ -905,12 +1038,12 @@ class KernelRouterDeleteTest(unittest.TestCase):
             )
             for n in NODES
         ]
-        _, hosts = mod.build_scripts(nodes, "delete")
-        script = hosts["chassis-1"]
-        self.assertIn("ip link delete veth-ovn-0", script)
+        _, create_hosts = mod.build_scripts(nodes, "create")
+        _, down = _router_branches(_router_script(create_hosts["chassis-1"]))
+        self.assertIn("ip link delete veth-ovn-0", down)
         self.assertGreater(
-            script.index("ip link delete veth-ovn-0"),
-            script.index("ip netns delete ns-kernel-0"),
+            down.index("ip link delete veth-ovn-0"),
+            down.index("ip netns delete ns-kernel-0"),
         )
 
     def test_moved_in_vlan_removed_from_inside_the_netns_before_teardown(self) -> None:
@@ -919,12 +1052,12 @@ class KernelRouterDeleteTest(unittest.TestCase):
         # stale 8021q registration on the parent, so recreating the same
         # vlan afterwards fails with "VLAN device already exists" (hit
         # live 2026-08-19 on an LXC).
-        _, hosts = mod.build_scripts(NODES, "delete")
-        script = hosts["chassis-1"]
-        self.assertIn("ip netns exec ns-kernel-0 ip link delete eth0.2280", script)
+        _, create_hosts = mod.build_scripts(NODES, "create")
+        _, down = _router_branches(_router_script(create_hosts["chassis-1"]))
+        self.assertIn("ip netns exec ns-kernel-0 ip link delete eth0.2280", down)
         self.assertLess(
-            script.index("ip netns exec ns-kernel-0 ip link delete eth0.2280"),
-            script.index("ip netns delete ns-kernel-0"),
+            down.index("ip netns exec ns-kernel-0 ip link delete eth0.2280"),
+            down.index("ip netns delete ns-kernel-0"),
         )
 
 
@@ -1006,17 +1139,16 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         # exactly the argv the shell generator prints as commands.
         ns = self._exec_runtime()
         _, create_hosts = mod.build_scripts(NODES, "create")
-        shell_commands = [
-            shlex.split(line)
-            for line in create_hosts["chassis-1"].splitlines()
-            if line
-            and not line.startswith("#")
-            and not line.startswith("set ")
-            and line not in ("OVN",)
-        ]
+        # File writes (heredocs for the router script + unit) are
+        # write_file() in Python, not commands — skip them from the shell
+        # side so only command argv are compared (2026-08-30).
+        shell_commands = _shell_command_lines(create_hosts["chassis-1"])
         argv_seen: list[list[str]] = []
         with mock.patch("subprocess.run") as run:
             run.return_value.returncode = 0
+            # File writes (the router script + unit) are write_file(), not
+            # commands — no-op them so the run_cmd argv stays comparable.
+            ns["write_file"] = mock.Mock()
             ns["_host_chassis_1_create"](False, True)
             argv_seen = [call.args[0] for call in run.call_args_list]
         self.assertEqual(shell_commands, argv_seen)

@@ -770,6 +770,22 @@ function computeRoutes(network: NetworkDefinition): IRNode[] {
   // its right (a tunnelRouterEndpoint does exactly that: the left's
   // via-less default stays inside Neighbor-defaultRoute, the right joins
   // Voda-defaultRoute).
+  //
+  // Every router's OWN declared route prefixes (across both endpoints,
+  // via-less or via) — a router's own route to a prefix wins over one it
+  // would otherwise LEARN as a participant of another domain's anchor.
+  // Without this a full-tunnel router (e.g. mullvad-de anchors 0.0.0.0/0
+  // via-less for Neighbor, but its right side also joins Voda-defaultRoute)
+  // gets voda's default written over its OWN tunnel egress — same node id,
+  // last-write-wins (hit live 2026-08-30).
+  const ownPrefixes = new Map<string, Set<string>>();
+  for (const r of network.allRouters) {
+    const set = new Set<string>();
+    for (const side of ["left", "right"] as const) {
+      for (const rt of r[side].routes ?? []) set.add(rt.dst.to_string());
+    }
+    ownPrefixes.set(r.name, set);
+  }
   for (const anchorRouter of network.allRouters) {
     for (const side of ["left", "right"] as const) {
       const anchor: Anchor = { router: anchorRouter, side };
@@ -805,6 +821,13 @@ function computeRoutes(network: NetworkDefinition): IRNode[] {
             }
             const nexthop = anchorAddressSharedWith(router, anchor, route.dst);
             if (nexthop === undefined) continue; // no shared domain / family with the anchor
+            // A router's OWN declared route to this prefix is its own
+            // authoritative egress — don't overwrite it with a learned one
+            // (e.g. a full-tunnel router must keep its tunnel egress, not
+            // take another domain's default, 2026-08-30).
+            if (ownPrefixes.get(router.name)?.has(route.dst.to_string())) {
+              continue;
+            }
             nodes.push(
               routeToIR(router, route.dst, nexthop, masq, domain.name),
             );
