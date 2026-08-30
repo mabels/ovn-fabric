@@ -630,7 +630,11 @@ class KernelRouterCreateTest(unittest.TestCase):
             ]
 
         for style, exec_client, exec_stop in [
-            ("dhclient", "/usr/sbin/dhclient -lf /var/lib/dhcp/dhclient.kernel-0.leases -d eth0.2280", "/usr/sbin/dhclient -lf /var/lib/dhcp/dhclient.kernel-0.leases -r eth0.2280"),
+            (
+                "dhclient",
+                "/usr/sbin/dhclient -lf /var/lib/dhcp/dhclient.kernel-0.leases -d eth0.2280",
+                "/usr/sbin/dhclient -lf /var/lib/dhcp/dhclient.kernel-0.leases -r eth0.2280",
+            ),
             ("dhcpcd", "/usr/sbin/dhcpcd -B eth0.2280", "/usr/sbin/dhcpcd -k eth0.2280"),
         ]:
             with self.subTest(style=style):
@@ -959,6 +963,7 @@ class KernelRouterCreateTest(unittest.TestCase):
                 )
                 for n in NODES
             ]
+
         _, create_hosts = mod.build_scripts(with_zerotier(), "create")
         router = _router_script(create_hosts["chassis-1"])
         up, _ = _router_branches(router)

@@ -144,6 +144,7 @@ class _ShellBody(Emitter):
     background a long-running/daemon app inside the netns) and heredoc
     appends, never Python. `background=True` is only meaningful here —
     the outer front-ends ignore it."""
+
     def sh(self, argv: list[str], background: bool = False) -> None:
         self.lines.append(shlex.join(argv) + (" &" if background else ""))
 
@@ -593,9 +594,7 @@ def _zerotier_wire_script(app: KernelApp, netns: str) -> str:
         )
     route_lines: list[str] = []
     for route in app.routes or []:
-        route_lines.append(
-            f'ip netns exec "$netns" ip route add {route.dst} dev "$var"'
-        )
+        route_lines.append(f'ip netns exec "$netns" ip route add {route.dst} dev "$var"')
     return "\n".join(
         [
             "#!/bin/sh",
@@ -875,9 +874,7 @@ def _emit_kernel_router_owner(
                 emit.comment(
                     f"# --- kernel router vlan: remove {real_name} from inside the netns ---"
                 )
-                emit.sh(
-                    netns_ops.netns_exec_argv(linux_net_ops.delete_link_argv(real_name), netns)
-                )
+                emit.sh(netns_ops.netns_exec_argv(linux_net_ops.delete_link_argv(real_name), netns))
         # `ip netns delete` tears down every remaining device inside
         # a namespace regardless of whether it was created there or
         # moved in later, same reasoning ovn-nbctl's own cascading
@@ -887,9 +884,7 @@ def _emit_kernel_router_owner(
             iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
             if iface is not None and iface["kind"] == "veth":
                 root_leg = f"veth-ovn-{iface['shortName']}"
-                emit.comment(
-                    f"# --- kernel router transit veth: remove root leg {root_leg} ---"
-                )
+                emit.comment(f"# --- kernel router transit veth: remove root leg {root_leg} ---")
                 emit.sh(linux_net_ops.delete_link_argv(root_leg))
         return
 
@@ -933,15 +928,9 @@ def _emit_kernel_router_owner(
             dev = f"veth-krn-{iface['shortName']}"
             peer = f"veth-ovn-{iface['shortName']}"
         else:
-            dev = (
-                _iface_real_name(iface)
-                if iface is not None
-                else _dummy_name(side_node.key.side)
-            )
+            dev = _iface_real_name(iface) if iface is not None else _dummy_name(side_node.key.side)
             peer = None
-        emit.comment(
-            f"# --- kernel router side: {owner.key.name} ({side_node.key.side.value}) ---"
-        )
+        emit.comment(f"# --- kernel router side: {owner.key.name} ({side_node.key.side.value}) ---")
         if iface is not None:
             if iface["kind"] == "vlan":
                 emit.sh(linux_net_ops.add_vlan_argv(iface["vlanParent"], dev, iface["vlanId"]))
