@@ -150,7 +150,7 @@ def _replace_home_ls(nodes: list[pt.Model], **changes: object) -> list[pt.Model]
 def _router_script(host_script: str, router: str = "kernel-0") -> str:
     lines = host_script.splitlines()
     marker = f"cat > /usr/local/sbin/ovn-kernel-{router}.sh << 'OVN'"
-    start = next(i for i, l in enumerate(lines) if l == marker)
+    start = next(i for i, line in enumerate(lines) if line == marker)
     end = next(i for i in range(start + 1, len(lines)) if lines[i] == "OVN")
     return "\n".join(lines[start + 1 : end])
 
