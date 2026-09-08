@@ -218,7 +218,9 @@ function normalizeKernelEndpoint(
 }
 
 export interface RouterBuilder {
-  routingDomains?: readonly RoutingDomain[];
+  // No routingDomains here — it's REQUIRED on the defineOvnRouter() callback's
+  // return value (define.ts), not a settable attribute, so a router author
+  // can't forget its membership (2026-09-08).
   // Always the OVN side — every endpoint builder (ovn/kernel/tunnel)
   // returns a plain OvnRouterEndpoint; the KernelRouterEndpoint and
   // TunnelRouterEndpoint shapes are INPUT types, never stored here.
@@ -434,7 +436,7 @@ export class NetworkBuilder {
 
   /** Declare a router connecting exactly two collision domains — see
    * Router/RouterEndpoint (types.ts) for why exactly two, not N. Named
-   * ovnRouter(), not router(): kernelRouterEndpoint()/
+   * defineOvnRouter(), not router(): kernelRouterEndpoint()/
    * ovnRouterEndpoint() (only reachable through the RouterBuilder this
    * passes into `build`, not as their own NetworkBuilder methods
    * anymore — 2026-08-12) already anticipate a future net.kernelRouter()
@@ -442,46 +444,54 @@ export class NetworkBuilder {
    * needed a name of its own even before the kernel-side counterpart
    * existed.
    *
-   * A single void callback, not `{left, right, routingDomains}` — moved
-   * here 2026-08-12: kernelRouterEndpoint() needs to know this router's
-   * OWN routingDomains at the moment it's called (to stamp the SAME
-   * membership onto the KernelRouter it creates, so a kernel-side route
-   * is gated by "is this router actually a participant of some
-   * RoutingDomain" the exact same way an OVN-side route already is —
-   * see KernelRouter.routingDomains, types.ts) — routingDomains can't be
-   * a value returned alongside left/right, since kernelRouterEndpoint()
-   * runs BEFORE that return happens. Setting it as an attribute on the
-   * SAME builder object passed into the callback (`router.routingDomains
-   * = [...]`, read live off `router` by kernelRouterEndpoint() below,
-   * not captured at builder-construction time) — set it before calling
-   * router.kernelRouterEndpoint(), same top-to-bottom declare-before-use
-   * discipline every other builder method in this file already
-   * requires. */
-  ovnRouter(name: string, build: (router: RouterBuilder) => void): Router {
+   * The `build` callback returns the router's `routingDomains` (REQUIRED
+   * on the return type) — read AFTER the callback runs, so the endpoint
+   * methods no longer depend on call-time ordering. The router-level
+   * membership is stamped onto any KernelRouter the endpoints created,
+   * when that endpoint didn't declare its own per-endpoint
+   * routingDomains (2026-09-08, superseding the pre-2026-09-08 mutable
+   * `router.routingDomains = [...]` attribute).
+   * Declare-before-use discipline every other builder method in this file
+   * requires (e.g. a collisionDomain must exist before a router references
+   * it). */
+  defineOvnRouter(
+    name: string,
+    build: (router: RouterBuilder) => {
+      readonly routingDomains: readonly RoutingDomain[];
+    },
+  ): Router {
     if (this.routersByName.has(name)) {
       throw new Error(`router "${name}" declared more than once`);
     }
+    // Sub-routers a tunnel endpoint creates (its `<name>-upstream` peer)
+    // are attached to THIS router, so the author lists only this top-level
+    // router and the sub-router is flattened at IR time (2026-09-08).
+    const subRouters: Router[] = [];
     const router: RouterBuilder = {
-      routingDomains: undefined,
       left: undefined,
       right: undefined,
       ovnRouterEndpoint: (input) => this.buildOvnRouterEndpoint(input),
+      // Router-level routingDomains is only known from the callback's
+      // RETURN value (read after the callback runs) — so it can't be
+      // passed in at endpoint-call time anymore. Each endpoint may carry
+      // its own per-endpoint routingDomains; the router-level default is
+      // stamped onto the KernelRouter by defineOvnRouter() below (2026-09-08).
       kernelRouterEndpoint: (input) =>
-        this.buildKernelRouterEndpoint(input, router.routingDomains, name),
+        this.buildKernelRouterEndpoint(input, undefined, name),
       tunnelRouterEndpoint: (input) =>
-        this.buildTunnelRouterEndpoint(input, name),
+        this.buildTunnelRouterEndpoint(input, name, subRouters),
     };
-    build(router);
+    const decl = build(router);
 
     if (router.left === undefined || router.right === undefined) {
       throw new Error(
         `router "${name}": both router.left and router.right must be ` +
-          `set inside the ovnRouter() callback`,
+          `set inside the defineOvnRouter() callback`,
       );
     }
     this.checkRouterEndpoint(name, router.left);
     this.checkRouterEndpoint(name, router.right);
-    for (const domain of router.routingDomains ?? []) {
+    for (const domain of decl.routingDomains) {
       if (this.routingDomainsByName.get(domain.name) !== domain) {
         throw new Error(
           `router "${name}" references routing domain "${domain.name}", ` +
@@ -490,11 +500,24 @@ export class NetworkBuilder {
         );
       }
     }
+    // Stamp the router-level membership onto the KernelRouter this router
+    // created, when its endpoint didn't carry its own per-endpoint
+    // routingDomains (2026-09-08).
+    const kernelRouter = this.kernelRoutersByName.get(name);
+    if (
+      kernelRouter !== undefined && kernelRouter.routingDomains === undefined
+    ) {
+      this.kernelRoutersByName.set(name, {
+        ...kernelRouter,
+        routingDomains: decl.routingDomains,
+      });
+    }
     const built: Router = {
       name,
       left: this.deriveGatewayChassis(router.left),
       right: this.deriveGatewayChassis(router.right),
-      routingDomains: router.routingDomains,
+      routingDomains: decl.routingDomains,
+      subRouters,
     };
     this.routersByName.set(name, built);
     return built;
@@ -851,6 +874,7 @@ export class NetworkBuilder {
   private buildTunnelRouterEndpoint(
     input: Omit<TunnelRouterEndpoint, "kind">,
     routerName: string,
+    subRouters: Router[],
   ): OvnRouterEndpoint {
     const {
       transit: meshLink,
@@ -975,18 +999,22 @@ export class NetworkBuilder {
     // binds to the backdoor domain's localnet bridge, and the internal
     // router's backdoor port carries that same veth for the bridge
     // binding (mirror of how the mesh transit binds its own veth).
-    this.ovnRouter(`${routerName}-upstream`, (peer) => {
-      peer.routingDomains = upstreamDomains;
-      peer.left = this.buildOvnRouterEndpoint({
-        l2Segment: backdoorDomain,
-        ipaddrs: upstreamPeerAddrs,
-        ifaces: [{ host, iface: upstreamVeth }],
-      });
-      peer.right = this.buildOvnRouterEndpoint({
-        l2Segment: upstreamBackbone.l2Segment,
-        ipaddrs: upstreamBackbone.ipaddrs,
-      });
-    });
+    const upstreamPeer = this.defineOvnRouter(
+      `${routerName}-upstream`,
+      (router) => {
+        router.left = this.buildOvnRouterEndpoint({
+          l2Segment: backdoorDomain,
+          ipaddrs: upstreamPeerAddrs,
+          ifaces: [{ host, iface: upstreamVeth }],
+        });
+        router.right = this.buildOvnRouterEndpoint({
+          l2Segment: upstreamBackbone.l2Segment,
+          ipaddrs: upstreamBackbone.ipaddrs,
+        });
+        return { routingDomains: upstreamDomains ?? [] };
+      },
+    );
+    subRouters.push(upstreamPeer);
 
     this.kernelRouter(routerName, {
       host,
@@ -1125,16 +1153,50 @@ export class NetworkBuilder {
     return segment;
   }
 
-  /** @internal used by defineNetwork to extract the final declarations */
-  build(name: string): NetworkDefinition {
+  /** @internal used by defineNetwork to extract the final declarations. The
+   * returned `routers` (and optional `hosts`) are the SOURCE OF TRUTH —
+   * every router/host registered during the callback must be listed in
+   * `decl`, so an author can't forget to declare one (2026-09-08). The
+   * derived sets (collision domains, kernel routers, routing domains,
+   * security groups) come from the Maps — they're only ever created by the
+   * returned routers' registration, so they stay consistent. */
+  build(
+    name: string,
+    decl: {
+      readonly hosts?: readonly Host[];
+      readonly routers: readonly Router[];
+    },
+  ): NetworkDefinition {
+    // The author lists only TOP-level routers; their subRouters (tunnel
+    // upstream peers) are flattened here. Every registered router must be
+    // reachable in that flattened tree (2026-09-08).
+    const allRouters = flattenRouters(decl.routers);
+    for (const router of this.routersByName.values()) {
+      if (!allRouters.includes(router)) {
+        throw new Error(
+          `router "${router.name}" was declared but is not reachable in ` +
+            `defineNetwork()'s returned routers[] (or one of their sub-routers)`,
+        );
+      }
+    }
+    if (decl.hosts !== undefined) {
+      for (const host of this.hostsByName.values()) {
+        if (!decl.hosts.includes(host)) {
+          throw new Error(
+            `host "${host.name}" was declared but not listed in ` +
+              `defineNetwork()'s returned hosts[]`,
+          );
+        }
+      }
+    }
     return {
       name,
       allUplinks: [...this.uplinksByName.values()],
       allSegments: [...this.segmentsByName.values()],
-      allHosts: [...this.hostsByName.values()],
+      allHosts: [...(decl.hosts ?? this.hostsByName.values())],
       allCollisionDomains: [...this.collisionDomainsByName.values()],
       backbone: this.backboneDomain,
-      allRouters: [...this.routersByName.values()],
+      allRouters,
       allKernelRouters: [...this.kernelRoutersByName.values()],
       allRoutingDomains: [...this.routingDomainsByName.values()],
       allSecurityGroups: [...this.securityGroupsByName.values()],
@@ -1145,11 +1207,26 @@ export class NetworkBuilder {
 
 export function defineNetwork(
   name: string,
-  build: (net: NetworkBuilder) => void,
+  build: (net: NetworkBuilder) => {
+    readonly hosts?: readonly Host[];
+    readonly routers: readonly Router[];
+  },
 ): NetworkDefinition {
   const builder = new NetworkBuilder();
-  build(builder);
-  return builder.build(name);
+  const decl = build(builder);
+  return builder.build(name, decl);
+}
+
+// Flatten a router and its subRouters (recursively) into the full router
+// set — a config author lists only top-level routers; a tunnel's upstream
+// peer rides on the tunnel router's subRouters (2026-09-08).
+function flattenRouters(routers: readonly Router[]): Router[] {
+  const out: Router[] = [];
+  for (const router of routers) {
+    out.push(router);
+    out.push(...flattenRouters(router.subRouters));
+  }
+  return out;
 }
 
 /** The per-declaration rule API handed to net.securityGroup()'s build

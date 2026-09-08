@@ -276,7 +276,7 @@ function kernelRouterBackRoutes(
 // RoutingDomain, the same rule that already gates every OVN-side route
 // (RouterEndpointRoute's own doc comment, types.ts) — `routingDomains`
 // is only ever populated with real, net.routingDomain()-registered
-// references (validated at ovnRouter() call time), so non-empty already
+// references (validated at defineOvnRouter() call time), so non-empty already
 // implies membership, no separate intersection with
 // network.allRoutingDomains needed. Back-routes need no separate gate:
 // `routeNodes` is already empty for a router with no RoutingDomain

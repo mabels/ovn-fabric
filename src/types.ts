@@ -732,10 +732,11 @@ export interface KernelRouter {
    * it's actually a participant of some declared RoutingDomain, same
    * rule that already gates every OVN-side route (src/ir.ts's
    * computeRoutes). Set once, at declaration time (NetworkBuilder.
-   * ovnRouter()'s callback sets `router.routingDomains` before calling
-   * `router.kernelRouterEndpoint()`, which reads it straight off the
-   * builder) — never a second, independently-stated copy that could
-   * drift from the owning Router's own routingDomains. */
+   * defineOvnRouter() stamps the router's returned routingDomains onto the
+   * KernelRouter it creates, when the endpoint didn't carry its own
+   * per-endpoint routingDomains, 2026-09-08) — never a second,
+   * independently-stated copy that could drift from the owning Router's
+   * own routingDomains. */
   readonly routingDomains?: readonly RoutingDomain[];
 }
 
@@ -919,6 +920,13 @@ export interface Router {
    * declared. See RoutingDomain's own doc comment for how a domain's
    * routes actually resolve per-router. */
   readonly routingDomains?: readonly RoutingDomain[];
+  /** Routers this router IMPLIES (derived, not author-declared) — e.g. a
+   * tunnelRouterEndpoint's internally-created `<name>-upstream` peer.
+   * Always an array (possibly empty). The config author lists only the
+   * TOP-level router in defineNetwork()'s returned routers[]; define.ts
+   * flattens each router's subRouters when assembling allRouters, so a
+   * tunnel's upstream peer never needs listing (2026-09-08). */
+  readonly subRouters: readonly Router[];
 }
 
 // ── SegmentGateway: how a segment's own gateway address is expressed ──
@@ -1102,7 +1110,7 @@ export type InterfaceKind =
    * netns, where that side's addresses/routes bind to it), `peerName`
    * is the root-side leg (attached to the transit domain's OVS bridge).
    * Constructed implicitly by NetworkBuilder.kernelRouterEndpoint()
-   * (define.ts) from the enclosing ovnRouter()'s LONG name — the
+   * (define.ts) from the enclosing defineOvnRouter()'s LONG name — the
    * IFNAMSIZ-safe shortening is the lower layers' job (src/ir.ts, same
    * as bridges' shortName) — never declared by config authors. */
   | {

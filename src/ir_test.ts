@@ -31,7 +31,7 @@ function networkWithBoundDomain(domainName: string) {
     const domain = net.collisionDomain(domainName);
     const other = net.collisionDomain(`${domainName}-other`);
     const host = net.localHost("chassis-1");
-    net.ovnRouter(`router-${domainName}`, (router) => {
+    const r1 = net.defineOvnRouter(`router-${domainName}`, (router) => {
       router.left = router.ovnRouterEndpoint({
         l2Segment: domain,
         ipaddrs: [IPv4.parse("192.168.1.1/24")],
@@ -41,7 +41,9 @@ function networkWithBoundDomain(domainName: string) {
         l2Segment: other,
         ipaddrs: [IPv4.parse("192.168.2.1/24")],
       });
+      return { routingDomains: [] };
     });
+    return { routers: [r1] };
   });
 }
 
@@ -86,7 +88,7 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
   const network = defineNetwork("test-net", (net) => {
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
-    net.ovnRouter("router-wan", (router) => {
+    const r1 = net.defineOvnRouter("router-wan", (router) => {
       router.left = router.kernelRouterEndpoint({
         host,
         transit: transitNetwork(
@@ -102,7 +104,9 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
         l2Segment: backbone,
         ipaddrs: [IPv4.parse("172.22.12.80/16")],
       });
+      return { routingDomains: [] };
     });
+    return { routers: [r1] };
   });
 
   const nodes = toIR(network);
@@ -171,8 +175,7 @@ Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes 
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
     const domain = net.routingDomain("test-domain");
-    net.ovnRouter("router-wan", (router) => {
-      router.routingDomains = [domain];
+    const r1 = net.defineOvnRouter("router-wan", (router) => {
       router.left = router.kernelRouterEndpoint({
         host,
         transit: transitNetwork(
@@ -196,7 +199,9 @@ Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes 
         l2Segment: backbone,
         ipaddrs: [IPv4.parse("172.22.12.80/16")],
       });
+      return { routingDomains: [domain] };
     });
+    return { routers: [r1] };
   });
 
   const nodes = toIR(network);
@@ -246,7 +251,7 @@ Deno.test("kernelRouterEndpoint: explicit security group wins, masq services are
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
     const out = net.securityGroup("wan-out", (g) => g.masq("ipv4"));
-    net.ovnRouter("router-wan", (router) => {
+    const r1 = net.defineOvnRouter("router-wan", (router) => {
       router.left = router.kernelRouterEndpoint({
         host,
         transit: transitNetwork(
@@ -267,7 +272,9 @@ Deno.test("kernelRouterEndpoint: explicit security group wins, masq services are
         l2Segment: backbone,
         ipaddrs: [IPv4.parse("172.22.12.80/16")],
       });
+      return { routingDomains: [] };
     });
+    return { routers: [r1] };
   });
 
   const nodes = toIR(network);
@@ -296,7 +303,7 @@ Deno.test("kernelRouterEndpoint: unregistered security group is rejected", () =>
     defineNetwork("test-net", (net) => {
       const host = net.localHost("chassis-1");
       const backbone = net.collisionDomain("backbone");
-      net.ovnRouter("router-wan", (router) => {
+      const r1 = net.defineOvnRouter("router-wan", (router) => {
         router.left = router.kernelRouterEndpoint({
           host,
           transit: transitNetwork(
@@ -313,7 +320,9 @@ Deno.test("kernelRouterEndpoint: unregistered security group is rejected", () =>
           l2Segment: backbone,
           ipaddrs: [IPv4.parse("172.22.12.80/16")],
         });
+        return { routingDomains: [] };
       });
+      return { routers: [r1] };
     });
   } catch {
     threw = true;
@@ -342,6 +351,7 @@ Deno.test("securityGroup builder: accumulates rules, registers once, rejects dup
       threw = true;
     }
     assertEquals(threw, true);
+    return { routers: [] };
   });
   assertEquals(network.allSecurityGroups.length, 1);
   assertEquals(network.allSecurityGroups[0].name, "g1");
@@ -354,7 +364,7 @@ Deno.test("kernelRouterEndpoint: kernel.app services resolve to app descriptors 
   const network = defineNetwork("test-net", (net) => {
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
-    net.ovnRouter("router-wan", (router) => {
+    const r1 = net.defineOvnRouter("router-wan", (router) => {
       router.left = router.kernelRouterEndpoint({
         host,
         transit: transitNetwork(
@@ -371,7 +381,9 @@ Deno.test("kernelRouterEndpoint: kernel.app services resolve to app descriptors 
         l2Segment: backbone,
         ipaddrs: [IPv4.parse("172.22.12.80/16")],
       });
+      return { routingDomains: [] };
     });
+    return { routers: [r1] };
   });
 
   const nodes = toIR(network);
@@ -406,7 +418,7 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker resolves router-prefixed name
   const network = defineNetwork("test-net", (net) => {
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
-    net.ovnRouter("router-wan", (router) => {
+    const r1 = net.defineOvnRouter("router-wan", (router) => {
       router.left = router.kernelRouterEndpoint({
         host,
         transit: transitNetwork(
@@ -431,7 +443,9 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker resolves router-prefixed name
         l2Segment: backbone,
         ipaddrs: [IPv4.parse("172.22.12.80/16")],
       });
+      return { routingDomains: [] };
     });
+    return { routers: [r1] };
   });
 
   const nodes = toIR(network);
@@ -458,7 +472,7 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker without ip gets a determinist
   const network = defineNetwork("test-net", (net) => {
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
-    net.ovnRouter("router-wan", (router) => {
+    const r1 = net.defineOvnRouter("router-wan", (router) => {
       router.left = router.kernelRouterEndpoint({
         host,
         transit: transitNetwork(
@@ -475,7 +489,9 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker without ip gets a determinist
         l2Segment: backbone,
         ipaddrs: [IPv4.parse("172.22.12.80/16")],
       });
+      return { routingDomains: [] };
     });
+    return { routers: [r1] };
   });
 
   const nodes = toIR(network);
@@ -501,7 +517,7 @@ Deno.test("kernelRouterEndpoint: builder function + buildAppDocker, image defaul
   const network = defineNetwork("test-net", (net) => {
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
-    net.ovnRouter("router-wan", (router) => {
+    const r1 = net.defineOvnRouter("router-wan", (router) => {
       router.left = router.kernelRouterEndpoint((endpoint) => {
         endpoint.host = host;
         endpoint.transit = transitNetwork(
@@ -521,7 +537,9 @@ Deno.test("kernelRouterEndpoint: builder function + buildAppDocker, image defaul
         l2Segment: backbone,
         ipaddrs: [IPv4.parse("172.22.12.80/16")],
       });
+      return { routingDomains: [] };
     });
+    return { routers: [r1] };
   });
 
   const nodes = toIR(network);
@@ -552,7 +570,7 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
     const backbone = net.collisionDomain("backbone");
     const neighborRoute = net.routingDomain("Neighbor-defaultRoute");
     const vodaRoute = net.routingDomain("Voda-defaultRoute");
-    net.ovnRouter("router-mullvad-de", (router) => {
+    const r1 = net.defineOvnRouter("router-mullvad-de", (router) => {
       router.left = router.tunnelRouterEndpoint({
         routingDomains: [neighborRoute],
         host,
@@ -589,10 +607,10 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
         l2Segment: backbone,
         ipaddrs: [IPv4.parse("172.22.0.140/16")],
       });
+      return { routingDomains: [] };
     });
     // A neighbor participant on the backbone, in the neighbor domain.
-    net.ovnRouter("router-neighbor", (router) => {
-      router.routingDomains = [neighborRoute];
+    const r2 = net.defineOvnRouter("router-neighbor", (router) => {
       router.left = router.ovnRouterEndpoint({
         l2Segment: net.collisionDomain("neighbor"),
         ipaddrs: [IPv4.parse("192.168.130.1/24")],
@@ -601,11 +619,11 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
         l2Segment: backbone,
         ipaddrs: [IPv4.parse("172.22.0.130/16")],
       });
+      return { routingDomains: [neighborRoute] };
     });
     // A voda participant on the backbone (so the tunnel's right side
     // learns the voda default; the tunnel's left default must NOT leak).
-    net.ovnRouter("router-voda", (router) => {
-      router.routingDomains = [vodaRoute];
+    const r3 = net.defineOvnRouter("router-voda", (router) => {
       router.left = router.ovnRouterEndpoint({
         l2Segment: net.collisionDomain("voda"),
         ipaddrs: [IPv4.parse("192.168.132.1/24")],
@@ -617,7 +635,9 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
         l2Segment: backbone,
         ipaddrs: [IPv4.parse("172.22.12.80/16")],
       });
+      return { routingDomains: [vodaRoute] };
     });
+    return { routers: [r1, r2, r3] };
   });
 
   const nodes = toIR(network);
@@ -657,7 +677,7 @@ Deno.test("tunnelRouterEndpoint: zerotier carries via-less tunnel routes onto it
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
     const zt = net.routingDomain("Zerotier-route");
-    net.ovnRouter("router-zerotier", (router) => {
+    const r1 = net.defineOvnRouter("router-zerotier", (router) => {
       router.left = router.tunnelRouterEndpoint({
         routingDomains: [zt],
         host,
@@ -684,7 +704,9 @@ Deno.test("tunnelRouterEndpoint: zerotier carries via-less tunnel routes onto it
         l2Segment: backbone,
         ipaddrs: [IPv4.parse("172.22.0.142/16")],
       });
+      return { routingDomains: [] };
     });
+    return { routers: [r1] };
   });
   const nodes = toIR(network);
   // The netns wire script gets the via-less supernet to egress the tunnel.
@@ -710,7 +732,7 @@ Deno.test("tunnelRouterEndpoint: zerotier instanceDir is derived from the router
   const network = defineNetwork("test-net", (net) => {
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
-    net.ovnRouter("router-zt", (router) => {
+    const r1 = net.defineOvnRouter("router-zt", (router) => {
       router.left = router.tunnelRouterEndpoint({
         host,
         transit: transitNetwork(IPv4.parse("10.12.85.1/28")),
@@ -725,7 +747,9 @@ Deno.test("tunnelRouterEndpoint: zerotier instanceDir is derived from the router
         l2Segment: backbone,
         ipaddrs: [IPv4.parse("172.22.0.142/16")],
       });
+      return { routingDomains: [] };
     });
+    return { routers: [r1] };
   });
   const nodes = toIR(network);
   const right = nodes["kernelrouter:router-zt|side:right"].data as {
@@ -747,7 +771,7 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
       { role: { kind: "chassis" } },
     );
     const backbone = net.collisionDomain("backbone");
-    net.ovnRouter("router-wan", (router) => {
+    const r1 = net.defineOvnRouter("router-wan", (router) => {
       router.left = router.kernelRouterEndpoint({
         host,
         transit: transitNetwork(
@@ -766,7 +790,9 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
         l2Segment: backbone,
         ipaddrs: [IPv4.parse("172.22.12.80/16")],
       });
+      return { routingDomains: [] };
     });
+    return { routers: [r1] };
   });
 
   const nodes = toIR(network);

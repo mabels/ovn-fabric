@@ -25,7 +25,7 @@
 // No RouterEndpoint factories here: ovnRouterEndpoint()/
 // kernelRouterEndpoint() live on NetworkBuilder (define.ts), only
 // reachable as router.ovnRouterEndpoint()/router.kernelRouterEndpoint()
-// inside a net.ovnRouter() callback (2026-08-12) — matching every other
+// inside a net.defineOvnRouter() callback (2026-08-12) — matching every other
 // builder call in a config, not a free function here
 // (kernelRouterEndpoint() needs builder access to register a real
 // transit CollisionDomain, so both live together for symmetry).
@@ -623,7 +623,7 @@ export function segmentVlan(input: SegmentVlanInput): Omit<Segment, "name"> {
 // ovnRouterEndpoint()/kernelRouterEndpoint() moved to define.ts,
 // 2026-08-12: private NetworkBuilder methods, only reachable as
 // router.ovnRouterEndpoint()/router.kernelRouterEndpoint() inside a
-// net.ovnRouter() callback — not free functions here, and not
+// net.defineOvnRouter() callback — not free functions here, and not
 // NetworkBuilder methods a config author calls directly either
 // (kernelRouterEndpoint() needs the callback's own RouterBuilder to
 // read routingDomains from, see RouterBuilder's own doc comment).
