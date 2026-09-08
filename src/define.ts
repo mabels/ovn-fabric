@@ -5,13 +5,14 @@
 // the same defineNetwork call).
 
 import type { UplinkBuilder } from "./factories.ts";
-import { fnv1a32 } from "./addressing.ts";
+import { fnv1a32, type TransitNetwork } from "./addressing.ts";
 import { IPv4, IPv6 } from "./ip.ts";
 import {
   CollisionDomain,
   FixedUplink,
   type Host,
   type HostAddress,
+  type HostInterface,
   type HostOs,
   type InterfaceKind,
   type KernelApp,
@@ -24,6 +25,7 @@ import {
   type OvnRouterEndpoint,
   type Router,
   type RouterEndpointRoute,
+  type RouterEndpointService,
   type RoutingDomain,
   type SecurityGroup,
   type SecurityGroupRule,
@@ -110,6 +112,111 @@ type SegmentSpec = Omit<Segment, "name">;
  * reachable through this object now, not as NetworkBuilder methods —
  * matches ovnRouter()'s own doc comment for why.
  */
+/** The mutable builder passed to `endpoint.buildAppDocker(name, (app) => {...})`
+ * (2026-08-31). `image` is OPTIONAL — it defaults to the router name at
+ * resolve time. */
+export interface DockerAppBuilder {
+  /** Optional — the image; defaults to the router name when omitted. */
+  image(image: string): void;
+  /** The container's command. */
+  cmd(cmd: string | readonly string[]): void;
+  /** Build the image on first use if missing (packages installed at
+   * image-build time; `from` determines apk vs apt, `dockerfile` the
+   * full-escape-hatch). */
+  build(build: {
+    from: string;
+    packages?: readonly string[];
+    dockerfile?: string;
+  }): void;
+  /** veth-mode only — the container's address on the router's segment. */
+  ip(ip: string): void;
+}
+
+/** The mutable builder passed to `router.kernelRouterEndpoint((endpoint) =>
+ * {...})` (2026-08-31) — configure the endpoint's fields directly and use
+ * `buildAppDocker` to add docker apps (a method that ONLY exists on kernel
+ * endpoints, not ovn/tunnel). */
+export interface KernelRouterEndpointBuilder {
+  host: Host;
+  transit: TransitNetwork;
+  ipaddrs?: readonly (IPv4 | IPv6)[];
+  ifaces?: readonly HostInterface[];
+  services?: RouterEndpointService[];
+  securityGroup?: SecurityGroup;
+  routes?: readonly RouterEndpointRoute[];
+  routingDomains?: readonly RoutingDomain[];
+  buildAppDocker(name: string, build: (app: DockerAppBuilder) => void): void;
+}
+
+/** `router.kernelRouterEndpoint()` accepts EITHER a plain input object (the
+ * pre-2026-08-31 form) OR a builder function (the new form, which exposes
+ * `endpoint.buildAppDocker`). */
+export type KernelEndpointBuilderFn =
+  | Omit<KernelRouterEndpoint, "kind">
+  | ((endpoint: KernelRouterEndpointBuilder) => void);
+
+function normalizeKernelEndpoint(
+  input: KernelEndpointBuilderFn,
+): Omit<KernelRouterEndpoint, "kind"> {
+  if (typeof input !== "function") return input;
+  const services: RouterEndpointService[] = [];
+  const endpoint: KernelRouterEndpointBuilder = {
+    host: undefined as unknown as Host,
+    transit: undefined as unknown as TransitNetwork,
+    services,
+    buildAppDocker: (name, build) => {
+      const app: {
+        kind: "kernel.app.docker";
+        name: string;
+        image?: string;
+        cmd?: string | readonly string[];
+        build?: {
+          from: string;
+          packages?: readonly string[];
+          dockerfile?: string;
+        };
+        ip?: string;
+      } = { kind: "kernel.app.docker", name };
+      const b: DockerAppBuilder = {
+        image: (image) => {
+          app.image = image;
+        },
+        cmd: (cmd) => {
+          app.cmd = cmd;
+        },
+        build: (bd) => {
+          app.build = bd;
+        },
+        ip: (ip) => {
+          app.ip = ip;
+        },
+      };
+      build(b);
+      services.push(app);
+    },
+  };
+  input(endpoint);
+  if (endpoint.host === undefined || endpoint.transit === undefined) {
+    throw new Error(
+      "kernelRouterEndpoint: builder must set `host` and `transit`",
+    );
+  }
+  return {
+    host: endpoint.host,
+    transit: endpoint.transit,
+    ipaddrs: endpoint.ipaddrs ?? [],
+    ...(endpoint.ifaces !== undefined ? { ifaces: endpoint.ifaces } : {}),
+    ...(services.length > 0 ? { services } : {}),
+    ...(endpoint.securityGroup !== undefined
+      ? { securityGroup: endpoint.securityGroup }
+      : {}),
+    ...(endpoint.routes !== undefined ? { routes: endpoint.routes } : {}),
+    ...(endpoint.routingDomains !== undefined
+      ? { routingDomains: endpoint.routingDomains }
+      : {}),
+  } as Omit<KernelRouterEndpoint, "kind">;
+}
+
 export interface RouterBuilder {
   routingDomains?: readonly RoutingDomain[];
   // Always the OVN side — every endpoint builder (ovn/kernel/tunnel)
@@ -119,7 +226,7 @@ export interface RouterBuilder {
   right?: OvnRouterEndpoint;
   ovnRouterEndpoint(input: Omit<OvnRouterEndpoint, "kind">): OvnRouterEndpoint;
   kernelRouterEndpoint(
-    input: Omit<KernelRouterEndpoint, "kind">,
+    input: KernelEndpointBuilderFn,
   ): OvnRouterEndpoint;
   tunnelRouterEndpoint(
     input: Omit<TunnelRouterEndpoint, "kind">,
@@ -509,10 +616,11 @@ export class NetworkBuilder {
    * routes are gated by the same RoutingDomain-membership rule an
    * OVN-side route already is (src/ir.ts's kernelRouterSideToIR). */
   private buildKernelRouterEndpoint(
-    input: Omit<KernelRouterEndpoint, "kind">,
+    input: KernelEndpointBuilderFn,
     routingDomains: readonly RoutingDomain[] | undefined,
     routerName: string,
   ): OvnRouterEndpoint {
+    input = normalizeKernelEndpoint(input);
     const {
       transit: link,
       host,
@@ -580,7 +688,26 @@ export class NetworkBuilder {
     const apps: KernelApp[] = [];
     for (const s of appServices) {
       if (s.kind === "kernel.app.dhcp-client") {
-        apps.push({ kind: "dhcp-client", style: s.style });
+        // dhcpcd is expressed as a GENERIC docker app that OWNS the
+        // router's interfaces (the container-owns-the-interfaces mode,
+        // signaled by omitting veth addressing) — image defaulted to the
+        // router name, cmd dhcpcd, and a build that bakes dhcpcd into the
+        // image (2026-08-31). dhclient stays a plain in-netns client.
+        if (s.style === "dhcpcd") {
+          // The container OWNS the router's interfaces (the "container IS the
+          // router" mode): it has NO veth addressing — the IR signals "owns
+          // interfaces" by omitting `ip`/`routerIp` (the deployer detects it
+          // structurally, never a TS flag, 2026-08-31).
+          apps.push({
+            kind: "docker",
+            image: `ovn-fabric-${routerName}`,
+            name: `${routerName}-dhcpcd`,
+            cmd: ["/sbin/dhcpcd"],
+            build: { from: "alpine:latest", packages: ["dhcpcd"] },
+          });
+        } else {
+          apps.push({ kind: "dhcp-client", style: s.style });
+        }
       } else if (s.kind === "kernel.app.docker") {
         // The container name is resolved HERE — the service's `name`
         // PREFIXED with the router name (so it's globally unique and
@@ -601,7 +728,9 @@ export class NetworkBuilder {
         const routerIp = containerIp.network().first();
         apps.push({
           kind: "docker",
-          image: s.image,
+          // `image` is optional — defaults to the router name (2026-08-31).
+          image: s.image ?? `ovn-fabric-${routerName}`,
+          ...(s.build !== undefined ? { build: s.build } : {}),
           name: s.name !== undefined
             ? `${routerName}-${s.name}`
             : `${routerName}-docker`,

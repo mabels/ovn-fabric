@@ -387,9 +387,26 @@ export type KernelApp =
   }
   | {
     readonly kind: "docker";
-    /** The image to run (the service's own resolved copy — the
-     * `image` field of the `kernel.app.docker` service). */
+    /** The image to run — resolved by buildKernelRouterEndpoint from the
+     * service's optional `image`, defaulting to `ovn-fabric-<router>` when
+     * omitted (2026-08-31). */
     readonly image: string;
+    /** Optional: build the image on first use if missing (packages
+     * installed at image-build time; `from` picks apk vs apt). */
+    readonly build?: {
+      readonly from: string;
+      readonly packages?: readonly string[];
+      readonly dockerfile?: string;
+    };
+    /** Whether the container OWNS the router's interfaces (the transit veth
+     * leg + this side's real interface moved into its netns, running `cmd`
+     * against the real one — the "container is the router" mode,
+     * dhcpcd-in-docker) is decided on the TS side when the IR interfaces are
+     * derived, and the IR carries the OUTCOME structurally, with NO flag: an
+     * interface-owning docker has NO veth addressing (`ip`/`routerIp`
+     * absent — it owns the real interface, not a veth), a veth-injection
+     * client always has it. The deployer branches on that concrete IR fact,
+     * never on a TS concept (2026-08-31). */
     /** The container name — always resolved by
      * buildKernelRouterEndpoint (the service's `name` prefixed with the
      * router name, `<router>-<name>`, default `<router>-docker`), so
@@ -802,8 +819,17 @@ export type RouterEndpointService =
   }
   | {
     readonly kind: "kernel.app.docker";
-    /** The image to run, e.g. "ubuntu". */
-    readonly image: string;
+    /** The image to run, e.g. "ubuntu". OPTIONAL — defaults to the
+     * router name (`ovn-fabric-<router>`) at resolve time (2026-08-31). */
+    readonly image?: string;
+    /** Optional: build the image on first use if missing — `from` is the
+     * base image (determines apk vs apt), `packages` the ones installed
+     * at image-build time, `dockerfile` the full escape hatch. */
+    readonly build?: {
+      readonly from: string;
+      readonly packages?: readonly string[];
+      readonly dockerfile?: string;
+    };
     /** The container name — PREFIXED with the router name at resolve
      * time (`<router>-<name>`), so it's globally unique and delete can
      * `docker rm -f` exactly what create started. Defaults to

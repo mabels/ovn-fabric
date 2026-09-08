@@ -208,6 +208,11 @@ export const ZerotierApp = type({
 export const DockerApp = type({
   kind: "'docker'",
   image: "string",
+  "build?": {
+    from: "string",
+    "packages?": "string[]",
+    "dockerfile?": "string",
+  },
   name: "string",
   "cmd?": "string[]",
   "ip?": "string",

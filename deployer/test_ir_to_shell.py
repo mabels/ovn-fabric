@@ -608,7 +608,7 @@ class KernelRouterCreateTest(unittest.TestCase):
         # on delete, BEFORE `ip netns delete`, since an app daemon holds
         # its netns alive past deletion (2026-08-23).
 
-        def with_app(style: str) -> list[pt.Model]:
+        def with_app() -> list[pt.Model]:
             return [
                 (
                     dataclasses.replace(
@@ -618,7 +618,7 @@ class KernelRouterCreateTest(unittest.TestCase):
                             apps=[
                                 AppDhcpClient(
                                     kind="dhcp-client",
-                                    style=pt.Style(style),
+                                    style=pt.Style("dhclient"),
                                 )
                             ],
                         ),
@@ -629,49 +629,114 @@ class KernelRouterCreateTest(unittest.TestCase):
                 for n in NODES
             ]
 
-        for style, exec_client, exec_stop in [
-            (
-                "dhclient",
-                "/usr/sbin/dhclient -lf /var/lib/dhcp/dhclient.kernel-0.leases -d eth0.2280",
-                "/usr/sbin/dhclient -lf /var/lib/dhcp/dhclient.kernel-0.leases -r eth0.2280",
-            ),
-            ("dhcpcd", "/usr/sbin/dhcpcd -B eth0.2280", "/usr/sbin/dhcpcd -k eth0.2280"),
-        ]:
-            with self.subTest(style=style):
-                _, create_hosts = mod.build_scripts(with_app(style), "create")
-                create_script = create_hosts["chassis-1"]
-                # The one router service is installed + started.
-                self.assertIn(
-                    "cat > /etc/systemd/system/ovn-kernel-kernel-0.service << 'OVN'",
-                    create_script,
+        # dhcpcd is NOT a dhcp-client app anymore — it resolves to a generic
+        # docker app that OWNS the router's interfaces, covered by the docker
+        # tests.
+        _, create_hosts = mod.build_scripts(with_app(), "create")
+        create_script = create_hosts["chassis-1"]
+        # The one router service is installed + started.
+        self.assertIn(
+            "cat > /etc/systemd/system/ovn-kernel-kernel-0.service << 'OVN'",
+            create_script,
+        )
+        self.assertIn(
+            "systemctl enable --now ovn-kernel-kernel-0.service",
+            create_script,
+        )
+        router = _router_script(create_script)
+        up, down = _router_branches(router)
+        # dhclient runs in the router netns, backgrounded; the down releases
+        # the lease explicitly.
+        self.assertIn(
+            "ip netns exec ns-kernel-0 /usr/sbin/dhclient -lf "
+            "/var/lib/dhcp/dhclient.kernel-0.leases -d eth0.2280 &",
+            up,
+        )
+        self.assertIn(
+            "ip netns exec ns-kernel-0 /usr/sbin/dhclient -lf "
+            "/var/lib/dhcp/dhclient.kernel-0.leases -r eth0.2280",
+            down,
+        )
+        self.assertNotIn("ovn-kernel-kernel-0-dhcp-client", create_script)
+        _, delete_hosts = mod.build_scripts(with_app(), "delete")
+        delete_script = delete_hosts["chassis-1"]
+        self.assertIn(
+            "systemctl disable --now ovn-kernel-kernel-0.service",
+            delete_script,
+        )
+
+    def test_dhcpcd_docker_applies_transit_veth_addressing_in_container(self) -> None:
+        # dhcpcd is a GENERIC docker app that OWNS the router's interfaces
+        # (signaled by omitting veth addressing): the container owns BOTH the
+        # transit veth leg and the real iface, and the transit
+        # leg's OWN static addresses (left side) are applied in the container
+        # too — an interface's addresses don't survive a netns move
+        # (2026-08-31).
+        left = pt.KernelRouterData(
+            host="host:chassis-1",
+            ipaddrs=["10.12.80.14/28"],
+            ifaces=[
+                pt.Interface(
+                    host="chassis-1",
+                    iface={
+                        "kind": "veth",
+                        "ifaceName": "veth-krn-9adb1d",
+                        "peerName": "veth-ovn-9adb1d",
+                        "shortName": "9adb1d",
+                    },
                 )
-                self.assertIn(
-                    "systemctl enable --now ovn-kernel-kernel-0.service",
-                    create_script,
+            ],
+        )
+
+        def with_dhcpcd() -> list[pt.Model]:
+            return [
+                (
+                    dataclasses.replace(n, data=left)
+                    if n.kind == "kernel.router" and n.key.side == pt.Side.left
+                    else (
+                        dataclasses.replace(
+                            n,
+                            data=dataclasses.replace(
+                                n.data,
+                                apps=[
+                                    # The IR signals "owns the interfaces" by
+                                    # OMITTING ip/routerIp (no veth addressing).
+                                    AppDocker(
+                                        kind="docker",
+                                        image="ovn-fabric-kernel-0",
+                                        name="kernel-0-dhcpcd",
+                                        cmd=["/sbin/dhcpcd"],
+                                        build=pt.Build(from_="alpine:latest", packages=["dhcpcd"]),
+                                    )
+                                ],
+                            ),
+                        )
+                        if n.kind == "kernel.router" and n.key.side == pt.Side.right
+                        else n
+                    )
                 )
-                # The client lives in the router's up/down script (no
-                # per-app unit). The up backgroundS the foreground daemon
-                # so `enable --now` returns once the netns/veths exist.
-                router = _router_script(create_script)
-                up, down = _router_branches(router)
-                self.assertIn(
-                    f"ip netns exec ns-kernel-0 {exec_client} &",
-                    up,
-                )
-                # ExecStop (the down branch) releases the lease explicitly —
-                # SIGTERM through `ip netns exec` is not reliable dhclient
-                # shutdown.
-                self.assertIn(
-                    f"ip netns exec ns-kernel-0 {exec_stop}",
-                    down,
-                )
-                self.assertNotIn("ovn-kernel-kernel-0-dhcp-client", create_script)
-                _, delete_hosts = mod.build_scripts(with_app(style), "delete")
-                delete_script = delete_hosts["chassis-1"]
-                self.assertIn(
-                    "systemctl disable --now ovn-kernel-kernel-0.service",
-                    delete_script,
-                )
+                for n in NODES
+            ]
+
+        _, create_hosts = mod.build_scripts(with_dhcpcd(), "create")
+        router = _router_script(create_hosts["chassis-1"])
+        up, _ = _router_branches(router)
+        # The transit veth is moved into the container AND gets its own
+        # static address there (same _apply_side_network path as the router
+        # netns).
+        self.assertIn(
+            'ip netns exec "$netns" ip link set "$transit_leg" netns "$container"',
+            up,
+        )
+        self.assertIn(
+            "ip netns exec kernel-0-dhcpcd ip addr add 10.12.80.14/28 dev veth-krn-9adb1d",
+            up,
+        )
+        # The image build uses a mktemp -d build context, cleaned up after —
+        # nothing is scattered on the host (2026-08-31).
+        self.assertIn("d=$(mktemp -d)", up)
+        self.assertIn('rm -rf "$d"', up)
+        self.assertNotIn("/usr/local/lib", up)
 
     def test_os_dependencies_are_installed_at_the_start_of_create(self) -> None:
         # The IR's ABSTRACT dependencies (ovn/ovs/ip/iptables/dhclient/

@@ -375,8 +375,18 @@ Deno.test("kernelRouterEndpoint: kernel.app services resolve to app descriptors 
   });
 
   const nodes = toIR(network);
+  // dhcpcd is expressed as a generic docker app that OWNS the router's
+  // interfaces, with an auto-build for the dhcpcd image.
   assertEquals(nodes["kernelrouter:router-wan|side:right"].data.apps, [
-    { kind: "dhcp-client", style: "dhcpcd" },
+    {
+      kind: "docker",
+      image: "ovn-fabric-router-wan",
+      name: "router-wan-dhcpcd",
+      cmd: ["/sbin/dhcpcd"],
+      build: { from: "alpine:latest", packages: ["dhcpcd"] },
+      // Interface-OWNING: NO veth fields at all — "owns the interfaces" is
+      // exactly the ABSENCE of the veth machinery (no ip/routerIp/vethName).
+    },
   ]);
   assertEquals(nodes["kernelrouter:router-wan|side:left"].data.apps, undefined);
   // The kernel.app service was split off, never becoming an RA config.
@@ -478,6 +488,54 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker without ip gets a determinist
       routerIp: `10.200.${fnv1a32("router-wan") % 256}.1/24`,
       vethName: `ve-${
         fnv1a32("router-wan-docker").toString(16).padStart(8, "0")
+      }`,
+    },
+  ]);
+});
+
+// kernelRouterEndpoint now accepts a builder FUNCTION (not just an object),
+// exposing endpoint.buildAppDocker — a method that only exists on kernel
+// endpoints. The docker app's `image` defaults to the router name, and the
+// `build` section is carried through (2026-08-31).
+Deno.test("kernelRouterEndpoint: builder function + buildAppDocker, image defaults to router name", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const backbone = net.collisionDomain("backbone");
+    net.ovnRouter("router-wan", (router) => {
+      router.left = router.kernelRouterEndpoint((endpoint) => {
+        endpoint.host = host;
+        endpoint.transit = transitNetwork(
+          IPv4.parse("10.12.80.1/28"),
+          IPv6.parse("fd00::10:12:80:1/124"),
+        );
+        endpoint.ipaddrs = [IPv4.parse("192.168.140.93/24")];
+        endpoint.ifaces = [
+          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
+        ];
+        endpoint.buildAppDocker("dhcpcd", (app) => {
+          app.cmd("/sbin/dhcpcd");
+          app.build({ from: "alpine:latest", packages: ["dhcpcd"] });
+        });
+      });
+      router.right = router.ovnRouterEndpoint({
+        l2Segment: backbone,
+        ipaddrs: [IPv4.parse("172.22.12.80/16")],
+      });
+    });
+  });
+
+  const nodes = toIR(network);
+  assertEquals(nodes["kernelrouter:router-wan|side:right"].data.apps, [
+    {
+      kind: "docker",
+      image: "ovn-fabric-router-wan",
+      build: { from: "alpine:latest", packages: ["dhcpcd"] },
+      name: "router-wan-dhcpcd",
+      cmd: ["/sbin/dhcpcd"],
+      ip: `10.200.${fnv1a32("router-wan") % 256}.2/24`,
+      routerIp: `10.200.${fnv1a32("router-wan") % 256}.1/24`,
+      vethName: `ve-${
+        fnv1a32("router-wan-dhcpcd").toString(16).padStart(8, "0")
       }`,
     },
   ]);

@@ -359,11 +359,13 @@ function kernelRouterSideToIR(
       // deployer turns each into its `ip netns exec` service script,
       // and stops/releases it on delete.
       apps: router[side].apps?.map((app) => {
-        // The docker app's veth pair needs SHORT, collision-free device
-        // names (IFNAMSIZ ≤ 15): `ve-<hash>` / `ve-<hash>-c` derived
-        // from the container name — same rule shortIfaceName applies
-        // everywhere else in this file.
-        if (app.kind === "docker") {
+        // A VETH-CLIENT docker app needs SHORT, collision-free veth device
+        // names (IFNAMSIZ ≤ 15): `ve-<hash>` / `ve-<hash>-c` derived from
+        // the container name — same rule shortIfaceName applies everywhere
+        // else in this file. An interface-OWNING docker (no veth addressing,
+        // e.g. dhcpcd-in-docker) gets NO veth fields — its "owns the
+        // interfaces" is exactly the ABSENCE of the veth machinery.
+        if (app.kind === "docker" && app.ip !== undefined) {
           const hash = fnv1a32(app.name).toString(16).padStart(8, "0");
           return { ...app, vethName: `ve-${hash}` };
         }

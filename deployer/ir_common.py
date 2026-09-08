@@ -75,6 +75,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import shlex
 
@@ -497,19 +498,79 @@ def _emit_security_group_rules(
         emit.sh(netns_ops.netns_exec_argv(argv, netns))
 
 
-def _docker_wire_script(app: KernelApp, router: str, netns: str) -> str:
-    """The wire script for one docker app: run the container with
-    `--network none`, then inject one veth into the router netns
+def _apply_side_network(
+    group: pt.SecurityGroupNode | None,
+    ipaddrs: list[str] | None,
+    routes: list[pt.KernelRouterRoute] | None,
+    netns: str,
+    dev: str,
+    emit: Emitter,
+) -> None:
+    """Apply a kernel router side's static addressing (addresses + routes)
+    and security-group rules (masq) to a target namespace — the router's
+    netns OR a docker container's netns (the dhcpcd-in-docker path). The
+    ONLY difference between the two is the namespace name, so both go
+    through this one function (2026-08-31)."""
+    for addr in ipaddrs or []:
+        argv = linux_net_ops.add_addr_argv(addr, dev)
+        emit.sh(netns_ops.netns_exec_argv(argv, netns))
+    for route in routes or []:
+        argv = linux_net_ops.add_route_argv(route.dst, dev, route.via)
+        emit.sh(netns_ops.netns_exec_argv(argv, netns))
+    if group is not None:
+        _emit_security_group_rules(group, netns, dev, emit)
+
+
+def _docker_dockerfile(build) -> str:
+    """The Dockerfile body for a docker app's optional `build` — a full
+    `dockerfile` wins; otherwise FROM <from> + install the packages with the
+    manager the base image implies (apk for alpine/arch, apt otherwise)
+    (2026-08-31)."""
+    if build.dockerfile:
+        return build.dockerfile
+    pkgs = " ".join(build.packages or [])
+    base = build.from_
+    if "alpine" in base or "arch" in base:
+        return f"FROM {base}\nRUN apk add --no-cache {pkgs}"
+    return f"FROM {base}\nRUN apt-get update && apt-get install -y {pkgs}"
+
+
+def _docker_image_ensure_lines(build, image: str) -> list[str]:
+    """The shell block that builds the docker app's image on first use (when
+    the app declares a `build`), so a fresh host doesn't need a manual
+    `docker build`. Empty when the app uses a prebuilt image. The build
+    context is a `mktemp -d` dir, removed right after — nothing is scattered
+    on the host (2026-08-31)."""
+    if build is None:
+        return []
+    return [
+        f'/usr/bin/docker image inspect "{image}" >/dev/null 2>&1 || {{',
+        "  d=$(mktemp -d)",
+        "  cat > \"$d/Dockerfile\" <<'DOCKERFILE'",
+        _docker_dockerfile(build),
+        "DOCKERFILE",
+        f'  /usr/bin/docker build -t "{image}" "$d" >/dev/null',
+        '  rm -rf "$d"',
+        "}",
+    ]
+
+
+def _docker_wire_script(app: KernelApp, router: str, netns: str, ctx: _SideContext) -> str:
+    """The wire script for one docker app (client mode): run the container
+    with `--network none`, then inject one veth into the router netns
     (CNI/Multus-style) — the container's eth0 gets `app.ip`, the router
     end `app.routerIp` (the subnet's first host, resolved in
     define.ts), and the container's default route is via the router.
-    Ends in `exec docker wait <container>` — the router `up` backgrounds
-    the script (the wait keeps the container's netns symlink live), and
-    the router `down` tears it down with `docker rm -f`."""
+    `ctx` is the endpoint, handed to EVERY docker app so it can decide its
+    own interface setup (2026-08-31). Ends in `exec docker wait
+    <container>` — the router `up` backgrounds the script (the wait keeps
+    the container's netns symlink live), and the router `down` tears it
+    down with `docker rm -f`."""
     container = app.name or f"{router}-docker"
     veth = app.vethName or ("ve-" + hashlib.md5(container.encode()).hexdigest()[:8])
     gateway = app.routerIp.split("/")[0]
     cmd_tokens = " ".join(shlex.quote(t) for t in (app.cmd or []))
+    build_lines = _docker_image_ensure_lines(app.build, app.image)
     return "\n".join(
         [
             "#!/bin/sh",
@@ -526,6 +587,7 @@ def _docker_wire_script(app: KernelApp, router: str, netns: str) -> str:
             f'container_ip="{app.ip}"',
             f'gateway="{gateway}"',
             "",
+            *build_lines,
             '/usr/bin/docker rm -f "$container" 2>/dev/null || true',
             '/usr/bin/docker run -d --network none --name "$container" "$image"'
             + (f" {cmd_tokens}" if cmd_tokens else ""),
@@ -541,6 +603,111 @@ def _docker_wire_script(app: KernelApp, router: str, netns: str) -> str:
             'ip netns exec "$container" ip link set eth0 up',
             'ip netns exec "$container" ip addr add "$container_ip" dev eth0',
             'ip netns exec "$container" ip route add default via "$gateway" dev eth0',
+            'exec /usr/bin/docker wait "$container"',
+        ]
+    )
+
+
+@dataclasses.dataclass
+class _SideContext:
+    """The facts a kernel router SIDE carries into its apps — the target
+    netns, the side's real interface `dev`, the transit veth's netns leg
+    (left side) and its addressing, plus the side's own static addressing
+    and security group (masq). Bundled so builders take ONE object instead
+    of a long positional list (2026-08-31)."""
+
+    netns: str
+    dev: str
+    transit_leg: str | None
+    group: pt.SecurityGroupNode | None
+    ipaddrs: list[str]
+    routes: list[pt.KernelRouterRoute]
+    transit_ipaddrs: list[str]
+    transit_routes: list[pt.KernelRouterRoute]
+
+
+def _docker_inject_script(app: KernelApp, container: str, ctx: _SideContext) -> str:
+    """The wire script for a docker app that OWNS the router's interfaces
+    (signaled in the IR by the ABSENCE of veth addressing — the "container
+    IS the router" mode): the container OWNS the router's
+    interfaces — the transit veth's netns-side leg (`ctx.transit_leg`, the
+    mesh uplink, with its own addressing) AND the side's real interface
+    `ctx.dev` — both moved in from the router netns (an interface lives in
+    exactly one netns). The static addressing (addresses + routes) and
+    security-group masq rules are applied to the CONTAINER netns from
+    OUTSIDE via _apply_side_network (the SAME code the router netns uses,
+    only the target namespace differs — a device's addresses don't
+    reliably carry across a netns move, confirmed live 2026-08-31). The
+    app's `cmd` then runs against the real WAN device (dhcpcd for the
+    dhcp-client service, which resolves to this docker form). The image is
+    auto-built on first use when `app.build` is set; the container runs
+    `--privileged` (NET_ADMIN) so `cmd` can configure the moved-in
+    interface (2026-08-31)."""
+    netns = ctx.netns
+    dev = ctx.dev
+    transit_leg = ctx.transit_leg
+    image = app.image or f"ovn-fabric-{container}"
+    cmd_tokens = " ".join(shlex.quote(t) for t in (app.cmd or ["sh"]))
+    build_lines = _docker_image_ensure_lines(app.build, image)
+    move_lines: list[str] = []
+    if transit_leg:
+        move_lines += [
+            'ip netns exec "$netns" ip link set "$transit_leg" netns "$container"',
+            'ip netns exec "$container" ip link set "$transit_leg" up',
+        ]
+    move_lines += [
+        'ip netns exec "$netns" ip link set "$dev" netns "$container"',
+        'ip netns exec "$container" ip link set "$dev" up',
+    ]
+    # A kernel router IS a router: enable IPv4/IPv6 forwarding in the
+    # container's netns, same as the router netns path (2026-08-31).
+    sysctl_lines = [
+        'ip netns exec "$container" sysctl -w net.ipv4.ip_forward=1',
+        'ip netns exec "$container" sysctl -w net.ipv6.conf.all.forwarding=1',
+    ]
+    # The static addressing + masq — the SAME helper the router netns path
+    # uses, only targeting the container's netns: the transit veth's own
+    # addresses/routes (left side) on `transit_leg`, then the side's on `dev`.
+    body = _ShellBody("create")
+    if transit_leg:
+        _apply_side_network(
+            None, ctx.transit_ipaddrs, ctx.transit_routes, container, transit_leg, body
+        )
+    _apply_side_network(ctx.group, ctx.ipaddrs, ctx.routes, container, dev, body)
+    return "\n".join(
+        [
+            "#!/bin/sh",
+            f"# ovn-fabric kernel app docker (owns the interfaces): {dev} in {netns}",
+            f"# (container {container}). Backgrounded by the router up.",
+            "set -eu",
+            f'container="{container}"',
+            f'netns="{netns}"',
+            f'dev="{dev}"',
+            f'transit_leg="{transit_leg or ""}"',
+            f'image="{image}"',
+            "",
+            *build_lines,
+            '/usr/bin/docker rm -f "$container" 2>/dev/null || true',
+            # --privileged so the container can move/config the interfaces
+            # and apply iptables (NET_ADMIN); its own netns is still
+            # `--network none` — it only owns what we move in.
+            "/usr/bin/docker run -d --privileged --network none "
+            '--name "$container" "$image" sleep infinity',
+            "pid=$(/usr/bin/docker inspect -f '{{.State.Pid}}' \"$container\")",
+            "mkdir -p /var/run/netns",
+            'ln -sf "/proc/$pid/ns/net" "/var/run/netns/$container"',
+            # Move the router's interfaces (transit veth leg + real iface)
+            # out of the router netns and into the container (one interface,
+            # one netns).
+            *move_lines,
+            # Enable forwarding in the container netns (it's the router).
+            *sysctl_lines,
+            # The side's static addressing + masq, applied from outside to
+            # the container netns (same code as the router netns path).
+            *body.lines,
+            # The app's cmd runs INSIDE the container (docker-managed)
+            # against the moved-in real interface.
+            f'/usr/bin/docker exec "$container" {cmd_tokens} "$dev"',
             'exec /usr/bin/docker wait "$container"',
         ]
     )
@@ -635,7 +802,7 @@ def _zerotier_wire_script(app: KernelApp, netns: str) -> str:
 
 
 def _emit_kernel_app_rules(
-    apps: list[KernelApp], router: str, netns: str, dev: str, emit: Emitter
+    apps: list[KernelApp], router: str, emit: Emitter, ctx: _SideContext
 ) -> None:
     """Start (create) / stop (delete) the apps attached to one side of a
     kernel router, INSIDE the router's netns — no per-app systemd units.
@@ -649,6 +816,8 @@ def _emit_kernel_app_rules(
     returns immediately, so it stays in the foreground. Delete stops the
     apps BEFORE `ip netns delete` — a running app daemon holds its netns
     alive (2026-08-23)."""
+    netns = ctx.netns
+    dev = ctx.dev
     for app in apps:
         if app.kind == "dhcp-client":
             if app.style == pt.Style.dhclient:
@@ -659,26 +828,21 @@ def _emit_kernel_app_rules(
                 lease = f"/var/lib/dhcp/dhclient.{router}.leases"
                 client_argv = ["/usr/sbin/dhclient", "-lf", lease, "-d", dev]
                 stop_argv = ["/usr/sbin/dhclient", "-lf", lease, "-r", dev]
-                client = "dhclient"
-            elif app.style == pt.Style.dhcpcd:
-                client_argv = ["/usr/sbin/dhcpcd", "-B", dev]
-                stop_argv = ["/usr/sbin/dhcpcd", "-k", dev]
-                client = "dhcpcd"
+                emit.comment(f"# --- kernel app: dhcp-client (dhclient) on {dev} in {netns} ---")
+                if emit.action == "create":
+                    # `-d` runs dhclient as a foreground daemon, so background it.
+                    emit.sh(netns_ops.netns_exec_argv(["mkdir", "-p", "/var/lib/dhcp"], netns))
+                    emit.sh(netns_ops.netns_exec_argv(client_argv, netns), background=True)
+                else:
+                    # Release the lease explicitly — SIGTERM through
+                    # `ip netns exec` is not a reliable dhclient shutdown.
+                    emit.sh(netns_ops.netns_exec_argv(stop_argv, netns))
             else:
                 emit.comment(
                     f'# unsupported dhcp-client style "{app.style}" on {dev} in {netns} — '
                     "skipped, see deployer/ir_to_shell.py"
                 )
                 continue
-            emit.comment(f"# --- kernel app: dhcp-client ({client}) on {dev} in {netns} ---")
-            if emit.action == "create":
-                # `-d` runs dhclient as a foreground daemon, so background it.
-                emit.sh(netns_ops.netns_exec_argv(["mkdir", "-p", "/var/lib/dhcp"], netns))
-                emit.sh(netns_ops.netns_exec_argv(client_argv, netns), background=True)
-            else:
-                # Release the lease explicitly — SIGTERM through
-                # `ip netns exec` is not a reliable dhclient shutdown.
-                emit.sh(netns_ops.netns_exec_argv(stop_argv, netns))
         elif app.kind == "docker":
             # The container gets ONE veth injected INTO the router netns
             # (CNI/Multus-style interface injection — the same primitive
@@ -695,6 +859,39 @@ def _emit_kernel_app_rules(
             # backgroundS it (the wait keeps the container's netns live,
             # but `up` must not block on it).
             container = app.name or f"{router}-docker"
+            # A docker that OWNS the router's interfaces ("container IS the
+            # router" mode, dhcpcd-in-docker) carries NO veth addressing in
+            # the IR — that structural fact (no `ip`) is how the TS side
+            # says "own the interfaces", so this is decided here, not by a
+            # TS concept name (2026-08-31).
+            if app.ip is None:
+                script_path = f"/usr/local/sbin/ovn-kernel-{router}-docker-inject.sh"
+                emit.comment(
+                    f"# --- kernel app: docker (owns the interfaces) ({container}) "
+                    f"on {dev} in {netns} ---"
+                )
+                if emit.action == "create":
+                    emit.append(script_path, _docker_inject_script(app, container, ctx))
+                    emit.sh(["/bin/sh", script_path], background=True)
+                else:
+                    emit.sh(["/usr/bin/docker", "rm", "-f", container])
+                    emit.sh(["rm", "-f", script_path])
+                    emit.sh(["rm", "-f", f"/var/run/netns/{container}"])
+                continue
+            # Else: the client mode — one veth injected into the router netns
+            # (CNI/Multus-style interface injection — the same primitive
+            # a k8s pod + Multus uses, 2026-08-23). `--network host`
+            # would share the docker DAEMON's netns (root), not the
+            # router's, so the container runs `--network none` and a
+            # wire script attaches it: docker run (none) -> get its PID
+            # -> veth pair -> one end into the container's netns (eth0),
+            # the other into the router netns with `router_ip`; the
+            # container's default route is via the router. The script
+            # is a single `/bin/sh <script>` argv, so it survives both
+            # front-ends (shell substitutions are not argv-safe). It ends
+            # in `exec docker wait <container>`, so the router `up`
+            # backgroundS it (the wait keeps the container's netns live,
+            # but `up` must not block on it).
             script_path = f"/usr/local/sbin/ovn-kernel-{router}-docker-wire.sh"
             if app.ip is None or app.routerIp is None:
                 raise ValueError(
@@ -703,7 +900,7 @@ def _emit_kernel_app_rules(
                 )
             emit.comment(f"# --- kernel app: docker ({container}) on {dev} in {netns} ---")
             if emit.action == "create":
-                emit.append(script_path, _docker_wire_script(app, router, netns))
+                emit.append(script_path, _docker_wire_script(app, router, netns, ctx))
                 emit.sh(["/bin/sh", script_path], background=True)
             else:
                 # Stopping a docker container is done THE HARD WAY — an
@@ -838,6 +1035,20 @@ def _emit_kernel_router_owner(
     into the router script's body emitter (always a _ShellBody — the router
     script is shell regardless of the outer front-end). See the module doc
     block above for the netns/side semantics."""
+    # The transit veth's netns-side leg (the router's mesh uplink, on the
+    # LEFT side) plus its static addressing — handed to container-owning
+    # apps (dhcpcd-in-docker) so the container becomes the router and
+    # carries this leg and its addresses too (2026-08-31).
+    transit_leg = None
+    transit_ipaddrs: list[str] = []
+    transit_routes: list[pt.KernelRouterRoute] = []
+    for side_node in _kernel_router_sides(owner.key.name, nodes):
+        if side_node.key.side == pt.Side.left:
+            iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
+            if iface is not None and iface["kind"] == "veth":
+                transit_leg = f"veth-krn-{iface['shortName']}"
+            transit_ipaddrs = list(side_node.data.ipaddrs or [])
+            transit_routes = list(side_node.data.routes or [])
     if action == "delete":
         # Delete the moved-in vlans from INSIDE the netns FIRST —
         # `ip netns delete` alone destroys the netdev but leaks a
@@ -865,9 +1076,21 @@ def _emit_kernel_router_owner(
                 _emit_kernel_app_rules(
                     side_node.data.apps,
                     owner.key.name,
-                    netns,
-                    dev,
                     emit,
+                    _SideContext(
+                        netns=netns,
+                        dev=dev,
+                        transit_leg=transit_leg,
+                        group=(
+                            _security_group_by_name(side_node.data.securityGroup, nodes)
+                            if side_node.data.securityGroup is not None
+                            else None
+                        ),
+                        ipaddrs=list(side_node.data.ipaddrs or []),
+                        routes=list(side_node.data.routes or []),
+                        transit_ipaddrs=transit_ipaddrs,
+                        transit_routes=transit_routes,
+                    ),
                 )
             if iface is not None and iface["kind"] == "vlan":
                 real_name = _iface_real_name(iface)
@@ -961,25 +1184,28 @@ def _emit_kernel_router_owner(
                     netns,
                 )
             )
-        for addr in side_node.data.ipaddrs or []:
-            argv = linux_net_ops.add_addr_argv(addr, dev)
-            emit.sh(netns_ops.netns_exec_argv(argv, netns))
-        for route in side_node.data.routes or []:
-            argv = linux_net_ops.add_route_argv(route.dst, dev, route.via)
-            emit.sh(netns_ops.netns_exec_argv(argv, netns))
-        # The side's attached security group (right side in practice)
-        # applies its rules to this real interface, inside the netns.
-        # The `security.group` node is implementation-abstract; the
-        # side node is where it's ATTACHED (2026-08-22).
-        if side_node.data.securityGroup is not None:
-            group = _security_group_by_name(side_node.data.securityGroup, nodes)
-            if group is None:
-                raise ValueError(
-                    f"kernel router {owner.key.name} ({side_node.key.side.value}) "
-                    f'references security group "{side_node.data.securityGroup}" '
-                    f"but no such security.group node"
-                )
-            _emit_security_group_rules(group, netns, dev, emit)
+        # The side's static addressing + security-group (masq) rules,
+        # applied inside the netns — SAME code as the dhcpcd-in-docker
+        # container path (only the target namespace differs).
+        group = (
+            _security_group_by_name(side_node.data.securityGroup, nodes)
+            if side_node.data.securityGroup is not None
+            else None
+        )
+        if side_node.data.securityGroup is not None and group is None:
+            raise ValueError(
+                f"kernel router {owner.key.name} ({side_node.key.side.value}) "
+                f'references security group "{side_node.data.securityGroup}" '
+                f"but no such security.group node"
+            )
+        _apply_side_network(
+            group,
+            list(side_node.data.ipaddrs or []),
+            list(side_node.data.routes or []),
+            netns,
+            dev,
+            emit,
+        )
         # The side's apps (right side in practice) run inside the
         # netns on this interface — started after the interface is up
         # and bound, so the DHCP client can immediately acquire a
@@ -988,9 +1214,21 @@ def _emit_kernel_router_owner(
             _emit_kernel_app_rules(
                 side_node.data.apps,
                 owner.key.name,
-                netns,
-                dev,
                 emit,
+                _SideContext(
+                    netns=netns,
+                    dev=dev,
+                    transit_leg=transit_leg,
+                    group=(
+                        _security_group_by_name(side_node.data.securityGroup, nodes)
+                        if side_node.data.securityGroup is not None
+                        else None
+                    ),
+                    ipaddrs=list(side_node.data.ipaddrs or []),
+                    routes=list(side_node.data.routes or []),
+                    transit_ipaddrs=transit_ipaddrs,
+                    transit_routes=transit_routes,
+                ),
             )
 
 
