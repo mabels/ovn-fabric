@@ -36,4 +36,9 @@ export const network = defineNetwork("minimal", (net) => {
       host,
     }),
   );
+
+  // defineNetwork requires the callback to return the hosts + routers it
+  // declared (2026-09-08). This legacy uplink/segment example declares no
+  // OVN routers, so routers is empty.
+  return { hosts: [host], routers: [] };
 });
