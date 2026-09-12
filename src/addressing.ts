@@ -146,7 +146,7 @@ export function uplinkBackboneNet(
 function extractSuffixFromIpv4Literal(addr: IPv4): number {
   const parts = addr.to_s().split(".");
   const last = parts[parts.length - 1];
-  const n = Number.parseInt(last, 10);
+  const n = last === undefined ? Number.NaN : Number.parseInt(last, 10);
   if (Number.isNaN(n)) {
     throw new Error(
       `segmentNet: could not extract a host-id from ipv4 literal "${addr.to_s()}"`,
@@ -158,7 +158,7 @@ function extractSuffixFromIpv4Literal(addr: IPv4): number {
 function extractSuffixFromIpv6Literal(addr: IPv6): number {
   const groups = addr.to_s().split(":").filter((g) => g.length > 0);
   const last = groups[groups.length - 1];
-  const n = Number.parseInt(last, 10);
+  const n = last === undefined ? Number.NaN : Number.parseInt(last, 10);
   if (Number.isNaN(n)) {
     throw new Error(
       `segmentNet: could not extract a host-id from ipv6 literal "${addr.to_s()}"`,
@@ -185,11 +185,11 @@ export function segmentNet(
   const id = typeof segment === "number" ? segmentId(segment) : segment;
 
   let ipv4: IPv4;
-  if (gateway.ipv4 !== undefined) {
+  if (gateway.ipv4) {
     ipv4 = gateway.ipv4;
-  } else if (gateway.suffix !== undefined) {
+  } else if (gateway.suffix) {
     ipv4 = IPv4.parse(`192.168.${id}.${gateway.suffix}/24`);
-  } else if (gateway.ipv6 !== undefined) {
+  } else if (gateway.ipv6) {
     const transferred = extractSuffixFromIpv6Literal(gateway.ipv6);
     ipv4 = IPv4.parse(`192.168.${id}.${transferred}/24`);
   } else {
@@ -199,12 +199,12 @@ export function segmentNet(
   }
 
   let ipv6: IPv6;
-  if (gateway.ipv6 !== undefined) {
+  if (gateway.ipv6) {
     ipv6 = gateway.ipv6;
-  } else if (gateway.suffix6 !== undefined || gateway.suffix !== undefined) {
+  } else if (gateway.suffix6 || gateway.suffix) {
     const suffix6 = gateway.suffix6 ?? gateway.suffix as number;
     ipv6 = IPv6.parse(`fd00:192:168:${id}::${suffix6}/64`);
-  } else if (gateway.ipv4 !== undefined) {
+  } else if (gateway.ipv4) {
     const transferred = extractSuffixFromIpv4Literal(gateway.ipv4);
     ipv6 = IPv6.parse(`fd00:192:168:${id}::${transferred}/64`);
   } else {
@@ -338,7 +338,7 @@ export function transitNetwork(ipv4?: IPv4, ipv6?: IPv6): TransitNetwork {
 // routed on a real physical LAN segment.
 
 export function macFromV4(ipv4: IPv4): string {
-  const octets = ipv4.to_s().split("/")[0].split(".").map((s) =>
+  const octets = (ipv4.to_s().split("/")[0] ?? "").split(".").map((s) =>
     Number.parseInt(s, 10)
   );
   if (octets.length !== 4 || octets.some((o) => Number.isNaN(o))) {

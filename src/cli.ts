@@ -82,7 +82,7 @@ async function loadConfig(configPath: string): Promise<NetworkDefinition> {
   const mod = await import(pathToFileURL(resolved).href);
 
   const found = Object.values(mod).find(isNetworkDefinition);
-  if (found === undefined) {
+  if (!found) {
     throw new Error(
       `${configPath} does not export a NetworkDefinition ` +
         `(the return value of defineNetwork(...))`,

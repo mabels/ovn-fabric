@@ -102,19 +102,25 @@ function resolveDiscovery(
   // generate-netns.ts).
   const ipv4 = client === "static"
     ? "static"
-    : spec?.ipv4 === undefined || spec.ipv4 === "dhcp"
+    : !spec?.ipv4 || spec.ipv4 === "dhcp"
     ? "dhcp"
     : "static";
   // static6 given implies ipv6 "static" outright — the v6 mirror of
   // client === "static" above. No pluggable client for v6 (SLAAC is
   // kernel-only, not a daemon), so static6's mere presence is the only
   // signal needed.
-  const ipv6 = static6 !== undefined
+  const ipv6 = static6
     ? "static"
-    : spec?.ipv6 === undefined || spec.ipv6 === "slaac"
+    : !spec?.ipv6 || spec.ipv6 === "slaac"
     ? "slaac"
     : "static";
-  return { ipv4, ipv6, client, static4, static6 };
+  return {
+    ipv4,
+    ipv6,
+    ...(client ? { client } : {}),
+    ...(static4 ? { static4 } : {}),
+    ...(static6 ? { static6 } : {}),
+  };
 }
 
 // ── vlan() ───────────────────────────────────────────────────────────
@@ -158,7 +164,7 @@ export function uplinkVlan(input: VlanUplinkInput): UplinkBuilder {
       kind: "vlan",
       vlanParent: input.vlanParent,
       vlanId: input.vlan ?? id,
-      ifaceName: input.ifaceName,
+      ...(input.ifaceName ? { ifaceName: input.ifaceName } : {}),
     };
 
     const addresses: Addresses = [
@@ -170,7 +176,7 @@ export function uplinkVlan(input: VlanUplinkInput): UplinkBuilder {
       slot,
       addresses,
       if: ifc,
-      nat: input.nat,
+      ...(input.nat ? { nat: input.nat } : {}),
       discovery: resolveDiscovery(
         input.addresses,
         input.client,
@@ -227,7 +233,7 @@ export function uplinkPhysical(input: PhysicalUplinkInput): UplinkBuilder {
       slot,
       addresses,
       if: ifc,
-      nat: input.nat,
+      ...(input.nat ? { nat: input.nat } : {}),
       discovery: resolveDiscovery(
         input.addresses,
         input.client,
@@ -286,7 +292,7 @@ export function uplinkDummy(input: DummyUplinkInput): UplinkBuilder {
     // id would fold to the IDENTICAL IPv6 addresses as this uplink's
     // own front-door transfer link above, even though slot keeps the
     // IPv4 side distinct. 3/4 keeps both stacks distinct.
-    const backdoor: Backdoor | undefined = input.backdoor === undefined
+    const backdoor: Backdoor | undefined = !input.backdoor
       ? undefined
       : (() => {
         const bdSlot = allocSlot();
@@ -304,7 +310,7 @@ export function uplinkDummy(input: DummyUplinkInput): UplinkBuilder {
       slot,
       addresses,
       if: ifc,
-      nat: input.nat,
+      ...(input.nat ? { nat: input.nat } : {}),
       // Defaults to "static"/"static" (no discovery) unlike
       // uplinkVlan/uplinkPhysical's "dhcp" default — a dummy interface
       // has no real ISP behind it, so dhclient/dhcpcd would just hang
@@ -315,7 +321,7 @@ export function uplinkDummy(input: DummyUplinkInput): UplinkBuilder {
         input.addresses ?? { ipv4: "static", ipv6: "static" },
         input.client,
       ),
-      backdoor,
+      ...(backdoor ? { backdoor } : {}),
       host: input.host,
     };
   };
@@ -379,7 +385,7 @@ export function uplinkWireguard(input: WireguardUplinkInput): UplinkBuilder {
     // see Backdoor's doc comment (types.ts) for why sharing a /28 with
     // this uplink's own front-door transfer link is broken, not just
     // untidy.
-    const backdoor: Backdoor | undefined = input.backdoor === undefined
+    const backdoor: Backdoor | undefined = !input.backdoor
       ? undefined
       : (() => {
         const bdSlot = allocSlot();
@@ -397,12 +403,12 @@ export function uplinkWireguard(input: WireguardUplinkInput): UplinkBuilder {
       slot,
       addresses,
       if: ifc,
-      nat: input.nat,
+      ...(input.nat ? { nat: input.nat } : {}),
       // wg-quick manages the tunnel's own address (and, via its
       // fwmark/policy-routing dance, its own default route) entirely —
       // nothing for dhclient/dhcpcd/static to do on this interface.
       discovery: { ipv4: "static", ipv6: "static" },
-      backdoor,
+      ...(backdoor ? { backdoor } : {}),
       host: input.host,
     };
   };
@@ -460,7 +466,7 @@ export function uplinkZerotier(input: ZerotierUplinkInput): UplinkBuilder {
 
     // Same separate-slot reasoning as uplinkWireguard()'s backdoor
     // above — see Backdoor's doc comment (types.ts).
-    const backdoor: Backdoor | undefined = input.backdoor === undefined
+    const backdoor: Backdoor | undefined = !input.backdoor
       ? undefined
       : (() => {
         const bdSlot = allocSlot();
@@ -478,14 +484,14 @@ export function uplinkZerotier(input: ZerotierUplinkInput): UplinkBuilder {
       slot,
       addresses,
       if: ifc,
-      nat: input.nat,
+      ...(input.nat ? { nat: input.nat } : {}),
       // The ZeroTier daemon manages its own address(es) AND its own
       // routes (via the controller's "managed routes", assuming
       // allowManaged stays enabled — the default) entirely on its
       // own — nothing for dhclient/dhcpcd/static to do here, same
       // reasoning as uplinkWireguard() above.
       discovery: { ipv4: "static", ipv6: "static" },
-      backdoor,
+      ...(backdoor ? { backdoor } : {}),
       host: input.host,
     };
   };
@@ -503,7 +509,7 @@ export function uplinkZerotier(input: ZerotierUplinkInput): UplinkBuilder {
 function resolveUplinkSelector(
   uplink: Uplink | UplinkSelector | undefined,
 ): UplinkSelector | undefined {
-  if (uplink === undefined) return undefined;
+  if (!uplink) return undefined;
   return "resolve" in uplink ? uplink : new FixedUplink(uplink);
 }
 
@@ -523,10 +529,10 @@ export interface ExtraRouteInput {
 function resolveExtraRoutes(
   extraRoutes: readonly ExtraRouteInput[] | undefined,
 ): readonly ExtraRoute[] | undefined {
-  if (extraRoutes === undefined) return undefined;
+  if (!extraRoutes) return undefined;
   return extraRoutes.map((r) => ({
     prefix: r.prefix,
-    prefix6: r.prefix6,
+    ...(r.prefix6 ? { prefix6: r.prefix6 } : {}),
     uplink: resolveUplinkSelector(r.uplink) as UplinkSelector,
   }));
 }
@@ -564,12 +570,14 @@ export function segmentPhysical(
   const id = segmentId(
     typeof input.id === "string" ? Number.parseInt(input.id, 10) : input.id,
   );
+  const uplink = resolveUplinkSelector(input.uplink);
+  const extraRoutes = resolveExtraRoutes(input.extraRoutes);
   return {
     addresses: [segmentNet(id, input.gateway)],
     if: { kind: "physical", name: input.name },
-    uplink: resolveUplinkSelector(input.uplink),
-    extraRoutes: resolveExtraRoutes(input.extraRoutes),
-    nat: input.nat,
+    ...(uplink ? { uplink } : {}),
+    ...(extraRoutes ? { extraRoutes } : {}),
+    ...(input.nat ? { nat: input.nat } : {}),
     slaac: input.slaac ?? true,
     host: input.host,
   };
@@ -604,17 +612,19 @@ export function segmentVlan(input: SegmentVlanInput): Omit<Segment, "name"> {
   const id = segmentId(
     typeof input.id === "string" ? Number.parseInt(input.id, 10) : input.id,
   );
+  const uplink = resolveUplinkSelector(input.uplink);
+  const extraRoutes = resolveExtraRoutes(input.extraRoutes);
   return {
     addresses: [segmentNet(id, input.gateway)],
     if: {
       kind: "vlan",
       vlanParent: input.vlanParent,
       vlanId: input.vlan ?? id,
-      ifaceName: input.ifaceName,
+      ...(input.ifaceName ? { ifaceName: input.ifaceName } : {}),
     },
-    uplink: resolveUplinkSelector(input.uplink),
-    extraRoutes: resolveExtraRoutes(input.extraRoutes),
-    nat: input.nat,
+    ...(uplink ? { uplink } : {}),
+    ...(extraRoutes ? { extraRoutes } : {}),
+    ...(input.nat ? { nat: input.nat } : {}),
     slaac: input.slaac ?? true,
     host: input.host,
   };

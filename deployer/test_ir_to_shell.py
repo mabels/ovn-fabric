@@ -1324,11 +1324,11 @@ class KernelServiceDeployTest(unittest.TestCase):
     def test_kernel_service_two_nics_create_and_delete(self) -> None:
         seg = self._ls("container-seg", "br-cont", 1130)
         cp = self._ls("control-plane", "br-cp", 1143)
-        svc = pt.KernelServiceNode(
-            id="kernel.service:dns",
-            kind="kernel.service",
+        svc = pt.KernelAppContainerNode(
+            id="kernel.app.container:dns",
+            kind="kernel.app.container",
             key=pt.KernelServiceKey(name="dns"),
-            data=pt.KernelServiceData(
+            data=pt.KernelAppContainerData(
                 host="host:chassis-1",
                 image="ovn-fabric-dns",
                 cmd=["/usr/sbin/dnsmasq", "--no-daemon"],
@@ -1339,7 +1339,9 @@ class KernelServiceDeployTest(unittest.TestCase):
             "left",
             "container-seg",
             pt.ServiceRef(
-                service="kernel.service:dns", name="container-seg", ipaddrs=["192.168.50.53/24"]
+                service="kernel.app.container:dns",
+                name="container-seg",
+                ipaddrs=["192.168.50.53/24"],
             ),
         )
         lrp_cp = self._lrp(
@@ -1347,7 +1349,7 @@ class KernelServiceDeployTest(unittest.TestCase):
             "left",
             "control-plane",
             pt.ServiceRef(
-                service="kernel.service:dns",
+                service="kernel.app.container:dns",
                 name="control-plane",
                 ipaddrs=["10.43.0.5/24"],
                 primary=True,
@@ -1359,6 +1361,8 @@ class KernelServiceDeployTest(unittest.TestCase):
         create = create_hosts["chassis-1"]
         self.assertIn("cat > /usr/local/sbin/ovn-kernel-service-dns.sh << 'OVN'", create)
         self.assertIn('image="ovn-fabric-dns"', create)
+        # The container (and its netns) is ovn-fabric-prefixed.
+        self.assertIn('container="ovn-fabric-dns"', create)
         # In-container NICs are named after their SEGMENT (IFNAMSIZ-safe).
         self.assertIn(
             'ip netns exec "$container" ip addr add 192.168.50.53/24 dev "container-seg"',
@@ -1378,7 +1382,7 @@ class KernelServiceDeployTest(unittest.TestCase):
         )
         self.assertIn("systemctl enable --now ovn-kernel-service-dns.service", create)
         # The `down` branch (inside the script) removes the container + ports.
-        self.assertIn('/usr/bin/docker rm -f "dns"', create)
+        self.assertIn('/usr/bin/docker rm -f "ovn-fabric-dns"', create)
         self.assertIn('del-port "br-cont" "sc-', create)
         self.assertIn('del-port "br-cp" "sc-', create)
         _, delete_hosts = mod.build_scripts(nodes, "delete")
@@ -1428,11 +1432,11 @@ class MultiServiceDeployTest(unittest.TestCase):
         )
 
         def svc(n: str):
-            return pt.KernelServiceNode(
-                id=f"kernel.service:{n}",
-                kind="kernel.service",
+            return pt.KernelAppContainerNode(
+                id=f"kernel.app.container:{n}",
+                kind="kernel.app.container",
                 key=pt.KernelServiceKey(name=n),
-                data=pt.KernelServiceData(host="host:chassis-1", image=f"img-{n}"),
+                data=pt.KernelAppContainerData(host="host:chassis-1", image=f"img-{n}"),
             )
 
         def lrp(router: str, seg_name: str, service: str):
@@ -1446,7 +1450,7 @@ class MultiServiceDeployTest(unittest.TestCase):
                     mac="02:00:00:00:00:01",
                     serviceRefs=[
                         pt.ServiceRef(
-                            service=f"kernel.service:{service}",
+                            service=f"kernel.app.container:{service}",
                             name="seg-a",
                             ipaddrs=["10.0.0.5/24"],
                         )
@@ -1523,8 +1527,8 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                 },
             },
             {
-                "id": "kernel.service:dns-129",
-                "kind": "kernel.service",
+                "id": "kernel.app.container:dns-129",
+                "kind": "kernel.app.container",
                 "key": {"name": "dns-129"},
                 "data": {
                     "host": "host:chassis-1",
@@ -1542,7 +1546,7 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                     "mac": "02:00:00:00:00:01",
                     "serviceRefs": [
                         {
-                            "service": "kernel.service:dns-129",
+                            "service": "kernel.app.container:dns-129",
                             "name": "management-v2",
                             "ipaddrs": ["192.168.129.5/24"],
                         }
@@ -1559,7 +1563,7 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                     "mac": "02:00:00:00:00:02",
                     "serviceRefs": [
                         {
-                            "service": "kernel.service:dns-129",
+                            "service": "kernel.app.container:dns-129",
                             "name": "control-plane",
                             "ipaddrs": ["10.43.0.129/24"],
                             "routes": [{"dst": "0.0.0.0/0", "via": "10.43.0.1"}],

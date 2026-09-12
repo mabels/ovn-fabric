@@ -23,8 +23,8 @@ import {
   type OvnClusterOptions,
   type OvnHostConfig,
   type OvnRouterEndpoint,
+  type OvnRouterEndpointSpec,
   type Router,
-  type RouterEndpointAttachment,
   type RouterEndpointRoute,
   type RouterEndpointService,
   type RoutingDomain,
@@ -198,7 +198,7 @@ function normalizeKernelEndpoint(
     },
   };
   input(endpoint);
-  if (endpoint.host === undefined || endpoint.transit === undefined) {
+  if (!endpoint.host || !endpoint.transit) {
     throw new Error(
       "kernelRouterEndpoint: builder must set `host` and `transit`",
     );
@@ -207,13 +207,13 @@ function normalizeKernelEndpoint(
     host: endpoint.host,
     transit: endpoint.transit,
     ipaddrs: endpoint.ipaddrs ?? [],
-    ...(endpoint.ifaces !== undefined ? { ifaces: endpoint.ifaces } : {}),
+    ...(endpoint.ifaces ? { ifaces: endpoint.ifaces } : {}),
     ...(services.length > 0 ? { services } : {}),
-    ...(endpoint.securityGroup !== undefined
+    ...(endpoint.securityGroup
       ? { securityGroup: endpoint.securityGroup }
       : {}),
-    ...(endpoint.routes !== undefined ? { routes: endpoint.routes } : {}),
-    ...(endpoint.routingDomains !== undefined
+    ...(endpoint.routes ? { routes: endpoint.routes } : {}),
+    ...(endpoint.routingDomains
       ? { routingDomains: endpoint.routingDomains }
       : {}),
   } as Omit<KernelRouterEndpoint, "kind">;
@@ -231,20 +231,22 @@ export interface EndpointBuilder {
       readonly routes?: readonly RouterEndpointRoute[];
       readonly primary?: boolean;
     },
-  ): RouterEndpointAttachment;
+  ): Extract<RouterEndpointService, { kind: "service.attach" }>;
 }
 
 function endpointBuilder(): EndpointBuilder {
   return {
     attachTo: (service, attachment) => ({
       kind: "service.attach",
-      service,
+      srvRef: service,
       ...attachment,
     }),
   };
 }
 
-type OvnEndpointFn = (ep: EndpointBuilder) => Omit<OvnRouterEndpoint, "kind">;
+type OvnEndpointFn = (
+  ep: EndpointBuilder,
+) => Omit<OvnRouterEndpointSpec, "kind">;
 
 /** The mutable spec handed to `net.service(name, (svc) => {...})` — set
  * `image` (required), `cmd`, `build`. Returns a re-usable Service handle. */
@@ -268,7 +270,7 @@ export interface RouterBuilder {
   left?: OvnRouterEndpoint;
   right?: OvnRouterEndpoint;
   ovnRouterEndpoint(
-    input: Omit<OvnRouterEndpoint, "kind"> | OvnEndpointFn,
+    input: Omit<OvnRouterEndpointSpec, "kind"> | OvnEndpointFn,
   ): OvnRouterEndpoint;
   kernelRouterEndpoint(
     input: KernelEndpointBuilderFn,
@@ -287,11 +289,11 @@ export interface RouterBuilder {
 export interface OvnRouterSpec {
   readonly routingDomains: readonly RoutingDomain[];
   readonly left:
-    | OvnRouterEndpoint
+    | OvnRouterEndpointSpec
     | KernelRouterEndpoint
     | TunnelRouterEndpoint;
   readonly right:
-    | OvnRouterEndpoint
+    | OvnRouterEndpointSpec
     | KernelRouterEndpoint
     | TunnelRouterEndpoint;
 }
@@ -331,7 +333,7 @@ export class NetworkBuilder {
       throw new Error(`host "${host.name}" declared more than once`);
     }
     if (host.ovn?.role.kind === "central") {
-      if (this.centralHostName !== undefined) {
+      if (this.centralHostName) {
         throw new Error(
           `host "${host.name}" declares a second central chassis — ` +
             `"${this.centralHostName}" already is one. HA central (multiple ` +
@@ -364,7 +366,7 @@ export class NetworkBuilder {
    * types.ts. At most once per defineNetwork call, same "declared more
    * than once" fail-fast as every other builder method. */
   ovnGlobal(options: OvnClusterOptions): void {
-    if (this.ovnGlobalOptions !== undefined) {
+    if (this.ovnGlobalOptions) {
       throw new Error("ovnGlobal() called more than once");
     }
     this.ovnGlobalOptions = options;
@@ -389,7 +391,7 @@ export class NetworkBuilder {
    * fail-fast as the central-chassis check above — a cluster has
    * exactly one backbone, not several. */
   backbone(name: string): CollisionDomain {
-    if (this.backboneDomain !== undefined) {
+    if (this.backboneDomain) {
       throw new Error(
         `backbone collision domain "${name}" declared more than once — ` +
           `"${this.backboneDomain.name}" already is one`,
@@ -417,7 +419,7 @@ export class NetworkBuilder {
       );
     }
     if (
-      endpoint.gatewayChassis !== undefined &&
+      endpoint.gatewayChassis &&
       !this.hostsByName.has(endpoint.gatewayChassis.name)
     ) {
       throw new Error(
@@ -446,10 +448,12 @@ export class NetworkBuilder {
   // on ifaces) leaves gatewayChassis unset, same as an explicit
   // omission — this only fills in the unambiguous case.
   private deriveGatewayChassis(endpoint: OvnRouterEndpoint): OvnRouterEndpoint {
-    if (endpoint.gatewayChassis !== undefined) return endpoint;
+    if (endpoint.gatewayChassis) return endpoint;
     const hosts = new Set((endpoint.ifaces ?? []).map((hi) => hi.host));
     if (hosts.size !== 1) return endpoint;
-    return { ...endpoint, gatewayChassis: [...hosts][0] };
+    const [onlyHost] = hosts;
+    if (onlyHost === undefined) return endpoint;
+    return { ...endpoint, gatewayChassis: onlyHost };
   }
 
   /** Declare a named group of routers that should learn about each
@@ -486,8 +490,10 @@ export class NetworkBuilder {
     return {
       name,
       image: svc.image,
-      ...(cmd !== undefined && cmd.length > 0 ? { cmd } : {}),
-      ...(svc.build !== undefined ? { build: svc.build } : {}),
+      ...(cmd && cmd.length > 0 ? { cmd } : {}),
+      ...(svc.build ? { build: svc.build } : {}),
+      // Filled in by the endpoint builders when this service is attached.
+      endpointRefs: [],
     };
   }
 
@@ -542,7 +548,10 @@ export class NetworkBuilder {
    * form's left/right) into a stored OvnRouterEndpoint — dispatching to the
    * same builders the router.endpoint methods use (2026-09-08). */
   private resolveEndpointSpec(
-    spec: OvnRouterEndpoint | KernelRouterEndpoint | TunnelRouterEndpoint,
+    spec:
+      | OvnRouterEndpointSpec
+      | KernelRouterEndpoint
+      | TunnelRouterEndpoint,
     routingDomains: readonly RoutingDomain[],
     routerName: string,
     subRouters: Router[],
@@ -575,8 +584,6 @@ export class NetworkBuilder {
     // router and the sub-router is flattened at IR time (2026-09-08).
     const subRouters: Router[] = [];
     const router: RouterBuilder = {
-      left: undefined,
-      right: undefined,
       ovnRouterEndpoint: (input) => this.buildOvnRouterEndpoint(input),
       // Router-level routingDomains is only known from the callback's
       // RETURN value (read after the callback runs) — so it can't be
@@ -609,7 +616,7 @@ export class NetworkBuilder {
       );
     }
 
-    if (router.left === undefined || router.right === undefined) {
+    if (!router.left || !router.right) {
       throw new Error(
         `router "${name}": both router.left and router.right must be ` +
           `set inside the defineOvnRouter() callback`,
@@ -631,7 +638,7 @@ export class NetworkBuilder {
     // routingDomains (2026-09-08).
     const kernelRouter = this.kernelRoutersByName.get(name);
     if (
-      kernelRouter !== undefined && kernelRouter.routingDomains === undefined
+      kernelRouter && !kernelRouter.routingDomains
     ) {
       this.kernelRoutersByName.set(name, {
         ...kernelRouter,
@@ -658,10 +665,29 @@ export class NetworkBuilder {
    * routingDomains; this one carries no such need but stays alongside
    * it for symmetry rather than being reachable a different way. */
   private buildOvnRouterEndpoint(
-    input: Omit<OvnRouterEndpoint, "kind"> | OvnEndpointFn,
+    input: Omit<OvnRouterEndpointSpec, "kind"> | OvnEndpointFn,
   ): OvnRouterEndpoint {
     const spec = typeof input === "function" ? input(endpointBuilder()) : input;
-    return { kind: "ovn", ...spec };
+    const base = { kind: "ovn" as const, ...spec };
+    // Inject THIS endpoint into every service entry (EndpointService<T> =
+    // T & { endpoint }) so the generator can read the endpoint's
+    // l2Segment/ipaddrs/routes per service (2026-09-08). The endpoint
+    // referenced is the un-wrapped one — its own fields are identical.
+    const endpoint = base as unknown as OvnRouterEndpoint;
+    if (!base.services) return endpoint;
+    return {
+      ...base,
+      services: base.services.map((service) => {
+        const entry = { ...service, endpoint };
+        // Attaching a reusable workload records the ENDPOINT-REFERENCE on
+        // the service — the wired entry itself ({ ...service, endpoint }) —
+        // so the service points back at the endpoints that attach it.
+        if (entry.kind === "service.attach") {
+          entry.srvRef.endpointRefs.push(entry);
+        }
+        return entry;
+      }),
+    } as OvnRouterEndpoint;
   }
 
   /** Declare a kernel router — a real Linux netns forwarding between two
@@ -778,13 +804,14 @@ export class NetworkBuilder {
       ifaces,
       services,
       securityGroup,
+      routes: inputRoutes,
       ...rest
     } = input;
     const transitDomain = this.collisionDomain(`transit-${routerName}`);
     const ovnSideAddrs = [link.left.ipv4, link.left.ipv6]
-      .filter((a): a is IPv4 | IPv6 => a !== undefined);
+      .filter((a): a is IPv4 | IPv6 => Boolean(a));
     const kernelSideAddrs = [link.right.ipv4, link.right.ipv6]
-      .filter((a): a is IPv4 | IPv6 => a !== undefined);
+      .filter((a): a is IPv4 | IPv6 => Boolean(a));
 
     // Kernel-side services (the `kernel.*` kinds of RouterEndpointService
     // — today `kernel.ipv4.masq`/`kernel.ipv6.masq`, later docker/
@@ -808,7 +835,7 @@ export class NetworkBuilder {
     // defineNetwork call, same "register + fail fast" split as every
     // other cross-reference here.
     if (
-      securityGroup !== undefined &&
+      securityGroup &&
       this.securityGroupsByName.get(securityGroup.name) !== securityGroup
     ) {
       throw new Error(
@@ -819,7 +846,7 @@ export class NetworkBuilder {
     const masqKinds = (kernelServices ?? []).filter((s) =>
       s.kind === "kernel.ipv4.masq" || s.kind === "kernel.ipv6.masq"
     );
-    const securityGroupDef = securityGroup !== undefined
+    const securityGroupDef = securityGroup
       ? securityGroup
       : masqKinds.length > 0
       ? this.securityGroup(`masq-${routerName}`, (group) => {
@@ -872,19 +899,17 @@ export class NetworkBuilder {
         const cmd = typeof s.cmd === "string"
           ? s.cmd.trim().split(/\s+/).filter((t) => t.length > 0)
           : s.cmd;
-        const containerIp = s.ipaddrs !== undefined && s.ipaddrs.length > 0
-          ? s.ipaddrs[0]
-          : IPv4.parse(`10.200.${fnv1a32(routerName) % 256}.2/24`);
+        const containerIp =
+          (s.ipaddrs && s.ipaddrs.length > 0 ? s.ipaddrs[0] : undefined) ??
+            IPv4.parse(`10.200.${fnv1a32(routerName) % 256}.2/24`);
         const routerIp = containerIp.network().first();
         apps.push({
           kind: "docker",
           // `image` is optional — defaults to the router name (2026-08-31).
           image: s.image ?? `ovn-fabric-${routerName}`,
-          ...(s.build !== undefined ? { build: s.build } : {}),
-          name: s.name !== undefined
-            ? `${routerName}-${s.name}`
-            : `${routerName}-docker`,
-          ...(cmd !== undefined && cmd.length > 0 ? { cmd } : {}),
+          ...(s.build ? { build: s.build } : {}),
+          name: s.name ? `${routerName}-${s.name}` : `${routerName}-docker`,
+          ...(cmd && cmd.length > 0 ? { cmd } : {}),
           ip: containerIp.to_string(),
           routerIp: routerIp.to_string(),
         });
@@ -899,7 +924,7 @@ export class NetworkBuilder {
     // the kernel netns's own real gateway, e.g. the actual ISP address,
     // is a different fact that belongs on the kernel side of the
     // transit link, exactly where the unmodified copy keeps it).
-    const ovnSideRoutes = input.routes?.map((route) => {
+    const ovnSideRoutes = inputRoutes?.map((route) => {
       // The OVN side of a transit link has exactly ONE reachable peer —
       // the paired KernelRouter — so every route declared on this
       // endpoint is rewritten to point at the kernel router's OWN
@@ -910,7 +935,7 @@ export class NetworkBuilder {
       // 2026-08-21: keeping 192.168.132.1 made the OVN logical router
       // ARP for its WAN gateway out the transit veth).
       const via = route.dst.is_ipv4() ? link.right.ipv4 : link.right.ipv6;
-      if (via === undefined) {
+      if (!via) {
         throw new Error(
           `kernelRouterEndpoint: route to ${route.dst.to_string()} has ` +
             `no matching-family kernel-side address on the transit link ` +
@@ -934,6 +959,7 @@ export class NetworkBuilder {
       peerName: `veth-ovn-${routerName}`,
     };
 
+    const kernelDomainMembership = input.routingDomains ?? routingDomains;
     this.kernelRouter(routerName, {
       host,
       left: {
@@ -948,26 +974,28 @@ export class NetworkBuilder {
       },
       right: {
         ipaddrs,
-        routes: input.routes,
-        ifaces,
-        apps: apps.length > 0 ? apps : undefined,
-        securityGroup: securityGroupDef,
+        ...(input.routes ? { routes: input.routes } : {}),
+        ...(ifaces ? { ifaces } : {}),
+        ...(apps.length > 0 ? { apps } : {}),
+        ...(securityGroupDef ? { securityGroup: securityGroupDef } : {}),
       },
       transitDomain,
       transitPeerAddrs: ovnSideAddrs,
       // The endpoint's OWN per-endpoint routingDomains override the
       // router-level ones stamped by ovnRouter() (2026-08-23) — an
       // endpoint-level membership gates only THIS side's routes.
-      routingDomains: input.routingDomains ?? routingDomains,
+      ...(kernelDomainMembership
+        ? { routingDomains: kernelDomainMembership }
+        : {}),
     });
 
     return this.buildOvnRouterEndpoint({
       ...rest,
-      routes: ovnSideRoutes,
+      ...(ovnSideRoutes ? { routes: ovnSideRoutes } : {}),
       l2Segment: transitDomain,
-      services: ovnServices !== undefined && ovnServices.length > 0
-        ? ovnServices
-        : undefined,
+      ...(ovnServices && ovnServices.length > 0
+        ? { services: ovnServices }
+        : {}),
       // Only the transit-side addresses live on the OVN port: `ipaddrs`
       // (the real-world-facing ones, e.g. 192.168.132.93/24) belong to
       // the kernel netns's OWN interface (KernelRouterSide.right above),
@@ -1009,7 +1037,6 @@ export class NetworkBuilder {
       upstreamBackbone,
       upstreamDomains,
       host,
-      tunnel,
       services,
       routes,
       routingDomains,
@@ -1018,40 +1045,46 @@ export class NetworkBuilder {
     const transitDomain = this.collisionDomain(`transit-${routerName}`);
     const backdoorDomain = this.collisionDomain(`backdoor-${routerName}`);
     const ovnSideAddrs = [meshLink.left.ipv4, meshLink.left.ipv6]
-      .filter((a): a is IPv4 | IPv6 => a !== undefined);
+      .filter((a): a is IPv4 | IPv6 => Boolean(a));
     const kernelSideAddrs = [meshLink.right.ipv4, meshLink.right.ipv6]
-      .filter((a): a is IPv4 | IPv6 => a !== undefined);
+      .filter((a): a is IPv4 | IPv6 => Boolean(a));
     const upstreamKernelAddrs = [upLink.right.ipv4, upLink.right.ipv6]
-      .filter((a): a is IPv4 | IPv6 => a !== undefined);
+      .filter((a): a is IPv4 | IPv6 => Boolean(a));
     const upstreamPeerAddrs = [upLink.left.ipv4, upLink.left.ipv6]
-      .filter((a): a is IPv4 | IPv6 => a !== undefined);
+      .filter((a): a is IPv4 | IPv6 => Boolean(a));
 
-    // The tunnel's egress masq belongs to the tunnel IFACE (the
-    // wireguard app emits it), NOT to the security-group shortcut —
-    // that would target the right side's real iface (the upstream
-    // veth), which is the tunnel ENDPOINT's path, not the egress.
-    const masqKinds = (services ?? []).filter((s) =>
-      s.kind === "kernel.ipv4.masq" || s.kind === "kernel.ipv6.masq"
+    // The tunnel WORKLOAD is a `wireguard`/`zerotier` entry in services[]
+    // (the config-side shortcut) — define.ts maps it to the kernel app; the
+    // IR never sees wireguard/zerotier (2026-09-08). The egress masq now
+    // lives ON the workload (masq), not as separate kernel.*.masq services.
+    const workload = (services ?? []).find(
+      (s) => s.kind === "wireguard" || s.kind === "zerotier",
     );
-    const ovnServices = services?.filter((s) => !s.kind.startsWith("kernel."));
-    const masq = masqKinds.map((s) =>
-      s.kind === "kernel.ipv4.masq" ? "ipv4" : "ipv6"
+    if (workload === undefined) {
+      throw new Error(
+        `tunnelRouterEndpoint "${routerName}": services[] must include a ` +
+          `wireguard or zerotier workload`,
+      );
+    }
+    const masq = workload.masq ?? [];
+    const ovnServices = (services ?? []).filter(
+      (s) => s.kind === "ipv6.slaac" || s.kind === "ipv6.ra",
     );
     const apps: KernelApp[] = [
-      tunnel.kind === "wireguard"
+      workload.kind === "wireguard"
         ? {
           kind: "wireguard",
-          ifaceName: tunnel.ifaceName,
-          config: tunnel.config,
+          ifaceName: workload.ifaceName,
+          config: workload.config,
           masq,
         }
         : {
           kind: "zerotier",
-          networkId: tunnel.networkId,
+          networkId: workload.networkId,
           // `instanceDir` is optional on the tunnel — derived from the
           // router name when omitted (types.ts), so a config author only
           // sets it when the default location is wrong.
-          instanceDir: tunnel.instanceDir ??
+          instanceDir: workload.instanceDir ??
             `/var/lib/zerotier-one-${routerName}`,
           masq,
           // The tunnel's via-less declared routes (e.g. the ztnet mesh
@@ -1061,7 +1094,7 @@ export class NetworkBuilder {
           // would target the upstream veth) so the wire script applies
           // them over the runtime interface (2026-08-30).
           routes: (routes ?? [])
-            .filter((r) => r.via === undefined)
+            .filter((r) => !r.via)
             .map((r) => ({ dst: r.dst.to_string() })),
         },
     ];
@@ -1076,11 +1109,11 @@ export class NetworkBuilder {
     // routes for the anchor (confirmed missing live, 2026-08-30). Via
     // routes are left as the author declared them.
     const ovnSideRoutes = (routes ?? []).map((route) => {
-      if (route.via !== undefined) return route;
+      if (route.via) return route;
       const via = route.dst.is_ipv4()
         ? meshLink.right.ipv4
         : meshLink.right.ipv6;
-      if (via === undefined) {
+      if (!via) {
         throw new Error(
           `tunnelRouterEndpoint: via-less route to ${route.dst.to_string()} has no ` +
             `matching-family kernel-side transit address to forward into the netns`,
@@ -1093,13 +1126,13 @@ export class NetworkBuilder {
     // upstream peer — that's how the tunnel's endpoint UDP escapes
     // (wg-quick's fwmark policy routing keeps it out of the tunnel).
     const upstreamRoutes: RouterEndpointRoute[] = [];
-    if (upLink.left.ipv4 !== undefined) {
+    if (upLink.left.ipv4) {
       upstreamRoutes.push({
         dst: IPv4.parse("0.0.0.0/0"),
         via: upLink.left.ipv4,
       });
     }
-    if (upLink.left.ipv6 !== undefined) {
+    if (upLink.left.ipv6) {
       upstreamRoutes.push({
         dst: IPv6.parse("::/0"),
         via: upLink.left.ipv6,
@@ -1151,26 +1184,24 @@ export class NetworkBuilder {
       },
       right: {
         ipaddrs: upstreamKernelAddrs,
-        routes: upstreamRoutes.length > 0 ? upstreamRoutes : undefined,
+        ...(upstreamRoutes.length > 0 ? { routes: upstreamRoutes } : {}),
         ifaces: [{ host, iface: upstreamVeth }],
-        apps: apps.length > 0 ? apps : undefined,
+        ...(apps.length > 0 ? { apps } : {}),
       },
       transitDomain,
       transitPeerAddrs: ovnSideAddrs,
-      upstreamPeerAddrs: upstreamPeerAddrs.length > 0
-        ? upstreamPeerAddrs
-        : undefined,
-      routingDomains,
+      ...(upstreamPeerAddrs.length > 0 ? { upstreamPeerAddrs } : {}),
+      ...(routingDomains ? { routingDomains } : {}),
     });
 
     return this.buildOvnRouterEndpoint({
       ...rest,
-      routes: ovnSideRoutes,
-      routingDomains,
+      ...(ovnSideRoutes ? { routes: ovnSideRoutes } : {}),
+      ...(routingDomains ? { routingDomains } : {}),
       l2Segment: transitDomain,
-      services: ovnServices !== undefined && ovnServices.length > 0
-        ? ovnServices
-        : undefined,
+      ...(ovnServices && ovnServices.length > 0
+        ? { services: ovnServices }
+        : {}),
       ipaddrs: ovnSideAddrs,
       ifaces: [{ host, iface: transitVeth }],
     });
@@ -1201,7 +1232,7 @@ export class NetworkBuilder {
     const spec = builder(allocSlot, name);
 
     const id = spec.addresses[0]?.id();
-    if (id !== undefined && this.usedUplinkIds.has(id)) {
+    if (id && this.usedUplinkIds.has(id)) {
       const existing = [...this.uplinksByName.entries()].find(
         ([, u]) => u.addresses[0]?.id() === id,
       )?.[0];
@@ -1219,7 +1250,7 @@ export class NetworkBuilder {
     // is guaranteed to already exist by the time this uplink's backdoor
     // is emitted — see generate-ovn.ts, scriptForHost).
     if (
-      spec.backdoor !== undefined &&
+      spec.backdoor &&
       !this.uplinksByName.has(spec.backdoor.via.name)
     ) {
       throw new Error(
@@ -1231,7 +1262,7 @@ export class NetworkBuilder {
     const uplink: Uplink = { name, ...spec };
 
     this.uplinksByName.set(name, uplink);
-    if (id !== undefined) this.usedUplinkIds.add(id);
+    if (id) this.usedUplinkIds.add(id);
     return uplink;
   }
 
@@ -1240,7 +1271,7 @@ export class NetworkBuilder {
       throw new Error(`segment "${name}" declared more than once`);
     }
     const id = spec.addresses[0]?.id();
-    if (id !== undefined && this.usedSegmentIds.has(id)) {
+    if (id && this.usedSegmentIds.has(id)) {
       const existing = [...this.segmentsByName.entries()].find(
         ([, s]) => s.addresses[0]?.id() === id,
       )?.[0];
@@ -1254,7 +1285,7 @@ export class NetworkBuilder {
     // Segment.uplink, types.ts) — not every segment resolves to
     // something, so this must be checked before the "resolve" in
     // probe below, which throws on undefined.
-    const selector: UplinkSelector | undefined = spec.uplink === undefined
+    const selector: UplinkSelector | undefined = !spec.uplink
       ? undefined
       : "resolve" in spec.uplink
       ? spec.uplink
@@ -1263,7 +1294,7 @@ export class NetworkBuilder {
     // fail fast: if an uplink WAS given, it must have been declared via
     // this same builder, not an arbitrary object that happens to match
     // the Uplink shape.
-    if (selector !== undefined) {
+    if (selector) {
       const resolved = selector.resolve();
       if (!this.uplinksByName.has(resolved.name)) {
         throw new Error(
@@ -1273,10 +1304,14 @@ export class NetworkBuilder {
       }
     }
 
-    const segment: Segment = { name, ...spec, uplink: selector };
+    const segment: Segment = {
+      name,
+      ...spec,
+      ...(selector ? { uplink: selector } : {}),
+    };
 
     this.segmentsByName.set(name, segment);
-    if (id !== undefined) this.usedSegmentIds.add(id);
+    if (id) this.usedSegmentIds.add(id);
     return segment;
   }
 
@@ -1306,7 +1341,7 @@ export class NetworkBuilder {
         );
       }
     }
-    if (decl.hosts !== undefined) {
+    if (decl.hosts) {
       for (const host of this.hostsByName.values()) {
         if (!decl.hosts.includes(host)) {
           throw new Error(
@@ -1322,12 +1357,12 @@ export class NetworkBuilder {
       allSegments: [...this.segmentsByName.values()],
       allHosts: [...(decl.hosts ?? this.hostsByName.values())],
       allCollisionDomains: [...this.collisionDomainsByName.values()],
-      backbone: this.backboneDomain,
+      ...(this.backboneDomain ? { backbone: this.backboneDomain } : {}),
       allRouters,
       allKernelRouters: [...this.kernelRoutersByName.values()],
       allRoutingDomains: [...this.routingDomainsByName.values()],
       allSecurityGroups: [...this.securityGroupsByName.values()],
-      ovnGlobal: this.ovnGlobalOptions,
+      ...(this.ovnGlobalOptions ? { ovnGlobal: this.ovnGlobalOptions } : {}),
     };
   }
 }

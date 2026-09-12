@@ -194,7 +194,7 @@ function emitUplinkTransferInterface(u: Uplink): string[] {
 // realIfaceFor, generate-netns.ts).
 
 function emitBackdoorInterface(u: Uplink): string[] {
-  if (u.backdoor === undefined) return [];
+  if (!u.backdoor) return [];
   const br = backdoorBridge(u.backdoor);
   return [
     `# --- backdoor interface: ${u.name} -> ${u.backdoor.via.name} ---`,
@@ -212,7 +212,11 @@ function emitSegment(s: Segment): string[] {
   const lspLocalnet = `lsp-${s.name}-localnet`;
   const lspRouter = `lsp-${s.name}-router`;
   const lrp = `lrp-${s.name}`;
-  const mac = macFromV4(s.addresses[0].ipv4);
+  const segAddr = s.addresses[0];
+  if (!segAddr) {
+    throw new Error(`segment "${s.name}" is missing its gateway address`);
+  }
+  const mac = macFromV4(segAddr.ipv4);
   const networkName = `seg-${s.name}`;
 
   const lines = [
@@ -227,8 +231,8 @@ function emitSegment(s: Segment): string[] {
       router,
       lrp,
       mac,
-      v4Prefix(s.addresses[0]),
-      v6Prefix(s.addresses[0]),
+      v4Prefix(segAddr),
+      v6Prefix(segAddr),
     ),
     ...emitGatewayChassis(lrp),
   ];
@@ -317,6 +321,11 @@ function emitUplinkTransfer(u: Uplink): string[] {
   const router = `router-uplink-${u.name}`;
   const ovnSide = u.addresses[0]; // host=1, see factories.ts
   const netnsSide = u.addresses[1]; // host=2 — the netns peer, real next-hop
+  if (!ovnSide || !netnsSide) {
+    throw new Error(
+      `uplink "${u.name}" is missing its transfer-link addresses`,
+    );
+  }
   const mac = macFromV4(ovnSide.ipv4);
   const networkName = `seg-uplink-${u.name}-transfer`;
 
@@ -363,7 +372,7 @@ function emitUplinkTransfer(u: Uplink): string[] {
 // that's exactly the route this borrowed traffic should also use.
 
 function emitBackdoor(u: Uplink): string[] {
-  if (u.backdoor === undefined) return [];
+  if (!u.backdoor) return [];
   const bd = u.backdoor;
 
   const sw = `sw-backdoor-${u.name}`;
@@ -372,6 +381,11 @@ function emitBackdoor(u: Uplink): string[] {
   const lspRouter = `lsp-backdoor-${u.name}-router`;
   const viaRouter = `router-uplink-${bd.via.name}`;
   const ovnSide = bd.addresses[0]; // host=1, lives on `via`'s router
+  if (!ovnSide) {
+    throw new Error(
+      `backdoor for uplink "${u.name}" is missing its transfer-link address`,
+    );
+  }
   const mac = macFromV4(ovnSide.ipv4);
   const networkName = `seg-backdoor-${u.name}`;
 
@@ -436,10 +450,17 @@ function emitBackboneJoin(
   const upLrpBb = `lrp-uplink-${resolved.name}-bb`;
   const upLspBb = `lsp-backbone-uplink-${resolved.name}`;
 
-  const segId = s.addresses[0].id();
+  const segAddr = s.addresses[0];
+  const upAddr = resolved.addresses[0];
+  if (!segAddr || !upAddr) {
+    throw new Error(
+      `backbone join for segment "${s.name}" is missing an address`,
+    );
+  }
+  const segId = segAddr.id();
   const segBackbone = segmentBackboneNet(segId, segBackboneHost);
   const upBackbone = uplinkBackboneNet(
-    resolved.addresses[0].id(),
+    upAddr.id(),
     resolved.slot,
     1,
   );
@@ -451,7 +472,7 @@ function emitBackboneJoin(
     const lines = [
       `ovn-nbctl --may-exist lr-route-add ${segRouter} ${r.v4Prefix.to_string()} ${upBackbone.ipv4.to_s()}`,
     ];
-    if (r.v6Prefix !== undefined) {
+    if (r.v6Prefix) {
       lines.push(
         `ovn-nbctl --may-exist lr-route-add ${segRouter} ${r.v6Prefix.to_string()} ${upBackbone.ipv6.to_s()}`,
       );
@@ -508,10 +529,10 @@ function emitBackboneJoin(
     // confirmed live — so v4Prefix(s.addresses[0]) is safe to pass
     // directly here without a separate network-address helper.
     `ovn-nbctl --may-exist lr-route-add ${upRouter} ${
-      v4Prefix(s.addresses[0])
+      v4Prefix(segAddr)
     } ${segBackbone.ipv4.to_s()}`,
     `ovn-nbctl --may-exist lr-route-add ${upRouter} ${
-      v6Prefix(s.addresses[0])
+      v6Prefix(segAddr)
     } ${segBackbone.ipv6.to_s()}`,
     "",
   ];
@@ -525,7 +546,7 @@ function emitSegmentBackboneJoin(s: Segment): string[] {
   // is the safe default until a real uplink (e.g. a WireGuard VPN
   // tunnel) exists for it, rather than falling through to whichever
   // uplink happens to be declared elsewhere in the config.
-  if (s.uplink === undefined) {
+  if (!s.uplink) {
     lines.push(`# --- segment ${s.name}: no uplink assigned, isolated ---`, "");
   } else {
     const resolved = s.uplink.resolve();
@@ -544,7 +565,7 @@ function emitSegmentBackboneJoin(s: Segment): string[] {
     // "192.168.132.94/24"), not already a network address, so it's run
     // through IPv4 .network() here rather than handed to ovn-nbctl
     // as-is.
-    if (resolved.discovery?.static4 !== undefined) {
+    if (resolved.discovery?.static4) {
       const network = resolved.discovery.static4.address.network();
       routes.push({ v4Prefix: network });
     }
@@ -567,7 +588,10 @@ function emitSegmentBackboneJoin(s: Segment): string[] {
     const resolved = extra.uplink.resolve();
     lines.push(
       ...emitBackboneJoin(s, resolved, i + 2, `-extra-${i}-${resolved.name}`, [
-        { v4Prefix: extra.prefix, v6Prefix: extra.prefix6 },
+        {
+          v4Prefix: extra.prefix,
+          ...(extra.prefix6 ? { v6Prefix: extra.prefix6 } : {}),
+        },
       ]),
     );
   });
@@ -643,7 +667,7 @@ function requiredPackages(uplinks: readonly Uplink[]): string[] {
     const client = u.discovery?.client;
     if (client === "dhclient" || client === "dhcpcd") {
       packages.add(CLIENT_PACKAGE[client]);
-    } else if (client === undefined && u.discovery?.ipv4 === "dhcp") {
+    } else if (!client && u.discovery?.ipv4 === "dhcp") {
       packages.add(CLIENT_PACKAGE.dhclient);
     }
     if (u.if.kind === "wireguard") packages.add("wireguard-tools");
@@ -739,16 +763,16 @@ function emitPreflightChecks(uplinks: readonly Uplink[]): string[] {
  */
 function emitMonitoring(host: Host): string[] {
   const ipfix = host.monitoring?.ipfix;
-  if (ipfix === undefined) return [];
+  if (!ipfix) return [];
 
   const createArgs = [`targets="${ipfix.target}"`];
-  if (ipfix.sampling !== undefined) {
+  if (ipfix.sampling) {
     createArgs.push(`sampling=${ipfix.sampling}`);
   }
-  if (ipfix.cacheActiveTimeout !== undefined) {
+  if (ipfix.cacheActiveTimeout) {
     createArgs.push(`cache_active_timeout=${ipfix.cacheActiveTimeout}`);
   }
-  if (ipfix.cacheMaxFlows !== undefined) {
+  if (ipfix.cacheMaxFlows) {
     createArgs.push(`cache_max_flows=${ipfix.cacheMaxFlows}`);
   }
 
@@ -945,7 +969,7 @@ function scriptForHost(
       networkName: `seg-uplink-${u.name}-transfer`,
       bridge: uplinkTransferBridge(u),
     });
-    if (u.backdoor !== undefined) {
+    if (u.backdoor) {
       interfaceLines.push(...emitBackdoorInterface(u));
       bridgeMappings.push({
         networkName: `seg-backdoor-${u.name}`,

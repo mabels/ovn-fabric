@@ -180,17 +180,19 @@ def _hydrate_app(raw: dict):
     )
 
 
-def _hydrate_kernel_service(raw: dict) -> pt.KernelServiceNode:
+def _hydrate_kernel_app_container(raw: dict) -> pt.KernelAppContainerNode:
+    # The node KIND is the workload kind — the data carries no nested `kind`.
     data = raw["data"]
     build_raw = data.get("build")
-    return pt.KernelServiceNode(
+    return pt.KernelAppContainerNode(
         id=raw["id"],
         kind=raw["kind"],
         key=pt.KernelServiceKey(name=raw["key"]["name"]),
-        data=pt.KernelServiceData(
+        data=pt.KernelAppContainerData(
             host=data["host"],
             image=data["image"],
             cmd=[c for c in data["cmd"]] if data.get("cmd") else None,
+            deps=[d for d in data["deps"]] if data.get("deps") else None,
             build=(
                 pt.Build(
                     from_=build_raw["from"],
@@ -200,6 +202,26 @@ def _hydrate_kernel_service(raw: dict) -> pt.KernelServiceNode:
                     dockerfile=build_raw.get("dockerfile"),
                 )
                 if build_raw
+                else None
+            ),
+        ),
+    )
+
+
+def _hydrate_kernel_app_service(raw: dict) -> pt.KernelAppServiceNode:
+    data = raw["data"]
+    return pt.KernelAppServiceNode(
+        id=raw["id"],
+        kind=raw["kind"],
+        key=pt.KernelServiceKey(name=raw["key"]["name"]),
+        data=pt.KernelAppServiceData(
+            host=data["host"],
+            up=[a for a in data["up"]],
+            down=[a for a in data["down"]] if data.get("down") else None,
+            deps=[d for d in data["deps"]] if data.get("deps") else None,
+            files=(
+                [pt.File(path=f["path"], content=f["content"]) for f in data["files"]]
+                if data.get("files")
                 else None
             ),
         ),
@@ -226,7 +248,8 @@ _HYDRATORS = {
     "ipv6.route": _hydrate_ipv6_route,
     "kernel.router": _hydrate_kernel_router,
     "security.group": _hydrate_security_group,
-    "kernel.service": _hydrate_kernel_service,
+    "kernel.app.container": _hydrate_kernel_app_container,
+    "kernel.app.service": _hydrate_kernel_app_service,
 }
 
 

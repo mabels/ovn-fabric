@@ -59,9 +59,9 @@ export interface HostAddress {
 }
 
 function primaryHostAddress(address: HostAddress): string {
-  if (address.fqdn !== undefined) return address.fqdn;
-  if (address.ipv4 !== undefined) return address.ipv4.to_s();
-  if (address.ipv6 !== undefined) return address.ipv6.to_s();
+  if (address.fqdn) return address.fqdn;
+  if (address.ipv4) return address.ipv4.to_s();
+  if (address.ipv6) return address.ipv6.to_s();
   throw new Error(
     "HostAddress requires at least one of fqdn/ipv4/ipv6",
   );
@@ -190,9 +190,9 @@ export function sshHost(
     address,
     connectAddress: primaryHostAddress(address),
     access: { method: "ssh", user },
-    os,
-    ovn,
-    monitoring,
+    ...(os ? { os } : {}),
+    ...(ovn ? { ovn } : {}),
+    ...(monitoring ? { monitoring } : {}),
   };
 }
 
@@ -207,9 +207,9 @@ export function localHost(
     address: { fqdn: "localhost" },
     connectAddress: "127.0.0.1",
     access: { method: "local" },
-    os,
-    ovn,
-    monitoring,
+    ...(os ? { os } : {}),
+    ...(ovn ? { ovn } : {}),
+    ...(monitoring ? { monitoring } : {}),
   };
 }
 
@@ -471,7 +471,9 @@ export interface HostInterface {
 // strategy per side, instead of a structural ("does it have l2Segment")
 // check — same discriminated-union pattern InterfaceKind already uses
 // in this file.
-interface RouterEndpointBase {
+interface RouterEndpointBase<
+  S = RouterEndpointService,
+> {
   /** A router port's own addresses — plain parsed IPv4/IPv6 values, one
    * array entry per address (IPv4.parse(...), IPv6.parse(...)), NOT
    * Addresses/NetId: NetId pairs a v4+v6 fold together under one
@@ -512,9 +514,14 @@ interface RouterEndpointBase {
    * ipv6_ra_configs key gets set (OVN's own default: no RA at all),
    * matching Segment.slaac's existing "false" branch. The array also
    * carries ServiceAttachments (`endpoint.attachTo(sv, {...})`) — a
-   * workload's NIC on this endpoint's segment (2026-09-08). */
-  readonly services?:
-    readonly (RouterEndpointService | RouterEndpointAttachment)[];
+   * workload's NIC on this endpoint's segment (2026-09-08).
+   *
+   * INTERNAL: the EndpointBuilder (define.ts) injects `endpoint` into every
+   * entry — see EndpointService — so each service carries a reference to
+   * the endpoint it's attached to (its l2Segment/ipaddrs/routes), which the
+   * generator (src/ir.ts) reads to wire the service's NIC. The author writes
+   * the plain kind; `endpoint` is added by the builder, never by hand. */
+  readonly services?: readonly S[];
   /** Routes this endpoint is the ANCHOR for — see RouterEndpointRoute
    * below. Declaring a route here IS what makes this (router, side)
    * the anchor; nothing infers it from address containment anymore.
@@ -537,7 +544,8 @@ interface RouterEndpointBase {
 /** Today's ONLY concrete shape — adds the one field that's actually
  * OVN-specific: which CollisionDomain (Logical_Switch) this LRP binds
  * into. */
-export interface OvnRouterEndpoint extends RouterEndpointBase {
+export interface OvnRouterEndpoint
+  extends RouterEndpointBase<EndpointService<RouterEndpointService>> {
   readonly kind: "ovn";
   readonly l2Segment: CollisionDomain;
 }
@@ -596,9 +604,9 @@ export interface TunnelRouterEndpoint {
   /** The upstream-side transit (right, veth-bdk-* style) — back toward
    * the physical path the tunnel endpoint is reached through. */
   readonly upstream: TransitNetwork;
-  /** The tunnel interface itself (wireguard or zerotier) — created by
-   * the `kernel.app.<kind>` service inside the netns. */
-  readonly tunnel: Extract<InterfaceKind, { kind: "wireguard" | "zerotier" }>;
+  // NOTE: the tunnel WORKLOAD is no longer a `tunnel` field — it's a
+  // `wireguard`/`zerotier` service in `services[]` below (define.ts maps it
+  // onto the generic kernel.app.service).
   /** The upstream-peer router's BACKBONE-facing port (2026-08-23): the
    * tunnel netns's upstream/backdoor leg terminates on an OVN router
    * (`<router>-upstream`) that tunnelRouterEndpoint defines INTERNALLY —
@@ -855,6 +863,34 @@ export type RouterEndpointService =
      * endpoint) is added via the endpoint's address (the segment/router
      * gateway) at resolve time (2026-09-08). */
     readonly routes?: readonly RouterEndpointRoute[];
+  }
+  | {
+    /** An ATTACHMENT: bind a reusable workload (`srvRef`, a net.service) to
+     * this endpoint's segment — one NIC on this L2 (2026-09-08). */
+    readonly kind: "service.attach";
+    readonly srvRef: Service;
+    readonly ipaddrs: readonly (IPv4 | IPv6)[];
+    readonly routes?: readonly RouterEndpointRoute[];
+    readonly primary?: boolean;
+  }
+  // CONFIG-SIDE WORKLOAD SHORTCUTS — kept in the topology; define.ts maps
+  // them onto the generic kernel.app.container / kernel.app.service (the IR
+  // knows nothing about wireguard/zerotier, 2026-09-08).
+  | {
+    readonly kind: "wireguard";
+    readonly ifaceName: string;
+    readonly config: Extract<
+      InterfaceKind,
+      { kind: "wireguard" }
+    >["config"];
+    readonly masq?: readonly ("ipv4" | "ipv6")[];
+  }
+  | {
+    readonly kind: "zerotier";
+    readonly networkId: string;
+    readonly instanceDir?: string;
+    readonly masq?: readonly ("ipv4" | "ipv6")[];
+    readonly routes?: readonly RouterEndpointRoute[];
   };
 
 // ── Service: a reusable WORKLOAD, and its network attachments ──────────
@@ -873,18 +909,34 @@ export interface Service {
     readonly packages?: readonly string[];
     readonly dockerfile?: string;
   };
+  /** ENDPOINT-REFERENCES — the `service.attach` entries that attach this
+   * service (each is the endpoint's `{ ...service, endpoint }` tuple, so it
+   * carries the endpoint AND the attachment's addressing), so the service
+   * knows which endpoints reference it. Filled in by the endpoint builders
+   * at attach time; mutable on purpose — populated during defineNetwork,
+   * not authored (2026-09-08). */
+  readonly endpointRefs: EndpointService<
+    Extract<RouterEndpointService, { kind: "service.attach" }>
+  >[];
 }
 
-/** One network attachment: binds a Service to a router endpoint's segment,
- * giving it a NIC (ipaddrs/routes) on that L2. `primary` marks the face
- * that carries the container's default route. */
-export interface RouterEndpointAttachment {
-  readonly kind: "service.attach";
-  readonly service: Service;
-  readonly ipaddrs: readonly (IPv4 | IPv6)[];
-  readonly routes?: readonly RouterEndpointRoute[];
-  readonly primary?: boolean;
-}
+/** INTERNAL — the EndpointBuilder injects `endpoint` into every `services[]`
+ * entry, so each service references the endpoint it's attached to. The
+ * generator reads `svc.endpoint` for the segment + addresses + routes to
+ * wire the service's NIC (a `wireguard`/`zerotier` service uses the
+ * endpoint's; `docker` carries its own). Added by the builder (define.ts),
+ * never written by hand (2026-09-08). */
+export type EndpointService<T> = T & {
+  readonly endpoint: OvnRouterEndpoint;
+};
+
+/** The AUTHOR-facing endpoint spec (before the builder injects `endpoint`
+ * into each service): same as OvnRouterEndpoint but `services` is the plain
+ * union. define.ts's buildOvnRouterEndpoint turns a spec into the stored
+ * OvnRouterEndpoint by injecting the endpoint into every service. */
+export type OvnRouterEndpointSpec = Omit<OvnRouterEndpoint, "services"> & {
+  readonly services?: readonly RouterEndpointService[];
+};
 
 /** One route entry declared directly on the RouterEndpoint that IS the
  * anchor for it — `dst` reachable via `via`, optionally NAT'd. Moved
@@ -1377,7 +1429,8 @@ export class PriorityUplink implements UplinkSelector {
   }
   resolve(): Uplink {
     const found = this.candidates.find((u) => this.isAvailable(u));
-    return found ?? this.candidates[0];
+    // The constructor rejects an empty candidate list, so index 0 exists.
+    return found ?? this.candidates[0]!;
   }
 }
 

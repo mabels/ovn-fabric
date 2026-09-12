@@ -78,7 +78,7 @@ function netnsName(u: Uplink): string {
 function realIfaceFor(u: Uplink): string | undefined {
   if (u.if.kind === "wireguard") return u.if.ifaceName;
   if (u.if.kind === "zerotier") return `$${zerotierIfaceVarName(u)}`;
-  if (u.backdoor !== undefined) return backdoorVethNetns(u.backdoor);
+  if (u.backdoor) return backdoorVethNetns(u.backdoor);
   if (u.if.kind === "vlan") {
     return u.if.ifaceName ?? `${u.if.vlanParent}.${u.if.vlanId}`;
   }
@@ -138,13 +138,13 @@ function emitWireguardInterface(
     "[Interface]",
     `PrivateKey = ${cfg.privateKey}`,
     `Address = ${cfg.address}`,
-    ...(cfg.listenPort !== undefined ? [`ListenPort = ${cfg.listenPort}`] : []),
-    ...(cfg.dns !== undefined ? [`DNS = ${cfg.dns}`] : []),
+    ...(cfg.listenPort ? [`ListenPort = ${cfg.listenPort}`] : []),
+    ...(cfg.dns ? [`DNS = ${cfg.dns}`] : []),
     "[Peer]",
     `PublicKey = ${cfg.peer.publicKey}`,
     `AllowedIPs = ${cfg.peer.allowedIps}`,
     `Endpoint = ${cfg.peer.endpoint}`,
-    ...(cfg.peer.persistentKeepalive !== undefined
+    ...(cfg.peer.persistentKeepalive
       ? [`PersistentKeepalive = ${cfg.peer.persistentKeepalive}`]
       : []),
   ];
@@ -312,7 +312,7 @@ function emitDhcpcd(_u: Uplink, ns: string, realIface: string): string[] {
  * to check for — only the address and the route. */
 function emitStaticIpv4(u: Uplink, ns: string, realIface: string): string[] {
   const cfg = u.discovery?.static4;
-  if (cfg === undefined) {
+  if (!cfg) {
     return [
       `# WARNING: client "static" requested for ${u.name} but no ` +
       `discovery.static4 given — nothing configured, see types.ts`,
@@ -340,7 +340,7 @@ function emitStaticIpv4(u: Uplink, ns: string, realIface: string): string[] {
  * the only other state and this is its one implementation. */
 function emitStaticIpv6(u: Uplink, ns: string, realIface: string): string[] {
   const cfg = u.discovery?.static6;
-  if (cfg === undefined) {
+  if (!cfg) {
     return [
       `# WARNING: discovery.ipv6 "static" requested for ${u.name} but no ` +
       `discovery.static6 given — nothing configured, see types.ts`,
@@ -368,7 +368,7 @@ function emitIpv4Discovery(
   // does nothing here at all.
   const client: DhcpClient | undefined = u.discovery?.client ??
     (u.discovery?.ipv4 === "dhcp" ? "dhclient" : undefined);
-  if (client === undefined) return [];
+  if (!client) return [];
 
   const lines = [`# --- ipv4 discovery: ${client} on ${realIface} ---`];
   switch (client) {
@@ -394,7 +394,7 @@ export function emitUplinkNetns(
   const vNetns = vethNetns(u);
 
   const realIface = realIfaceFor(u);
-  if (realIface === undefined) {
+  if (!realIface) {
     return [
       `# unsupported uplink interface kind "${u.if.kind}" for ${u.name} ` +
       `— skipped, see generate-netns.ts`,
@@ -404,6 +404,11 @@ export function emitUplinkNetns(
 
   const ovnSide = u.addresses[0]; // host=1
   const netnsSide = u.addresses[1]; // host=2
+  if (!ovnSide || !netnsSide) {
+    throw new Error(
+      `uplink "${u.name}" is missing its transfer-link addresses`,
+    );
+  }
 
   const lines: string[] = [`# --- uplink: ${u.name} (netns side) ---`];
 
@@ -457,7 +462,7 @@ export function emitUplinkNetns(
   // of its own — it's a separate, always-useful bootstrap path (see
   // Backdoor, types.ts), not a substitute for one except in the
   // "dummy" placeholder case (see realIfaceFor above).
-  if (u.backdoor !== undefined) {
+  if (u.backdoor) {
     lines.push(...emitBackdoorVethAndRoute(u, u.backdoor));
   }
   if (u.if.kind === "wireguard") {
@@ -468,7 +473,7 @@ export function emitUplinkNetns(
     // Same "real interface of its own, alongside any backdoor" shape
     // as wireguard above.
     lines.push(...emitZerotierInterface(u, ns, u.if));
-  } else if (u.backdoor === undefined) {
+  } else if (!u.backdoor) {
     // No backdoor AND no wireguard tunnel: fall through to the plain
     // vlan/dummy/physical creation. (When a backdoor IS present and
     // `u.if.kind === "dummy"`, realIface already resolved to the
@@ -527,6 +532,7 @@ export function emitUplinkNetns(
   // exactly the same as writing the bare network address would.
   for (const seg of segmentsOnThisUplink) {
     const segAddr = seg.addresses[0];
+    if (!segAddr) continue;
     if (u.nat?.ipv4?.some((r) => r.kind === "masq")) {
       lines.push(
         `ip netns exec ${ns} iptables -t nat -C POSTROUTING -s ` +
@@ -589,6 +595,11 @@ export function emitBackdoorVethAndRoute(u: Uplink, bd: Backdoor): string[] {
   const vNetns = backdoorVethNetns(bd);
   const ovnSide = bd.addresses[0]; // host=3, lives on the `via` router
   const netnsSide = bd.addresses[1]; // host=4, lives in this uplink's netns
+  if (!ovnSide || !netnsSide) {
+    throw new Error(
+      `backdoor for uplink "${u.name}" is missing its transfer-link addresses`,
+    );
+  }
 
   const lines: string[] = [
     `# --- backdoor: ${u.name} -> ${bd.via.name} (borrowed egress, netns side) ---`,
@@ -682,11 +693,11 @@ export function emitBackdoorNat(
   segmentsOnThisUplink: readonly Segment[],
 ): string[] {
   const bd = u.backdoor;
-  if (bd === undefined) return [];
+  if (!bd) return [];
 
   const viaNs = netnsName(bd.via);
   const viaRealIface = realIfaceFor(bd.via);
-  if (viaRealIface === undefined) return [];
+  if (!viaRealIface) return [];
 
   const lines: string[] = [];
 
@@ -694,6 +705,7 @@ export function emitBackdoorNat(
     // Backdoor IS u's realIface — NAT scoped per resolving segment.
     for (const seg of segmentsOnThisUplink) {
       const segAddr = seg.addresses[0];
+      if (!segAddr) continue;
       if (bd.via.nat?.ipv4?.some((r) => r.kind === "masq")) {
         lines.push(
           `ip netns exec ${viaNs} iptables -t nat -C POSTROUTING -s ` +
@@ -716,6 +728,7 @@ export function emitBackdoorNat(
     // carries ITS bootstrap traffic, sourced from the backdoor's own
     // transit address, not any segment.
     const netnsSide = bd.addresses[1];
+    if (!netnsSide) return lines;
     if (bd.via.nat?.ipv4?.some((r) => r.kind === "masq")) {
       lines.push(
         `ip netns exec ${viaNs} iptables -t nat -C POSTROUTING -s ` +

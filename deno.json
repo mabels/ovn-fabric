@@ -15,7 +15,9 @@
   },
   "minimumDependencyAge": {
     "age": "P1D",
-    "exclude": ["jsr:@adviser/ipaddress"]
+    "exclude": [
+      "jsr:@adviser/ipaddress"
+    ]
   },
   "tasks": {
     "check": "deno check src/*.ts",
@@ -25,16 +27,39 @@
     "lint": "deno lint"
   },
   "fmt": {
-    "include": ["src/**/*.ts", "examples/**/*.ts"]
+    "include": [
+      "src/**/*.ts",
+      "examples/**/*.ts"
+    ]
   },
   "lint": {
-    "include": ["src/**/*.ts", "examples/**/*.ts"],
+    "include": [
+      "src/**/*.ts",
+      "examples/**/*.ts"
+    ],
     "rules": {
-      "exclude": ["no-import-prefix"]
+      "exclude": [
+        "no-import-prefix"
+      ]
     }
   },
   "publish": {
-    "include": ["src/**/*.ts", "README.md", "LICENSE"],
-    "exclude": ["src/*_test.ts"]
+    "include": [
+      "src/**/*.ts",
+      "README.md",
+      "LICENSE"
+    ],
+    "exclude": [
+      "src/*_test.ts"
+    ]
+  },
+  "compilerOptions": {
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "noPropertyAccessFromIndexSignature": true,
+    "allowUnreachableCode": false,
+    "allowUnusedLabels": false
   }
 }

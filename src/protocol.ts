@@ -120,7 +120,7 @@ export const OvnLrpData = type({
   // was declared, not "set zero keys."
   "ipv6RaConfigs?": { "[string]": "string" },
   // Workloads ATTACHED at this endpoint (endpoint.attachTo) — each is one
-  // NIC for the referenced kernel.service on this endpoint's segment
+  // NIC for the referenced kernel.app.container on this endpoint's segment
   // (2026-09-08).
   "serviceRefs?": ServiceRef.array(),
 });
@@ -321,8 +321,17 @@ export const SecurityGroupNode = type({
 // referencing endpoint. One service referenced by N endpoints = one
 // container with N NICs (the k8s pod model, 2026-09-08).
 export const KernelServiceKey = type({ name: "string" });
-export const KernelServiceData = type({
-  // `host:<name>` — the referenced infra.host id the container runs on.
+// A service's WORKLOAD is its NODE KIND — exactly TWO generic kinds, NOT
+// nested inside a `kernel.service` envelope. The IR (and the deployer) know
+// NOTHING about wireguard/zerotier: those are CONFIG-side shortcuts
+// (types.ts/define.ts) that map onto `kernel.app.service` with their
+// command/configs/deps. `host` is the `host:<name>` id. A workload carries
+// NO network of its own — its NICs come from the endpoints that reference
+// it (OvnLrpData.serviceRefs).
+//
+// `kernel.app.container` — a docker container the host runs; the deployer
+// performs the netns magic (veth injection) on it.
+export const KernelAppContainerData = type({
   host: "string",
   image: "string",
   "cmd?": "string[]",
@@ -331,12 +340,37 @@ export const KernelServiceData = type({
     "packages?": "string[]",
     "dockerfile?": "string",
   },
+  "deps?": "string[]",
 });
-export const KernelServiceNode = type({
+// `kernel.app.service` — a netns + a NAMED PROCESS to start/stop. Generic:
+// the command, its stop counterpart, any config FILES to write first, and
+// its abstract `deps` are all data — no wireguard/zerotier knowledge here.
+export const KernelAppServiceFile = type({
+  path: "string",
+  content: "string",
+});
+export const KernelAppServiceData = type({
+  host: "string",
+  // Start/stop argv, run INSIDE the service's netns.
+  up: "string[]",
+  "down?": "string[]",
+  // Files written before `up` (e.g. a wg conf) — {path, content}.
+  "files?": KernelAppServiceFile.array(),
+  // ABSTRACT requirements (e.g. "wireguard-tools", "zerotier-one") — the
+  // deployer maps these to the host OS's concrete packages.
+  "deps?": "string[]",
+});
+export const KernelAppContainerNode = type({
   id: "string",
-  kind: "'kernel.service'",
+  kind: "'kernel.app.container'",
   key: KernelServiceKey,
-  data: KernelServiceData,
+  data: KernelAppContainerData,
+});
+export const KernelAppServiceNode = type({
+  id: "string",
+  kind: "'kernel.app.service'",
+  key: KernelServiceKey,
+  data: KernelAppServiceData,
 });
 
 export const IRNode = InfraHostNode.or(OvnLsNode).or(OvnLrpNode).or(
@@ -348,7 +382,9 @@ export const IRNode = InfraHostNode.or(OvnLsNode).or(OvnLrpNode).or(
 ).or(
   SecurityGroupNode,
 ).or(
-  KernelServiceNode,
+  KernelAppContainerNode,
+).or(
+  KernelAppServiceNode,
 );
 
 // Every node kind's envelope has the exact same shape (id: string,
@@ -401,11 +437,18 @@ export function buildJsonSchema(): Record<string, unknown> {
     ),
     ServiceRef: ServiceRef.toJsonSchema(),
     KernelServiceKey: KernelServiceKey.toJsonSchema(),
-    KernelServiceData: KernelServiceData.toJsonSchema(),
-    KernelServiceNode: nodeSchema(
-      "kernel.service",
+    KernelAppServiceFile: KernelAppServiceFile.toJsonSchema(),
+    KernelAppContainerData: KernelAppContainerData.toJsonSchema(),
+    KernelAppServiceData: KernelAppServiceData.toJsonSchema(),
+    KernelAppContainerNode: nodeSchema(
+      "kernel.app.container",
       "KernelServiceKey",
-      "KernelServiceData",
+      "KernelAppContainerData",
+    ),
+    KernelAppServiceNode: nodeSchema(
+      "kernel.app.service",
+      "KernelServiceKey",
+      "KernelAppServiceData",
     ),
   };
   return {
@@ -419,7 +462,8 @@ export function buildJsonSchema(): Record<string, unknown> {
       "Ipv6RouteNode",
       "KernelRouterNode",
       "SecurityGroupNode",
-      "KernelServiceNode",
+      "KernelAppContainerNode",
+      "KernelAppServiceNode",
     ].map((
       name,
     ) => ({

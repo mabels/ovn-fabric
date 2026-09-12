@@ -1458,8 +1458,8 @@ def _service_faces(service_name: str, host_name: str, nodes: list[pt.Model]):
     nic) — `dev` is the root-side leg; `nic` is the IN-CONTAINER interface
     name, already RESOLVED by the generator (ServiceRef.name — the deployer
     never shortens). Derived from every ovn.lrp that REFERENCES this
-    service (`kernel.service:<name>`) — the endpoint carries the attachment."""
-    service_id = f"kernel.service:{service_name}"
+    service (`kernel.app.container:<name>`) — the endpoint carries the attachment."""
+    service_id = f"kernel.app.container:{service_name}"
     base = hashlib.md5(service_name.encode()).hexdigest()[:8]
     out = []
     i = 0
@@ -1475,14 +1475,22 @@ def _service_faces(service_name: str, host_name: str, nodes: list[pt.Model]):
     return out
 
 
-def _service_up_lines(node: pt.KernelServiceNode, faces) -> list[str]:
+def _service_up_lines(
+    node: pt.KernelAppContainerNode | pt.KernelAppServiceNode,
+    faces,
+) -> list[str]:
     """The `up` body: build/run the container, then for EACH NIC (from a
     referencing endpoint) move a veth into its netns, name it after the
     segment, apply that reference's ipaddrs/routes, and bind the root leg
     into the segment's OVS bridge."""
+    if node.kind != "kernel.app.container":
+        raise NotImplementedError(
+            f"'{node.kind}' service '{node.key.name}': rendering this "
+            f"workload is not implemented yet"
+        )
     cmd_tokens = " ".join(shlex.quote(t) for t in (node.data.cmd or []))
     lines = [
-        f'container="{node.key.name}"',
+        f'container="ovn-fabric-{node.key.name}"',
         f'image="{node.data.image}"',
         "",
         *_docker_image_ensure_lines(node.data.build, node.data.image),
@@ -1519,16 +1527,19 @@ def _service_up_lines(node: pt.KernelServiceNode, faces) -> list[str]:
     return lines
 
 
-def _service_down_lines(node: pt.KernelServiceNode, faces) -> list[str]:
+def _service_down_lines(
+    node: pt.KernelAppContainerNode | pt.KernelAppServiceNode,
+    faces,
+) -> list[str]:
     """The `down` body: remove the container (which destroys its netns and
     the moved-in NICs), then its root legs and bridge ports."""
-    lines = [f'/usr/bin/docker rm -f "{node.key.name}" 2>/dev/null || true']
+    lines = [f'/usr/bin/docker rm -f "ovn-fabric-{node.key.name}" 2>/dev/null || true']
     for _i, _ref, bridge, dev, _nic in faces:
         lines += [
             f'/usr/bin/ovs-vsctl --if-exists del-port "{bridge}" "{dev}"',
             f'ip link delete "{dev}" 2>/dev/null || true',
         ]
-    lines.append(f'rm -f "/var/run/netns/{node.key.name}"')
+    lines.append(f'rm -f "/var/run/netns/ovn-fabric-{node.key.name}"')
     return lines
 
 
@@ -1585,7 +1596,11 @@ def _emit_kernel_services(host_id: str, nodes: list[pt.Model], emit: Emitter) ->
     mechanics as the kernel router. Runs AFTER _emit_iface_bindings so the
     segment bridges already exist (2026-09-08)."""
     host_name = host_id.split(":", 1)[1]
-    services = [n for n in nodes if n.kind == "kernel.service" and n.data.host == host_id]
+    services = [
+        n
+        for n in nodes
+        if n.kind in ("kernel.app.container", "kernel.app.service") and n.data.host == host_id
+    ]
     for node in services:
         name = node.key.name
         faces = _service_faces(name, host_name, nodes)

@@ -42,7 +42,6 @@ import type {
   KernelRouter,
   OvnRouterEndpoint,
   Router,
-  RouterEndpointAttachment,
   RouterEndpointService,
   RoutingDomain,
   SecurityGroup,
@@ -97,7 +96,7 @@ function resolveEncapIp(host: Host): string | undefined {
 // deliberately NO deinstall.
 function hostDependencies(host: Host, network: NetworkDefinition): string[] {
   const deps = new Set<string>();
-  if (host.ovn !== undefined) {
+  if (host.ovn) {
     deps.add("ovn");
     deps.add("ovs");
   }
@@ -178,7 +177,7 @@ function transitPeer(
   kernelRouter: KernelRouter,
   routers: readonly Router[],
 ): { readonly router: Router; readonly side: "left" | "right" } | undefined {
-  if (kernelRouter.transitDomain === undefined) return undefined;
+  if (!kernelRouter.transitDomain) return undefined;
   for (const router of routers) {
     for (const side of ["left", "right"] as const) {
       const endpoint = router[side];
@@ -224,7 +223,7 @@ function kernelRouterBackRoutes(
   routeNodes: readonly IRNode[],
 ): Array<{ dst: string; via: string }> {
   const peer = transitPeer(kernelRouter, routers);
-  if (peer === undefined) return [];
+  if (!peer) return [];
   // .to_s() (bare, no prefix length), not addrStrings()'s .to_string() —
   // a route node's own `nexthop` is always stored bare (routeToIR
   // above: `nexthop: nexthop.to_s()`), so comparing against it needs
@@ -243,19 +242,19 @@ function kernelRouterBackRoutes(
   );
   const rightApplied = new Set(
     (kernelRouter.right.routes ?? [])
-      .filter((r) => r.via !== undefined)
+      .filter((r) => r.via)
       .map((r) => r.dst.to_string()),
   );
   const routes: Array<{ dst: string; via: string }> = [];
   for (const node of routeNodes) {
-    if (node.key.ovnrouter !== peer.router.name) continue;
-    if (!ownDomains.has(node.data.domain as string)) continue;
-    const nexthop = node.data.nexthop as string;
+    if (node.key["ovnrouter"] !== peer.router.name) continue;
+    if (!ownDomains.has(node.data["domain"] as string)) continue;
+    const nexthop = node.data["nexthop"] as string;
     if (ownAddrs.has(nexthop)) continue;
-    const prefix = node.key.prefix as string;
+    const prefix = node.key["prefix"] as string;
     if (rightApplied.has(prefix)) continue;
     const via = peerAddrs.find((a) => a.is_ipv4() === !prefix.includes(":"));
-    if (via === undefined) continue;
+    if (!via) continue;
     routes.push({ dst: prefix, via: via.to_s() });
   }
   return routes;
@@ -300,11 +299,11 @@ function kernelRouterSideToIR(
   routeNodes: readonly IRNode[],
 ): IRNode {
   const id = `kernelrouter:${router.name}|side:${side}`;
-  const inDomain = router.routingDomains !== undefined &&
+  const inDomain = router.routingDomains &&
     router.routingDomains.length > 0;
   const declaredRoutes = inDomain
     ? router[side].routes
-      ?.filter((r) => r.via !== undefined)
+      ?.filter((r) => r.via)
       .map((r) => ({ dst: r.dst.to_string(), via: r.via!.to_s() }))
     : undefined;
   const backRoutes = side === "left"
@@ -337,7 +336,7 @@ function kernelRouterSideToIR(
       host: `host:${router.host.name}`,
       ipaddrs: addrStrings(router[side].ipaddrs),
       routes: routes.length > 0 ? routes : undefined,
-      ifaces: ifaces !== undefined && ifaces.length > 0 ? ifaces : undefined,
+      ifaces: ifaces && ifaces.length > 0 ? ifaces : undefined,
       // The tunnel router's UPSTREAM peer address (tunnelRouterEndpoint(),
       // define.ts) — the OTHER end of the upstream veth (right side only):
       // the deployer brings that peer leg UP and assigns it this address
@@ -367,7 +366,7 @@ function kernelRouterSideToIR(
         // else in this file. An interface-OWNING docker (no veth addressing,
         // e.g. dhcpcd-in-docker) gets NO veth fields — its "owns the
         // interfaces" is exactly the ABSENCE of the veth machinery.
-        if (app.kind === "docker" && app.ip !== undefined) {
+        if (app.kind === "docker" && app.ip) {
           const hash = fnv1a32(app.name).toString(16).padStart(8, "0");
           return { ...app, vethName: `ve-${hash}` };
         }
@@ -526,9 +525,9 @@ function collisionDomainToIR(
 // IPv4 in ipaddrs — required to exist as one or the other, since an
 // LRP with no mac at all can't be created.
 function resolveMac(lrp: string, endpoint: OvnRouterEndpoint): string {
-  if (endpoint.mac !== undefined) return endpoint.mac;
+  if (endpoint.mac) return endpoint.mac;
   const v4 = endpoint.ipaddrs.find((addr): addr is IPv4 => addr.is_ipv4());
-  if (v4 === undefined) {
+  if (!v4) {
     throw new Error(
       `${lrp}: no IPv4 address to derive a MAC from, and no explicit ` +
         `RouterEndpoint.mac override`,
@@ -561,26 +560,26 @@ function isKernelService(
 
 function resolveIpv6RaConfigs(
   services:
-    | readonly (RouterEndpointService | RouterEndpointAttachment)[]
+    | readonly RouterEndpointService[]
     | undefined,
 ): Record<string, string> | undefined {
-  if (services === undefined || services.length === 0) return undefined;
+  if (!services || services.length === 0) return undefined;
   const configs: Record<string, string> = {};
   for (const service of services) {
     // A service ATTACHMENT (endpoint.attachTo) is a workload NIC, not an
     // LRP config — a workload attachment is emitted as a serviceRef, skip here.
     if (service.kind === "service.attach") continue;
     if (service.kind === "ipv6.slaac") {
-      configs.address_mode = "slaac";
+      configs["address_mode"] = "slaac";
       continue;
     }
     if (service.kind === "ipv6.ra") {
-      configs.send_periodic = "true";
-      if (service.minInterval !== undefined) {
-        configs.min_interval = String(service.minInterval);
+      configs["send_periodic"] = "true";
+      if (service.minInterval) {
+        configs["min_interval"] = String(service.minInterval);
       }
-      if (service.maxInterval !== undefined) {
-        configs.max_interval = String(service.maxInterval);
+      if (service.maxInterval) {
+        configs["max_interval"] = String(service.maxInterval);
       }
       continue;
     }
@@ -592,11 +591,18 @@ function resolveIpv6RaConfigs(
     // A `kernel.*` service reaching an OVN endpoint is now LEGITIMATE: a
     // `kernel.app.docker` listed on a plain ovnRouterEndpoint's services[]
     // is a container the leg's host exposes on that segment (emitted as a
-    // kernel.service node, see resolveServiceRefs/serviceNodes) — it produces
+    // kernel.app.container node, see resolveServiceRefs/serviceNodes) — it produces
     // no RA config here, so skip it. Kernel-router services are otherwise
     // still split off in buildKernelRouterEndpoint before the OVN endpoint
     // is built.
     if (isKernelService(service)) {
+      continue;
+    }
+    // Config-side workload shortcuts (wireguard/zerotier) are consumed by
+    // buildTunnelRouterEndpoint and never reach an OVN endpoint's services
+    // (they'd be a config error if they did) — skip so the exhaustiveness
+    // check below stays meaningful (2026-09-08).
+    if (service.kind === "wireguard" || service.kind === "zerotier") {
       continue;
     }
     const unknownKind: never = service;
@@ -637,7 +643,7 @@ function routerEndpointToIR(
 }
 
 // A workload attachment at this endpoint — REFERENCES the
-// `kernel.service:<name>` node, with this segment's addressing. `routes`
+// `kernel.app.container:<name>` node, with this segment's addressing. `routes`
 // is explicit, else (only on the PRIMARY reference) a default per family
 // via this endpoint's own address (the segment gateway); an off-segment
 // `via` is unreachable on this L2 and throws (2026-09-08).
@@ -656,11 +662,11 @@ function resolveServiceRefs(
   );
   if (refs.length === 0) return undefined;
   return refs.map((ref) => {
-    const routes = ref.routes !== undefined && ref.routes.length > 0
+    const routes = ref.routes && ref.routes.length > 0
       ? ref.routes.map((r) => {
-        if (r.via !== undefined && !viaIsOnSegment(endpoint, r.via)) {
+        if (r.via && !viaIsOnSegment(endpoint, r.via)) {
           throw new Error(
-            `service "${ref.service.name}" on ${router.name} (${side}): route ` +
+            `service "${ref.srvRef.name}" on ${router.name} (${side}): route ` +
               `${r.dst.to_string()} via ${r.via.to_s()} — the via is not on ` +
               `segment "${endpoint.l2Segment.name}" (${
                 endpoint.ipaddrs.map((a) => a.to_string()).join(", ")
@@ -669,12 +675,12 @@ function resolveServiceRefs(
         }
         return {
           dst: r.dst.to_string(),
-          ...(r.via !== undefined ? { via: r.via.to_s() } : {}),
+          ...(r.via ? { via: r.via.to_s() } : {}),
         };
       })
       : (ref.primary ? defaultRoutesViaEndpoint(endpoint) : []);
     return {
-      service: `kernel.service:${ref.service.name}`,
+      service: `kernel.app.container:${ref.srvRef.name}`,
       // The in-container NIC name — resolved HERE (generator side), not by
       // the deployer: the segment name when it fits IFNAMSIZ, else the fnv1a
       // short form (shortIfaceName, same rule as every other short name).
@@ -871,14 +877,14 @@ function computeRoutes(network: NetworkDefinition): IRNode[] {
               // toward it — they always should (confirmed live,
               // 2026-08-12), so this `continue` is scoped to the
               // anchor's own branch, not the whole route entry.
-              if (route.via === undefined) continue;
+              if (!route.via) continue;
               nodes.push(
                 routeToIR(router, route.dst, route.via, masq, domain.name),
               );
               continue;
             }
             const nexthop = anchorAddressSharedWith(router, anchor, route.dst);
-            if (nexthop === undefined) continue; // no shared domain / family with the anchor
+            if (!nexthop) continue; // no shared domain / family with the anchor
             // A router's OWN declared route to this prefix is its own
             // authoritative egress — don't overwrite it with a learned one
             // (e.g. a full-tunnel router must keep its tunnel egress, not
@@ -914,7 +920,7 @@ function computeRoutes(network: NetworkDefinition): IRNode[] {
 // BOTH members of the SAME RoutingDomain — same scope computeRoutes
 // already uses for `participants`. This still runs "any ways", i.e.
 // unconditionally on whether that domain's own `route.via` entries
-// resolve for a given family (see computeRoutes's `via === undefined`
+// resolve for a given family (see computeRoutes's `!via`
 // skip, e.g. IPv6 default via SLAAC/RA) — a domain's participants
 // still need direct routes to each other's own subnets regardless of
 // whether the domain also has an external via-route.
@@ -961,7 +967,8 @@ function computeInterconnectRoutes(network: NetworkDefinition): IRNode[] {
 }
 
 // A `kernel.app.docker` service listed on a segment-facing OVN endpoint's
-// services[] resolves into one `kernel.service` node per referenced service\n// (the workload), with the referencing endpoints carrying the NICs: a
+// services[] resolves into one `kernel.app.container` node per referenced
+// service (the workload), with the referencing endpoints carrying the NICs: a
 // container the endpoint's leg HOST runs, bound to the leg's collision
 // domain (an L2 endpoint on that segment, not a router) (2026-09-08).
 // A container with no declared routes defaults out the endpoint that hosts
@@ -996,7 +1003,7 @@ function viaIsOnSegment(
   return false;
 }
 
-// One `kernel.service` node per referenced workload — the image/cmd/build
+// One `kernel.app.container` node per referenced workload — the image/cmd/build
 // plus the host it runs on. Networks are NOT here: they live on the
 // endpoints that reference this service (OvnLrpData.serviceRefs,
 // resolveServiceRefs above), so the container's NICs are DERIVED from the
@@ -1009,9 +1016,9 @@ function serviceNodes(network: NetworkDefinition): IRNode[] {
       if (endpoint.kind !== "ovn") continue;
       for (const entry of endpoint.services ?? []) {
         if (entry.kind !== "service.attach") continue;
-        const service = entry.service;
+        const service = entry.srvRef;
         const hostName = endpoint.ifaces?.[0]?.host.name;
-        if (hostName === undefined) {
+        if (!hostName) {
           throw new Error(
             `service "${service.name}": attached at ${router.name} (${side}) ` +
               `but that endpoint has no ifaces to name the host running the ` +
@@ -1019,7 +1026,7 @@ function serviceNodes(network: NetworkDefinition): IRNode[] {
           );
         }
         const known = hosts.get(service);
-        if (known === undefined) {
+        if (!known) {
           hosts.set(service, hostName);
         } else if (known !== hostName) {
           throw new Error(
@@ -1033,15 +1040,17 @@ function serviceNodes(network: NetworkDefinition): IRNode[] {
 
   const out: IRNode[] = [];
   for (const [service, hostName] of hosts) {
+    // A net.service is a docker container → the node kind IS the workload
+    // kind (`kernel.app.container`), no `kernel.service` envelope.
     out.push({
-      id: `kernel.service:${service.name}`,
-      kind: "kernel.service",
+      id: `kernel.app.container:${service.name}`,
+      kind: "kernel.app.container",
       key: { name: service.name },
       data: {
         host: `host:${hostName}`,
         image: service.image,
-        ...(service.cmd !== undefined ? { cmd: service.cmd } : {}),
-        ...(service.build !== undefined ? { build: service.build } : {}),
+        ...(service.cmd ? { cmd: service.cmd } : {}),
+        ...(service.build ? { build: service.build } : {}),
       },
     } as IRNode);
   }
@@ -1080,7 +1089,7 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
     }
   }
 
-  // Workloads: one `kernel.service` node per referenced service; the
+  // Workloads: one `kernel.app.container` node per referenced service; the
   // endpoints referencing it carry the NICs (OvnLrpData.serviceRefs,
   // emitted in the router loop above) (2026-09-08).
   for (const service of serviceNodes(network)) {

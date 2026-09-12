@@ -17,14 +17,24 @@ import type { CollisionDomain, Service } from "./types.ts";
 // collisionDomainToIR's own doc comment, src/ir.ts) — so exercising it
 // needs a domain with at least one real-world-bound interface, not a
 // bare collision domain.
+// Fails loudly if the IR node the test asked for is missing, instead of
+// letting a later property access blow up with a TypeError.
+function node(nodes: Record<string, IRNode>, key: string): IRNode {
+  const found = nodes[key];
+  if (!found) throw new Error(`missing IR node: ${key}`);
+  return found;
+}
+
 function lsShortIfaceName(
   nodes: Record<string, IRNode>,
   domain: string,
 ): string {
-  const interfaces = nodes[`ls:${domain}`].data.interfaces as Array<
+  const interfaces = node(nodes, `ls:${domain}`).data["interfaces"] as Array<
     { iface: Record<string, unknown> }
   >;
-  return interfaces[0].iface.shortName as string;
+  const first = interfaces[0];
+  if (!first) throw new Error(`no interfaces on ls:${domain}`);
+  return first.iface["shortName"] as string;
 }
 
 function networkWithBoundDomain(domainName: string) {
@@ -111,16 +121,16 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
   });
 
   const nodes = toIR(network);
-  const right = nodes["kernelrouter:router-wan|side:right"];
-  assertEquals(right.data.ipaddrs, ["192.168.132.93/24"]);
-  assertEquals(right.data.ifaces, [
+  const right = node(nodes, "kernelrouter:router-wan|side:right");
+  assertEquals(right.data["ipaddrs"], ["192.168.132.93/24"]);
+  assertEquals(right.data["ifaces"], [
     {
       host: "chassis-1",
       iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 },
     },
   ]);
 
-  const left = nodes["kernelrouter:router-wan|side:left"];
+  const left = node(nodes, "kernelrouter:router-wan|side:left");
   // The transit leg's own veth pair, constructed implicitly in
   // buildKernelRouterEndpoint from the ovnRouter() name — the LONG leg
   // names exceed IFNAMSIZ, so the IR resolves the IFNAMSIZ-safe
@@ -130,7 +140,7 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
     0,
     6,
   );
-  assertEquals(left.data.ifaces, [
+  assertEquals(left.data["ifaces"], [
     {
       host: "chassis-1",
       iface: {
@@ -147,8 +157,8 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
   // (so the deployer attaches the actual created devices), plus the
   // bridge `shortName` (readable/hash, same rule shortIfaceName applies
   // everywhere; "br-transit-router-wan" exceeds IFNAMSIZ).
-  const transitLs = nodes["ls:transit-router-wan"];
-  assertEquals(transitLs.data.interfaces, [
+  const transitLs = node(nodes, "ls:transit-router-wan");
+  assertEquals(transitLs.data["interfaces"], [
     {
       host: "chassis-1",
       iface: {
@@ -212,21 +222,21 @@ Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes 
   // own `right` (asserted by the sibling test above). And no ipv6_ra
   // configs: the kernel.* services were split off, never reaching the
   // OVN endpoint's RA handling.
-  const leftLrp = nodes["ovnrouter:router-wan|lrp:left"];
-  assertEquals(leftLrp.data.addresses, [
+  const leftLrp = node(nodes, "ovnrouter:router-wan|lrp:left");
+  assertEquals(leftLrp.data["addresses"], [
     "10.12.80.1/28",
     "fd00::10:12:80:1/124",
   ]);
-  assertEquals(leftLrp.data.ipv6RaConfigs, undefined);
+  assertEquals(leftLrp.data["ipv6RaConfigs"], undefined);
 
   // Both default routes point at the kernel router's transit side, even
   // though the v4 one was declared with a literal ISP `via`.
   assertEquals(
-    nodes["ovnrouter:router-wan|route:0.0.0.0/0"].data.nexthop,
+    node(nodes, "ovnrouter:router-wan|route:0.0.0.0/0").data["nexthop"],
     "10.12.80.14",
   );
   assertEquals(
-    nodes["ovnrouter:router-wan|route:::/0"].data.nexthop,
+    node(nodes, "ovnrouter:router-wan|route:::/0").data["nexthop"],
     "fd00::10:12:80:f",
   );
 
@@ -234,11 +244,11 @@ Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes 
   // net.securityGroup()) to a group named `masq-<router>` attached to
   // the kernel router's RIGHT (WAN) side, emitted as an
   // implementation-abstract `security.group` node carrying the rules.
-  const right = nodes["kernelrouter:router-wan|side:right"];
-  assertEquals(right.data.securityGroup, "masq-router-wan");
-  const left = nodes["kernelrouter:router-wan|side:left"];
-  assertEquals(left.data.securityGroup, undefined);
-  assertEquals(nodes["securitygroup:masq-router-wan"].data.rules, [
+  const right = node(nodes, "kernelrouter:router-wan|side:right");
+  assertEquals(right.data["securityGroup"], "masq-router-wan");
+  const left = node(nodes, "kernelrouter:router-wan|side:left");
+  assertEquals(left.data["securityGroup"], undefined);
+  assertEquals(node(nodes, "securitygroup:masq-router-wan").data["rules"], [
     { family: "ipv4", kind: "masq" },
     { family: "ipv6", kind: "masq" },
   ]);
@@ -282,10 +292,10 @@ Deno.test("kernelRouterEndpoint: explicit security group wins, masq services are
   // The explicit group is attached, exactly as built (ipv4-only masq);
   // the services' ipv6 masq never made it in.
   assertEquals(
-    nodes["kernelrouter:router-wan|side:right"].data.securityGroup,
+    node(nodes, "kernelrouter:router-wan|side:right").data["securityGroup"],
     "wan-out",
   );
-  assertEquals(nodes["securitygroup:wan-out"].data.rules, [
+  assertEquals(node(nodes, "securitygroup:wan-out").data["rules"], [
     { family: "ipv4", kind: "masq" },
   ]);
   assertEquals(nodes["securitygroup:masq-router-wan"], undefined);
@@ -355,7 +365,9 @@ Deno.test("securityGroup builder: accumulates rules, registers once, rejects dup
     return { routers: [] };
   });
   assertEquals(network.allSecurityGroups.length, 1);
-  assertEquals(network.allSecurityGroups[0].name, "g1");
+  const firstGroup = network.allSecurityGroups[0];
+  if (!firstGroup) throw new Error("expected one security group");
+  assertEquals(firstGroup.name, "g1");
 });
 
 // `kernel.app.*` services resolve to KernelApp descriptors carried on
@@ -390,7 +402,7 @@ Deno.test("kernelRouterEndpoint: kernel.app services resolve to app descriptors 
   const nodes = toIR(network);
   // dhcpcd is expressed as a generic docker app that OWNS the router's
   // interfaces, with an auto-build for the dhcpcd image.
-  assertEquals(nodes["kernelrouter:router-wan|side:right"].data.apps, [
+  assertEquals(node(nodes, "kernelrouter:router-wan|side:right").data["apps"], [
     {
       kind: "docker",
       image: "ovn-fabric-router-wan",
@@ -401,10 +413,13 @@ Deno.test("kernelRouterEndpoint: kernel.app services resolve to app descriptors 
       // exactly the ABSENCE of the veth machinery (no ip/routerIp/vethName).
     },
   ]);
-  assertEquals(nodes["kernelrouter:router-wan|side:left"].data.apps, undefined);
+  assertEquals(
+    node(nodes, "kernelrouter:router-wan|side:left").data["apps"],
+    undefined,
+  );
   // The kernel.app service was split off, never becoming an RA config.
   assertEquals(
-    nodes["ovnrouter:router-wan|lrp:left"].data.ipv6RaConfigs,
+    node(nodes, "ovnrouter:router-wan|lrp:left").data["ipv6RaConfigs"],
     undefined,
   );
 });
@@ -452,7 +467,7 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker resolves router-prefixed name
   const nodes = toIR(network);
   // The veth prefix is a short `ve-<hash>` derived from the container
   // name (same fnv1a32 rule shortIfaceName applies).
-  assertEquals(nodes["kernelrouter:router-wan|side:right"].data.apps, [
+  assertEquals(node(nodes, "kernelrouter:router-wan|side:right").data["apps"], [
     {
       kind: "docker",
       image: "ubuntu",
@@ -496,7 +511,7 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker without ip gets a determinist
   });
 
   const nodes = toIR(network);
-  assertEquals(nodes["kernelrouter:router-wan|side:right"].data.apps, [
+  assertEquals(node(nodes, "kernelrouter:router-wan|side:right").data["apps"], [
     {
       kind: "docker",
       image: "ubuntu",
@@ -544,7 +559,7 @@ Deno.test("kernelRouterEndpoint: builder function + buildAppDocker, image defaul
   });
 
   const nodes = toIR(network);
-  assertEquals(nodes["kernelrouter:router-wan|side:right"].data.apps, [
+  assertEquals(node(nodes, "kernelrouter:router-wan|side:right").data["apps"], [
     {
       kind: "docker",
       image: "ovn-fabric-router-wan",
@@ -583,21 +598,23 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
           IPv4.parse("10.12.82.1/28"),
           IPv6.parse("fd00::10:12:82:1/124"),
         ),
-        tunnel: {
-          kind: "wireguard",
-          ifaceName: "mullvad-de",
-          config: {
-            privateKey: "k",
-            address: "10.64.56.207/32",
-            peer: {
-              publicKey: "p",
-              allowedIps: "0.0.0.0/0",
-              endpoint: "1.2.3.4:51820",
-            },
-          },
-        },
         routes: [{ dst: IPv4.parse("0.0.0.0/0") }],
-        services: [{ kind: "kernel.ipv4.masq" }, { kind: "kernel.ipv6.masq" }],
+        services: [
+          {
+            kind: "wireguard",
+            ifaceName: "mullvad-de",
+            config: {
+              privateKey: "k",
+              address: "10.64.56.207/32",
+              peer: {
+                publicKey: "p",
+                allowedIps: "0.0.0.0/0",
+                endpoint: "1.2.3.4:51820",
+              },
+            },
+            masq: ["ipv4", "ipv6"],
+          },
+        ],
         upstreamBackbone: {
           l2Segment: backbone,
           ipaddrs: [IPv4.parse("172.22.0.150/16")],
@@ -644,7 +661,7 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
   const nodes = toIR(network);
   // neighbor defaults out the tunnel (rewritten to its backbone addr).
   assertEquals(
-    nodes["ovnrouter:router-neighbor|route:0.0.0.0/0"].data,
+    node(nodes, "ovnrouter:router-neighbor|route:0.0.0.0/0").data,
     { nexthop: "172.22.0.140", masq: false, domain: "Neighbor-defaultRoute" },
   );
   // No leakage: the tunnel default stays inside Neighbor-defaultRoute,
@@ -653,18 +670,18 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
   // side, keeps its OWN tunnel egress (0.0.0.0/0 -> its netns) instead
   // of overwriting it with voda's learned default (2026-08-30).
   assertEquals(
-    nodes["ovnrouter:router-voda|route:0.0.0.0/0"].data,
+    node(nodes, "ovnrouter:router-voda|route:0.0.0.0/0").data,
     { nexthop: "192.168.132.1", masq: false, domain: "Voda-defaultRoute" },
   );
   assertEquals(
-    nodes["ovnrouter:router-mullvad-de|route:0.0.0.0/0"].data,
+    node(nodes, "ovnrouter:router-mullvad-de|route:0.0.0.0/0").data,
     { nexthop: "10.12.81.14", masq: false, domain: "Neighbor-defaultRoute" },
   );
   // The netns backroutes are scoped to the tunnel router's OWN domain:
   // only the neighbor subnet comes back into the netns (no home/voda
   // leakage) — the whole point of the separate domains.
   assertEquals(
-    nodes["kernelrouter:router-mullvad-de|side:left"].data.routes,
+    node(nodes, "kernelrouter:router-mullvad-de|side:left").data["routes"],
     [{ dst: "192.168.130.0/24", via: "10.12.81.1" }],
   );
 });
@@ -690,12 +707,14 @@ Deno.test("tunnelRouterEndpoint: zerotier carries via-less tunnel routes onto it
           IPv4.parse("10.12.86.1/28"),
           IPv6.parse("fd00::10:12:86:1/124"),
         ),
-        tunnel: {
-          kind: "zerotier",
-          networkId: "02cfbec15c2319ff",
-          instanceDir: "/var/lib/zerotier-one-uplink-zerotier",
-        },
         routes: [{ dst: IPv4.parse("192.168.0.0/16") }],
+        services: [
+          {
+            kind: "zerotier",
+            networkId: "02cfbec15c2319ff",
+            instanceDir: "/var/lib/zerotier-one-uplink-zerotier",
+          },
+        ],
         upstreamBackbone: {
           l2Segment: backbone,
           ipaddrs: [IPv4.parse("172.22.0.152/16")],
@@ -711,7 +730,7 @@ Deno.test("tunnelRouterEndpoint: zerotier carries via-less tunnel routes onto it
   });
   const nodes = toIR(network);
   // The netns wire script gets the via-less supernet to egress the tunnel.
-  const right = nodes["kernelrouter:router-zerotier|side:right"].data as {
+  const right = node(nodes, "kernelrouter:router-zerotier|side:right").data as {
     apps?: Array<{ kind: string; routes?: Array<{ dst: string }> }>;
   };
   const app = right.apps?.find((a) => a.kind === "zerotier");
@@ -721,7 +740,7 @@ Deno.test("tunnelRouterEndpoint: zerotier carries via-less tunnel routes onto it
   // otherwise it has no way to send ztnet traffic to the tunnel
   // (2026-08-30).
   assertEquals(
-    nodes["ovnrouter:router-zerotier|route:192.168.0.0/16"].data,
+    node(nodes, "ovnrouter:router-zerotier|route:192.168.0.0/16").data,
     { nexthop: "10.12.85.14", masq: false, domain: "Zerotier-route" },
   );
 });
@@ -738,7 +757,7 @@ Deno.test("tunnelRouterEndpoint: zerotier instanceDir is derived from the router
         host,
         transit: transitNetwork(IPv4.parse("10.12.85.1/28")),
         upstream: transitNetwork(IPv4.parse("10.12.86.1/28")),
-        tunnel: { kind: "zerotier", networkId: "02cfbec15c2319ff" },
+        services: [{ kind: "zerotier", networkId: "02cfbec15c2319ff" }],
         upstreamBackbone: {
           l2Segment: backbone,
           ipaddrs: [IPv4.parse("172.22.0.152/16")],
@@ -753,7 +772,7 @@ Deno.test("tunnelRouterEndpoint: zerotier instanceDir is derived from the router
     return { routers: [r1] };
   });
   const nodes = toIR(network);
-  const right = nodes["kernelrouter:router-zt|side:right"].data as {
+  const right = node(nodes, "kernelrouter:router-zt|side:right").data as {
     apps?: Array<{ kind: string; instanceDir?: string }>;
   };
   const app = right.apps?.find((a) => a.kind === "zerotier");
@@ -797,8 +816,8 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
   });
 
   const nodes = toIR(network);
-  const hostNode = nodes["host:chassis-1"];
-  assertEquals(hostNode.data.dependencies, [
+  const hostNode = node(nodes, "host:chassis-1");
+  assertEquals(hostNode.data["dependencies"], [
     "ovn",
     "ovs",
     "ip",
@@ -806,7 +825,7 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
     "dhclient",
   ]);
   // os not set -> assume Ubuntu (2026-08-23).
-  assertEquals(hostNode.data.os, { name: "ubuntu", version: "26.04" });
+  assertEquals(hostNode.data["os"], { name: "ubuntu", version: "26.04" });
 });
 
 // defineOvnRouter object form (OvnRouterSpec): routingDomains is declared
@@ -841,11 +860,14 @@ Deno.test("defineOvnRouter object form: declarative OvnRouterSpec resolves left/
   });
   assertEquals(network.allRouters.length, 1);
   const r = network.allRouters[0];
+  if (!r) throw new Error("expected one router");
   assertEquals(r.name, "router-x");
   assertEquals(r.routingDomains?.[0]?.name, "Route-D");
   assertEquals(r.left.l2Segment.name, "seg-a");
   assertEquals(r.right.l2Segment.name, "seg-b");
-  assertEquals(r.left.ipaddrs[0].to_string(), "192.168.1.1/24");
+  const firstAddr = r.left.ipaddrs[0];
+  if (!firstAddr) throw new Error("expected one left ipaddr");
+  assertEquals(firstAddr.to_string(), "192.168.1.1/24");
 });
 
 // A Service attached at an OVN endpoint (ep.attachTo) becomes a
@@ -882,15 +904,15 @@ Deno.test("net.service + ep.attachTo -> kernel.service node + endpoint serviceRe
   });
   const nodes = toIR(network);
   // The workload is its OWN node (no network baked in)…
-  assertEquals(nodes["kernel.service:dns"].data, {
+  assertEquals(node(nodes, "kernel.app.container:dns").data, {
     host: "host:chassis-1",
     image: "ovn-fabric-dns",
     cmd: ["/usr/sbin/dnsmasq", "--no-daemon"],
   });
   // …and the ENDPOINT references it (its NIC on that segment).
-  assertEquals(nodes["ovnrouter:router-x|lrp:left"].data.serviceRefs, [
+  assertEquals(node(nodes, "ovnrouter:router-x|lrp:left").data["serviceRefs"], [
     {
-      service: "kernel.service:dns",
+      service: "kernel.app.container:dns",
       name: "seg-a",
       ipaddrs: ["192.168.1.53/24"],
     },
@@ -1007,24 +1029,135 @@ Deno.test("multiple services attached across endpoints -> one service node each"
   });
   const nodes = toIR(network);
   assertEquals(
-    Object.keys(nodes).filter((k) => k.startsWith("kernel.service:")).sort(),
+    Object.keys(nodes).filter((k) => k.startsWith("kernel.app.container:"))
+      .sort(),
     [
-      "kernel.service:dns-128",
-      "kernel.service:dns-129",
+      "kernel.app.container:dns-128",
+      "kernel.app.container:dns-129",
     ],
   );
-  assertEquals(nodes["ovnrouter:router-home-v2|lrp:left"].data.serviceRefs, [
-    {
-      service: "kernel.service:dns-128",
-      name: "home-v2",
-      ipaddrs: ["192.168.128.5/24"],
-    },
-  ]);
-  const cpRefs = (nodes["ovnrouter:router-control-plane-v2|lrp:left"].data as {
-    serviceRefs?: { service: string }[];
-  }).serviceRefs ?? [];
+  assertEquals(
+    node(nodes, "ovnrouter:router-home-v2|lrp:left").data[
+      "serviceRefs"
+    ],
+    [
+      {
+        service: "kernel.app.container:dns-128",
+        name: "home-v2",
+        ipaddrs: ["192.168.128.5/24"],
+      },
+    ],
+  );
+  const cpRefs = (node(nodes, "ovnrouter:router-control-plane-v2|lrp:left")
+    .data as {
+      serviceRefs?: { service: string }[];
+    }).serviceRefs ?? [];
   assertEquals(cpRefs.map((r) => r.service).sort(), [
-    "kernel.service:dns-128",
-    "kernel.service:dns-129",
+    "kernel.app.container:dns-128",
+    "kernel.app.container:dns-129",
   ]);
+});
+
+// The EndpointBuilder injects the endpoint into every services[] entry
+// (EndpointService<T> = T & { endpoint }), so the generator can read the
+// endpoint's l2Segment/ipaddrs/routes per service.
+Deno.test("endpoint builder injects `endpoint` into every service entry", () => {
+  const network = defineNetwork("t", (net) => {
+    const host = net.localHost("chassis-1");
+    const a = net.collisionDomain("seg-a");
+    const b = net.collisionDomain("seg-b");
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-x", (router) => {
+          router.left = router.ovnRouterEndpoint((_ep) => ({
+            l2Segment: a,
+            ipaddrs: [IPv4.parse("192.168.1.1/24")],
+            ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+            services: [{ kind: "ipv6.slaac" }],
+          }));
+          router.right = router.ovnRouterEndpoint({
+            l2Segment: b,
+            ipaddrs: [IPv4.parse("192.168.2.1/24")],
+          });
+          return { routingDomains: [] };
+        }),
+      ],
+    };
+  });
+  const firstRouter = network.allRouters[0];
+  if (!firstRouter) throw new Error("expected one router");
+  const left = firstRouter.left;
+  const svc = left.services?.[0] as unknown as {
+    kind: string;
+    endpoint: {
+      l2Segment: { name: string };
+      ipaddrs: { to_string(): string }[];
+    };
+  };
+  assertEquals(svc.kind, "ipv6.slaac");
+  assertEquals(svc.endpoint.l2Segment.name, "seg-a");
+  assertEquals(svc.endpoint.ipaddrs[0]?.to_string(), "192.168.1.1/24");
+});
+
+// Attaching a reusable service records an ENDPOINT REFERENCE on the
+// service itself (its counterpart to the endpoint's service.attach), one
+// per endpoint it's attached to.
+Deno.test("attachTo records endpointRefs on the service", () => {
+  let dns!: Service;
+  defineNetwork("t", (net) => {
+    const host = net.localHost("chassis-1");
+    const a = net.collisionDomain("seg-a");
+    const b = net.collisionDomain("seg-b");
+    const cp = net.collisionDomain("control-plane");
+    dns = net.service("dns", (svc) => {
+      svc.image = "x";
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-a", (router) => {
+          router.left = router.ovnRouterEndpoint((ep) => ({
+            l2Segment: a,
+            ipaddrs: [IPv4.parse("192.168.1.1/24")],
+            ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+            services: [
+              ep.attachTo(dns, { ipaddrs: [IPv4.parse("192.168.1.5/24")] }),
+            ],
+          }));
+          router.right = router.ovnRouterEndpoint({
+            l2Segment: b,
+            ipaddrs: [IPv4.parse("192.168.2.1/24")],
+          });
+          return { routingDomains: [] };
+        }),
+        net.defineOvnRouter("router-cp", (router) => {
+          router.left = router.ovnRouterEndpoint((ep) => ({
+            l2Segment: cp,
+            ipaddrs: [IPv4.parse("10.43.0.1/24")],
+            ifaces: [{ host, iface: { kind: "physical", name: "eth1" } }],
+            services: [
+              ep.attachTo(dns, {
+                ipaddrs: [IPv4.parse("10.43.0.5/24")],
+                primary: true,
+              }),
+            ],
+          }));
+          router.right = router.ovnRouterEndpoint({
+            l2Segment: b,
+            ipaddrs: [IPv4.parse("172.22.0.2/16")],
+          });
+          return { routingDomains: [] };
+        }),
+      ],
+    };
+  });
+  assertEquals(
+    dns.endpointRefs.map((r) => r.endpoint.l2Segment.name).sort(),
+    ["control-plane", "seg-a"],
+  );
+  assertEquals(
+    dns.endpointRefs.find((r) => r.primary)?.endpoint.l2Segment.name,
+    "control-plane",
+  );
 });
