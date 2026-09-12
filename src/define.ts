@@ -24,12 +24,14 @@ import {
   type OvnHostConfig,
   type OvnRouterEndpoint,
   type Router,
+  type RouterEndpointAttachment,
   type RouterEndpointRoute,
   type RouterEndpointService,
   type RoutingDomain,
   type SecurityGroup,
   type SecurityGroupRule,
   type Segment,
+  type Service,
   sshHost,
   type TunnelRouterEndpoint,
   type Uplink,
@@ -217,6 +219,45 @@ function normalizeKernelEndpoint(
   } as Omit<KernelRouterEndpoint, "kind">;
 }
 
+/** The context passed to `router.ovnRouterEndpoint((ep) => ({...}))` — the
+ * callback RETURNS the endpoint spec (so required fields like `ipaddrs`
+ * are enforced), and `ep.attachTo(sv, {...})` produces a NIC for a service
+ * on THIS endpoint's segment (2026-09-08). */
+export interface EndpointBuilder {
+  attachTo(
+    service: Service,
+    attachment: {
+      readonly ipaddrs: readonly (IPv4 | IPv6)[];
+      readonly routes?: readonly RouterEndpointRoute[];
+      readonly primary?: boolean;
+    },
+  ): RouterEndpointAttachment;
+}
+
+function endpointBuilder(): EndpointBuilder {
+  return {
+    attachTo: (service, attachment) => ({
+      kind: "service.attach",
+      service,
+      ...attachment,
+    }),
+  };
+}
+
+type OvnEndpointFn = (ep: EndpointBuilder) => Omit<OvnRouterEndpoint, "kind">;
+
+/** The mutable spec handed to `net.service(name, (svc) => {...})` — set
+ * `image` (required), `cmd`, `build`. Returns a re-usable Service handle. */
+export interface ServiceBuilder {
+  image: string;
+  cmd?: string | readonly string[];
+  build?: {
+    readonly from: string;
+    readonly packages?: readonly string[];
+    readonly dockerfile?: string;
+  };
+}
+
 export interface RouterBuilder {
   // No routingDomains here — it's REQUIRED on the defineOvnRouter() callback's
   // return value (define.ts), not a settable attribute, so a router author
@@ -226,7 +267,9 @@ export interface RouterBuilder {
   // TunnelRouterEndpoint shapes are INPUT types, never stored here.
   left?: OvnRouterEndpoint;
   right?: OvnRouterEndpoint;
-  ovnRouterEndpoint(input: Omit<OvnRouterEndpoint, "kind">): OvnRouterEndpoint;
+  ovnRouterEndpoint(
+    input: Omit<OvnRouterEndpoint, "kind"> | OvnEndpointFn,
+  ): OvnRouterEndpoint;
   kernelRouterEndpoint(
     input: KernelEndpointBuilderFn,
   ): OvnRouterEndpoint;
@@ -425,6 +468,29 @@ export class NetworkBuilder {
     return domain;
   }
 
+  /** Declare a reusable WORKLOAD — an image + command + optional build,
+   * network-free. Bind it to segments by ATTACHING it at endpoints
+   * (`endpoint.attachTo(svc, {...})`): each attachment is one NIC on that
+   * endpoint's segment; attaching one service at N endpoints is one
+   * container with N NICs (the k8s pod model, 2026-09-08). See Service
+   * (types.ts). */
+  service(name: string, build: (svc: ServiceBuilder) => void): Service {
+    const svc: ServiceBuilder = { image: "" };
+    build(svc);
+    if (svc.image === "") {
+      throw new Error(`service "${name}": builder must set an image`);
+    }
+    const cmd = typeof svc.cmd === "string"
+      ? svc.cmd.trim().split(/\s+/).filter(Boolean)
+      : svc.cmd;
+    return {
+      name,
+      image: svc.image,
+      ...(cmd !== undefined && cmd.length > 0 ? { cmd } : {}),
+      ...(svc.build !== undefined ? { build: svc.build } : {}),
+    };
+  }
+
   /** Declare a named security group — the ONE way a security group gets
    * built (see SecurityGroupBuilder for the per-call rule API; the
    * returned SecurityGroup is the fully-resolved name+rules object, not
@@ -592,9 +658,10 @@ export class NetworkBuilder {
    * routingDomains; this one carries no such need but stays alongside
    * it for symmetry rather than being reachable a different way. */
   private buildOvnRouterEndpoint(
-    input: Omit<OvnRouterEndpoint, "kind">,
+    input: Omit<OvnRouterEndpoint, "kind"> | OvnEndpointFn,
   ): OvnRouterEndpoint {
-    return { kind: "ovn", ...input };
+    const spec = typeof input === "function" ? input(endpointBuilder()) : input;
+    return { kind: "ovn", ...spec };
   }
 
   /** Declare a kernel router — a real Linux netns forwarding between two

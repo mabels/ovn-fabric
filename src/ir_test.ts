@@ -10,6 +10,7 @@ import { defineNetwork } from "./define.ts";
 import { toIR } from "./ir.ts";
 import type { IRNode } from "./ir.ts";
 import { IPv4, IPv6 } from "./ip.ts";
+import type { CollisionDomain, Service } from "./types.ts";
 
 // shortIfaceName now lives on each interface entry (`iface.shortName`),
 // not on the ovn.ls node's own `data` (2026-08-12 — see
@@ -847,90 +848,183 @@ Deno.test("defineOvnRouter object form: declarative OvnRouterSpec resolves left/
   assertEquals(r.left.ipaddrs[0].to_string(), "192.168.1.1/24");
 });
 
-// A kernel.app.docker service on a plain OVN endpoint's services[] becomes
-// a kernel.container node: the leg's host runs it, bound to that segment.
-Deno.test("docker service on an ovn endpoint -> kernel.container node", () => {
+// A Service attached at an OVN endpoint (ep.attachTo) becomes a
+// kernel.container node with a FACE (NIC) on that endpoint's segment.
+Deno.test("net.service + ep.attachTo -> kernel.service node + endpoint serviceRef", () => {
   const network = defineNetwork("test-net", (net) => {
     const host = net.localHost("chassis-1");
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
+    const dns = net.service("dns", (svc) => {
+      svc.image = "ovn-fabric-dns";
+      svc.cmd = ["/usr/sbin/dnsmasq", "--no-daemon"];
+    });
     return {
       hosts: [host],
       routers: [
-        net.defineOvnRouter("router-x", {
-          routingDomains: [],
-          left: {
-            kind: "ovn",
+        net.defineOvnRouter("router-x", (router) => {
+          router.left = router.ovnRouterEndpoint((ep) => ({
             l2Segment: a,
             ipaddrs: [IPv4.parse("192.168.1.1/24")],
             ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
             services: [
-              {
-                kind: "kernel.app.docker",
-                name: "dns",
-                image: "ovn-fabric-dns",
-                cmd: ["/usr/sbin/dnsmasq", "--no-daemon"],
-                ipaddrs: [IPv4.parse("192.168.1.53/24")],
-              },
+              ep.attachTo(dns, { ipaddrs: [IPv4.parse("192.168.1.53/24")] }),
             ],
-          },
-          right: {
-            kind: "ovn",
+          }));
+          router.right = router.ovnRouterEndpoint({
             l2Segment: b,
             ipaddrs: [IPv4.parse("192.168.2.1/24")],
-          },
+          });
+          return { routingDomains: [] };
         }),
       ],
     };
   });
   const nodes = toIR(network);
-  const c = nodes["kernel.container:dns"] as { data: Record<string, unknown> };
-  assertEquals(c.data.host, "host:chassis-1");
-  assertEquals(c.data.l2Segment, "ls:seg-a");
-  assertEquals(c.data.ipaddrs, ["192.168.1.53/24"]);
-  assertEquals(c.data.image, "ovn-fabric-dns");
-  assertEquals(c.data.cmd, ["/usr/sbin/dnsmasq", "--no-daemon"]);
+  // The workload is its OWN node (no network baked in)…
+  assertEquals(nodes["kernel.service:dns"].data, {
+    host: "host:chassis-1",
+    image: "ovn-fabric-dns",
+    cmd: ["/usr/sbin/dnsmasq", "--no-daemon"],
+  });
+  // …and the ENDPOINT references it (its NIC on that segment).
+  assertEquals(nodes["ovnrouter:router-x|lrp:left"].data.serviceRefs, [
+    {
+      service: "kernel.service:dns",
+      name: "seg-a",
+      ipaddrs: ["192.168.1.53/24"],
+    },
+  ]);
 });
 
-// A single-homed container's route via must be on the segment it attaches
-// to — an off-segment next-hop is unreachable and must throw.
-Deno.test("docker service route via must be on the endpoint's segment", () => {
+// A container's route via must be on the face's segment — an off-segment
+// next-hop is unreachable and must throw.
+Deno.test("attached service route via must be on the endpoint's segment", () => {
   const build = (via: string) =>
     defineNetwork("test-net", (net) => {
       const host = net.localHost("chassis-1");
       const a = net.collisionDomain("seg-a");
       const b = net.collisionDomain("seg-b");
+      const dns = net.service("dns", (svc) => {
+        svc.image = "x";
+      });
       return {
         hosts: [host],
         routers: [
-          net.defineOvnRouter("router-x", {
-            routingDomains: [],
-            left: {
-              kind: "ovn",
+          net.defineOvnRouter("router-x", (router) => {
+            router.left = router.ovnRouterEndpoint((ep) => ({
               l2Segment: a,
               ipaddrs: [IPv4.parse("192.168.1.1/24")],
               ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
-              services: [{
-                kind: "kernel.app.docker",
-                name: "dns",
-                image: "x",
-                routes: [{
-                  dst: IPv4.parse("0.0.0.0/0"),
-                  via: IPv4.parse(via),
-                }],
-              }],
-            },
-            right: {
-              kind: "ovn",
+              services: [
+                ep.attachTo(dns, {
+                  ipaddrs: [IPv4.parse("192.168.1.53/24")],
+                  routes: [{
+                    dst: IPv4.parse("0.0.0.0/0"),
+                    via: IPv4.parse(via),
+                  }],
+                }),
+              ],
+            }));
+            router.right = router.ovnRouterEndpoint({
               l2Segment: b,
               ipaddrs: [IPv4.parse("192.168.2.1/24")],
-            },
+            });
+            return { routingDomains: [] };
           }),
         ],
       };
     });
-  // On-segment via (.1) is fine.
-  toIR(build("192.168.1.1"));
-  // Off-segment via is an unreachable next-hop -> error.
-  assertThrows(() => toIR(build("10.9.9.1")));
+  toIR(build("192.168.1.1")); // on-segment via is fine
+  assertThrows(() => toIR(build("10.9.9.1"))); // off-segment -> error
+});
+
+// Multiple DISTINCT services, each attached to its own segment AND the
+// shared control plane -> one kernel.service node per service; the
+// control-plane endpoint references BOTH.
+Deno.test("multiple services attached across endpoints -> one service node each", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const seg128 = net.collisionDomain("home-v2");
+    const seg129 = net.collisionDomain("management-v2");
+    const cp = net.collisionDomain("control-plane");
+    const backbone = net.collisionDomain("backbone");
+    const dnsFor = (seg: number) =>
+      net.service(`dns-${seg}`, (svc) => {
+        svc.image = "ovn-fabric-dns";
+      });
+    const dns128 = dnsFor(128);
+    const dns129 = dnsFor(129);
+    const seg = (
+      router: string,
+      l2: CollisionDomain,
+      svc: Service,
+      v4: string,
+    ) =>
+      net.defineOvnRouter(router, (r) => {
+        r.left = r.ovnRouterEndpoint((ep) => ({
+          l2Segment: l2,
+          ipaddrs: [IPv4.parse(v4)],
+          ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+          services: [ep.attachTo(svc, { ipaddrs: [IPv4.parse(v4)] })],
+        }));
+        r.right = r.ovnRouterEndpoint({
+          l2Segment: backbone,
+          ipaddrs: [IPv4.parse("172.22.0.9/16")],
+        });
+        return { routingDomains: [] };
+      });
+    return {
+      hosts: [host],
+      collisionDomains: [backbone],
+      routers: [
+        seg("router-home-v2", seg128, dns128, "192.168.128.5/24"),
+        seg("router-management-v2", seg129, dns129, "192.168.129.5/24"),
+        net.defineOvnRouter("router-control-plane-v2", (r) => {
+          r.left = r.ovnRouterEndpoint((ep) => ({
+            l2Segment: cp,
+            ipaddrs: [IPv4.parse("10.43.0.1/24")],
+            ifaces: [{ host, iface: { kind: "physical", name: "eth1" } }],
+            services: [
+              ep.attachTo(dns128, {
+                ipaddrs: [IPv4.parse("10.43.0.128/24")],
+                primary: true,
+              }),
+              ep.attachTo(dns129, {
+                ipaddrs: [IPv4.parse("10.43.0.129/24")],
+                primary: true,
+              }),
+            ],
+          }));
+          r.right = r.ovnRouterEndpoint({
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.0.2/16")],
+          });
+          return { routingDomains: [] };
+        }),
+      ],
+    };
+  });
+  const nodes = toIR(network);
+  assertEquals(
+    Object.keys(nodes).filter((k) => k.startsWith("kernel.service:")).sort(),
+    [
+      "kernel.service:dns-128",
+      "kernel.service:dns-129",
+    ],
+  );
+  assertEquals(nodes["ovnrouter:router-home-v2|lrp:left"].data.serviceRefs, [
+    {
+      service: "kernel.service:dns-128",
+      name: "home-v2",
+      ipaddrs: ["192.168.128.5/24"],
+    },
+  ]);
+  const cpRefs = (nodes["ovnrouter:router-control-plane-v2|lrp:left"].data as {
+    serviceRefs?: { service: string }[];
+  }).serviceRefs ?? [];
+  assertEquals(cpRefs.map((r) => r.service).sort(), [
+    "kernel.service:dns-128",
+    "kernel.service:dns-129",
+  ]);
 });

@@ -1285,15 +1285,14 @@ if __name__ == "__main__":
     unittest.main()
 
 
-# A kernel.container node (a docker service on a segment) renders on its
-# host: build image, run the container, bind a veth into the segment's OVS
-# bridge, run the cmd. Delete removes the container + bridge port.
-class KernelContainerDeployTest(unittest.TestCase):
-    def test_kernel_container_create_and_delete(self) -> None:
-        seg = pt.OvnLsNode(
-            id="ls:container-seg",
+# A kernel.service node (a workload) renders ONE container, with one veth
+# per REFERENCING ovn.lrp (each lrp carries a serviceRef — its NIC).
+class KernelServiceDeployTest(unittest.TestCase):
+    def _ls(self, name: str, short: str, vlan: int) -> object:
+        return pt.OvnLsNode(
+            id=f"ls:{name}",
             kind="ovn.ls",
-            key=pt.OvnLsKey(name="container-seg"),
+            key=pt.OvnLsKey(name=name),
             data=pt.OvnLsData(
                 interfaces=[
                     pt.Interface(
@@ -1301,47 +1300,296 @@ class KernelContainerDeployTest(unittest.TestCase):
                         iface={
                             "kind": "vlan",
                             "vlanParent": "eth0",
-                            "vlanId": 1130,
-                            "shortName": "br-cont",
+                            "vlanId": vlan,
+                            "shortName": short,
                         },
                     )
                 ]
             ),
         )
-        cont = pt.KernelContainerNode(
-            id="kernel.container:dns",
-            kind="kernel.container",
-            key=pt.KernelContainerKey(name="dns"),
-            data=pt.KernelContainerData(
+
+    def _lrp(self, router: str, side: str, seg: str, ref: object) -> object:
+        return pt.OvnLrpNode(
+            id=f"ovnrouter:{router}|lrp:{side}",
+            kind="ovn.lrp",
+            key=pt.OvnLrpKey(ovnrouter=router, side=pt.Side(side)),
+            data=pt.OvnLrpData(
+                l2Segment=f"ls:{seg}",
+                addresses=[],
+                mac="02:00:00:00:00:01",
+                serviceRefs=[ref],
+            ),
+        )
+
+    def test_kernel_service_two_nics_create_and_delete(self) -> None:
+        seg = self._ls("container-seg", "br-cont", 1130)
+        cp = self._ls("control-plane", "br-cp", 1143)
+        svc = pt.KernelServiceNode(
+            id="kernel.service:dns",
+            kind="kernel.service",
+            key=pt.KernelServiceKey(name="dns"),
+            data=pt.KernelServiceData(
                 host="host:chassis-1",
-                l2Segment="ls:container-seg",
-                ipaddrs=["192.168.50.53/24"],
                 image="ovn-fabric-dns",
                 cmd=["/usr/sbin/dnsmasq", "--no-daemon"],
             ),
         )
-        nodes = list(NODES) + [seg, cont]
+        lrp_seg = self._lrp(
+            "router-x",
+            "left",
+            "container-seg",
+            pt.ServiceRef(
+                service="kernel.service:dns", name="container-seg", ipaddrs=["192.168.50.53/24"]
+            ),
+        )
+        lrp_cp = self._lrp(
+            "router-cp",
+            "left",
+            "control-plane",
+            pt.ServiceRef(
+                service="kernel.service:dns",
+                name="control-plane",
+                ipaddrs=["10.43.0.5/24"],
+                primary=True,
+                routes=[pt.Route(dst="0.0.0.0/0", via="10.43.0.1")],
+            ),
+        )
+        nodes = list(NODES) + [seg, cp, svc, lrp_seg, lrp_cp]
         _, create_hosts = mod.build_scripts(nodes, "create")
         create = create_hosts["chassis-1"]
-        # The wire script builds the image and binds the veth into br-cont.
-        self.assertIn("cat > /usr/local/sbin/ovn-kernel-container-dns.sh << 'OVN'", create)
+        self.assertIn("cat > /usr/local/sbin/ovn-kernel-service-dns.sh << 'OVN'", create)
         self.assertIn('image="ovn-fabric-dns"', create)
-        self.assertIn('ovs-vsctl add-port "$bridge" "$dev"', create)
-        self.assertIn("ip addr add 192.168.50.53/24 dev eth0", create)
-        # The service is the container's command — docker run -d backgrounds it.
+        # In-container NICs are named after their SEGMENT (IFNAMSIZ-safe).
         self.assertIn(
-            'docker run -d --privileged --network none --name "$container" '
-            '"$image" /usr/sbin/dnsmasq --no-daemon',
+            'ip netns exec "$container" ip addr add 192.168.50.53/24 dev "container-seg"',
             create,
         )
-        self.assertNotIn("docker exec", create)
-        # The container's wire script is written AFTER the segment bridge is
-        # bound (its veth attaches to that bridge).
-        self.assertGreater(
-            create.index("ovn-kernel-container-dns.sh"),
-            create.index("ovs-vsctl add-port br-cont eth0.1130"),
+        self.assertIn(
+            'ip netns exec "$container" ip addr add 10.43.0.5/24 dev "control-plane"',
+            create,
         )
+        self.assertIn('ip netns exec "$container" ip route add 0.0.0.0/0 via 10.43.0.1', create)
+        self.assertIn('ovs-vsctl add-port "br-cont" "sc-', create)
+        self.assertIn('ovs-vsctl add-port "br-cp" "sc-', create)
+        # Create installs + starts a systemd unit (like the kernel router).
+        self.assertIn(
+            "cat > /etc/systemd/system/ovn-kernel-service-dns.service << 'OVN'",
+            create,
+        )
+        self.assertIn("systemctl enable --now ovn-kernel-service-dns.service", create)
+        # The `down` branch (inside the script) removes the container + ports.
+        self.assertIn('/usr/bin/docker rm -f "dns"', create)
+        self.assertIn('del-port "br-cont" "sc-', create)
+        self.assertIn('del-port "br-cp" "sc-', create)
         _, delete_hosts = mod.build_scripts(nodes, "delete")
         delete = delete_hosts["chassis-1"]
-        self.assertIn("/usr/bin/docker rm -f dns", delete)
-        self.assertIn("del-port br-cont sc-", delete)
+        self.assertIn("systemctl disable --now ovn-kernel-service-dns.service", delete)
+
+
+# Two DISTINCT kernel.service nodes referenced by separate LRPs render two
+# independent containers (one per service).
+class MultiServiceDeployTest(unittest.TestCase):
+    def test_two_services_render_two_containers(self) -> None:
+        seg = pt.OvnLsNode(
+            id="ls:seg-a",
+            kind="ovn.ls",
+            key=pt.OvnLsKey(name="seg-a"),
+            data=pt.OvnLsData(
+                interfaces=[
+                    pt.Interface(
+                        host="chassis-1",
+                        iface={
+                            "kind": "vlan",
+                            "vlanParent": "eth0",
+                            "vlanId": 1128,
+                            "shortName": "br-a",
+                        },
+                    )
+                ]
+            ),
+        )
+        seg2 = pt.OvnLsNode(
+            id="ls:seg-b",
+            kind="ovn.ls",
+            key=pt.OvnLsKey(name="seg-b"),
+            data=pt.OvnLsData(
+                interfaces=[
+                    pt.Interface(
+                        host="chassis-1",
+                        iface={
+                            "kind": "vlan",
+                            "vlanParent": "eth0",
+                            "vlanId": 1129,
+                            "shortName": "br-b",
+                        },
+                    )
+                ]
+            ),
+        )
+
+        def svc(n: str):
+            return pt.KernelServiceNode(
+                id=f"kernel.service:{n}",
+                kind="kernel.service",
+                key=pt.KernelServiceKey(name=n),
+                data=pt.KernelServiceData(host="host:chassis-1", image=f"img-{n}"),
+            )
+
+        def lrp(router: str, seg_name: str, service: str):
+            return pt.OvnLrpNode(
+                id=f"ovnrouter:{router}|lrp:left",
+                kind="ovn.lrp",
+                key=pt.OvnLrpKey(ovnrouter=router, side=pt.Side("left")),
+                data=pt.OvnLrpData(
+                    l2Segment=f"ls:{seg_name}",
+                    addresses=[],
+                    mac="02:00:00:00:00:01",
+                    serviceRefs=[
+                        pt.ServiceRef(
+                            service=f"kernel.service:{service}",
+                            name="seg-a",
+                            ipaddrs=["10.0.0.5/24"],
+                        )
+                    ],
+                ),
+            )
+
+        nodes = list(NODES) + [
+            seg,
+            seg2,
+            svc("dns-128"),
+            svc("dns-129"),
+            lrp("router-a", "seg-a", "dns-128"),
+            lrp("router-b", "seg-b", "dns-129"),
+        ]
+        _, create_hosts = mod.build_scripts(nodes, "create")
+        create = create_hosts["chassis-1"]
+        self.assertIn("ovn-kernel-service-dns-128.sh", create)
+        self.assertIn("ovn-kernel-service-dns-129.sh", create)
+        self.assertIn('image="img-dns-128"', create)
+        self.assertIn('image="img-dns-129"', create)
+
+
+# End-to-end for the REAL shape: a dns service attached to a real segment
+# (management-v2, a localnet vlan) AND the control plane (primary, default
+# route) — hydrated from IR JSON and rendered to the host shell.
+class DnsServiceEndToEndTest(unittest.TestCase):
+    def test_dns_on_real_segment_and_control_plane(self) -> None:
+        raw = [
+            {
+                "id": "host:chassis-1",
+                "kind": "infra.host",
+                "key": {"host": "chassis-1"},
+                "data": {
+                    "connectAddress": "10.0.0.6",
+                    "ovnRole": "central",
+                    "os": {"name": "ubuntu", "version": "26.04"},
+                },
+            },
+            {
+                "id": "ls:management-v2",
+                "kind": "ovn.ls",
+                "key": {"name": "management-v2"},
+                "data": {
+                    "interfaces": [
+                        {
+                            "host": "chassis-1",
+                            "iface": {
+                                "kind": "vlan",
+                                "vlanParent": "eth0",
+                                "vlanId": 1129,
+                                "shortName": "br-management-v2",
+                            },
+                        }
+                    ]
+                },
+            },
+            {
+                "id": "ls:control-plane",
+                "kind": "ovn.ls",
+                "key": {"name": "control-plane"},
+                "data": {
+                    "interfaces": [
+                        {
+                            "host": "chassis-1",
+                            "iface": {
+                                "kind": "vlan",
+                                "vlanParent": "eth0",
+                                "vlanId": 1143,
+                                "shortName": "br-control-plane",
+                            },
+                        }
+                    ]
+                },
+            },
+            {
+                "id": "kernel.service:dns-129",
+                "kind": "kernel.service",
+                "key": {"name": "dns-129"},
+                "data": {
+                    "host": "host:chassis-1",
+                    "image": "ovn-fabric-dns",
+                    "cmd": ["/usr/sbin/dnsmasq", "--no-daemon", "--no-resolv", "--server=1.1.1.1"],
+                },
+            },
+            {
+                "id": "ovnrouter:router-management-v2|lrp:left",
+                "kind": "ovn.lrp",
+                "key": {"ovnrouter": "router-management-v2", "side": "left"},
+                "data": {
+                    "l2Segment": "ls:management-v2",
+                    "addresses": ["192.168.129.1/24"],
+                    "mac": "02:00:00:00:00:01",
+                    "serviceRefs": [
+                        {
+                            "service": "kernel.service:dns-129",
+                            "name": "management-v2",
+                            "ipaddrs": ["192.168.129.5/24"],
+                        }
+                    ],
+                },
+            },
+            {
+                "id": "ovnrouter:router-control-plane-v2|lrp:left",
+                "kind": "ovn.lrp",
+                "key": {"ovnrouter": "router-control-plane-v2", "side": "left"},
+                "data": {
+                    "l2Segment": "ls:control-plane",
+                    "addresses": ["10.43.0.1/24"],
+                    "mac": "02:00:00:00:00:02",
+                    "serviceRefs": [
+                        {
+                            "service": "kernel.service:dns-129",
+                            "name": "control-plane",
+                            "ipaddrs": ["10.43.0.129/24"],
+                            "routes": [{"dst": "0.0.0.0/0", "via": "10.43.0.1"}],
+                            "primary": True,
+                        }
+                    ],
+                },
+            },
+        ]
+        from protocol.hydrate import hydrate_nodes
+
+        nodes = hydrate_nodes(raw)
+        _, create_hosts = mod.build_scripts(nodes, "create")
+        s = create_hosts["chassis-1"]
+        self.assertIn("ovn-kernel-service-dns-129.sh", s)
+        # Serving NIC on the real segment, admin NIC on the control plane.
+        self.assertIn(
+            'ip netns exec "$container" ip addr add 192.168.129.5/24 dev "management-v2"',
+            s,
+        )
+        self.assertIn(
+            'ip netns exec "$container" ip addr add 10.43.0.129/24 dev "control-plane"',
+            s,
+        )
+        self.assertIn('ip netns exec "$container" ip route add 0.0.0.0/0 via 10.43.0.1', s)
+        self.assertIn('ovs-vsctl add-port "br-management-v2" "sc-', s)
+        self.assertIn('ovs-vsctl add-port "br-control-plane" "sc-', s)
+        # Same systemd mechanics as the kernel router: one unit per service.
+        self.assertIn(
+            "cat > /etc/systemd/system/ovn-kernel-service-dns-129.service << 'OVN'",
+            s,
+        )
+        self.assertIn("systemctl enable --now ovn-kernel-service-dns-129.service", s)

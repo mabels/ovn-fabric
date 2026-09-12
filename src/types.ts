@@ -510,8 +510,11 @@ interface RouterEndpointBase {
   /** IPv6 RA/SLAAC behavior on this endpoint's LRP — see
    * RouterEndpointService above. Undefined/empty means neither
    * ipv6_ra_configs key gets set (OVN's own default: no RA at all),
-   * matching Segment.slaac's existing "false" branch. */
-  readonly services?: readonly RouterEndpointService[];
+   * matching Segment.slaac's existing "false" branch. The array also
+   * carries ServiceAttachments (`endpoint.attachTo(sv, {...})`) — a
+   * workload's NIC on this endpoint's segment (2026-09-08). */
+  readonly services?:
+    readonly (RouterEndpointService | RouterEndpointAttachment)[];
   /** Routes this endpoint is the ANCHOR for — see RouterEndpointRoute
    * below. Declaring a route here IS what makes this (router, side)
    * the anchor; nothing infers it from address containment anymore.
@@ -853,6 +856,35 @@ export type RouterEndpointService =
      * gateway) at resolve time (2026-09-08). */
     readonly routes?: readonly RouterEndpointRoute[];
   };
+
+// ── Service: a reusable WORKLOAD, and its network attachments ──────────
+// A `service` (net.service(), define.ts) is WHAT runs — an image + command
+// + optional build — declared ONCE and network-free. It is bound to
+// networks by ATTACHING it at router endpoints: each attachment
+// (endpoint.attachTo(sv, {...})) is one NIC on that endpoint's segment.
+// One service attached at N endpoints = one container with N NICs (the
+// k8s pod model, 2026-09-08).
+export interface Service {
+  readonly name: string;
+  readonly image: string;
+  readonly cmd?: readonly string[];
+  readonly build?: {
+    readonly from: string;
+    readonly packages?: readonly string[];
+    readonly dockerfile?: string;
+  };
+}
+
+/** One network attachment: binds a Service to a router endpoint's segment,
+ * giving it a NIC (ipaddrs/routes) on that L2. `primary` marks the face
+ * that carries the container's default route. */
+export interface RouterEndpointAttachment {
+  readonly kind: "service.attach";
+  readonly service: Service;
+  readonly ipaddrs: readonly (IPv4 | IPv6)[];
+  readonly routes?: readonly RouterEndpointRoute[];
+  readonly primary?: boolean;
+}
 
 /** One route entry declared directly on the RouterEndpoint that IS the
  * anchor for it — `dst` reachable via `via`, optionally NAT'd. Moved

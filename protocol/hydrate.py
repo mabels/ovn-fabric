@@ -63,6 +63,24 @@ def _hydrate_ovn_lrp(raw: dict) -> pt.OvnLrpNode:
             mac=data["mac"],
             gatewayChassis=data.get("gatewayChassis"),
             ipv6RaConfigs=data.get("ipv6RaConfigs"),
+            serviceRefs=(
+                [
+                    pt.ServiceRef(
+                        service=r["service"],
+                        name=r["name"],
+                        ipaddrs=[a for a in r["ipaddrs"]] if r.get("ipaddrs") else None,
+                        routes=(
+                            [pt.Route(dst=x["dst"], via=x.get("via")) for x in r["routes"]]
+                            if r.get("routes")
+                            else None
+                        ),
+                        primary=r.get("primary"),
+                    )
+                    for r in data["serviceRefs"]
+                ]
+                if data.get("serviceRefs")
+                else None
+            ),
         ),
     )
 
@@ -162,22 +180,15 @@ def _hydrate_app(raw: dict):
     )
 
 
-def _hydrate_kernel_container(raw: dict) -> pt.KernelContainerNode:
+def _hydrate_kernel_service(raw: dict) -> pt.KernelServiceNode:
     data = raw["data"]
     build_raw = data.get("build")
-    return pt.KernelContainerNode(
+    return pt.KernelServiceNode(
         id=raw["id"],
         kind=raw["kind"],
-        key=pt.KernelContainerKey(name=raw["key"]["name"]),
-        data=pt.KernelContainerData(
+        key=pt.KernelServiceKey(name=raw["key"]["name"]),
+        data=pt.KernelServiceData(
             host=data["host"],
-            l2Segment=data["l2Segment"],
-            ipaddrs=[a for a in data["ipaddrs"]] if data.get("ipaddrs") else None,
-            routes=(
-                [pt.Route(dst=r["dst"], via=r.get("via")) for r in data["routes"]]
-                if data.get("routes")
-                else None
-            ),
             image=data["image"],
             cmd=[c for c in data["cmd"]] if data.get("cmd") else None,
             build=(
@@ -215,7 +226,7 @@ _HYDRATORS = {
     "ipv6.route": _hydrate_ipv6_route,
     "kernel.router": _hydrate_kernel_router,
     "security.group": _hydrate_security_group,
-    "kernel.container": _hydrate_kernel_container,
+    "kernel.service": _hydrate_kernel_service,
 }
 
 

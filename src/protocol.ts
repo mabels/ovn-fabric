@@ -87,6 +87,19 @@ export const OvnLrpKey = type({
   ovnrouter: "string",
   side: "'left'|'right'",
 });
+// (KernelRouterRoute + ServiceRef live here, before OvnLrpData, because
+// OvnLrpData.serviceRefs uses ServiceRef at module-eval time.)
+export const KernelRouterRoute = type({ dst: "string", "via?": "string" });
+export const ServiceRef = type({
+  service: "string",
+  // The in-container NIC name — RESOLVED by the generator (src/ir.ts's
+  // shortIfaceName/fnv1a32: the segment name when it fits IFNAMSIZ, else a
+  // hashed short form). The deployer uses it verbatim, never shortens.
+  name: "string",
+  "ipaddrs?": "string[]",
+  "routes?": KernelRouterRoute.array(),
+  "primary?": "boolean",
+});
 export const OvnLrpData = type({
   // `ls:<name>` — the referenced ovn.ls node's own id, not the bare
   // domain name (src/ir.ts's own routerEndpointToIR — every cross-node
@@ -106,6 +119,10 @@ export const OvnLrpData = type({
   // RouterEndpointService, types.ts) — undefined means no RA service
   // was declared, not "set zero keys."
   "ipv6RaConfigs?": { "[string]": "string" },
+  // Workloads ATTACHED at this endpoint (endpoint.attachTo) — each is one
+  // NIC for the referenced kernel.service on this endpoint's segment
+  // (2026-09-08).
+  "serviceRefs?": ServiceRef.array(),
 });
 export const OvnLrpNode = type({
   id: "string",
@@ -165,7 +182,6 @@ export const KernelRouterKey = type({
   name: "string",
   "side?": "'left'|'right'",
 });
-export const KernelRouterRoute = type({ dst: "string", "via?": "string" });
 // KernelApp — a fully-resolved kernel-netns application (types.ts): the
 // `kernel.app.*` service kinds resolved at declaration time. An `or`
 // union DISCRIMINATED on `kind` (2026-08-23) — each variant carries
@@ -299,19 +315,15 @@ export const SecurityGroupNode = type({
   data: SecurityGroupData,
 });
 
-// A docker container a kernel HOST runs, exposed ON one collision domain
-// (segment) — a `kernel.app.docker` service listed in a plain
-// ovnRouterEndpoint's services[] (the endpoint's segment + ifaces' host).
-// It is an L2 endpoint on that segment (its own ipaddrs), not a router.
-export const KernelContainerKey = type({ name: "string" });
-export const KernelContainerData = type({
-  // `host:<name>` / `ls:<name>` — the referenced infra.host / ovn.ls ids.
+// A reusable WORKLOAD (net.service) a kernel HOST runs — the image + cmd +
+// optional build, network-free. It has NO network of its own: it is bound
+// by the ENDPOINTS that reference it (OvnLrpData.serviceRefs) — one NIC per
+// referencing endpoint. One service referenced by N endpoints = one
+// container with N NICs (the k8s pod model, 2026-09-08).
+export const KernelServiceKey = type({ name: "string" });
+export const KernelServiceData = type({
+  // `host:<name>` — the referenced infra.host id the container runs on.
   host: "string",
-  l2Segment: "string",
-  "ipaddrs?": "string[]",
-  // The container's own routes ({dst, via}) — e.g. its default via the
-  // segment gateway. Resolved by ir.ts (default-via-endpoint when unset).
-  "routes?": KernelRouterRoute.array(),
   image: "string",
   "cmd?": "string[]",
   "build?": {
@@ -320,11 +332,11 @@ export const KernelContainerData = type({
     "dockerfile?": "string",
   },
 });
-export const KernelContainerNode = type({
+export const KernelServiceNode = type({
   id: "string",
-  kind: "'kernel.container'",
-  key: KernelContainerKey,
-  data: KernelContainerData,
+  kind: "'kernel.service'",
+  key: KernelServiceKey,
+  data: KernelServiceData,
 });
 
 export const IRNode = InfraHostNode.or(OvnLsNode).or(OvnLrpNode).or(
@@ -336,7 +348,7 @@ export const IRNode = InfraHostNode.or(OvnLsNode).or(OvnLrpNode).or(
 ).or(
   SecurityGroupNode,
 ).or(
-  KernelContainerNode,
+  KernelServiceNode,
 );
 
 // Every node kind's envelope has the exact same shape (id: string,
@@ -387,12 +399,13 @@ export function buildJsonSchema(): Record<string, unknown> {
       "SecurityGroupKey",
       "SecurityGroupData",
     ),
-    KernelContainerKey: KernelContainerKey.toJsonSchema(),
-    KernelContainerData: KernelContainerData.toJsonSchema(),
-    KernelContainerNode: nodeSchema(
-      "kernel.container",
-      "KernelContainerKey",
-      "KernelContainerData",
+    ServiceRef: ServiceRef.toJsonSchema(),
+    KernelServiceKey: KernelServiceKey.toJsonSchema(),
+    KernelServiceData: KernelServiceData.toJsonSchema(),
+    KernelServiceNode: nodeSchema(
+      "kernel.service",
+      "KernelServiceKey",
+      "KernelServiceData",
     ),
   };
   return {
@@ -406,7 +419,7 @@ export function buildJsonSchema(): Record<string, unknown> {
       "Ipv6RouteNode",
       "KernelRouterNode",
       "SecurityGroupNode",
-      "KernelContainerNode",
+      "KernelServiceNode",
     ].map((
       name,
     ) => ({
