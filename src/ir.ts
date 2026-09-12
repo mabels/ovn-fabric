@@ -579,22 +579,18 @@ function resolveIpv6RaConfigs(
     }
     // Exhaustive on purpose, not "anything that isn't slaac must be
     // ra" — confirmed live, 2026-08-12: a services entry with a kind
-    // outside the OVN `ipv6.*` pair (e.g. a config author's in-progress
-    // sketch toward kernel-side NAT service kinds) silently got treated
-    // as "ipv6.ra" and set send_periodic=true on an endpoint that never
-    // asked for it — TypeScript's own exhaustiveness checking doesn't
-    // help here if the config author's object literal reaches this
-    // function without ever being checked (e.g. `deno run` without a
-    // preceding `deno check`). A real runtime throw catches it instead.
-    // The `kernel.*` kinds should never arrive here (they're split off
-    // in buildKernelRouterEndpoint, define.ts, before the OVN endpoint
-    // is built) — if one does, that's exactly the bug this throws for.
+    // outside the OVN `ipv6.*` pair silently got treated as "ipv6.ra"
+    // and set send_periodic=true on an endpoint that never asked for
+    // it — a real runtime catch beats silent misbehavior.
+    // A `kernel.*` service reaching an OVN endpoint is now LEGITIMATE: a
+    // `kernel.app.docker` listed on a plain ovnRouterEndpoint's services[]
+    // is a container the leg's host exposes on that segment (emitted as a
+    // kernel.container node, see dockerContainersOnEndpoint) — it produces
+    // no RA config here, so skip it. Kernel-router services are otherwise
+    // still split off in buildKernelRouterEndpoint before the OVN endpoint
+    // is built.
     if (isKernelService(service)) {
-      throw new Error(
-        `resolveIpv6RaConfigs: kernel-side service "${service.kind}" reached ` +
-          `an OVN endpoint — buildKernelRouterEndpoint should have split ` +
-          `it off onto the KernelRouter's own side`,
-      );
+      continue;
     }
     const unknownKind: never = service;
     throw new Error(
@@ -904,6 +900,109 @@ function computeInterconnectRoutes(network: NetworkDefinition): IRNode[] {
   return nodes;
 }
 
+// A `kernel.app.docker` service listed on a segment-facing OVN endpoint's
+// services[] resolves into one `kernel.container` IR node per service: a
+// container the endpoint's leg HOST runs, bound to the leg's collision
+// domain (an L2 endpoint on that segment, not a router) (2026-09-08).
+// A container with no declared routes defaults out the endpoint that hosts
+// it: one default route per family the endpoint's OWN ipaddrs carry, via
+// that family's address (the .1 gateway on the shared segment).
+function defaultRoutesViaEndpoint(
+  endpoint: OvnRouterEndpoint,
+): { dst: string; via: string }[] {
+  const out: { dst: string; via: string }[] = [];
+  for (const addr of endpoint.ipaddrs) {
+    if (addr.is_ipv4()) {
+      out.push({ dst: "0.0.0.0/0", via: addr.to_s() });
+    } else {
+      out.push({ dst: "::/0", via: addr.to_s() });
+    }
+  }
+  return out;
+}
+
+// A container's route `via` must be an address reachable on the segment it
+// sits on — i.e. inside the network of one of the hosting endpoint's OWN
+// ipaddrs (same family). A via off-segment would be an unreachable
+// next-hop for a single-homed container (2026-09-08).
+function viaIsOnSegment(
+  endpoint: OvnRouterEndpoint,
+  via: IPv4 | IPv6,
+): boolean {
+  for (const addr of endpoint.ipaddrs) {
+    if (addr.is_ipv4() !== via.is_ipv4()) continue;
+    if (addr.network().includes(via)) return true;
+  }
+  return false;
+}
+
+function dockerContainersOnEndpoint(
+  router: Router,
+  side: "left" | "right",
+  endpoint: OvnRouterEndpoint,
+): IRNode[] {
+  const hostName = endpoint.ifaces?.[0]?.host.name;
+  const out: IRNode[] = [];
+  for (const service of endpoint.services ?? []) {
+    if (service.kind !== "kernel.app.docker") continue;
+    if (hostName === undefined) {
+      throw new Error(
+        `router "${router.name}" (${side}): a kernel.app.docker service needs ` +
+          `the endpoint's ifaces to name the host that runs the container`,
+      );
+    }
+    const name = service.name ?? `${router.name}-${side}-container`;
+    if (service.image === undefined) {
+      throw new Error(
+        `kernel.app.docker service "${name}" on ${router.name}: needs an ` +
+          `image (no router-name default applies to a segment container)`,
+      );
+    }
+    const cmd = typeof service.cmd === "string"
+      ? service.cmd.trim().split(/\s+/).filter(Boolean)
+      : (service.cmd ?? []);
+    // The container's routes. If the author set none, default each family
+    // present on this endpoint via the endpoint's OWN address — the
+    // container is on the same segment as the router leg, so that address
+    // (.1) is its gateway (2026-09-08).
+    const routes = service.routes !== undefined && service.routes.length > 0
+      ? service.routes.map((r) => {
+        if (r.via !== undefined && !viaIsOnSegment(endpoint, r.via)) {
+          throw new Error(
+            `kernel.app.docker service "${name}" on ${router.name}: route ` +
+              `${r.dst.to_string()} via ${r.via.to_s()} — the via is not on ` +
+              `segment "${endpoint.l2Segment.name}" (${
+                endpoint.ipaddrs.map((a) => a.to_string()).join(", ")
+              }); a single-homed container's next-hop must be ` +
+              `reachable on its own L2`,
+          );
+        }
+        return {
+          dst: r.dst.to_string(),
+          ...(r.via !== undefined ? { via: r.via.to_s() } : {}),
+        };
+      })
+      : defaultRoutesViaEndpoint(endpoint);
+    out.push({
+      id: `kernel.container:${name}`,
+      kind: "kernel.container",
+      key: { name },
+      data: {
+        host: `host:${hostName}`,
+        l2Segment: `ls:${endpoint.l2Segment.name}`,
+        ...(service.ipaddrs !== undefined
+          ? { ipaddrs: service.ipaddrs.map((a) => a.to_string()) }
+          : {}),
+        image: service.image,
+        ...(cmd.length > 0 ? { cmd } : {}),
+        ...(service.build !== undefined ? { build: service.build } : {}),
+        ...(routes.length > 0 ? { routes } : {}),
+      },
+    } as IRNode);
+  }
+  return out;
+}
+
 export function toIR(network: NetworkDefinition): Record<string, IRNode> {
   const nodes: Record<string, IRNode> = {};
 
@@ -933,6 +1032,13 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
       }
       const node = routerEndpointToIR(router, side, endpoint);
       nodes[node.id] = node;
+      // A `kernel.app.docker` service on a segment-facing leg becomes a
+      // container the leg's host runs, bound to that segment (2026-09-08).
+      for (
+        const container of dockerContainersOnEndpoint(router, side, endpoint)
+      ) {
+        nodes[container.id] = container;
+      }
     }
   }
 

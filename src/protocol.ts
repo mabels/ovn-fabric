@@ -219,6 +219,21 @@ export const DockerApp = type({
   "routerIp?": "string",
   "vethName?": "string",
 });
+// The CONFIG-side `kernel.app.docker` service kind (types.ts's
+// RouterEndpointService): a docker container the kernel host runs. `image`
+// defaults to the router name at resolve time (define.ts); the kind is
+// resolved into the IR `docker` app (DockerApp) on the KernelRouter.
+export const KernelAppDockerService = type({
+  kind: "'kernel.app.docker'",
+  "image?": "string",
+  "build?": {
+    from: "string",
+    "packages?": "string[]",
+    "dockerfile?": "string",
+  },
+  "name?": "string",
+  "cmd?": "string | string[]",
+});
 export const KernelApp = DhcpClientApp.or(WireguardApp).or(ZerotierApp).or(
   DockerApp,
 );
@@ -284,6 +299,34 @@ export const SecurityGroupNode = type({
   data: SecurityGroupData,
 });
 
+// A docker container a kernel HOST runs, exposed ON one collision domain
+// (segment) — a `kernel.app.docker` service listed in a plain
+// ovnRouterEndpoint's services[] (the endpoint's segment + ifaces' host).
+// It is an L2 endpoint on that segment (its own ipaddrs), not a router.
+export const KernelContainerKey = type({ name: "string" });
+export const KernelContainerData = type({
+  // `host:<name>` / `ls:<name>` — the referenced infra.host / ovn.ls ids.
+  host: "string",
+  l2Segment: "string",
+  "ipaddrs?": "string[]",
+  // The container's own routes ({dst, via}) — e.g. its default via the
+  // segment gateway. Resolved by ir.ts (default-via-endpoint when unset).
+  "routes?": KernelRouterRoute.array(),
+  image: "string",
+  "cmd?": "string[]",
+  "build?": {
+    from: "string",
+    "packages?": "string[]",
+    "dockerfile?": "string",
+  },
+});
+export const KernelContainerNode = type({
+  id: "string",
+  kind: "'kernel.container'",
+  key: KernelContainerKey,
+  data: KernelContainerData,
+});
+
 export const IRNode = InfraHostNode.or(OvnLsNode).or(OvnLrpNode).or(
   Ipv4RouteNode,
 ).or(
@@ -292,6 +335,8 @@ export const IRNode = InfraHostNode.or(OvnLsNode).or(OvnLrpNode).or(
   KernelRouterNode,
 ).or(
   SecurityGroupNode,
+).or(
+  KernelContainerNode,
 );
 
 // Every node kind's envelope has the exact same shape (id: string,
@@ -342,6 +387,13 @@ export function buildJsonSchema(): Record<string, unknown> {
       "SecurityGroupKey",
       "SecurityGroupData",
     ),
+    KernelContainerKey: KernelContainerKey.toJsonSchema(),
+    KernelContainerData: KernelContainerData.toJsonSchema(),
+    KernelContainerNode: nodeSchema(
+      "kernel.container",
+      "KernelContainerKey",
+      "KernelContainerData",
+    ),
   };
   return {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -354,6 +406,7 @@ export function buildJsonSchema(): Record<string, unknown> {
       "Ipv6RouteNode",
       "KernelRouterNode",
       "SecurityGroupNode",
+      "KernelContainerNode",
     ].map((
       name,
     ) => ({

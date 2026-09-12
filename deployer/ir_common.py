@@ -1433,6 +1433,101 @@ def _emit_os_dependencies(host_node: pt.InfraHostNode, emit: Emitter) -> None:
     emit.blank()
 
 
+# The OVS bridge (`br-<shortname>`) a kernel.container's segment is bound
+# to ON this host — the ovn.ls node's interface shortName (same bridge the
+# segment's localnet iface binds into via _emit_iface_bindings). The
+# container's veth root leg attaches there, putting it on the segment's L2.
+def _container_domain_bridge(node: pt.KernelContainerNode, nodes: list[pt.Model]) -> str:
+    # ovn.ls interface `host` is the bare host NAME (not the `host:` id) —
+    # same convention _host_bindings/_emit_iface_bindings use.
+    host_name = node.data.host.split(":", 1)[1]
+    for ls in nodes:
+        if ls.kind != "ovn.ls" or ls.id != node.data.l2Segment:
+            continue
+        for binding in ls.data.interfaces:
+            if binding.host == host_name and isinstance(binding.iface, dict):
+                short = binding.iface.get("shortName")
+                if short:
+                    return short
+    raise ValueError(
+        f"kernel.container {node.key.name}: no ovn.ls interface on {host_name} for "
+        f"{node.data.l2Segment} to bind its veth to"
+    )
+
+
+def _container_wire_script(node: pt.KernelContainerNode, bridge: str) -> str:
+    """The wire script for one kernel.container: run the image, move a veth
+    into its netns as eth0 (ipaddrs applied from outside), bind the other
+    leg into the segment's OVS bridge, then run the container's cmd. The
+    router `up` backgrounds it (2026-09-08)."""
+    container = node.key.name
+    dev = "sc-" + hashlib.md5(container.encode()).hexdigest()[:8]
+    peer = f"{dev}-c"
+    cmd_tokens = " ".join(shlex.quote(t) for t in (node.data.cmd or []))
+    build_lines = _docker_image_ensure_lines(node.data.build, node.data.image)
+    addr_lines = [
+        f'ip netns exec "$container" ip addr add {a} dev eth0' for a in (node.data.ipaddrs or [])
+    ]
+    route_lines = [
+        f'ip netns exec "$container" ip route add {r.dst} via {r.via}'
+        for r in (node.data.routes or [])
+    ]
+    return "\n".join(
+        [
+            "#!/bin/sh",
+            f"# ovn-fabric kernel.container: {container} on {bridge}",
+            "# Backgrounded by the host create.",
+            "set -eu",
+            f'container="{container}"',
+            f'bridge="{bridge}"',
+            f'dev="{dev}"',
+            f'peer="{peer}"',
+            f'image="{node.data.image}"',
+            "",
+            *build_lines,
+            '/usr/bin/docker rm -f "$container" 2>/dev/null || true',
+            # The service IS the container's command — `docker run -d` runs
+            # it in the background (no sleep + docker exec dance).
+            "/usr/bin/docker run -d --privileged --network none --name "
+            f'"$container" "$image" {cmd_tokens}'.rstrip(),
+            "pid=$(/usr/bin/docker inspect -f '{{.State.Pid}}' \"$container\")",
+            "mkdir -p /var/run/netns",
+            'ln -sf "/proc/$pid/ns/net" "/var/run/netns/$container"',
+            'ip link add "$dev" type veth peer name "$peer"',
+            'ip link set "$peer" netns "$container"',
+            'ip netns exec "$container" ip link set "$peer" name eth0',
+            'ip netns exec "$container" ip link set eth0 up',
+            *addr_lines,
+            *route_lines,
+            'ip link set "$dev" up',
+            '/usr/bin/ovs-vsctl add-port "$bridge" "$dev"',
+        ]
+    )
+
+
+def _emit_kernel_containers(host_id: str, nodes: list[pt.Model], emit: Emitter) -> None:
+    """CREATE runs each kernel.container this host owns (image build, veth
+    bound into the segment bridge, cmd running inside); DELETE removes the
+    container and its bridge port. Runs AFTER _emit_iface_bindings so the
+    segment bridge already exists (2026-09-08)."""
+    containers = [n for n in nodes if n.kind == "kernel.container" and n.data.host == host_id]
+    for node in containers:
+        name = node.key.name
+        bridge = _container_domain_bridge(node, nodes)
+        script_path = f"/usr/local/sbin/ovn-kernel-container-{name}.sh"
+        dev = "sc-" + hashlib.md5(name.encode()).hexdigest()[:8]
+        emit.comment(f"# --- kernel.container: {name} on {bridge} ---")
+        if emit.action == "delete":
+            emit.sh(["/usr/bin/docker", "rm", "-f", name])
+            emit.sh(["/usr/bin/ovs-vsctl", "--if-exists", "del-port", bridge, dev])
+            emit.sh(["rm", "-f", script_path])
+            emit.sh(["rm", "-f", f"/var/run/netns/{name}"])
+            continue
+        emit.append(script_path, _container_wire_script(node, bridge))
+        emit.sh(["chmod", "+x", script_path])
+        emit.sh(["/bin/sh", script_path], background=True)
+
+
 def _emit_host(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter) -> None:
     host_name = host_node.key.host
     data = host_node.data
@@ -1459,6 +1554,7 @@ def _emit_host(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter
         # would `ip link delete` a device that's still in the netns
         # (2026-08-18).
         _emit_kernel_router(host_node.id, nodes, emit)
+        _emit_kernel_containers(host_node.id, nodes, emit)
         _emit_iface_bindings(host_name, nodes, emit)
         return
 
@@ -1466,7 +1562,10 @@ def _emit_host(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter
     # works without them; no deinstall ever (2026-08-23).
     _emit_os_dependencies(host_node, emit)
     _emit_kernel_router(host_node.id, nodes, emit)
+    # The segment bridges must exist (bound by _emit_iface_bindings) before
+    # a container's veth can attach — containers come AFTER.
     _emit_iface_bindings(host_name, nodes, emit)
+    _emit_kernel_containers(host_node.id, nodes, emit)
 
     if data.ovnRole == pt.OvnRole.central:
         emit.comment("# central: expose the shared NB/SB DBs to every other chassis")

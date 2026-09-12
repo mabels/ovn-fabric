@@ -4,7 +4,7 @@
 // the generator computes the FINAL name a real kernel object needs,
 // the translator only ever applies an already-resolved fact).
 
-import { assertEquals, assertNotEquals } from "jsr:@std/assert@1";
+import { assertEquals, assertNotEquals, assertThrows } from "jsr:@std/assert@1";
 import { fnv1a32, transitNetwork } from "./addressing.ts";
 import { defineNetwork } from "./define.ts";
 import { toIR } from "./ir.ts";
@@ -432,7 +432,7 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker resolves router-prefixed name
             name: "test-docker",
             image: "ubuntu",
             cmd: "sleep 86400",
-            ip: "10.200.0.2/24",
+            ipaddrs: [IPv4.parse("10.200.0.2/24")],
           },
         ],
         ifaces: [
@@ -806,4 +806,131 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
   ]);
   // os not set -> assume Ubuntu (2026-08-23).
   assertEquals(hostNode.data.os, { name: "ubuntu", version: "26.04" });
+});
+
+// defineOvnRouter object form (OvnRouterSpec): routingDomains is declared
+// up-front and left/right are kind-tagged endpoint specs resolved by the
+// builder — a fully declarative alternative to the builder-function form
+// (2026-09-08).
+Deno.test("defineOvnRouter object form: declarative OvnRouterSpec resolves left/right", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const a = net.collisionDomain("seg-a");
+    const b = net.collisionDomain("seg-b");
+    const d = net.routingDomain("Route-D");
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-x", {
+          routingDomains: [d],
+          left: {
+            kind: "ovn",
+            l2Segment: a,
+            ipaddrs: [IPv4.parse("192.168.1.1/24")],
+            ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+          },
+          right: {
+            kind: "ovn",
+            l2Segment: b,
+            ipaddrs: [IPv4.parse("192.168.2.1/24")],
+          },
+        }),
+      ],
+    };
+  });
+  assertEquals(network.allRouters.length, 1);
+  const r = network.allRouters[0];
+  assertEquals(r.name, "router-x");
+  assertEquals(r.routingDomains?.[0]?.name, "Route-D");
+  assertEquals(r.left.l2Segment.name, "seg-a");
+  assertEquals(r.right.l2Segment.name, "seg-b");
+  assertEquals(r.left.ipaddrs[0].to_string(), "192.168.1.1/24");
+});
+
+// A kernel.app.docker service on a plain OVN endpoint's services[] becomes
+// a kernel.container node: the leg's host runs it, bound to that segment.
+Deno.test("docker service on an ovn endpoint -> kernel.container node", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const a = net.collisionDomain("seg-a");
+    const b = net.collisionDomain("seg-b");
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-x", {
+          routingDomains: [],
+          left: {
+            kind: "ovn",
+            l2Segment: a,
+            ipaddrs: [IPv4.parse("192.168.1.1/24")],
+            ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+            services: [
+              {
+                kind: "kernel.app.docker",
+                name: "dns",
+                image: "ovn-fabric-dns",
+                cmd: ["/usr/sbin/dnsmasq", "--no-daemon"],
+                ipaddrs: [IPv4.parse("192.168.1.53/24")],
+              },
+            ],
+          },
+          right: {
+            kind: "ovn",
+            l2Segment: b,
+            ipaddrs: [IPv4.parse("192.168.2.1/24")],
+          },
+        }),
+      ],
+    };
+  });
+  const nodes = toIR(network);
+  const c = nodes["kernel.container:dns"] as { data: Record<string, unknown> };
+  assertEquals(c.data.host, "host:chassis-1");
+  assertEquals(c.data.l2Segment, "ls:seg-a");
+  assertEquals(c.data.ipaddrs, ["192.168.1.53/24"]);
+  assertEquals(c.data.image, "ovn-fabric-dns");
+  assertEquals(c.data.cmd, ["/usr/sbin/dnsmasq", "--no-daemon"]);
+});
+
+// A single-homed container's route via must be on the segment it attaches
+// to — an off-segment next-hop is unreachable and must throw.
+Deno.test("docker service route via must be on the endpoint's segment", () => {
+  const build = (via: string) =>
+    defineNetwork("test-net", (net) => {
+      const host = net.localHost("chassis-1");
+      const a = net.collisionDomain("seg-a");
+      const b = net.collisionDomain("seg-b");
+      return {
+        hosts: [host],
+        routers: [
+          net.defineOvnRouter("router-x", {
+            routingDomains: [],
+            left: {
+              kind: "ovn",
+              l2Segment: a,
+              ipaddrs: [IPv4.parse("192.168.1.1/24")],
+              ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+              services: [{
+                kind: "kernel.app.docker",
+                name: "dns",
+                image: "x",
+                routes: [{
+                  dst: IPv4.parse("0.0.0.0/0"),
+                  via: IPv4.parse(via),
+                }],
+              }],
+            },
+            right: {
+              kind: "ovn",
+              l2Segment: b,
+              ipaddrs: [IPv4.parse("192.168.2.1/24")],
+            },
+          }),
+        ],
+      };
+    });
+  // On-segment via (.1) is fine.
+  toIR(build("192.168.1.1"));
+  // Off-segment via is an unreachable next-hop -> error.
+  assertThrows(() => toIR(build("10.9.9.1")));
 });

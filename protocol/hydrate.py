@@ -162,6 +162,39 @@ def _hydrate_app(raw: dict):
     )
 
 
+def _hydrate_kernel_container(raw: dict) -> pt.KernelContainerNode:
+    data = raw["data"]
+    build_raw = data.get("build")
+    return pt.KernelContainerNode(
+        id=raw["id"],
+        kind=raw["kind"],
+        key=pt.KernelContainerKey(name=raw["key"]["name"]),
+        data=pt.KernelContainerData(
+            host=data["host"],
+            l2Segment=data["l2Segment"],
+            ipaddrs=[a for a in data["ipaddrs"]] if data.get("ipaddrs") else None,
+            routes=(
+                [pt.Route(dst=r["dst"], via=r.get("via")) for r in data["routes"]]
+                if data.get("routes")
+                else None
+            ),
+            image=data["image"],
+            cmd=[c for c in data["cmd"]] if data.get("cmd") else None,
+            build=(
+                pt.Build(
+                    from_=build_raw["from"],
+                    packages=(
+                        [p for p in build_raw["packages"]] if build_raw.get("packages") else None
+                    ),
+                    dockerfile=build_raw.get("dockerfile"),
+                )
+                if build_raw
+                else None
+            ),
+        ),
+    )
+
+
 def _hydrate_security_group(raw: dict) -> pt.SecurityGroupNode:
     data = raw["data"]
     return pt.SecurityGroupNode(
@@ -182,6 +215,7 @@ _HYDRATORS = {
     "ipv6.route": _hydrate_ipv6_route,
     "kernel.router": _hydrate_kernel_router,
     "security.group": _hydrate_security_group,
+    "kernel.container": _hydrate_kernel_container,
 }
 
 

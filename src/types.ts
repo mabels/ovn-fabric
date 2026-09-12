@@ -840,12 +840,18 @@ export type RouterEndpointService =
      * ["sleep", "86400"] — the trailing args of `docker run`
      * (normalized to tokens at resolve time). */
     readonly cmd?: string | readonly string[];
-    /** The container's interface address on the router's services
-     * segment, e.g. "10.200.0.2/24" — the container gets ONE veth into
-     * the kernel router's netns (the CNI/Multus-style interface
-     * injection), and this is the address on its end. The router end is
-     * the subnet's first host (`.1`). */
-    readonly ip?: string;
+    /** The container's addresses on the attached network (a segment, or a
+     * kernel router's services segment) — parsed IPv4/IPv6 with prefixes,
+     * same as an endpoint's `ipaddrs`. For the veth-injection mode the
+     * FIRST entry is the container's interface address and the peer end is
+     * that subnet's first host (`.1`); for a container bound to a segment
+     * they are its addresses on that segment. */
+    readonly ipaddrs?: readonly (IPv4 | IPv6)[];
+    /** The container's OWN routes (e.g. its default via the segment
+     * gateway). Omitted/empty → a default route (per family on the
+     * endpoint) is added via the endpoint's address (the segment/router
+     * gateway) at resolve time (2026-09-08). */
+    readonly routes?: readonly RouterEndpointRoute[];
   };
 
 /** One route entry declared directly on the RouterEndpoint that IS the

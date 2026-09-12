@@ -1283,3 +1283,65 @@ class GeneratePythonDeployerTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# A kernel.container node (a docker service on a segment) renders on its
+# host: build image, run the container, bind a veth into the segment's OVS
+# bridge, run the cmd. Delete removes the container + bridge port.
+class KernelContainerDeployTest(unittest.TestCase):
+    def test_kernel_container_create_and_delete(self) -> None:
+        seg = pt.OvnLsNode(
+            id="ls:container-seg",
+            kind="ovn.ls",
+            key=pt.OvnLsKey(name="container-seg"),
+            data=pt.OvnLsData(
+                interfaces=[
+                    pt.Interface(
+                        host="chassis-1",
+                        iface={
+                            "kind": "vlan",
+                            "vlanParent": "eth0",
+                            "vlanId": 1130,
+                            "shortName": "br-cont",
+                        },
+                    )
+                ]
+            ),
+        )
+        cont = pt.KernelContainerNode(
+            id="kernel.container:dns",
+            kind="kernel.container",
+            key=pt.KernelContainerKey(name="dns"),
+            data=pt.KernelContainerData(
+                host="host:chassis-1",
+                l2Segment="ls:container-seg",
+                ipaddrs=["192.168.50.53/24"],
+                image="ovn-fabric-dns",
+                cmd=["/usr/sbin/dnsmasq", "--no-daemon"],
+            ),
+        )
+        nodes = list(NODES) + [seg, cont]
+        _, create_hosts = mod.build_scripts(nodes, "create")
+        create = create_hosts["chassis-1"]
+        # The wire script builds the image and binds the veth into br-cont.
+        self.assertIn("cat > /usr/local/sbin/ovn-kernel-container-dns.sh << 'OVN'", create)
+        self.assertIn('image="ovn-fabric-dns"', create)
+        self.assertIn('ovs-vsctl add-port "$bridge" "$dev"', create)
+        self.assertIn("ip addr add 192.168.50.53/24 dev eth0", create)
+        # The service is the container's command — docker run -d backgrounds it.
+        self.assertIn(
+            'docker run -d --privileged --network none --name "$container" '
+            '"$image" /usr/sbin/dnsmasq --no-daemon',
+            create,
+        )
+        self.assertNotIn("docker exec", create)
+        # The container's wire script is written AFTER the segment bridge is
+        # bound (its veth attaches to that bridge).
+        self.assertGreater(
+            create.index("ovn-kernel-container-dns.sh"),
+            create.index("ovs-vsctl add-port br-cont eth0.1130"),
+        )
+        _, delete_hosts = mod.build_scripts(nodes, "delete")
+        delete = delete_hosts["chassis-1"]
+        self.assertIn("/usr/bin/docker rm -f dns", delete)
+        self.assertIn("del-port br-cont sc-", delete)

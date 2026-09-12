@@ -235,6 +235,24 @@ export interface RouterBuilder {
   ): OvnRouterEndpoint;
 }
 
+/** The DECLARATIVE object form of defineOvnRouter() (2026-09-08): a router
+ * as one typed value — routingDomains (required) up-front, and left/right
+ * as kind-tagged endpoint specs. RoutingDomains is known here BEFORE the
+ * endpoints are resolved, so a kernel/tunnel spec is built with it
+ * directly (no deferred stamp). Endpoint services are plain objects in
+ * each spec's `services` array. */
+export interface OvnRouterSpec {
+  readonly routingDomains: readonly RoutingDomain[];
+  readonly left:
+    | OvnRouterEndpoint
+    | KernelRouterEndpoint
+    | TunnelRouterEndpoint;
+  readonly right:
+    | OvnRouterEndpoint
+    | KernelRouterEndpoint
+    | TunnelRouterEndpoint;
+}
+
 /**
  * The builder context passed into defineNetwork's callback. Each method
  * both registers the declared thing and returns a handle to it, so later
@@ -454,11 +472,34 @@ export class NetworkBuilder {
    * Declare-before-use discipline every other builder method in this file
    * requires (e.g. a collisionDomain must exist before a router references
    * it). */
+  /** Resolve a kind-tagged endpoint spec (the defineOvnRouter() object
+   * form's left/right) into a stored OvnRouterEndpoint — dispatching to the
+   * same builders the router.endpoint methods use (2026-09-08). */
+  private resolveEndpointSpec(
+    spec: OvnRouterEndpoint | KernelRouterEndpoint | TunnelRouterEndpoint,
+    routingDomains: readonly RoutingDomain[],
+    routerName: string,
+    subRouters: Router[],
+  ): OvnRouterEndpoint {
+    if (spec.kind === "ovn") {
+      const { kind: _kind, ...rest } = spec;
+      return this.buildOvnRouterEndpoint(rest);
+    }
+    if (spec.kind === "kernel") {
+      const { kind: _kind, ...rest } = spec;
+      return this.buildKernelRouterEndpoint(rest, routingDomains, routerName);
+    }
+    const { kind: _kind, ...rest } = spec;
+    return this.buildTunnelRouterEndpoint(rest, routerName, subRouters);
+  }
+
   defineOvnRouter(
     name: string,
-    build: (router: RouterBuilder) => {
-      readonly routingDomains: readonly RoutingDomain[];
-    },
+    build:
+      | OvnRouterSpec
+      | ((router: RouterBuilder) => {
+        readonly routingDomains: readonly RoutingDomain[];
+      }),
   ): Router {
     if (this.routersByName.has(name)) {
       throw new Error(`router "${name}" declared more than once`);
@@ -481,7 +522,26 @@ export class NetworkBuilder {
       tunnelRouterEndpoint: (input) =>
         this.buildTunnelRouterEndpoint(input, name, subRouters),
     };
-    const decl = build(router);
+    // The object form carries routingDomains up-front, so its kernel/tunnel
+    // specs are resolved with it directly (no deferred stamp needed); the
+    // builder form still returns routingDomains after left/right are set.
+    const routingDomains = typeof build === "function"
+      ? build(router).routingDomains
+      : build.routingDomains;
+    if (typeof build !== "function") {
+      router.left = this.resolveEndpointSpec(
+        build.left,
+        build.routingDomains,
+        name,
+        subRouters,
+      );
+      router.right = this.resolveEndpointSpec(
+        build.right,
+        build.routingDomains,
+        name,
+        subRouters,
+      );
+    }
 
     if (router.left === undefined || router.right === undefined) {
       throw new Error(
@@ -491,7 +551,7 @@ export class NetworkBuilder {
     }
     this.checkRouterEndpoint(name, router.left);
     this.checkRouterEndpoint(name, router.right);
-    for (const domain of decl.routingDomains) {
+    for (const domain of routingDomains) {
       if (this.routingDomainsByName.get(domain.name) !== domain) {
         throw new Error(
           `router "${name}" references routing domain "${domain.name}", ` +
@@ -509,14 +569,14 @@ export class NetworkBuilder {
     ) {
       this.kernelRoutersByName.set(name, {
         ...kernelRouter,
-        routingDomains: decl.routingDomains,
+        routingDomains,
       });
     }
     const built: Router = {
       name,
       left: this.deriveGatewayChassis(router.left),
       right: this.deriveGatewayChassis(router.right),
-      routingDomains: decl.routingDomains,
+      routingDomains,
       subRouters,
     };
     this.routersByName.set(name, built);
@@ -745,8 +805,8 @@ export class NetworkBuilder {
         const cmd = typeof s.cmd === "string"
           ? s.cmd.trim().split(/\s+/).filter((t) => t.length > 0)
           : s.cmd;
-        const containerIp = s.ip !== undefined
-          ? IPv4.parse(s.ip)
+        const containerIp = s.ipaddrs !== undefined && s.ipaddrs.length > 0
+          ? s.ipaddrs[0]
           : IPv4.parse(`10.200.${fnv1a32(routerName) % 256}.2/24`);
         const routerIp = containerIp.network().first();
         apps.push({
