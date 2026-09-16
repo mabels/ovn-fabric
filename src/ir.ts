@@ -612,6 +612,7 @@ function resolveIpv6RaConfigs(
 function routerEndpointToIR(
   router: Router,
   endpoint: OvnRouterEndpoint,
+  dstsByDomain: ReadonlyMap<string, ReadonlySet<string>>,
 ): IRNode {
   const scope = `ovnrouter:${router.name}`;
   const id = `${scope}|lrp:${endpoint.name}`;
@@ -631,24 +632,85 @@ function routerEndpointToIR(
         ? `host:${endpoint.gatewayChassis.name}`
         : undefined,
       ipv6RaConfigs: resolveIpv6RaConfigs(endpoint.services),
-      serviceRefs: resolveServiceRefs(router, endpoint),
+      serviceRefs: resolveServiceRefs(router, endpoint, dstsByDomain),
     },
   };
 }
 
+function isDefaultDst(dst: IPv4 | IPv6): boolean {
+  const s = dst.to_string();
+  return s === "0.0.0.0/0" || s === "::/0";
+}
+
+// The destinations a RoutingDomain distributes. An explicit, non-empty
+// `routes` on the domain OVERRIDES; otherwise they are CALCULATED — the dst
+// prefixes of the route nodes the domain's own participants actually
+// resolved (anchors + interconnect below), i.e. what the domain really
+// distributes through the network. A domain that resolved no routes (a pure
+// membership tag) distributes nothing. `routes: []` is treated the same as
+// omitting it: no override, calculate.
+function domainDsts(
+  domain: RoutingDomain,
+  dstsByDomain: ReadonlyMap<string, ReadonlySet<string>>,
+): readonly string[] {
+  if (domain.routes && domain.routes.length > 0) {
+    return domain.routes.map((r) => r.dst.to_string());
+  }
+  return [...(dstsByDomain.get(domain.name) ?? [])];
+}
+
+// The routes a workload NIC inherits at the WORKLOAD layer: the calculated
+// (or explicitly overridden) destinations of every RoutingDomain its
+// endpoint's router participates in, next-hopped at THIS endpoint's own
+// gateway (the address a container on this segment must use). A dst the
+// endpoint is already ON-LINK for is skipped — the connected route already
+// covers it. Explicit attachment routes (ref.routes) win outright; see
+// resolveServiceRefs below — this is the ONLY source of a workload's
+// routes (there is no per-attachment "primary" flag).
+function workloadDomainRoutes(
+  router: Router,
+  endpoint: OvnRouterEndpoint,
+  attachmentAddrs: readonly (IPv4 | IPv6)[],
+  dstsByDomain: ReadonlyMap<string, ReadonlySet<string>>,
+): { dst: string; via: string }[] {
+  const domains = endpoint.routingDomains ?? router.routingDomains ?? [];
+  const out: { dst: string; via: string }[] = [];
+  for (const domain of domains) {
+    for (const dst of domainDsts(domain, dstsByDomain)) {
+      const isV4 = !dst.includes(":");
+      // The NIC can only use a next hop of a family it actually has an
+      // address for — the ATTACHMENT's addresses, not the endpoint's: a
+      // v4-only container NIC must not get a v6 route just because the
+      // router port has a v6 address (the gateway would be unreachable and
+      // `ip route add` fails, taking the rest of the script with it).
+      if (!attachmentAddrs.some((a) => a.is_ipv4() === isV4)) continue;
+      const gateway = endpoint.ipaddrs.find((a) => a.is_ipv4() === isV4);
+      if (!gateway) continue;
+      const onLink = attachmentAddrs.some((a) =>
+        a.is_ipv4() === isV4 && a.network().to_string() === dst
+      );
+      if (onLink) continue;
+      if (out.some((r) => r.dst === dst)) continue;
+      out.push({ dst, via: gateway.to_s() });
+    }
+  }
+  return out;
+}
+
 // A workload attachment at this endpoint — REFERENCES the
-// `kernel.app.container:<name>` node, with this segment's addressing. `routes`
-// is explicit, else (only on the PRIMARY reference) a default per family
-// via this endpoint's own address (the segment gateway); an off-segment
-// `via` is unreachable on this L2 and throws (2026-09-08).
+// `kernel.app.container:<name>` node, with this segment's addressing.
+// `routes` is explicit; otherwise the NIC inherits the routes of the
+// RoutingDomains its endpoint's router participates in, next-hopped at this
+// segment's gateway (workloadDomainRoutes above). An off-segment `via` on an
+// explicit route is unreachable on this L2 and throws (2026-09-08).
 function resolveServiceRefs(
   router: Router,
   endpoint: OvnRouterEndpoint,
+  dstsByDomain: ReadonlyMap<string, ReadonlySet<string>>,
 ): {
   service: string;
   ipaddrs?: string[];
   routes?: { dst: string; via?: string }[];
-  primary?: boolean;
 }[] | undefined {
   const refs = (endpoint.services ?? []).filter((s) =>
     s.kind === "service.attach"
@@ -672,7 +734,7 @@ function resolveServiceRefs(
           ...(r.via ? { via: r.via.to_s() } : {}),
         };
       })
-      : (ref.primary ? defaultRoutesViaEndpoint(endpoint) : []);
+      : workloadDomainRoutes(router, endpoint, ref.ipaddrs, dstsByDomain);
     return {
       service: `kernel.app.container:${ref.srvRef.name}`,
       // The in-container NIC name — resolved HERE (generator side), not by
@@ -682,9 +744,32 @@ function resolveServiceRefs(
       ...(ref.ipaddrs.length > 0
         ? { ipaddrs: ref.ipaddrs.map((a) => a.to_string()) }
         : {}),
-      ...(routes.length > 0 ? { routes } : {}),
-      ...(ref.primary ? { primary: true } : {}),
+      ...(routes.length > 0 ? { routes: orderRoutes(routes) } : {}),
     };
+  });
+}
+
+// Defaults FIRST, and all IPv4 before all IPv6, then lexically. The
+// deployer applies these in order inside a `set -e` script: a route that
+// can't be installed (e.g. a v6 gateway on a NIC whose v6 address is still
+// tentative) would otherwise abort before the default ever landed, leaving
+// the container with no default at all (hit live, 2026-09-16). Putting the
+// v4 default first makes that failure survivable; sorting the rest keeps
+// the IR diff-stable.
+function orderRoutes(
+  routes: readonly { dst: string; via?: string }[],
+): { dst: string; via?: string }[] {
+  const key = (dst: string): [number, number, string] => [
+    dst.includes(":") ? 1 : 0, // IPv4 before IPv6
+    dst === "0.0.0.0/0" || dst === "::/0" ? 0 : 1, // default before the rest
+    dst,
+  ];
+  return [...routes].sort((a, b) => {
+    const ka = key(a.dst);
+    const kb = key(b.dst);
+    if (ka[0] !== kb[0]) return ka[0] - kb[0];
+    if (ka[1] !== kb[1]) return ka[1] - kb[1];
+    return ka[2] < kb[2] ? -1 : ka[2] > kb[2] ? 1 : 0;
   });
 }
 
@@ -894,6 +979,53 @@ function computeRoutes(network: NetworkDefinition): IRNode[] {
       }
     }
   }
+  // Domain routes at the ROUTER layer (2026-09-16): every participant of a
+  // domain also learns each NON-default dst the domain declares
+  // (RoutingDomain.routes), routed via whichever participant OWNS it (an
+  // endpoint subnet containing the dst) on a CollisionDomain the two share.
+  // Defaults (0.0.0.0/0, ::/0) are deliberately excluded: they have no
+  // owning participant, and the anchor loop above already covers them. This
+  // deliberately overlaps computeInterconnectRoutes — same node id, same
+  // next hop — because both describe "reach a peer's own subnet"; it only
+  // adds anything for a domain dst that is NOT a participant's subnet.
+  for (const domain of network.allRoutingDomains) {
+    const participants = network.allRouters.filter((r) =>
+      isDomainParticipant(r, domain)
+    );
+    // EXPLICIT overrides only — a domain's CALCULATED routes are the
+    // anchor/interconnect routes already produced above, so distributing
+    // them again here would just duplicate those node ids.
+    for (const route of domain.routes ?? []) {
+      if (isDefaultDst(route.dst)) continue;
+      const dst = route.dst.to_string();
+      for (const router of participants) {
+        if (ownPrefixes.get(router.name)?.has(dst)) continue;
+        const ownsDst = (
+          candidate: Router,
+        ): OvnRouterEndpoint | undefined =>
+          candidate.endpoints.find((e) =>
+            e.ipaddrs.some((a) =>
+              a.is_ipv4() === route.dst.is_ipv4() &&
+              a.network().to_string() === dst
+            )
+          );
+        if (ownsDst(router)) continue; // already on-link for this dst
+        const owner = participants.find((p) =>
+          p.name !== router.name && ownsDst(p) !== undefined
+        );
+        if (!owner) continue;
+        const ownerEndpoint = ownsDst(owner);
+        if (!ownerEndpoint) continue;
+        const nexthop = anchorAddressSharedWith(
+          router,
+          { router: owner, endpoint: ownerEndpoint },
+          route.dst,
+        );
+        if (!nexthop) continue;
+        nodes.push(routeToIR(router, route.dst, nexthop, false, domain.name));
+      }
+    }
+  }
   return nodes;
 }
 
@@ -970,22 +1102,9 @@ function computeInterconnectRoutes(network: NetworkDefinition): IRNode[] {
 // service (the workload), with the referencing endpoints carrying the NICs: a
 // container the endpoint's leg HOST runs, bound to the leg's collision
 // domain (an L2 endpoint on that segment, not a router) (2026-09-08).
-// A container with no declared routes defaults out the endpoint that hosts
-// it: one default route per family the endpoint's OWN ipaddrs carry, via
-// that family's address (the .1 gateway on the shared segment).
-function defaultRoutesViaEndpoint(
-  endpoint: OvnRouterEndpoint,
-): { dst: string; via: string }[] {
-  const out: { dst: string; via: string }[] = [];
-  for (const addr of endpoint.ipaddrs) {
-    if (addr.is_ipv4()) {
-      out.push({ dst: "0.0.0.0/0", via: addr.to_s() });
-    } else {
-      out.push({ dst: "::/0", via: addr.to_s() });
-    }
-  }
-  return out;
-}
+// A container's routes come from its attachment's explicit `routes` if any,
+// else from the RoutingDomains its segment's router participates in
+// (workloadDomainRoutes above).
 
 // A container's route `via` must be an address reachable on the segment it
 // sits on — i.e. inside the network of one of the hosting endpoint's OWN
@@ -1058,6 +1177,44 @@ function serviceNodes(network: NetworkDefinition): IRNode[] {
 export function toIR(network: NetworkDefinition): Record<string, IRNode> {
   const nodes: Record<string, IRNode> = {};
 
+  // Route nodes FIRST (2026-09-16): a RoutingDomain's CALCULATED destinations
+  // are the prefixes its participants actually resolved (anchors +
+  // interconnect), and a workload inherits them (workloadDomainRoutes) — so
+  // they must exist before the endpoints are emitted. Insertion order is
+  // irrelevant here; the final map is sorted by id below.
+  const interconnectRoutes = computeInterconnectRoutes(network);
+  const domainRoutes = computeRoutes(network);
+  // Infrastructure subnets (OVN-internal transit/backdoor links and the
+  // backbone) are NOT destinations a workload should route to: they're
+  // router plumbing. Their prefixes leak into a domain's calculated set via
+  // interconnect (a tunnel's upstream router is a Voda-defaultRoute
+  // participant, so its transit subnets get distributed), so filter them out
+  // of what workloads inherit.
+  const infraPrefixes = new Set<string>();
+  for (const router of network.allRouters) {
+    for (const endpoint of router.endpoints) {
+      const name = endpoint.l2Segment.name;
+      const infra = name === network.backbone?.name ||
+        name.startsWith("transit-") || name.startsWith("backdoor-");
+      if (!infra) continue;
+      for (const addr of endpoint.ipaddrs) {
+        infraPrefixes.add(addr.network().to_string());
+      }
+    }
+  }
+  const dstsByDomain = new Map<string, Set<string>>();
+  for (const route of [...interconnectRoutes, ...domainRoutes]) {
+    const domain = route.data["domain"] as string;
+    const prefix = route.key["prefix"] as string;
+    if (infraPrefixes.has(prefix)) continue;
+    let set = dstsByDomain.get(domain);
+    if (!set) {
+      set = new Set();
+      dstsByDomain.set(domain, set);
+    }
+    set.add(prefix);
+  }
+
   for (const host of network.allHosts) {
     const node = hostToIR(host, hostDependencies(host, network));
     nodes[node.id] = node;
@@ -1081,7 +1238,7 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
             `"${endpoint.kind}" — toIR() has no emission strategy for it yet`,
         );
       }
-      const node = routerEndpointToIR(router, endpoint);
+      const node = routerEndpointToIR(router, endpoint, dstsByDomain);
       nodes[node.id] = node;
     }
   }
@@ -1101,10 +1258,10 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
   // router loop below (moved 2026-08-13) — kernelRouterSideToIR's own
   // back-route mirroring needs the FULL, already-deduped route set to
   // mirror from.
-  for (const route of computeInterconnectRoutes(network)) {
+  for (const route of interconnectRoutes) {
     nodes[route.id] = route;
   }
-  for (const route of computeRoutes(network)) {
+  for (const route of domainRoutes) {
     nodes[route.id] = route;
   }
   const routeNodes = Object.values(nodes).filter((n) =>

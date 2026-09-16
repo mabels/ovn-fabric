@@ -134,7 +134,6 @@ export interface EndpointBuilder {
     attachment: {
       readonly ipaddrs: readonly (IPv4 | IPv6)[];
       readonly routes?: readonly RouterEndpointRoute[];
-      readonly primary?: boolean;
     },
   ): Extract<RouterEndpointService, { kind: "service.attach" }>;
 }

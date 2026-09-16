@@ -40,8 +40,9 @@ class ShellEmitter(Emitter):
     def __init__(self, action: Action) -> None:
         super().__init__(action)
 
-    def sh(self, argv: list[str], background: bool = False) -> None:
-        self.lines.append(shlex.join(argv) + (" &" if background else ""))
+    def sh(self, argv: list[str], background: bool = False, optional: bool = False) -> None:
+        line = shlex.join(argv) + (" &" if background else "")
+        self.lines.append(line + (" || true" if optional else ""))
 
     def append(self, path: str, content: str) -> None:
         self.lines.append(f"cat > {path} << 'OVN'")

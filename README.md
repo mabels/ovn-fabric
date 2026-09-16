@@ -143,11 +143,22 @@ non-shebang line would break that.
   and an upstream leg on the other. Both are consumed into a plain OVN
   endpoint by their builder; the netns itself is emitted as `kernel.router`
   IR nodes.
+- **RoutingDomain** — a membership + route-distribution tag,
+  `net.routingDomain(name, { routes? })`. With no (or an empty) `routes`,
+  the domain's destinations are **calculated** from what its participants
+  actually resolve (anchor routes + interconnect), minus infrastructure
+  transit/backdoor/backbone prefixes; an explicit non-empty `routes` array
+  overrides that. The domain's routes reach both its **router** participants
+  (next-hopped at a peer's address on a shared domain) and any **workload**
+  attached to a participating segment (next-hopped at that segment's
+  gateway).
 - **Service / workload** — a reusable, network-free workload
   (`net.service(name, (svc) => {...})`) attached to one or more endpoints
-  with `ep.attachTo(svc, { ipaddrs, routes?, primary? })`: one NIC per
-  attachment (the k8s pod model). Each becomes a `kernel.app.container`
-  node (a docker container the host runs).
+  with `ep.attachTo(svc, { ipaddrs, routes? })`: one NIC per attachment (the
+  k8s pod model). A NIC's routes are its explicit `routes`, else the routes
+  of the RoutingDomains its endpoint's router participates in, via that
+  segment's gateway. Each workload becomes a `kernel.app.container` node (a
+  docker container the host runs).
 
 See the doc comments in `src/types.ts` for the full model — every field has
 an explanation of what it's for and why it's shaped the way it is.

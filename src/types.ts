@@ -838,8 +838,11 @@ export type RouterEndpointService =
     readonly kind: "service.attach";
     readonly srvRef: Service;
     readonly ipaddrs: readonly (IPv4 | IPv6)[];
+    /** Explicit routes for THIS NIC (over the segment gateway). Omitted/
+     * empty → the NIC inherits the routes of the RoutingDomains its
+     * endpoint's router participates in, next-hopped at this endpoint's
+     * address (workloadDomainRoutes, src/ir.ts). */
     readonly routes?: readonly RouterEndpointRoute[];
-    readonly primary?: boolean;
   }
   // CONFIG-SIDE WORKLOAD SHORTCUTS — kept in the topology; define.ts maps
   // them onto the generic kernel.app.container / kernel.app.service (the IR
@@ -946,6 +949,14 @@ export interface RouterEndpointRoute {
   readonly with?: "masq";
 }
 
+/** One destination a RoutingDomain distributes — the DST only; the next
+ * hop is resolved per consumer (a participating router's address on the
+ * shared CollisionDomain, or a workload's gateway on the segment it
+ * attaches to). */
+export interface RoutingDomainRoute {
+  readonly dst: IPv4 | IPv6;
+}
+
 /** A named group of routers that should all learn about each other's
  * anchor routes — declared once via net.routingDomain(), then
  * referenced by any number of routers' Router.routingDomains. Purely a
@@ -967,6 +978,18 @@ export interface RouterEndpointRoute {
  * apply anything"). */
 export interface RoutingDomain {
   readonly name: string;
+  /** The destinations this domain distributes to its participants
+   * (routers) and, transitively, to workloads attached to their
+   * segments (src/ir.ts's domainDsts/workloadDomainRoutes).
+   *
+   * Omitted OR empty → CALCULATED: the destinations the domain's
+   * participants actually resolved (anchor routes + interconnect),
+   * minus infrastructure transit/backdoor/backbone prefixes. An explicit,
+   * non-empty array (net.routingDomain()'s 2nd arg) OVERRIDES that
+   * calculated set — e.g. a domain that distributes specific prefixes
+   * only. There is no fixed implicit default; a `*-defaultRoute` domain
+   * gets its default because its anchor declares one. */
+  readonly routes?: readonly RoutingDomainRoute[];
 }
 
 export interface Router {

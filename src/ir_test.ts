@@ -1160,11 +1160,9 @@ Deno.test("multiple services attached across endpoints -> one service node each"
                 services: [
                   ep.attachTo(dns128, {
                     ipaddrs: [IPv4.parse("10.43.0.128/24")],
-                    primary: true,
                   }),
                   ep.attachTo(dns129, {
                     ipaddrs: [IPv4.parse("10.43.0.129/24")],
-                    primary: true,
                   }),
                 ],
               })),
@@ -1317,7 +1315,6 @@ Deno.test("attachTo records endpointRefs on the service", () => {
                 services: [
                   ep.attachTo(dns, {
                     ipaddrs: [IPv4.parse("10.43.0.5/24")],
-                    primary: true,
                   }),
                 ],
               })),
@@ -1335,9 +1332,10 @@ Deno.test("attachTo records endpointRefs on the service", () => {
     dns.endpointRefs.map((r) => r.endpoint.l2Segment.name).sort(),
     ["control-plane", "seg-a"],
   );
+  // Every attachment carries its endpoint (no per-attachment flags).
   assertEquals(
-    dns.endpointRefs.find((r) => r.primary)?.endpoint.l2Segment.name,
-    "control-plane",
+    dns.endpointRefs.every((r) => r.endpoint.l2Segment.name.length > 0),
+    true,
   );
 });
 
@@ -1516,4 +1514,255 @@ Deno.test("defineOvnRouter: one explicit endpoint name across two routers is rej
     Error,
     "unique across the whole network",
   );
+});
+
+// ── RoutingDomain.routes: calculated vs explicit override ────────────
+// A domain with no explicit routes distributes what its participants
+// actually RESOLVED (anchor + interconnect); a workload NIC on one of its
+// segments inherits that, next-hopped at the segment's gateway.
+Deno.test("routingDomain: calculated routes reach a workload via its segment gateway", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const seg = net.collisionDomain("seg-a");
+    const bseg = net.collisionDomain("seg-b");
+    const bb = net.collisionDomain("bb");
+    const d = net.routingDomain("D");
+    const svc = net.service("svc", (s) => {
+      s.image = "img";
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-a", (r) => ({
+          routingDomains: [d],
+          endpoints: [
+            r.ovnRouterEndpoint((ep) => ({
+              l2Segment: seg,
+              ipaddrs: [IPv4.parse("10.0.0.1/24")],
+              ifaces: [
+                {
+                  host,
+                  iface: { kind: "vlan", vlanParent: "eth0", vlanId: 10 },
+                },
+              ],
+              services: [
+                ep.attachTo(svc, { ipaddrs: [IPv4.parse("10.0.0.9/24")] }),
+              ],
+            })),
+            r.ovnRouterEndpoint({
+              l2Segment: bb,
+              ipaddrs: [IPv4.parse("172.16.0.1/16")],
+            }),
+          ],
+        })),
+        // The anchor: router-b's segment endpoint declares the default, so
+        // domain D resolves a default route for its participants.
+        net.defineOvnRouter("router-b", (r) => ({
+          routingDomains: [d],
+          endpoints: [
+            r.ovnRouterEndpoint({
+              l2Segment: bseg,
+              ipaddrs: [IPv4.parse("10.1.0.1/24")],
+              routes: [
+                {
+                  dst: IPv4.parse("0.0.0.0/0"),
+                  via: IPv4.parse("10.1.0.254"),
+                },
+              ],
+            }),
+            r.ovnRouterEndpoint({
+              l2Segment: bb,
+              ipaddrs: [IPv4.parse("172.16.0.2/16")],
+            }),
+          ],
+        })),
+      ],
+    };
+  });
+  const router = network.allRouters.find((r) => r.name === "router-a");
+  if (!router) throw new Error("expected router-a");
+  const lrp = node(
+    toIR(network),
+    `ovnrouter:router-a|lrp:${endpointOn(router, "seg-a").name}`,
+  );
+  const refs = (lrp.data as { serviceRefs?: { routes?: unknown }[] })
+    .serviceRefs ?? [];
+  const routes = refs[0]?.routes as { dst: string; via: string }[];
+  // D's calculated set = the anchor's default + the interconnect peer
+  // subnets; the on-link 10.0.0.0/24 is skipped. Everything is next-hopped
+  // at the segment gateway.
+  assertEquals(routes.map((r) => r.dst).sort(), ["0.0.0.0/0", "10.1.0.0/24"]);
+  assertEquals(routes.every((r) => r.via === "10.0.0.1"), true);
+});
+
+Deno.test("routingDomain: explicit routes replace the calculated set", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const seg = net.collisionDomain("seg-a");
+    const bb = net.collisionDomain("bb");
+    const d = net.routingDomain("D", {
+      routes: [{ dst: IPv4.parse("192.168.129.0/24") }],
+    });
+    const svc = net.service("svc", (s) => {
+      s.image = "img";
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-a", (r) => ({
+          routingDomains: [d],
+          endpoints: [
+            r.ovnRouterEndpoint((ep) => ({
+              l2Segment: seg,
+              ipaddrs: [IPv4.parse("10.0.0.1/24")],
+              ifaces: [
+                {
+                  host,
+                  iface: { kind: "vlan", vlanParent: "eth0", vlanId: 10 },
+                },
+              ],
+              services: [
+                ep.attachTo(svc, { ipaddrs: [IPv4.parse("10.0.0.9/24")] }),
+              ],
+            })),
+            r.ovnRouterEndpoint({
+              l2Segment: bb,
+              ipaddrs: [IPv4.parse("172.16.0.1/16")],
+            }),
+          ],
+        })),
+      ],
+    };
+  });
+  const router = network.allRouters[0];
+  if (!router) throw new Error("expected one router");
+  const lrp = node(
+    toIR(network),
+    `ovnrouter:router-a|lrp:${endpointOn(router, "seg-a").name}`,
+  );
+  const refs = (lrp.data as { serviceRefs?: { routes?: unknown }[] })
+    .serviceRefs ?? [];
+  // Exactly the declared prefix — no default alongside it.
+  assertEquals(refs[0]?.routes, [
+    { dst: "192.168.129.0/24", via: "10.0.0.1" },
+  ]);
+});
+
+Deno.test("routingDomain: a dst the attachment is on-link for is skipped", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const seg = net.collisionDomain("seg-a");
+    const bb = net.collisionDomain("bb");
+    const d = net.routingDomain("D", {
+      routes: [{ dst: IPv4.parse("10.0.0.0/24") }],
+    });
+    const svc = net.service("svc", (s) => {
+      s.image = "img";
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-a", (r) => ({
+          routingDomains: [d],
+          endpoints: [
+            r.ovnRouterEndpoint((ep) => ({
+              l2Segment: seg,
+              ipaddrs: [IPv4.parse("10.0.0.1/24")],
+              ifaces: [
+                {
+                  host,
+                  iface: { kind: "vlan", vlanParent: "eth0", vlanId: 10 },
+                },
+              ],
+              services: [
+                ep.attachTo(svc, { ipaddrs: [IPv4.parse("10.0.0.9/24")] }),
+              ],
+            })),
+            r.ovnRouterEndpoint({
+              l2Segment: bb,
+              ipaddrs: [IPv4.parse("172.16.0.1/16")],
+            }),
+          ],
+        })),
+      ],
+    };
+  });
+  const router = network.allRouters[0];
+  if (!router) throw new Error("expected one router");
+  const lrp = node(
+    toIR(network),
+    `ovnrouter:router-a|lrp:${endpointOn(router, "seg-a").name}`,
+  );
+  const refs = (lrp.data as { serviceRefs?: { routes?: unknown }[] })
+    .serviceRefs ?? [];
+  // On-link, so the connected route already covers it — nothing emitted.
+  assertEquals(refs[0]?.routes, undefined);
+});
+
+Deno.test("workload routes: a prefix reached from two NICs stays on both (per-NIC tables)", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const segA = net.collisionDomain("seg-a");
+    const segB = net.collisionDomain("seg-b");
+    // Both domains distribute the same destination — e.g. ControlPlane-Route
+    // and Zerotier-route both reaching the management subnet. The
+    // deployer puts each NIC's routes in their OWN table (selected by a
+    // source rule), so both are kept rather than one being dropped.
+    const d1 = net.routingDomain("D1", {
+      routes: [{ dst: IPv4.parse("10.5.0.0/24") }],
+    });
+    const d2 = net.routingDomain("D2", {
+      routes: [{ dst: IPv4.parse("10.5.0.0/24") }],
+    });
+    const svc = net.service("svc", (s) => {
+      s.image = "img";
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-a", (r) => ({
+          routingDomains: [d1, d2],
+          endpoints: [
+            r.ovnRouterEndpoint((ep) => ({
+              l2Segment: segA,
+              ipaddrs: [IPv4.parse("10.0.0.1/24")],
+              ifaces: [
+                {
+                  host,
+                  iface: { kind: "vlan", vlanParent: "eth0", vlanId: 10 },
+                },
+              ],
+              services: [
+                ep.attachTo(svc, { ipaddrs: [IPv4.parse("10.0.0.9/24")] }),
+              ],
+            })),
+            r.ovnRouterEndpoint((ep) => ({
+              l2Segment: segB,
+              ipaddrs: [IPv4.parse("10.1.0.1/24")],
+              ifaces: [
+                {
+                  host,
+                  iface: { kind: "vlan", vlanParent: "eth0", vlanId: 11 },
+                },
+              ],
+              services: [
+                ep.attachTo(svc, { ipaddrs: [IPv4.parse("10.1.0.9/24")] }),
+              ],
+            })),
+          ],
+        })),
+      ],
+    };
+  });
+  const router = network.allRouters[0];
+  if (!router) throw new Error("expected one router");
+  const nodes = toIR(network);
+  const withRoute = router.endpoints.filter((ep) => {
+    const lrp = node(nodes, `ovnrouter:router-a|lrp:${ep.name}`);
+    const refs = (lrp.data as {
+      serviceRefs?: { routes?: { dst: string }[] }[];
+    }).serviceRefs ?? [];
+    return (refs[0]?.routes ?? []).some((r) => r.dst === "10.5.0.0/24");
+  });
+  assertEquals(withRoute.length, 2);
 });

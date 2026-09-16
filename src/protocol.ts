@@ -102,7 +102,6 @@ export const ServiceRef = type({
   name: "string",
   "ipaddrs?": "string[]",
   "routes?": KernelRouterRoute.array(),
-  "primary?": "boolean",
 });
 export const OvnLrpData = type({
   // `ls:<name>` — the referenced ovn.ls node's own id, not the bare

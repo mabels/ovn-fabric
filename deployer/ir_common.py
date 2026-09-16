@@ -77,6 +77,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import ipaddress
 import shlex
 
 from ladops import linux_net as linux_net_ops
@@ -124,7 +125,11 @@ class Emitter:
         backend has no envelope and never calls this."""
         self.lines.append(text)
 
-    def sh(self, argv: list[str], background: bool = False) -> None:
+    def sh(self, argv: list[str], background: bool = False, optional: bool = False) -> None:
+        """`optional=True`: this command failing must NOT stop the rest of
+        the pass — it is reported and skipped. Used for per-unit
+        `systemctl enable --now` so one broken workload/router can't block
+        every other operation (2026-09-16)."""
         raise NotImplementedError
 
     def append(self, path: str, content: str) -> None:
@@ -146,8 +151,9 @@ class _ShellBody(Emitter):
     appends, never Python. `background=True` is only meaningful here —
     the outer front-ends ignore it."""
 
-    def sh(self, argv: list[str], background: bool = False) -> None:
-        self.lines.append(shlex.join(argv) + (" &" if background else ""))
+    def sh(self, argv: list[str], background: bool = False, optional: bool = False) -> None:
+        line = shlex.join(argv) + (" &" if background else "")
+        self.lines.append(line + (" || true" if optional else ""))
 
     def append(self, path: str, content: str) -> None:
         # A delimiter distinct from the outer front-ends' `OVN`, so the
@@ -387,9 +393,7 @@ def _emit_cluster_body(nodes: list[pt.Model], emit: Emitter) -> None:
     # Explicit sorts make the emitted script byte-stable regardless of
     # the IR's input order (routers, switches; ports/routes are sorted
     # where they are emitted).
-    switches = sorted(
-        (n for n in nodes if n.kind == "ovn.ls"), key=lambda n: n.key.name
-    )
+    switches = sorted((n for n in nodes if n.kind == "ovn.ls"), key=lambda n: n.key.name)
     router_groups = _group_router_ports(nodes)
     routes_by_router = _group_routes_by_router(nodes)
     # Resolved for both actions — _emit_router's delete branch simply
@@ -1332,7 +1336,9 @@ def _emit_kernel_router(host_id: str, nodes: list[pt.Model], emit: Emitter) -> N
         emit.sh(["chmod", "+x", script_path])
         emit.append(unit_path, _kernel_router_unit(router, script_path))
         emit.sh(["systemctl", "daemon-reload"])
-        emit.sh(["systemctl", "enable", "--now", unit])
+        # Optional: one broken router unit must not stop the rest of the
+        # deploy (it is reported and the pass continues).
+        emit.sh(["systemctl", "enable", "--now", unit], optional=True)
     if len(emit.lines) > before:
         emit.blank()
 
@@ -1516,8 +1522,22 @@ def _service_up_lines(
         "mkdir -p /var/run/netns",
         'ln -sf "/proc/$pid/ns/net" "/var/run/netns/$container"',
     ]
-    for _i, ref, bridge, dev, nic in faces:
+    for i, ref, bridge, dev, nic in faces:
         peer = f"{dev}c"
+        # Per-NIC routing table + a source rule: source-based policy
+        # routing. Two NICs of the same workload may legitimately reach the
+        # SAME destination (e.g. both ControlPlane-Route and Zerotier-route
+        # resolve 192.168.129.0/24). In one table the second `ip route add`
+        # fails with EEXIST — which under `set -e` aborted the rest of the
+        # wiring (hit live 2026-09-16) — and `ip route replace` would
+        # instead silently re-home an existing (possibly NAT'd) route. A
+        # separate table per NIC, entered by a rule matching that NIC's own
+        # source prefix, keeps every path intact and picks the one that
+        # belongs to the source address. 1000+ stays clear of the kernel's
+        # reserved table ids (and tables are per-netns, so they don't
+        # collide across containers).
+        table = 1000 + i
+        networks = [str(ipaddress.ip_interface(a).network) for a in (ref.ipaddrs or [])]
         lines += [
             f"# --- NIC {nic} on {bridge} ---",
             f'ip link add "{dev}" type veth peer name "{peer}"',
@@ -1528,11 +1548,22 @@ def _service_up_lines(
         lines += [
             f'ip netns exec "$container" ip addr add {a} dev "{nic}"' for a in (ref.ipaddrs or [])
         ]
-        lines += [
-            f'ip netns exec "$container" ip route add {r.dst}'
-            + (f" via {r.via}" if r.via is not None else "")
-            for r in (ref.routes or [])
-        ]
+        if ref.routes:
+            # `ip route`/`ip rule` default to the IPv4 family, so an IPv6
+            # destination/source needs an explicit `ip -6` — otherwise the
+            # kernel rejects it ("Invalid source address") and `set -e`
+            # aborts the rest of the wiring (hit live 2026-09-16).
+            lines += [
+                f'ip netns exec "$container" ip {"-6" if ":" in r.dst else "-4"} route add {r.dst}'
+                + (f" via {r.via}" if r.via is not None else f' dev "{nic}"')
+                + f" table {table}"
+                for r in (ref.routes or [])
+            ]
+            lines += [
+                f'ip netns exec "$container" ip '
+                f'{"-6" if ":" in n else "-4"} rule add from {n} lookup {table}'
+                for n in networks
+            ]
         lines += [
             f'ip link set "{dev}" up',
             f'/usr/bin/ovs-vsctl add-port "{bridge}" "{dev}"',
@@ -1635,7 +1666,10 @@ def _emit_kernel_services(host_id: str, nodes: list[pt.Model], emit: Emitter) ->
         emit.sh(["chmod", "+x", script_path])
         emit.append(unit_path, _service_unit(name, script_path))
         emit.sh(["systemctl", "daemon-reload"])
-        emit.sh(["systemctl", "enable", "--now", unit])
+        # Optional: a non-working workload must not block every other
+        # operation — the failure is reported and the deploy continues to
+        # the next service (2026-09-16).
+        emit.sh(["systemctl", "enable", "--now", unit], optional=True)
 
 
 def _emit_host(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter) -> None:

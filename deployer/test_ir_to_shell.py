@@ -182,7 +182,14 @@ def _shell_command_lines(script: str) -> list[list[str]]:
             in_heredoc = stripped.split("'")[1]
             continue
         if line and not line.startswith("#") and not line.startswith("set "):
-            commands.append(shlex.split(line))
+            argv = shlex.split(line)
+            # `|| true` is the SHELL backend's rendering of an OPTIONAL
+            # command (Emitter.sh(optional=True), 2026-09-16); the Python
+            # backend expresses the same thing through run_cmd's abort
+            # flag, so drop it before comparing argv.
+            if argv[-2:] == ["||", "true"]:
+                argv = argv[:-2]
+            commands.append(argv)
     return commands
 
 
@@ -1356,7 +1363,6 @@ class KernelServiceDeployTest(unittest.TestCase):
                 service="kernel.app.container:dns",
                 name="control-plane",
                 ipaddrs=["10.43.0.5/24"],
-                primary=True,
                 routes=[pt.Route(dst="0.0.0.0/0", via="10.43.0.1")],
             ),
         )
@@ -1376,7 +1382,17 @@ class KernelServiceDeployTest(unittest.TestCase):
             'ip netns exec "$container" ip addr add 10.43.0.5/24 dev "control-plane"',
             create,
         )
-        self.assertIn('ip netns exec "$container" ip route add 0.0.0.0/0 via 10.43.0.1', create)
+        # Per-NIC source-based policy routing: the route goes into its own
+        # table, selected by a rule matching the NIC's own source prefix.
+        self.assertRegex(
+            create,
+            r'ip netns exec "\$container" ip -4 route add 0\.0\.0\.0/0'
+            r" via 10\.43\.0\.1 table 100\d",
+        )
+        self.assertRegex(
+            create,
+            r'ip netns exec "\$container" ip -4 rule add from 10\.43\.0\.0/24 lookup 100\d',
+        )
         self.assertIn('ovs-vsctl add-port "br-cont" "sc-', create)
         self.assertIn('ovs-vsctl add-port "br-cp" "sc-', create)
         # Create installs + starts a systemd unit (like the kernel router).
@@ -1392,6 +1408,52 @@ class KernelServiceDeployTest(unittest.TestCase):
         _, delete_hosts = mod.build_scripts(nodes, "delete")
         delete = delete_hosts["chassis-1"]
         self.assertIn("systemctl disable --now ovn-kernel-service-dns.service", delete)
+
+    def test_kernel_service_ipv6_routes_use_the_v6_family(self) -> None:
+        cp = self._ls("control-plane", "br-cp", 1143)
+        svc = pt.KernelAppContainerNode(
+            id="kernel.app.container:dns6",
+            kind="kernel.app.container",
+            key=pt.KernelServiceKey(name="dns6"),
+            data=pt.KernelAppContainerData(
+                host="host:chassis-1",
+                image="ovn-fabric-dns",
+                cmd=["/usr/sbin/dnsmasq", "--no-daemon"],
+            ),
+        )
+        lrp = self._lrp(
+            "router-cp",
+            "left",
+            "control-plane",
+            pt.ServiceRef(
+                service="kernel.app.container:dns6",
+                name="control-plane",
+                ipaddrs=["10.43.0.5/24", "2600:70ff:b3c0::cb:5/112"],
+                routes=[
+                    pt.Route(dst="192.168.129.0/24", via="10.43.0.1"),
+                    pt.Route(
+                        dst="2600:70ff:b3c0:129::/64",
+                        via="2600:70ff:b3c0::cb:1",
+                    ),
+                ],
+            ),
+        )
+        nodes = list(NODES) + [cp, svc, lrp]
+        _, create_hosts = mod.build_scripts(nodes, "create")
+        create = create_hosts["chassis-1"]
+        # IPv6 route/rule MUST carry `-6`: `ip route`/`ip rule` default to
+        # IPv4 and reject a v6 prefix/source with "Invalid source address"
+        # (hit live 2026-09-16).
+        self.assertRegex(
+            create,
+            r'ip netns exec "\$container" ip -6 route add 2600:70ff:b3c0:129::/64'
+            r" via 2600:70ff:b3c0::cb:1 table 100\d",
+        )
+        self.assertRegex(
+            create,
+            r'ip netns exec "\$container" ip -6 rule add from'
+            r" 2600:70ff:b3c0::cb:0/112 lookup 100\d",
+        )
 
 
 # Two DISTINCT kernel.service nodes referenced by separate LRPs render two
@@ -1450,7 +1512,7 @@ class MultiServiceDeployTest(unittest.TestCase):
                 kind="ovn.lrp",
                 key=pt.OvnLrpKey(ovnrouter=router, name=name),
                 data=pt.OvnLrpData(
-                        l2Segment=f"ls:{seg_name}",
+                    l2Segment=f"ls:{seg_name}",
                     addresses=[],
                     mac="02:00:00:00:00:01",
                     serviceRefs=[
@@ -1480,8 +1542,8 @@ class MultiServiceDeployTest(unittest.TestCase):
 
 
 # End-to-end for the REAL shape: a dns service attached to a real segment
-# (management-v2, a localnet vlan) AND the control plane (primary, default
-# route) — hydrated from IR JSON and rendered to the host shell.
+# (management-v2, a localnet vlan) AND the control plane (explicit
+# default route) — hydrated from IR JSON and rendered to the host shell.
 class DnsServiceEndToEndTest(unittest.TestCase):
     def test_dns_on_real_segment_and_control_plane(self) -> None:
         raw = [
@@ -1578,7 +1640,6 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                             "name": "control-plane",
                             "ipaddrs": ["10.43.0.129/24"],
                             "routes": [{"dst": "0.0.0.0/0", "via": "10.43.0.1"}],
-                            "primary": True,
                         }
                     ],
                 },
@@ -1599,7 +1660,15 @@ class DnsServiceEndToEndTest(unittest.TestCase):
             'ip netns exec "$container" ip addr add 10.43.0.129/24 dev "control-plane"',
             s,
         )
-        self.assertIn('ip netns exec "$container" ip route add 0.0.0.0/0 via 10.43.0.1', s)
+        self.assertRegex(
+            s,
+            r'ip netns exec "\$container" ip -4 route add 0\.0\.0\.0/0'
+            r" via 10\.43\.0\.1 table 100\d",
+        )
+        self.assertRegex(
+            s,
+            r'ip netns exec "\$container" ip -4 rule add from 10\.43\.0\.0/24 lookup 100\d',
+        )
         self.assertIn('ovs-vsctl add-port "br-management-v2" "sc-', s)
         self.assertIn('ovs-vsctl add-port "br-control-plane" "sc-', s)
         # Same systemd mechanics as the kernel router: one unit per service.

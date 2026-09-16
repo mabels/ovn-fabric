@@ -39,6 +39,7 @@ import {
   type OvnRouterEndpoint,
   type Router,
   type RoutingDomain,
+  type RoutingDomainRoute,
   type SecurityGroup,
   type Service,
   sshHost,
@@ -238,12 +239,23 @@ export class NetworkBuilder implements RouterEndpointContext {
    * RouterEndpoint is the real anchor (RouterEndpoint.routes) — this
    * only registers the membership tag, the same "register + fail fast
    * on duplicates, resolve later" split every other builder method
-   * already follows. */
-  routingDomain(name: string): RoutingDomain {
+   * already follows.
+   *
+   * 2nd arg (2026-09-16): an explicit, non-empty `{ routes }` OVERRIDES the
+   * destinations this domain would otherwise distribute; omit it (or pass
+   * an empty array) to let them be CALCULATED from what the domain's
+   * participants actually resolve — see RoutingDomain.routes (types.ts). */
+  routingDomain(
+    name: string,
+    spec?: { readonly routes: readonly RoutingDomainRoute[] },
+  ): RoutingDomain {
     if (this.routingDomainsByName.has(name)) {
       throw new Error(`routing domain "${name}" declared more than once`);
     }
-    const domain: RoutingDomain = { name };
+    const domain: RoutingDomain = {
+      name,
+      ...(spec ? { routes: spec.routes } : {}),
+    };
     this.routingDomainsByName.set(name, domain);
     return domain;
   }

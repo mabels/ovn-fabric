@@ -74,7 +74,6 @@ def _hydrate_ovn_lrp(raw: dict) -> pt.OvnLrpNode:
                             if r.get("routes")
                             else None
                         ),
-                        primary=r.get("primary"),
                     )
                     for r in data["serviceRefs"]
                 ]

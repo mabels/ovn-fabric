@@ -59,10 +59,13 @@ class PythonEmitter(Emitter):
         self.label = label
         super().__init__(action)
 
-    def sh(self, argv: list[str], background: bool = False) -> None:
+    def sh(self, argv: list[str], background: bool = False, optional: bool = False) -> None:
         # `background` is only meaningful in the nested shell router-body
         # emitter (_ShellBody) — the Python runtime has no `&` notion.
-        self.lines.append(f"run_cmd({self.label!r}, _sh({argv!r}), verbose, abort_on_error)")
+        # `optional=True` retires the create-action abort for this one
+        # command: it warns and continues (the runtime's own policy).
+        abort = "False" if optional else "abort_on_error"
+        self.lines.append(f"run_cmd({self.label!r}, _sh({argv!r}), verbose, {abort})")
 
     def append(self, path: str, content: str) -> None:
         self.lines.append(
