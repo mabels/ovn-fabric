@@ -1,43 +1,17 @@
-// types.ts — distinct identity types and the switchable-uplink mechanism.
-// No topology data lives here. This file defines the SHAPE; model.ts
+// types.ts — the shapes a topology config declares: hosts, collision
+// domains, routers/router endpoints, kernel routers, and services. No
+// topology data lives here. This file defines the SHAPE; define.ts
 // declares the FACTS.
 
 import type { TransitNetwork } from "./addressing.ts";
 import type { IPv4, IPv6 } from "./ip.ts";
 
-// ── distinct identity types ──────────────────────────────────────
-// Branded types: structurally still numbers at runtime, but the type
-// checker will not let a SegmentId be passed where an UplinkId is
-// expected, or vice versa. Every bug from tonight's session was
-// "correct math, applied to the wrong identifier" — a checker that
-// treats number as number cannot catch that; two distinct branded
-// types can.
-
-type Brand<T, B extends string> = T & { readonly __brand: B };
-
-export type SegmentId = Brand<number, "SegmentId">;
-export type UplinkId = Brand<number, "UplinkId">;
-
-export function segmentId(n: number): SegmentId {
-  if (n < 0 || n > 255) {
-    throw new RangeError(`SegmentId out of range (0-255): ${n}`);
-  }
-  return n as SegmentId;
-}
-
-export function uplinkId(n: number): UplinkId {
-  if (n < 0 || n > 65535) {
-    throw new RangeError(`UplinkId out of range: ${n}`);
-  }
-  return n as UplinkId;
-}
-
 // ── host / chassis ─────────────────────────────────────────────────
-// Where a given segment's or uplink's OVN/OVS configuration is actually
-// applied. A given deployment may run everything on one chassis, but the
-// model does not assume that — each Segment/Uplink declares which Host
-// it runs on, so a future topology with multiple chassis is a config
-// change, not a redesign.
+// Where a given router's OVN/OVS configuration is actually applied. A
+// given deployment may run everything on one chassis, but the model
+// does not assume that — each router endpoint declares the Host its
+// interfaces live on, so a future topology with multiple chassis is a
+// config change, not a redesign.
 
 export type AccessMethod =
   | { method: "ssh"; user: string }
@@ -74,7 +48,7 @@ function primaryHostAddress(address: HostAddress): string {
 // northd + the NB/SB databases). Every other chassis runs only
 // ovn-host/ovn-controller, pointed at the central chassis's SB DB
 // remotely instead of a local one — this is the real, previously
-// undone TODO from generate-ovn.ts's requiredPackages doc comment
+// undone TODO from the legacy generator's requiredPackages doc comment
 // (2026-07-19): today every Host gets its own full independent stack,
 // so N hosts under one defineNetwork silently become N uncoordinated
 // clusters, not one shared one.
@@ -109,7 +83,7 @@ export interface OvnClusterOptions {
   readonly ipsec?: boolean;
   /** OUI-ish prefix OVN uses when auto-generating MAC addresses for
    * ports declared with dynamic addressing. Unused by this project
-   * today — every uplink/segment declares an explicit MAC. */
+   * today — every router port declares an explicit MAC. */
   readonly macPrefix?: string;
   /** Batches similar logical switches into shared flow tables — a real
    * scale optimization, irrelevant at today's segment counts. */
@@ -258,42 +232,6 @@ export class CollisionDomain {
     return this.interfaces;
   }
 }
-
-// ── NetId: the identity every segment/uplink/transfer-link carries ──
-// Backed by the `ipaddress` library (not std — see ADR discussion: std
-// libraries lack reliable prefix-notation parsing and the 128-bit
-// arithmetic IPv6 fold rules need). id() returns the raw numeric
-// identifier this NetId was derived from (a segment or uplink number);
-// vlan() returns the physical VLAN tag if one applies, or undefined —
-// note this is a DERIVED convenience, distinct from whether the thing
-// holding this NetId actually has an `if: { kind: "vlan", ... }` — a
-// NetId can report a vlan() number purely because of its fold rule
-// while the real physical attachment (see InterfaceKind below) is
-// something else entirely (a WireGuard interface, a plain port). Don't
-// use vlan() to decide physical wiring; use the owning Uplink/Segment's
-// `if` field for that.
-//
-// NetId instances are produced by factory functions in addressing.ts
-// (segmentNet(), uplinkNet(), transferNet()), not constructed directly
-// here — this interface only defines the shape every factory must
-// satisfy. The fold operation itself is string construction (see
-// addressing.ts header comment) — IPAddress.parse() is called only
-// after the address string is fully built.
-
-export interface NetId {
-  readonly ipv4: IPv4;
-  readonly ipv6: IPv6;
-  id(): number;
-  vlan(): number | undefined;
-}
-
-/**
- * An address PAIR — the thing config/topology.ts actually declares per
- * Uplink/Segment via `addresses: [...]`. Most things have exactly one
- * NetId; the array form exists for cases like a transfer link, which
- * conceptually carries both its OVN-side and netns-side identity.
- */
-export type Addresses = readonly NetId[];
 
 // ── security groups: not designed yet ───────────────────────────────
 // A dummy placeholder, not a real mechanism — see ADR 0002's "Firewall
@@ -475,20 +413,14 @@ interface RouterEndpointBase<
   S = RouterEndpointService,
 > {
   /** A router port's own addresses — plain parsed IPv4/IPv6 values, one
-   * array entry per address (IPv4.parse(...), IPv6.parse(...)), NOT
-   * Addresses/NetId: NetId pairs a v4+v6 fold together under one
-   * Segment/Uplink identity (id()/vlan()), which a router endpoint
-   * doesn't have — there's no segment/uplink id to fold from, and
-   * forcing one here means fabricating a meaningless id() just to
-   * satisfy the type. A router endpoint's addresses are simply
-   * declared, the same way SegmentGateway's explicit-override arm
-   * already is. */
+   * array entry per address (IPv4.parse(...), IPv6.parse(...)). A
+   * router endpoint has no segment/uplink identity for a fold rule to
+   * derive an address from, so its addresses are simply declared. */
   readonly ipaddrs: readonly (IPv4 | IPv6)[];
   /** Explicit MAC override. Required when ipaddrs has no IPv4 for
-   * macFromV4() to fold (e.g. an uplink's transfer-link endpoint whose
-   * real address isn't declared yet, or is DHCP-assigned) — undefined
-   * otherwise means "derive it from ipaddrs's IPv4, same as every
-   * Uplink/Segment already does." */
+   * macFromV4() to fold (e.g. an endpoint whose real address isn't
+   * declared yet, or is DHCP-assigned) — undefined otherwise means
+   * "derive it from ipaddrs's IPv4." */
   readonly mac?: string;
   /** Real physical/tunnel attachment(s) for this endpoint's side of the
    * collision domain — a segment's localnet port needs one (it bridges
@@ -511,10 +443,9 @@ interface RouterEndpointBase<
   readonly securityGroup?: SecurityGroupRef;
   /** IPv6 RA/SLAAC behavior on this endpoint's LRP — see
    * RouterEndpointService above. Undefined/empty means neither
-   * ipv6_ra_configs key gets set (OVN's own default: no RA at all),
-   * matching Segment.slaac's existing "false" branch. The array also
-   * carries ServiceAttachments (`endpoint.attachTo(sv, {...})`) — a
-   * workload's NIC on this endpoint's segment (2026-09-08).
+   * ipv6_ra_configs key gets set (OVN's own default: no RA at all). The
+   * array also carries ServiceAttachments (`endpoint.attachTo(sv, {...})`)
+   * — a workload's NIC on this endpoint's segment (2026-09-08).
    *
    * INTERNAL: the EndpointBuilder (define.ts) injects `endpoint` into every
    * entry — see EndpointService — so each service carries a reference to
@@ -557,10 +488,10 @@ export interface OvnRouterEndpoint
  * the topology itself, never assembled by hand. `host`: which real
  * chassis the netns this eventually creates (KernelRouter, below)
  * actually runs on — required, since nothing else in scope at a
- * net.kernelRouterEndpoint() call site supplies it. real/discovery/nat/
- * backdoor still land here once the kernel-side generator design is
- * settled further than "create the netns, assign it these addresses"
- * (see KernelRouter's own doc comment). */
+ * net.kernelRouterEndpoint() call site supplies it. NAT
+ * (`kernel.*.masq` services) and apps still land here; real-interface
+ * discovery is not modeled yet beyond "create the netns, assign it
+ * these addresses" (see KernelRouter's own doc comment). */
 export interface KernelRouterEndpoint extends RouterEndpointBase {
   readonly kind: "kernel";
   readonly host: Host;
@@ -718,26 +649,27 @@ export interface KernelRouter {
    * router-voda-avm-v2 got its own default route via kernel-0's
    * transit-facing address, but kernel-0 itself had no route back to
    * home/management's own subnets — nothing told it those exist).
-   * Optional, not required: a KernelRouter declared directly via
-   * net.kernelRouter() (the low-level primitive, no OVN pairing at all)
-   * has no transit domain to name. */
-  readonly transitDomain?: CollisionDomain;
+   * Always set: both builders (kernelRouterEndpoint()/
+   * tunnelRouterEndpoint()) create the KernelRouter as an OVN twin, so
+   * there is always a transit domain to name. */
+  readonly transitDomain: CollisionDomain;
   /** The OVN twin's OWN address on `transitDomain` (kernelRouterEndpoint()'s
    * own `ovnSideAddrs`) — the nexthop for every route mirrored onto
    * `left` per transitDomain's own doc comment above. NOT the same as
    * `left.ipaddrs` (this KernelRouter's OWN address on that same
    * domain) — this is the address on the OTHER end of that same wire.
-   * Same "optional, only set by kernelRouterEndpoint()" reasoning as
-   * transitDomain above. */
-  readonly transitPeerAddrs?: readonly (IPv4 | IPv6)[];
+   * Always set, like transitDomain above. */
+  readonly transitPeerAddrs: readonly (IPv4 | IPv6)[];
   /** The tunnel router's UPSTREAM transit peer (tunnelRouterEndpoint(),
    * define.ts) — the OTHER end of the upstream wire (e.g. the physical-
    * path router the tunnel netns borrows egress from): the nexthop for
    * the netns's default route out the upstream leg, which is how the
    * tunnel's own endpoint UDP reaches the real internet (wg-quick's
-   * fwmark policy routing keeps it out of the tunnel). Set only by
-   * tunnelRouterEndpoint(). */
-  readonly upstreamPeerAddrs?: readonly (IPv4 | IPv6)[];
+   * fwmark policy routing keeps it out of the tunnel). Populated by
+   * tunnelRouterEndpoint(); EMPTY for a plain kernelRouterEndpoint() —
+   * it has no upstream leg, its real default lives in `right`'s own
+   * routes (KernelRouterSide.routes). Always present, possibly empty. */
+  readonly upstreamPeerAddrs: readonly (IPv4 | IPv6)[];
   /** Same field, same meaning as Router.routingDomains below — a
    * KernelRouter's own routes (KernelRouterSide.routes) only apply if
    * it's actually a participant of some declared RoutingDomain, same
@@ -757,11 +689,10 @@ export type RouterEndpoint =
   | TunnelRouterEndpoint;
 
 // ── RouterEndpoint services: IPv6 RA/SLAAC + kernel-side services ──
-// The Router/RouterEndpoint equivalent of the legacy Segment.slaac
-// boolean (generate-ovn.ts) — but split into its two REAL, independently
-// meaningful OVN behaviors instead of one flag toggling both together,
-// because they genuinely differ (confirmed live, generate-ovn.ts's own
-// ipv6_ra_configs history/upstream-bug comment):
+// IPv6 RA is split into its two REAL, independently meaningful OVN
+// behaviors instead of one flag toggling both together, because they
+// genuinely differ (confirmed live, the ipv6_ra_configs history/
+// upstream-bug comment):
 //   - "ipv6.slaac" sets ipv6_ra_configs:address_mode=slaac — this alone
 //     already makes OVN answer solicited Router Solicitations (the
 //     lr_in_nd_ra_options/lr_in_nd_ra_response responder), even with no
@@ -769,13 +700,11 @@ export type RouterEndpoint =
 //   - "ipv6.ra" sets ipv6_ra_configs:send_periodic=true (+ optional
 //     min/max interval overrides) — genuinely UNSOLICITED, self-timer-
 //     driven RA, pinctrl-injected, which needed a real upstream OVN fix
-//     (ovn-org/ovn#313) before it worked at all on a DGP/patch port —
-//     see generate-ovn.ts's emitSegmentBackboneJoin for the full story.
-// Both live in ipv6_ra_configs (a single OVSDB smap column), and the
-// legacy Segment.slaac always sets both together — but they're
+//     (ovn-org/ovn#313) before it worked at all on a DGP/patch port.
+// Both live in ipv6_ra_configs (a single OVSDB smap column), but they're
 // independently useful (e.g. "ipv6.slaac" alone for solicited-only, no
 // periodic chatter), so RouterEndpoint models them as two composable
-// services instead of reintroducing one boolean that can't express that.
+// services instead of one boolean that can't express that.
 //
 // The `kernel.*` kinds are the OPPOSITE world — services that apply
 // INSIDE a KernelRouter's netns, never to an OVN LRP. Two families:
@@ -1019,44 +948,6 @@ export interface Router {
   readonly subRouters: readonly Router[];
 }
 
-// ── SegmentGateway: how a segment's own gateway address is expressed ──
-// The config-facing input to segmentNet() (addressing.ts) and, via it,
-// segmentPhysical()/segmentVlan() (factories.ts). Either family can be
-// given as an explicit, already-parsed IPv4/IPv6 — used EXACTLY as
-// given, no segment-default-prefix substitution: if the standard /24
-// (v4) or /64 (v6) doesn't fit, write the prefix yourself, e.g.
-// `IPv4.parse("192.168.130.5/28")` — or folded from `suffix`/`suffix6`
-// into the segment's standard pattern (192.168.<id>.<suffix>/24,
-// fd00:192:168:<id>::<suffix6 ?? suffix>/64). At least one field must
-// resolve an address for EACH family — see segmentNet's resolution
-// rules (addressing.ts) for exactly how a partial combination gets
-// filled in (e.g. only `ipv6` given transfers its host-id into the v4
-// fold too, so a caller supplying one family's literal doesn't also
-// have to spell out a redundant suffix).
-export interface SegmentGateway {
-  /** Host-id folded into the segment's standard pattern. Required
-   * unless at least one of `ipv4`/`ipv6` is given instead. */
-  readonly suffix?: number;
-  /** Override just the IPv6 host-id, if it should differ from `suffix`
-   * (e.g. gateway answers on ...::<suffix6> while IPv4 answers on
-   * .<suffix>). Defaults to `suffix`. Ignored if `ipv6` is set. */
-  readonly suffix6?: number;
-  /** Replaces the folded v4 pattern entirely — for a gateway address
-   * that doesn't fit this segment's usual 192.168.<id>.<n>/24 shape. */
-  readonly ipv4?: IPv4;
-  /** Same as `ipv4`, for the v6 side. */
-  readonly ipv6?: IPv6;
-}
-
-// ── physical realization ─────────────────────────────────────────
-// HOW a Segment/Uplink actually attaches to a real wire. Deliberately
-// separate from addressing: a NetId's vlan() can return a number purely
-// from its fold rule while the real interface here is something else
-// entirely (WireGuard, a bridge port with no VLAN at all). This is the
-// split that was missing before tonight's correction — conflating
-// "has an address" with "is a VLAN" broke as soon as WireGuard needed
-// modelling, since a WireGuard tunnel has addresses but is not a VLAN.
-
 /** The [Peer] stanza of a wg-quick conf — see InterfaceKind's
  * "wireguard" variant below. */
 export interface WireguardPeer {
@@ -1071,9 +962,9 @@ export interface WireguardPeer {
   readonly persistentKeepalive?: number;
 }
 
-/** The [Interface] stanza plus its one [Peer] — everything
- * emitWireguardInterface (generate-netns.ts) needs to reconstruct a
- * wg-quick conf byte-for-byte. See InterfaceKind's "wireguard" variant
+/** The [Interface] stanza plus its one [Peer] — everything the deployer
+ * needs to reconstruct a wg-quick conf byte-for-byte. See InterfaceKind's
+ * "wireguard" variant
  * for why the PrivateKey lives here, in a git-tracked file, rather
  * than behind an env var/secret manager as this project's credentials
  * normally would. */
@@ -1109,18 +1000,17 @@ export type InterfaceKind =
    * hand-rolled `wg setconf`/`ip link` calls — wg-quick's own fwmark +
    * policy-routing dance is exactly what's needed here (the tunnel's
    * own handshake/keepalive UDP packets must keep leaving via whatever
-   * route already existed — the Backdoor below, typically — while
-   * every OTHER packet gets diverted into the tunnel), and re-deriving
+   * route already existed — its kernel netns's upstream leg, typically —
+   * while every OTHER packet gets diverted into the tunnel), and re-deriving
    * that by hand would just duplicate a battle-tested implementation.
    * Confirmed live, 2026-07-06: this is genuinely how it behaves when
    * a default route already exists in the netns before `wg-quick up`
    * runs.
    *
    * `config` (see WireguardInterfaceConfig below) is declared directly
-   * in config/topology.ts and written verbatim to
-   * /etc/wireguard/<ifaceName>.conf on the target host by the
-   * generator (see emitWireguardInterface, generate-netns.ts) — INCLUDING
-   * the PrivateKey. This is a DELIBERATE, EXPLICIT exception to this
+   * in the topology and written verbatim to
+   * /etc/wireguard/<ifaceName>.conf on the target host by the deployer —
+   * INCLUDING the PrivateKey. This is a DELIBERATE, EXPLICIT exception to this
    * project's usual "never hard-code credentials, use env vars/secret
    * managers" policy, made 2026-07-06 after being asked to confirm:
    * the tradeoff (a real credential living in a git-tracked source
@@ -1131,11 +1021,9 @@ export type InterfaceKind =
    * full).
    *
    * `ifaceName` is the real kernel interface name AND the .conf's
-   * basename on disk — defaults to this uplink's OWN name (see
-   * uplinkWireguard, factories.ts, which threads UplinkBuilder's
-   * `name` parameter through), overridable when that default doesn't
-   * fit: it exceeds IFNAMSIZ (15 usable characters), or would rename
-   * an already-running real interface unnecessarily. */
+   * basename on disk, overridable when the chosen name doesn't fit:
+   * it exceeds IFNAMSIZ (15 usable characters), or would rename an
+   * already-running real interface unnecessarily. */
   | {
     kind: "wireguard";
     ifaceName: string;
@@ -1147,15 +1035,14 @@ export type InterfaceKind =
    * ZeroTier is a persistent userspace DAEMON (no in-kernel device the
    * way WireGuard has), and it names its own resulting interface
    * itself rather than accepting one from the caller. Because of that,
-   * the real interface name is NOT known at generation time — it gets
-   * captured into a shell variable at RUNTIME by emitZerotierInterface
-   * (generate-netns.ts), the same way `$CHASSIS` is already resolved
-   * live in the generated script rather than computed here (see
-   * generate-ovn.ts header comment). NOT yet verified against a live
-   * host (unlike "wireguard", which went through several rounds of
-   * live correction) — treat the exact zerotier-one/zerotier-cli
-   * invocations this produces as a first draft to test and iterate on,
-   * same as wireguard's own history.
+   * the real interface name is NOT known at generation time — the
+   * deployer's zerotier service script captures it into a shell
+   * variable at RUNTIME, the same way `$CHASSIS` is already resolved
+   * live in the generated script rather than computed here. NOT yet
+   * verified against a live host (unlike "wireguard", which went
+   * through several rounds of live correction) — treat the exact
+   * zerotier-one/zerotier-cli invocations this produces as a first
+   * draft to test and iterate on, same as wireguard's own history.
    *
    * `authorization` is deliberately NOT modeled here: joining a
    * network only gets this node as far as an unauthorized member —
@@ -1178,21 +1065,16 @@ export type InterfaceKind =
      * one truly load-bearing file). OPTIONAL — when omitted,
      * buildTunnelRouterEndpoint (define.ts) derives
      * `/var/lib/zerotier-one-<router name>` from the enclosing router's
-     * name (the legacy uplink default is `/var/lib/zerotier-one-uplink-
-     * <uplink name>`, factories.ts). */
+     * name. */
     instanceDir?: string;
   }
   /** A placeholder Linux dummy interface — no real backing device, no
-   * real-world connectivity. Stands in for an uplink whose real
-   * mechanism (e.g. a WireGuard tunnel) isn't built yet, so the rest of
-   * the chain (OVN router, transfer link, backbone join, back-routes)
+   * real-world connectivity. Stands in for a real mechanism (e.g. a
+   * WireGuard tunnel) that isn't built yet, so the rest of the chain
    * can be wired up and tested end-to-end first. No `name` field, on
    * purpose: unlike "vlan"/"physical", a dummy interface has no
-   * pre-existing real-world name to preserve — the generator derives
-   * and creates it itself, at a slot-based name (see generate-netns.ts,
-   * dummyIface()), the same IFNAMSIZ-safe convention already used for
-   * every other uplink-owned kernel interface (veth-ovn-N, veth-krn-N,
-   * br-up-N). See WireGuard design discussion, 2026-07-06. */
+   * pre-existing real-world name to preserve — the deployer derives
+   * and creates it itself, IFNAMSIZ-safe. */
   | { kind: "dummy" }
   /** A veth pair owned by a KernelRouter's netns — the real wiring of an
    * OVN<->kernel transit link (2026-08-18): `ifaceName` is the netns-
@@ -1208,305 +1090,3 @@ export type InterfaceKind =
     ifaceName: string;
     peerName: string;
   };
-
-// ── NAT ────────────────────────────────────────────────────────────
-// Per-stack, since a segment/uplink might need v4 masquerade but not
-// v6 (the common case once real delegated IPv6 prefixes exist — see
-// ADR 0001 consequence notes on DHCPv6-PD vs NAT66).
-
-export type NatRule = { readonly kind: "masq" };
-
-export interface Nat {
-  readonly ipv4?: readonly NatRule[];
-  readonly ipv6?: readonly NatRule[];
-}
-
-// ── discovery ──────────────────────────────────────────────────────
-// HOW this Uplink/Segment's real-world address is learned, per stack.
-// "static" means the NetId's address IS the real address, nothing to
-// discover. This is what determines which mechanism runs inside an
-// uplink's netns (see ADR 0001 — dhclient supervision, SLAAC accept_ra
-// handling, etc.) — addressing.ts and define.ts do not need to know
-// about discovery; it's read by the (not yet built) generation layer.
-
-/** Which real userspace program acquires this uplink's IPv4 lease when
- * discovery.ipv4 is "dhcp". Defaults to "dhclient" (the only client
- * used so far, and the one confirmed live). "dhcpcd" is the same
- * "dhcp" discovery KIND, a different PROGRAM doing it — same
- * idempotent "already running? no-op : start" shape, different
- * command line (see generate-netns.ts, emitIpv4Discovery). "static"
- * is different again: not a program at all, just "configure this
- * fixed address and gateway directly" — added 2026-07-06 for a real
- * uplink whose real-world address is known and stable (e.g. a
- * reserved LAN IP on the ISP router) rather than DHCP-leased. Kept as
- * its own field rather than folded into the ipv4 union so a future
- * WireGuard uplink — not "dhcp" at all, its own InterfaceKind branch
- * entirely (see WireGuard design discussion, 2026-07-06) — never has
- * to touch this dance. */
-export type DhcpClient = "dhclient" | "dhcpcd" | "static";
-
-/** The fixed address+prefix and default gateway to configure directly
- * on a real interface when Discovery.client is "static" — see
- * emitStaticIpv4 (generate-netns.ts). Only consulted then; every other
- * client ignores it. Holds real, family-checked IPv4 values (see
- * ip.ts) — a config author builds these directly in topology.ts via
- * `IPv4.parse(...)`, so a v6 literal handed here fails to parse right
- * there, not on a live host months later. A named constructor
- * (StaticIpv4.of) rather than a plain object literal so a SECOND
- * real-world mistake — a gateway that isn't actually on the address's
- * own subnet, e.g. address 192.0.2.93/24 with gateway 198.51.100.1 —
- * fails the same way, at config-build time, instead of surfacing as an
- * unreachable default route on the live host. */
-export class StaticIpv4 {
-  readonly address: IPv4;
-  readonly gateway: IPv4;
-
-  private constructor(address: IPv4, gateway: IPv4) {
-    this.address = address;
-    this.gateway = gateway;
-  }
-
-  static of(address: IPv4, gateway: IPv4): StaticIpv4 {
-    if (!address.includes(gateway)) {
-      throw new Error(
-        `StaticIpv4.of: gateway ${gateway.to_s()} is not within ${address.to_string()}`,
-      );
-    }
-    return new StaticIpv4(address, gateway);
-  }
-}
-
-/** The fixed address+prefix and default gateway to configure directly
- * on a real interface when Discovery.ipv6 is "static" — see
- * emitStaticIpv6 (generate-netns.ts). Mirrors StaticIpv4 exactly (built
- * from `IPv6.parse(...)`/`StaticIpv6.of(...)` instead — see ip.ts); the
- * only reason this is a separate class rather than reusing StaticIpv4
- * is readability at the call site (an "ipv6:" field holding something
- * literally named StaticIpv4 would read wrong), not a difference in
- * shape or behavior. Added 2026-08-03 to close a real gap:
- * discovery.ipv6 already accepted the literal "static" value, but
- * nothing ever consulted an actual address for it — every uplink that
- * wanted a fixed v6 address had no way to express one, unlike v4's
- * static4/client:"static" pair. */
-export class StaticIpv6 {
-  readonly address: IPv6;
-  readonly gateway: IPv6;
-
-  private constructor(address: IPv6, gateway: IPv6) {
-    this.address = address;
-    this.gateway = gateway;
-  }
-
-  static of(address: IPv6, gateway: IPv6): StaticIpv6 {
-    if (!address.includes(gateway)) {
-      throw new Error(
-        `StaticIpv6.of: gateway ${gateway.to_s()} is not within ${address.to_string()}`,
-      );
-    }
-    return new StaticIpv6(address, gateway);
-  }
-}
-
-export interface Discovery {
-  readonly ipv4?: "static" | "dhcp";
-  readonly ipv6?: "static" | "slaac";
-  /** Defaults to "dhclient" when ipv4 is "dhcp" and no client is
-   * given; otherwise (ipv4 "static" with no explicit client — e.g. a
-   * backdoor's merged dummy interface, see Backdoor below) nothing
-   * runs here at all. */
-  readonly client?: DhcpClient;
-  /** Only consulted when client === "static". See StaticIpv4. */
-  readonly static4?: StaticIpv4;
-  /** Only consulted when ipv6 === "static". See StaticIpv6. Unlike
-   * v4, there's no pluggable "client" concept here — SLAAC is a pure
-   * kernel mechanism (accept_ra), not a userspace daemon, so "static"
-   * is the only other state and static6's mere presence is what
-   * triggers it (see resolveDiscovery, factories.ts). */
-  readonly static6?: StaticIpv6;
-}
-
-// ── backdoor: borrowed egress for a VPN-like uplink ─────────────────
-// Any uplink with no real interface of its own (dummy today; WireGuard,
-// ZeroTier, Tailscale, ... tomorrow — anything tunnel-shaped) still
-// needs a mundane, unencrypted path to the real internet: something has
-// to carry the tunnel's own setup/keepalive traffic, separate from
-// whatever the tunnel itself eventually carries. A backdoor is exactly
-// that: a second, dedicated transfer-link-shaped connection from this
-// uplink's OWN netns into an ALREADY-real uplink's router (`via`),
-// borrowing its egress instead of duplicating one.
-//
-// Deliberately generic — this is not a WireGuard-specific concept, it's
-// what ANY VPN-shaped uplink needs (originally built by hand for one
-// specific VPN uplink borrowing a plain uplink's egress, then
-// generalized here).
-//
-// `addresses`/`slot` here are the backdoor's OWN dedicated /28 — NOT
-// the owning uplink's own `addresses` (that's its front-door transfer
-// link to ITS OWN router). Drawing them from a genuinely separate slot
-// is required, not optional: sharing the front-door's /28 (both links'
-// addresses inside the SAME subnet, on two different netns interfaces)
-// was tried and is broken — Linux ends up with two equally-specific
-// connected routes for the one prefix, on two different devices, and
-// which one actually wins is unreliable, not a real design. Confirmed
-// live, this session — a ping "worked" against the shared-subnet
-// version, but for the wrong reason, not because the intended path
-// (through `via`'s router) was actually the one carrying it.
-export interface Backdoor {
-  /** The real, already-working uplink this borrows egress from (e.g.
-   * isp-primary). Must already be declared — see NetworkBuilder.uplink(). */
-  readonly via: Uplink;
-  /** This backdoor's own transfer-link addresses (OVN-side, netns-side)
-   * — drawn from the same global slot sequence as every other transfer
-   * link (see NetworkBuilder), so it can never collide with one. */
-  readonly addresses: Addresses;
-  /** The slot this backdoor consumed — used to derive its own
-   * IFNAMSIZ-safe kernel interface/bridge names, same convention as
-   * uplinkTransferBridge()/vethOvn()/vethNetns() (generate-netns.ts). */
-  readonly slot: number;
-}
-
-// ── Uplink ───────────────────────────────────────────────────────────
-
-export interface Uplink {
-  /** Unique per network — also used directly as the prefix for every
-   * generated OVN object name (sw-<name>, router-<name>, lrp-<name>,
-   * ...). Uniqueness is enforced by NetworkBuilder (see define.ts). */
-  readonly name: string;
-  /** The small sequential index NetworkBuilder assigned this uplink
-   * (0-4095), used for BOTH the transfer-link IPv4 block (transferNet)
-   * and the backbone-leg IPv4 block (uplinkBackboneNet) — kept on the
-   * resolved object so tier-2 generation can recover it without
-   * re-deriving it from an already-computed address. */
-  readonly slot: number;
-  readonly addresses: Addresses;
-  readonly if: InterfaceKind;
-  readonly nat?: Nat;
-  readonly discovery?: Discovery;
-  /** Borrowed egress for a VPN-like uplink with no real interface of
-   * its own — see Backdoor above. Undefined for every uplink that has
-   * real connectivity itself (a VLAN uplink, a physical NIC, a working
-   * VPN tunnel, ...). */
-  readonly backdoor?: Backdoor;
-  readonly host: Host;
-}
-
-// ── switchable uplink selection ───────────────────────────────────
-// A segment does not hold a fixed Uplink reference. It holds an
-// UplinkSelector — something that can be asked "which uplink right
-// now" — so the generator can support failover/manual-switch later
-// without changing the Segment type or any derivation logic that
-// consumes it. Three selector strategies are provided; all of them
-// satisfy the same interface, so emit-time code only ever calls
-// `.resolve()` and never needs to know which strategy is in play.
-
-export interface UplinkSelector {
-  resolve(): Uplink;
-}
-
-/** Always the same uplink. The common case, and tonight's actual need. */
-export class FixedUplink implements UplinkSelector {
-  constructor(private readonly uplink: Uplink) {}
-  resolve(): Uplink {
-    return this.uplink;
-  }
-}
-
-/**
- * Picks the first uplink in priority order whose `isAvailable` callback
- * returns true. `isAvailable` is injected, not hardcoded — at generation
- * time it might always return true (no live-state check, "as designed"
- * output); at a future runtime-aware stage it could call a data-source
- * plugin (see ADR 0001 §5) to check a real lease/handshake state.
- */
-export class PriorityUplink implements UplinkSelector {
-  constructor(
-    private readonly candidates: readonly Uplink[],
-    private readonly isAvailable: (u: Uplink) => boolean = () => true,
-  ) {
-    if (candidates.length === 0) {
-      throw new Error("PriorityUplink requires at least one candidate");
-    }
-  }
-  resolve(): Uplink {
-    const found = this.candidates.find((u) => this.isAvailable(u));
-    // The constructor rejects an empty candidate list, so index 0 exists.
-    return found ?? this.candidates[0]!;
-  }
-}
-
-/** Explicit manual override — for an operator-driven "switch to X now". */
-export class ManualUplink implements UplinkSelector {
-  private current: Uplink;
-  constructor(initial: Uplink) {
-    this.current = initial;
-  }
-  resolve(): Uplink {
-    return this.current;
-  }
-  switchTo(uplink: Uplink): void {
-    this.current = uplink;
-  }
-}
-
-// ── extra routes: a MORE-SPECIFIC route via a SECONDARY uplink ──────
-// A segment's primary `uplink` (below) gets the default route
-// (0.0.0.0/0 / ::/0) plus NAT — that's its one general-purpose
-// internet egress. An ExtraRoute is a completely separate, additional
-// backbone join to a DIFFERENT uplink, carrying only a specific prefix
-// — e.g. routing a private supernet (192.168.0.0/16) into a VPN-mesh
-// uplink (ZeroTier, a second WireGuard peer, ...) so traffic to OTHER
-// sites in that mesh goes there, while everything else still leaves
-// via the segment's normal uplink. Deliberately separate from `uplink`
-// rather than trying to extend UplinkSelector to return multiple
-// uplinks with per-uplink route scoping — a segment can have zero,
-// one, or several of these, each independent, each getting its own
-// backbone join (see emitBackboneJoin, generate-ovn.ts) distinctly
-// named from the primary join so multiple simultaneous joins for the
-// same segment never collide.
-export interface ExtraRoute {
-  /** e.g. IPv4.parse("192.168.0.0/16"). Passed straight to `ovn-nbctl
-   * lr-route-add` — no fold/derivation, just the literal, family-checked
-   * prefix the caller built directly in topology.ts (see ip.ts). */
-  readonly prefix: IPv4;
-  /** IPv6 equivalent, if this route needs one too. Omit for a v4-only
-   * extra route (the common case for a private-supernet-shaped
-   * route). */
-  readonly prefix6?: IPv6;
-  /** Already resolved to a selector by the factory (segmentPhysical/
-   * segmentVlan), same normalization as Segment.uplink — the caller in
-   * config/topology.ts may pass a plain Uplink or any UplinkSelector,
-   * see resolveUplinkSelector (factories.ts). */
-  readonly uplink: UplinkSelector;
-}
-
-// ── Segment ──────────────────────────────────────────────────────────
-
-export interface Segment {
-  /** Unique per network — also used directly as the prefix for every
-   * generated OVN object name (sw-<name>, router-<name>, lrp-<name>,
-   * ...). Uniqueness is enforced by NetworkBuilder (see define.ts). */
-  readonly name: string;
-  readonly addresses: Addresses;
-  readonly if: InterfaceKind;
-  /** Undefined means "no egress yet" — deliberately, not a bug: a
-   * segment meant to eventually exit via an uplink that doesn't exist
-   * yet (e.g. a VPN WireGuard tunnel not built out) should have NO
-   * backbone join, NO route, and NO NAT generated for it at all, not
-   * be silently routed out whichever uplink happens to be declared —
-   * confirmed live: two VPN-bound segments were provisionally pointed
-   * at the general default uplink and got MASQUERADEd out alongside
-   * another segment, defeating the whole point of routing them
-   * through a separate VPN egress later. See emitSegmentBackboneJoin
-   * (generate-ovn.ts), which returns no lines at all when this is
-   * undefined. */
-  readonly uplink?: UplinkSelector;
-  /** Zero or more additional, more-specific routes via a SECONDARY
-   * uplink — see ExtraRoute above. Independent of `uplink`; a segment
-   * can have a primary uplink, extra routes, both, or neither. */
-  readonly extraRoutes?: readonly ExtraRoute[];
-  readonly nat?: Nat;
-  /** Whether OVN advertises RA/SLAAC for this segment's IPv6 prefix so
-   * clients self-configure a global address (see generate-ovn.ts). */
-  readonly slaac: boolean;
-  readonly host: Host;
-}

@@ -23,16 +23,13 @@
 // router's `kernel.*.masq` services (RouterEndpointService, types.ts)
 // become an IMPLEMENTATION-ABSTRACT `security.group` node
 // (securityGroupToIR below) carrying the POSTROUTING MASQUERADE rules
-// for its real-world-facing interface. Backdoors and uplink discovery (DHCP/static) still have no
-// home in the new shape yet (see topology.cluster-draft.ts's own
-// comments, written while designing this) — none of those are
-// attempted here, not because they're forgotten, but because there's
-// nothing yet to extract them FROM. Static routes (RoutingDomain, see
-// computeRoutes/computeInterconnectRoutes below) and IPv6 RA/SLAAC (see
-// RouterEndpointService, types.ts, resolved below) both ARE covered.
-// The legacy Uplink/Segment path (still what's actually deployed) isn't
-// covered either — toIR() only walks allCollisionDomains/allRouters/
-// allHosts, not allUplinks/allSegments.
+// for its real-world-facing interface. Real-interface discovery
+// (DHCP/static) still has no home in this shape yet — not because it's
+// forgotten, but because there's nothing yet to extract it FROM. Static
+// routes (RoutingDomain, see computeRoutes/computeInterconnectRoutes
+// below) and IPv6 RA/SLAAC (see RouterEndpointService, types.ts,
+// resolved below) both ARE covered. toIR() walks allCollisionDomains/
+// allRouters/allHosts.
 
 import { fnv1a32, macFromV4 } from "./addressing.ts";
 import type { IPv4, IPv6 } from "./ip.ts";
@@ -57,9 +54,8 @@ export interface IRNode {
 }
 
 // RouterEndpoint.ipaddrs is a flat (IPv4 | IPv6)[], one entry per
-// address — not NetId[] (see RouterEndpoint, types.ts: a router
-// endpoint has no segment/uplink id for NetId's id()/vlan() to report).
-// to_string() (not to_s()) is the one that includes the prefix length.
+// address (see RouterEndpoint, types.ts). to_string() (not to_s()) is
+// the one that includes the prefix length.
 function addrStrings(ipaddrs: OvnRouterEndpoint["ipaddrs"]): string[] {
   return ipaddrs.map((addr) => addr.to_string());
 }
@@ -168,16 +164,14 @@ function kernelRouterToIR(router: KernelRouter): IRNode {
 
 // Which (Router, side) is THIS KernelRouter's own OVN twin — the
 // endpoint whose l2Segment IS this KernelRouter's own transitDomain
-// (types.ts's own doc comment on that field). Undefined for a
-// KernelRouter with no transitDomain at all (net.kernelRouter(), the
-// low-level primitive, used with no OVN pairing) or — shouldn't happen,
-// but not assumed — one whose transitDomain no Router endpoint
-// actually references.
+// (types.ts's own doc comment on that field). Always defined in
+// practice (both builders pair the KernelRouter with an OVN twin), but
+// returns undefined — shouldn't happen, not assumed — when no Router
+// endpoint actually references that transitDomain.
 function transitPeer(
   kernelRouter: KernelRouter,
   routers: readonly Router[],
 ): { readonly router: Router; readonly side: "left" | "right" } | undefined {
-  if (!kernelRouter.transitDomain) return undefined;
   for (const router of routers) {
     for (const side of ["left", "right"] as const) {
       const endpoint = router[side];
@@ -345,7 +339,7 @@ function kernelRouterSideToIR(
       // LOWERLAYERDOWN and the default is `linkdown`, confirmed live
       // 2026-08-23).
       upstreamPeerAddrs: side === "right"
-        ? addrStrings(router.upstreamPeerAddrs ?? [])
+        ? addrStrings(router.upstreamPeerAddrs)
         : undefined,
       // The security group attached to THIS side's interface (right
       // side only in practice — set by buildKernelRouterEndpoint,
@@ -696,8 +690,7 @@ function resolveServiceRefs(
 
 // ── ipv4.route / ipv6.route ──────────────────────────────────────────
 // Matches ADR 0002's own node-kind table exactly (`ovnrouter:<scope>|
-// route:<prefix>`, originally drafted for the legacy Uplink/Segment
-// model — the same shape fits Router/RoutingDomain unchanged).
+// route:<prefix>` — the shape fits Router/RoutingDomain).
 //
 // The ANCHOR — whichever (router, side) a route's `via` is actually
 // reachable from — is DECLARED, not inferred: it's simply whichever
@@ -722,7 +715,7 @@ function resolveServiceRefs(
 // gets no route from that entry. Not an error: a declared route is one
 // possible SOURCE of reachability among several (SLAAC/RA on a segment
 // being the other one already real in this project, see
-// generate-ovn.ts's ipv6_ra_configs) — a source that doesn't resolve
+// the legacy generator's ipv6_ra_configs) — a source that doesn't resolve
 // for a given router/family just isn't the one supplying it there.
 
 interface Anchor {

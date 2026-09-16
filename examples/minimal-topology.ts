@@ -1,44 +1,56 @@
-// examples/minimal-topology.ts — the smallest possible topology.
-// One host, one physical WAN uplink (masqueraded), one physical LAN
-// segment behind it. Copy this file as a starting point for your own
-// config — see the README for the full model (segments, uplinks,
-// backdoors, WireGuard, etc). This file is also used as a CI smoke
-// test (see .github/workflows/ci.yaml), so keep it runnable.
+// examples/minimal-topology.ts — the smallest possible DEPLOYABLE
+// topology under the current (router-endpoint) model: one OVN central,
+// one chassis, and one logical router with a client-facing LAN leg and
+// an upstream leg. Copy this file as a starting point for your own
+// config — see the README for the full model (collision domains,
+// kernel/tunnel router endpoints, workloads, etc).
+//
+// This file is also used as a CI smoke test (see
+// .github/workflows/ci.yaml), so keep it runnable. It is deliberately
+// small, but unlike a bare single-host sketch it actually hydrates and
+// emits through the Python deployer: an OVN cluster needs a central
+// chassis to point every chassis's ovn-remote at, and that chassis
+// needs a real address to build that remote from.
 
-import {
-  defineNetwork,
-  ManualUplink,
-  segmentPhysical,
-  uplinkPhysical,
-} from "../src/mod.ts";
+import { defineNetwork, IPv4 } from "../src/mod.ts";
 
 export const network = defineNetwork("minimal", (net) => {
-  const host = net.localHost("this-host");
-
-  const wan = net.uplink(
-    "wan",
-    uplinkPhysical({
-      id: "1",
-      name: "eth0",
-      nat: { ipv4: [{ kind: "masq" }], ipv6: [{ kind: "masq" }] },
-      host,
-    }),
+  const central = net.sshHost(
+    "central",
+    { ipv4: IPv4.parse("10.99.0.1/32") },
+    "root",
+    undefined,
+    { role: { kind: "central" } },
+  );
+  const chassis = net.sshHost(
+    "chassis",
+    { ipv4: IPv4.parse("10.99.0.2/32") },
+    "root",
+    undefined,
+    { role: { kind: "chassis" } },
   );
 
-  net.segment(
-    "lan",
-    segmentPhysical({
-      id: "10",
-      name: "eth1",
-      uplink: new ManualUplink(wan),
-      gateway: { suffix: 2 },
-      slaac: false,
-      host,
-    }),
-  );
+  const lan = net.collisionDomain("lan");
+  const upstream = net.collisionDomain("upstream");
 
-  // defineNetwork requires the callback to return the hosts + routers it
-  // declared (2026-09-08). This legacy uplink/segment example declares no
-  // OVN routers, so routers is empty.
-  return { hosts: [host], routers: [] };
+  const router = net.defineOvnRouter("router-lan", (router) => {
+    router.left = router.ovnRouterEndpoint({
+      l2Segment: lan,
+      ipaddrs: [IPv4.parse("192.168.10.1/24")],
+      ifaces: [
+        {
+          host: chassis,
+          iface: { kind: "vlan", vlanParent: "eth1", vlanId: 10 },
+        },
+      ],
+      services: [{ kind: "ipv6.slaac" }, { kind: "ipv6.ra" }],
+    });
+    router.right = router.ovnRouterEndpoint({
+      l2Segment: upstream,
+      ipaddrs: [IPv4.parse("10.0.0.2/30")],
+    });
+    return { routingDomains: [] };
+  });
+
+  return { hosts: [central, chassis], routers: [router] };
 });
