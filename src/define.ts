@@ -13,6 +13,8 @@
 import type {
   OvnRouterSpec,
   RouterBuilder,
+  RouterBuildResult,
+  RouterEndpointSpec,
   ServiceBuilder,
 } from "./builders.ts";
 import type { NetworkDefinition } from "./network-definition.ts";
@@ -30,19 +32,16 @@ import {
   type HostAddress,
   type HostOs,
   type KernelRouter,
-  type KernelRouterEndpoint,
   type KernelRouterSide,
   localHost,
   type OvnClusterOptions,
   type OvnHostConfig,
   type OvnRouterEndpoint,
-  type OvnRouterEndpointSpec,
   type Router,
   type RoutingDomain,
   type SecurityGroup,
   type Service,
   sshHost,
-  type TunnelRouterEndpoint,
 } from "./types.ts";
 
 // Re-export the pieces split out of this file, so configs and mod.ts keep
@@ -68,6 +67,15 @@ export class NetworkBuilder implements RouterEndpointContext {
   private readonly kernelRoutersByName = new Map<string, KernelRouter>();
   private readonly routingDomainsByName = new Map<string, RoutingDomain>();
   private readonly securityGroupsByName = new Map<string, SecurityGroup>();
+  // Endpoint name → owning router. Endpoint names are the merge key across
+  // the TS/Python boundary (EndpointBase.name, types.ts) AND the real
+  // Logical_Router_Port names the deployer creates, which OVN treats as
+  // globally unique — so a name may occur at most once in the whole
+  // network, not just once per router. The derived form can't collide (it
+  // folds the router name into the fnv1a64, define.ts/deriveEndpointName),
+  // so this only ever fires for explicit `name` overrides — which is
+  // exactly the case a per-router Set missed.
+  private readonly endpointOwnerByName = new Map<string, string>();
 
   // Both host-declaring methods route through this — the "at most one
   // central chassis per cluster" check has to live in exactly one
@@ -175,6 +183,27 @@ export class NetworkBuilder implements RouterEndpointContext {
           `net.sshHost()/net.localHost() in this defineNetwork call`,
       );
     }
+  }
+
+  /** Claim one endpoint name network-wide (endpointOwnerByName above) —
+   * the enforcement half of EndpointBase.name (types.ts). The derived form
+   * never reaches a collision (router name is folded into the hash), so
+   * this only fires for an explicit `name` override: either twice in one
+   * router or once each in two routers. */
+  private registerEndpointName(routerName: string, endpointName: string): void {
+    const owner = this.endpointOwnerByName.get(endpointName);
+    if (owner === undefined) {
+      this.endpointOwnerByName.set(endpointName, routerName);
+      return;
+    }
+    throw new Error(
+      owner === routerName
+        ? `router "${routerName}": two endpoints resolve to the same name ` +
+          `"${endpointName}" — give one an explicit \`name\``
+        : `endpoint name "${endpointName}" is already used by router ` +
+          `"${owner}" — endpoint names are unique across the whole ` +
+          `network; give one an explicit \`name\``,
+    );
   }
 
   // gatewayChassis's natural default when a config author leaves it
@@ -299,13 +328,10 @@ export class NetworkBuilder implements RouterEndpointContext {
    * requires (e.g. a collisionDomain must exist before a router references
    * it). */
   /** Resolve a kind-tagged endpoint spec (the defineOvnRouter() object
-   * form's left/right) into a stored OvnRouterEndpoint — dispatching to the
-   * same builders the router.endpoint methods use (2026-09-08). */
+   * form's endpoints[]) into a stored OvnRouterEndpoint — dispatching to
+   * the same builders the router.endpoint methods use (2026-09-08). */
   private resolveEndpointSpec(
-    spec:
-      | OvnRouterEndpointSpec
-      | KernelRouterEndpoint
-      | TunnelRouterEndpoint,
+    spec: RouterEndpointSpec,
     routingDomains: readonly RoutingDomain[],
     routerName: string,
     subRouters: Router[],
@@ -329,11 +355,7 @@ export class NetworkBuilder implements RouterEndpointContext {
 
   defineOvnRouter(
     name: string,
-    build:
-      | OvnRouterSpec
-      | ((router: RouterBuilder) => {
-        readonly routingDomains: readonly RoutingDomain[];
-      }),
+    build: OvnRouterSpec | ((router: RouterBuilder) => RouterBuildResult),
   ): Router {
     if (this.routersByName.has(name)) {
       throw new Error(`router "${name}" declared more than once`);
@@ -357,43 +379,38 @@ export class NetworkBuilder implements RouterEndpointContext {
     };
     // The object form carries routingDomains up-front, so its kernel/tunnel
     // specs are resolved with it directly (no deferred stamp needed); the
-    // builder form still returns routingDomains after left/right are set.
-    const routingDomains = typeof build === "function"
-      ? build(router).routingDomains
-      : build.routingDomains;
-    if (typeof build !== "function") {
-      router.left = this.resolveEndpointSpec(
-        build.left,
-        build.routingDomains,
-        name,
-        subRouters,
-      );
-      router.right = this.resolveEndpointSpec(
-        build.right,
-        build.routingDomains,
-        name,
-        subRouters,
+    // builder form returns routingDomains alongside its endpoints.
+    let routingDomains: readonly RoutingDomain[];
+    let resolved: readonly OvnRouterEndpoint[];
+    if (typeof build === "function") {
+      const result = build(router);
+      routingDomains = result.routingDomains;
+      resolved = result.endpoints;
+    } else {
+      routingDomains = build.routingDomains;
+      resolved = build.endpoints.map((spec) =>
+        this.resolveEndpointSpec(spec, build.routingDomains, name, subRouters)
       );
     }
 
-    if (!router.left || !router.right) {
+    // A router exists to join domains: one endpoint joins nothing, so at
+    // least two are required (2026-09-16). No fixed left/right — an
+    // endpoint is addressed by its own `name`.
+    if (resolved.length < 2) {
       throw new Error(
-        `router "${name}": both router.left and router.right must be ` +
-          `set inside the defineOvnRouter() callback`,
+        `router "${name}": needs at least 2 endpoints, got ` +
+          `${resolved.length} — return them from defineOvnRouter()'s ` +
+          `callback as \`endpoints: [...]\`.`,
       );
     }
-    this.checkRouterEndpoint(name, router.left);
-    this.checkRouterEndpoint(name, router.right);
-    // Endpoint names are the merge key (EndpointBase.name, types.ts) — two
-    // endpoints of one router sharing one would silently alias on the
-    // Python side. The derived form can't collide (it folds the router
-    // name and the attachment domain, and two endpoints can't share a
-    // domain), so only an explicit `name` override can reach this.
-    if (router.left.name === router.right.name) {
-      throw new Error(
-        `router "${name}": both endpoints resolve to the same name ` +
-          `"${router.left.name}" — give one an explicit \`name\``,
-      );
+    for (const endpoint of resolved) {
+      this.checkRouterEndpoint(name, endpoint);
+    }
+    // Endpoint names are the merge key (EndpointBase.name, types.ts) and
+    // the real OVN port names — unique across the WHOLE network, not just
+    // within this router (registerEndpointName, above).
+    for (const endpoint of resolved) {
+      this.registerEndpointName(name, endpoint.name);
     }
     for (const domain of routingDomains) {
       if (this.routingDomainsByName.get(domain.name) !== domain) {
@@ -418,8 +435,10 @@ export class NetworkBuilder implements RouterEndpointContext {
     }
     const built: Router = {
       name,
-      left: this.deriveGatewayChassis(router.left),
-      right: this.deriveGatewayChassis(router.right),
+      // Sorted by name (see Router.endpoints, types.ts) — declaration
+      // order must not leak into the IR/deployer output.
+      endpoints: resolved.map((endpoint) => this.deriveGatewayChassis(endpoint))
+        .sort(byName),
       routingDomains,
       subRouters,
     };
@@ -491,13 +510,15 @@ export class NetworkBuilder implements RouterEndpointContext {
     }
     return {
       name,
-      allHosts: [...(decl.hosts ?? this.hostsByName.values())],
-      allCollisionDomains: [...this.collisionDomainsByName.values()],
+      allHosts: [...(decl.hosts ?? this.hostsByName.values())].sort(byName),
+      allCollisionDomains: [...this.collisionDomainsByName.values()].sort(
+        byName,
+      ),
       ...(this.backboneDomain ? { backbone: this.backboneDomain } : {}),
       allRouters,
-      allKernelRouters: [...this.kernelRoutersByName.values()],
-      allRoutingDomains: [...this.routingDomainsByName.values()],
-      allSecurityGroups: [...this.securityGroupsByName.values()],
+      allKernelRouters: [...this.kernelRoutersByName.values()].sort(byName),
+      allRoutingDomains: [...this.routingDomainsByName.values()].sort(byName),
+      allSecurityGroups: [...this.securityGroupsByName.values()].sort(byName),
       ...(this.ovnGlobalOptions ? { ovnGlobal: this.ovnGlobalOptions } : {}),
     };
   }
@@ -515,14 +536,26 @@ export function defineNetwork(
   return builder.build(name, decl);
 }
 
+// Lexical, UTF-16 code-unit order — deliberately NOT localeCompare(),
+// which is locale/environment dependent and would make the IR (and so
+// the deployer output) differ between machines for the same config. The
+// whole point of sorting here is diff-STABLE output.
+function byName(
+  a: { readonly name: string },
+  b: { readonly name: string },
+): number {
+  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+}
+
 // Flatten a router and its subRouters (recursively) into the full router
 // set — a config author lists only top-level routers; a tunnel's upstream
-// peer rides on the tunnel router's subRouters (2026-09-08).
+// peer rides on the tunnel router's subRouters (2026-09-08). Sorted by
+// name so the flattened order is independent of declaration order.
 function flattenRouters(routers: readonly Router[]): Router[] {
   const out: Router[] = [];
   for (const router of routers) {
     out.push(router);
     out.push(...flattenRouters(router.subRouters));
   }
-  return out;
+  return out.sort(byName);
 }

@@ -12,6 +12,7 @@ import {
   normalizeKernelEndpoint,
   type OvnEndpointFn,
   type RouterBuilder,
+  type RouterBuildResult,
 } from "./builders.ts";
 import type { SecurityGroupBuilder } from "./security-group.ts";
 import type {
@@ -36,9 +37,7 @@ export interface RouterEndpointContext {
   collisionDomain(name: string): CollisionDomain;
   defineOvnRouter(
     name: string,
-    build: (
-      router: RouterBuilder,
-    ) => { readonly routingDomains: readonly RoutingDomain[] },
+    build: (router: RouterBuilder) => RouterBuildResult,
   ): Router;
   kernelRouter(
     name: string,
@@ -573,18 +572,20 @@ export function buildTunnelRouterEndpoint(
   // binding (mirror of how the mesh transit binds its own veth).
   const upstreamPeer = ctx.defineOvnRouter(
     `${routerName}-upstream`,
-    (router) => {
-      router.left = buildOvnRouterEndpoint({
-        l2Segment: backdoorDomain,
-        ipaddrs: upstreamPeerAddrs,
-        ifaces: [{ host, iface: upstreamVeth }],
-      }, { routerName: `${routerName}-upstream`, role: "ovn" });
-      router.right = buildOvnRouterEndpoint({
-        l2Segment: upstreamBackbone.l2Segment,
-        ipaddrs: upstreamBackbone.ipaddrs,
-      }, { routerName: `${routerName}-upstream`, role: "ovn" });
-      return { routingDomains: upstreamDomains ?? [] };
-    },
+    () => ({
+      routingDomains: upstreamDomains ?? [],
+      endpoints: [
+        buildOvnRouterEndpoint({
+          l2Segment: backdoorDomain,
+          ipaddrs: upstreamPeerAddrs,
+          ifaces: [{ host, iface: upstreamVeth }],
+        }, { routerName: `${routerName}-upstream`, role: "ovn" }),
+        buildOvnRouterEndpoint({
+          l2Segment: upstreamBackbone.l2Segment,
+          ipaddrs: upstreamBackbone.ipaddrs,
+        }, { routerName: `${routerName}-upstream`, role: "ovn" }),
+      ],
+    }),
   );
   subRouters.push(upstreamPeer);
 

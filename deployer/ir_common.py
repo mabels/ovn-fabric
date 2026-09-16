@@ -311,9 +311,9 @@ def _emit_router_routes(router: str, routes: list[RouteNode], emit: Emitter) -> 
     for node in routes:
         by_domain.setdefault(node.data.domain, []).append(node)
 
-    for domain, domain_routes in by_domain.items():
+    for domain in sorted(by_domain):
         emit.comment(f"# --- routes: {router} ({domain}) ---")
-        for node in domain_routes:
+        for node in sorted(by_domain[domain], key=lambda n: n.key.prefix):
             emit.sh(ovn_ops.lr_route_add_argv(router, node.key.prefix, node.data.nexthop))
 
 
@@ -343,11 +343,18 @@ def _emit_router(
 
     emit.comment(f"# --- router: {router} ---")
     emit.sh(ovn_ops.lr_add_argv(router))
-    for node in ports:
-        side = node.key.side.value
+    # Sorted by the port's own name so the emitted block is stable
+    # regardless of the IR's input order (the IR out of src/ir.ts is
+    # already sorted, but the deployer must not depend on that).
+    for node in sorted(ports, key=lambda n: n.key.name):
         data = node.data
-        lrp = f"lrp-{router}-{side}"
-        lsp = f"lsp-{router}-{side}"
+        # The port name is the endpoint's own identity
+        # (EndpointBase.name, src/ir.ts's routerEndpointToIR) — carried in
+        # the KEY, like `side` was, never duplicated into data. The peer
+        # LSP name is derived from it (the router-type LSP that binds the
+        # switch's port to this LRP).
+        lrp = node.key.name
+        lsp = f"lsp-{lrp.removeprefix('lrp-')}"
         # data.l2Segment/gatewayChassis are the referenced ovn.ls/
         # infra.host node's own id (`ls:<name>`/`host:<name>` —
         # 2026-08-12, src/ir.ts), resolved back to the real name every
@@ -377,13 +384,19 @@ def _emit_router(
 
 def _emit_cluster_body(nodes: list[pt.Model], emit: Emitter) -> None:
     action = emit.action
-    switches = [n for n in nodes if n.kind == "ovn.ls"]
+    # Explicit sorts make the emitted script byte-stable regardless of
+    # the IR's input order (routers, switches; ports/routes are sorted
+    # where they are emitted).
+    switches = sorted(
+        (n for n in nodes if n.kind == "ovn.ls"), key=lambda n: n.key.name
+    )
     router_groups = _group_router_ports(nodes)
     routes_by_router = _group_routes_by_router(nodes)
     # Resolved for both actions — _emit_router's delete branch simply
     # doesn't read them (2026-08-19, flag schema).
     host_names = _host_name_by_id(nodes)
     domain_names = _domain_name_by_id(nodes)
+    routers = sorted(router_groups)
 
     if action == "create":
         bindable_domains = _domains_with_bindable_interfaces(nodes)
@@ -391,20 +404,20 @@ def _emit_cluster_body(nodes: list[pt.Model], emit: Emitter) -> None:
             _emit_logical_switch(node, emit)
             if node.key.name in bindable_domains:
                 _emit_localnet_lsp_create(node.key.name, emit)
-        for router, ports in router_groups.items():
+        for router in routers:
             _emit_router(
                 router,
-                ports,
+                router_groups[router],
                 routes_by_router.get(router, []),
                 host_names,
                 domain_names,
                 emit,
             )
     else:
-        for router, ports in router_groups.items():
+        for router in routers:
             _emit_router(
                 router,
-                ports,
+                router_groups[router],
                 routes_by_router.get(router, []),
                 host_names,
                 domain_names,

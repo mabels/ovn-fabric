@@ -81,9 +81,9 @@ NODES: list[pt.Model] = [
         data=pt.OvnLsData(interfaces=[]),
     ),
     pt.OvnLrpNode(
-        id="ovnrouter:router-home|lrp:left",
+        id="ovnrouter:router-home|lrp:lrp-router-home-left",
         kind="ovn.lrp",
-        key=pt.OvnLrpKey(ovnrouter="router-home", side=pt.Side.left),
+        key=pt.OvnLrpKey(ovnrouter="router-home", name="lrp-router-home-left"),
         data=pt.OvnLrpData(
             l2Segment="ls:home",
             addresses=["192.168.1.1/24"],
@@ -92,9 +92,9 @@ NODES: list[pt.Model] = [
         ),
     ),
     pt.OvnLrpNode(
-        id="ovnrouter:router-home|lrp:right",
+        id="ovnrouter:router-home|lrp:lrp-router-home-right",
         kind="ovn.lrp",
-        key=pt.OvnLrpKey(ovnrouter="router-home", side=pt.Side.right),
+        key=pt.OvnLrpKey(ovnrouter="router-home", name="lrp-router-home-right"),
         data=pt.OvnLrpData(
             l2Segment="ls:backbone",
             addresses=["172.22.0.1/16"],
@@ -1309,10 +1309,14 @@ class KernelServiceDeployTest(unittest.TestCase):
         )
 
     def _lrp(self, router: str, side: str, seg: str, ref: object) -> object:
+        # Endpoint identity is its own `name` (no more positional side);
+        # keep the historical lrp-<router>-<side> shape so the emitted
+        # lrp/lsp names (and the assertions on them) stay unchanged.
+        name = f"lrp-{router}-{side}"
         return pt.OvnLrpNode(
-            id=f"ovnrouter:{router}|lrp:{side}",
+            id=f"ovnrouter:{router}|lrp:{name}",
             kind="ovn.lrp",
-            key=pt.OvnLrpKey(ovnrouter=router, side=pt.Side(side)),
+            key=pt.OvnLrpKey(ovnrouter=router, name=name),
             data=pt.OvnLrpData(
                 l2Segment=f"ls:{seg}",
                 addresses=[],
@@ -1440,12 +1444,13 @@ class MultiServiceDeployTest(unittest.TestCase):
             )
 
         def lrp(router: str, seg_name: str, service: str):
+            name = f"lrp-{router}-left"
             return pt.OvnLrpNode(
-                id=f"ovnrouter:{router}|lrp:left",
+                id=f"ovnrouter:{router}|lrp:{name}",
                 kind="ovn.lrp",
-                key=pt.OvnLrpKey(ovnrouter=router, side=pt.Side("left")),
+                key=pt.OvnLrpKey(ovnrouter=router, name=name),
                 data=pt.OvnLrpData(
-                    l2Segment=f"ls:{seg_name}",
+                        l2Segment=f"ls:{seg_name}",
                     addresses=[],
                     mac="02:00:00:00:00:01",
                     serviceRefs=[
@@ -1537,9 +1542,12 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                 },
             },
             {
-                "id": "ovnrouter:router-management-v2|lrp:left",
+                "id": "ovnrouter:router-management-v2|lrp:lrp-router-management-v2-left",
                 "kind": "ovn.lrp",
-                "key": {"ovnrouter": "router-management-v2", "side": "left"},
+                "key": {
+                    "ovnrouter": "router-management-v2",
+                    "name": "lrp-router-management-v2-left",
+                },
                 "data": {
                     "l2Segment": "ls:management-v2",
                     "addresses": ["192.168.129.1/24"],
@@ -1554,9 +1562,12 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                 },
             },
             {
-                "id": "ovnrouter:router-control-plane-v2|lrp:left",
+                "id": "ovnrouter:router-control-plane-v2|lrp:lrp-router-control-plane-v2-left",
                 "kind": "ovn.lrp",
-                "key": {"ovnrouter": "router-control-plane-v2", "side": "left"},
+                "key": {
+                    "ovnrouter": "router-control-plane-v2",
+                    "name": "lrp-router-control-plane-v2-left",
+                },
                 "data": {
                     "l2Segment": "ls:control-plane",
                     "addresses": ["10.43.0.1/24"],

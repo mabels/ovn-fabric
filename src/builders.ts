@@ -167,21 +167,19 @@ export interface ServiceBuilder {
 
 /**
  * The builder context passed into defineNetwork's callback per router —
- * same "context object, void callback" idiom as defineNetwork's own `net`,
- * one level down. `left`/`right` are plain SETTABLE attributes, not a
- * returned object: kernelRouterEndpoint() needs to read them at the moment
- * it resolves, and ovnRouterEndpoint()/kernelRouterEndpoint()/
- * tunnelRouterEndpoint() are ONLY reachable through this object, not as
- * NetworkBuilder methods — the router-level routingDomains is REQUIRED on
- * the callback's return value (define.ts), so an author can't forget its
- * membership (2026-09-08). Always the OVN side: every endpoint builder
+ * same "context object" idiom as defineNetwork's own `net`, one level
+ * down. It exposes ONLY the endpoint factory methods
+ * (ovnRouterEndpoint()/kernelRouterEndpoint()/tunnelRouterEndpoint(),
+ * never NetworkBuilder methods); the callback RETURNS the router's
+ * endpoints and its routingDomains together (RouterBuildResult below), so
+ * an author can't forget the membership and position stops being
+ * meaningful (an endpoint is addressed by its own `name`, not by being
+ * "left"/"right"). Always the OVN side: every endpoint builder
  * (ovn/kernel/tunnel) returns a plain OvnRouterEndpoint; the
  * KernelRouterEndpoint and TunnelRouterEndpoint shapes are INPUT types,
  * never stored here.
  */
 export interface RouterBuilder {
-  left?: OvnRouterEndpoint;
-  right?: OvnRouterEndpoint;
   ovnRouterEndpoint(
     input: Omit<OvnRouterEndpointSpec, "kind"> | OvnEndpointFn,
   ): OvnRouterEndpoint;
@@ -193,20 +191,27 @@ export interface RouterBuilder {
   ): OvnRouterEndpoint;
 }
 
+/** What a defineOvnRouter() callback returns: the router's own
+ * routingDomains plus the endpoints it built (>= 2, enforced). */
+export interface RouterBuildResult {
+  readonly routingDomains: readonly RoutingDomain[];
+  readonly endpoints: readonly OvnRouterEndpoint[];
+}
+
+/** A kind-tagged endpoint INPUT in the declarative object form — resolved
+ * by resolveEndpointSpec (define.ts) into a stored OvnRouterEndpoint. */
+export type RouterEndpointSpec =
+  | OvnRouterEndpointSpec
+  | KernelRouterEndpoint
+  | TunnelRouterEndpoint;
+
 /** The DECLARATIVE object form of defineOvnRouter() (2026-09-08): a router
- * as one typed value — routingDomains (required) up-front, and left/right
- * as kind-tagged endpoint specs. RoutingDomains is known here BEFORE the
- * endpoints are resolved, so a kernel/tunnel spec is built with it
- * directly (no deferred stamp). Endpoint services are plain objects in
- * each spec's `services` array. */
+ * as one typed value — routingDomains (required) up-front, and an
+ * `endpoints` array of kind-tagged endpoint specs. RoutingDomains is known
+ * here BEFORE the endpoints are resolved, so a kernel/tunnel spec is built
+ * with it directly (no deferred stamp). Endpoint services are plain
+ * objects in each spec's `services` array. */
 export interface OvnRouterSpec {
   readonly routingDomains: readonly RoutingDomain[];
-  readonly left:
-    | OvnRouterEndpointSpec
-    | KernelRouterEndpoint
-    | TunnelRouterEndpoint;
-  readonly right:
-    | OvnRouterEndpointSpec
-    | KernelRouterEndpoint
-    | TunnelRouterEndpoint;
+  readonly endpoints: readonly RouterEndpointSpec[];
 }

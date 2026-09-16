@@ -117,14 +117,13 @@ const generate = command({
     console.log(`  routers: ${net.allRouters.length}`);
     for (const r of net.allRouters) {
       console.log(`    - ${r.name}`);
-      for (const side of ["left", "right"] as const) {
-        const ep = r[side];
+      for (const ep of r.endpoints) {
         const addrs = ep.ipaddrs.map((a) => a.to_string());
         const ifaces = (ep.ifaces ?? [])
           .map((hi) => describeInterface(hi.iface))
           .join(", ");
         console.log(
-          `        ${side}: ls=${ep.l2Segment.name}` +
+          `        ${ep.name}: ls=${ep.l2Segment.name}` +
             (addrs.length > 0 ? ` addrs=[${addrs.join(", ")}]` : "") +
             (ifaces.length > 0 ? ` ifaces=[${ifaces}]` : ""),
         );

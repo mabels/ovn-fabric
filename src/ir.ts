@@ -162,7 +162,7 @@ function kernelRouterToIR(router: KernelRouter): IRNode {
   };
 }
 
-// Which (Router, side) is THIS KernelRouter's own OVN twin — the
+// Which (Router, endpoint) is THIS KernelRouter's own OVN twin — the
 // endpoint whose l2Segment IS this KernelRouter's own transitDomain
 // (types.ts's own doc comment on that field). Always defined in
 // practice (both builders pair the KernelRouter with an OVN twin), but
@@ -171,15 +171,16 @@ function kernelRouterToIR(router: KernelRouter): IRNode {
 function transitPeer(
   kernelRouter: KernelRouter,
   routers: readonly Router[],
-): { readonly router: Router; readonly side: "left" | "right" } | undefined {
+):
+  | { readonly router: Router; readonly endpoint: OvnRouterEndpoint }
+  | undefined {
   for (const router of routers) {
-    for (const side of ["left", "right"] as const) {
-      const endpoint = router[side];
+    for (const endpoint of router.endpoints) {
       if (
         endpoint.kind === "ovn" &&
         endpoint.l2Segment.name === kernelRouter.transitDomain.name
       ) {
-        return { router, side };
+        return { router, endpoint };
       }
     }
   }
@@ -461,7 +462,7 @@ function collisionDomainToIR(
   const shortName = shortIfaceName("br-", domain.name);
   const interfaces: Array<{ host: string; iface: unknown }> = [];
   for (const router of routers) {
-    for (const endpoint of [router.left, router.right]) {
+    for (const endpoint of router.endpoints) {
       if (endpoint.kind !== "ovn" || endpoint.l2Segment.name !== domain.name) {
         continue;
       }
@@ -505,10 +506,11 @@ function collisionDomainToIR(
 // real, on the reconciler side, from real Logical_Router_Port data —
 // see reconciler/ovn/reconcile.py) — this is the DESIRED-state half of
 // the same fact. Key extends the ADR's `ovnrouter:<scope>|lrp` with the
-// endpoint's own side (left/right), not a port name the config author
-// chose — Router/RouterEndpoint has no separate per-endpoint name field
-// (see Router, types.ts), so `left`/`right` IS the local identity here,
-// the same role a chosen LRP name plays on the reconciler side.
+// endpoint's own `name` (EndpointBase.name, types.ts) — the SAME identity
+// the reconciler keys a live port by (`ovnrouter:<router>|lrp:<port
+// name>`), which is what lets the two sides be merged at all. `name` is
+// derived from configuration (or pinned by the author), never positional,
+// so reordering endpoints cannot re-key a port.
 // Resolved HERE, not left for the shell-conversion step to guess: the
 // IR is the desired-state boundary between this project's TypeScript
 // half and its Python half (deployer/ir_to_shell.py) — it should carry
@@ -609,16 +611,14 @@ function resolveIpv6RaConfigs(
 
 function routerEndpointToIR(
   router: Router,
-  side: "left" | "right",
   endpoint: OvnRouterEndpoint,
 ): IRNode {
   const scope = `ovnrouter:${router.name}`;
-  const id = `${scope}|lrp:${side}`;
-  const lrp = `lrp-${router.name}-${side}`;
+  const id = `${scope}|lrp:${endpoint.name}`;
   return {
     id,
     kind: "ovn.lrp",
-    key: { ovnrouter: router.name, side },
+    key: { ovnrouter: router.name, name: endpoint.name },
     data: {
       // `ls:<name>`/`host:<name>` — the referenced ovn.ls/infra.host
       // node's own id (hostToIR/collisionDomainToIR above), not the
@@ -626,12 +626,12 @@ function routerEndpointToIR(
       // consistently an id, not a mix of ids and bare strings.
       l2Segment: `ls:${endpoint.l2Segment.name}`,
       addresses: addrStrings(endpoint.ipaddrs),
-      mac: resolveMac(lrp, endpoint),
+      mac: resolveMac(endpoint.name, endpoint),
       gatewayChassis: endpoint.gatewayChassis
         ? `host:${endpoint.gatewayChassis.name}`
         : undefined,
       ipv6RaConfigs: resolveIpv6RaConfigs(endpoint.services),
-      serviceRefs: resolveServiceRefs(router, side, endpoint),
+      serviceRefs: resolveServiceRefs(router, endpoint),
     },
   };
 }
@@ -643,7 +643,6 @@ function routerEndpointToIR(
 // `via` is unreachable on this L2 and throws (2026-09-08).
 function resolveServiceRefs(
   router: Router,
-  side: "left" | "right",
   endpoint: OvnRouterEndpoint,
 ): {
   service: string;
@@ -660,7 +659,8 @@ function resolveServiceRefs(
       ? ref.routes.map((r) => {
         if (r.via && !viaIsOnSegment(endpoint, r.via)) {
           throw new Error(
-            `service "${ref.srvRef.name}" on ${router.name} (${side}): route ` +
+            `service "${ref.srvRef.name}" on ${router.name} ` +
+              `(${endpoint.name}): route ` +
               `${r.dst.to_string()} via ${r.via.to_s()} — the via is not on ` +
               `segment "${endpoint.l2Segment.name}" (${
                 endpoint.ipaddrs.map((a) => a.to_string()).join(", ")
@@ -720,7 +720,7 @@ function resolveServiceRefs(
 
 interface Anchor {
   readonly router: Router;
-  readonly side: "left" | "right";
+  readonly endpoint: OvnRouterEndpoint;
 }
 
 // A real type guard (not just a boolean check) — narrows `b` to the
@@ -749,21 +749,25 @@ function sharesL2Segment(a: OvnRouterEndpoint, b: OvnRouterEndpoint): boolean {
 }
 
 // The anchor's OWN address, of `dst`'s family, on whichever endpoint
-// `router` actually shares a CollisionDomain with — i.e. NOT the
-// anchor-side endpoint itself (that's what `via` already sits on),
-// its OTHER endpoint, the one facing the rest of the cluster.
+// `router` actually shares a CollisionDomain with — i.e. NOT the anchor
+// endpoint itself (that's what `via` already sits on), but one of the
+// anchor router's OTHER endpoints, the one facing the rest of the cluster.
+// With an endpoint array there may be several such endpoints; the first
+// (in the router's own sorted order) that both shares a domain with
+// `router` and carries an address of `dst`'s family wins.
 function anchorAddressSharedWith(
   router: Router,
   anchor: Anchor,
   dst: IPv4 | IPv6,
 ): (IPv4 | IPv6) | undefined {
-  const anchorOtherSide = anchor.side === "left"
-    ? anchor.router.right
-    : anchor.router.left;
-  const shared = sharesL2Segment(router.left, anchorOtherSide) ||
-    sharesL2Segment(router.right, anchorOtherSide);
-  if (!shared) return undefined;
-  return anchorOtherSide.ipaddrs.find((addr) => isSameFamily(addr, dst));
+  for (const candidate of anchor.router.endpoints) {
+    if (candidate === anchor.endpoint) continue;
+    const shared = router.endpoints.some((e) => sharesL2Segment(e, candidate));
+    if (!shared) continue;
+    const addr = candidate.ipaddrs.find((a) => isSameFamily(a, dst));
+    if (addr) return addr;
+  }
+  return undefined;
 }
 
 // `domain` names WHICH RoutingDomain produced this route (net.
@@ -810,12 +814,11 @@ function routeToIR(
 // A router participates in `domain` if its router-level membership names
 // it OR any of its endpoints does (per-endpoint routingDomains,
 // 2026-08-23 — a tunnelRouterEndpoint participates in Neighbor-defaultRoute
-// via its LEFT and Voda-defaultRoute via its RIGHT, neither on the
-// router itself).
+// via its tunnel endpoint and Voda-defaultRoute via its backbone endpoint,
+// neither on the router itself).
 function isDomainParticipant(router: Router, domain: RoutingDomain): boolean {
   return router.routingDomains?.includes(domain) === true ||
-    router.left.routingDomains?.includes(domain) === true ||
-    router.right.routingDomains?.includes(domain) === true;
+    router.endpoints.some((e) => e.routingDomains?.includes(domain) === true);
 }
 
 function computeRoutes(network: NetworkDefinition): IRNode[] {
@@ -823,32 +826,30 @@ function computeRoutes(network: NetworkDefinition): IRNode[] {
   // Anchor-outer (2026-08-23): routing-domain membership is PER ENDPOINT
   // now — an endpoint's declared routes participate in its OWN
   // routingDomains (falling back to the router-level ones), so a router
-  // can anchor one domain from its left and participate in another from
-  // its right (a tunnelRouterEndpoint does exactly that: the left's
-  // via-less default stays inside Neighbor-defaultRoute, the right joins
-  // Voda-defaultRoute).
+  // can anchor one domain from one endpoint and participate in another
+  // from another (a tunnelRouterEndpoint does exactly that).
   //
-  // Every router's OWN declared route prefixes (across both endpoints,
+  // Every router's OWN declared route prefixes (across all endpoints,
   // via-less or via) — a router's own route to a prefix wins over one it
   // would otherwise LEARN as a participant of another domain's anchor.
   // Without this a full-tunnel router (e.g. mullvad-de anchors 0.0.0.0/0
-  // via-less for Neighbor, but its right side also joins Voda-defaultRoute)
-  // gets voda's default written over its OWN tunnel egress — same node id,
-  // last-write-wins (hit live 2026-08-30).
+  // via-less for Neighbor, but its backbone endpoint also joins
+  // Voda-defaultRoute) gets voda's default written over its OWN tunnel
+  // egress — same node id, last-write-wins (hit live 2026-08-30).
   const ownPrefixes = new Map<string, Set<string>>();
   for (const r of network.allRouters) {
     const set = new Set<string>();
-    for (const side of ["left", "right"] as const) {
-      for (const rt of r[side].routes ?? []) set.add(rt.dst.to_string());
+    for (const endpoint of r.endpoints) {
+      for (const rt of endpoint.routes ?? []) set.add(rt.dst.to_string());
     }
     ownPrefixes.set(r.name, set);
   }
   for (const anchorRouter of network.allRouters) {
-    for (const side of ["left", "right"] as const) {
-      const anchor: Anchor = { router: anchorRouter, side };
-      const routes = anchorRouter[side].routes ?? [];
+    for (const anchorEndpoint of anchorRouter.endpoints) {
+      const anchor: Anchor = { router: anchorRouter, endpoint: anchorEndpoint };
+      const routes = anchorEndpoint.routes ?? [];
       if (routes.length === 0) continue;
-      const endpointDomains = anchorRouter[side].routingDomains ??
+      const endpointDomains = anchorEndpoint.routingDomains ??
         anchorRouter.routingDomains ??
         [];
       for (const domain of endpointDomains) {
@@ -863,11 +864,11 @@ function computeRoutes(network: NetworkDefinition): IRNode[] {
             if (router.name === anchorRouter.name) {
               // No `via` here means "the anchor needs no literal route
               // of its own for this — handled elsewhere on its own
-              // side" (e.g. SLAAC/RA, a less-specific default, or the
-              // tunnel egress inside a tunnelRouterEndpoint's netns).
-              // That's a statement about the ANCHOR only, not about
-              // whether OTHER participants should still learn to route
-              // toward it — they always should (confirmed live,
+              // endpoint" (e.g. SLAAC/RA, a less-specific default, or
+              // the tunnel egress inside a tunnelRouterEndpoint's
+              // netns). That's a statement about the ANCHOR only, not
+              // about whether OTHER participants should still learn to
+              // route toward it — they always should (confirmed live,
               // 2026-08-12), so this `continue` is scoped to the
               // anchor's own branch, not the whole route entry.
               if (!route.via) continue;
@@ -919,11 +920,14 @@ function computeRoutes(network: NetworkDefinition): IRNode[] {
 // whether the domain also has an external via-route.
 //
 // For every ordered pair of distinct participants (r1, r2) that share
-// a CollisionDomain: r1 learns a route to r2's OTHER endpoint's
-// subnet, next-hop r2's own address on the SHARED domain (not r2's
-// address on its other side — that's not reachable from r1 at all).
-// Symmetric — running the same pair the other way round produces r2's
-// own route back to r1.
+// a CollisionDomain: r1 learns a route to each of r2's OTHER endpoints'
+// subnets, next-hop r2's own address on the SHARED domain (not r2's
+// address on a different endpoint — that's not reachable from r1 at
+// all). Symmetric — running the same pair the other way round produces
+// r2's own route back to r1. "Other endpoints" (plural now that a router
+// owns an array): every endpoint of r2 except the one sharing the
+// domain, which for the two-endpoint case is exactly the old single
+// "other side".
 function computeInterconnectRoutes(network: NetworkDefinition): IRNode[] {
   const nodes: IRNode[] = [];
   for (const domain of network.allRoutingDomains) {
@@ -933,22 +937,24 @@ function computeInterconnectRoutes(network: NetworkDefinition): IRNode[] {
     for (const r1 of participants) {
       for (const r2 of participants) {
         if (r1.name === r2.name) continue;
-        for (const r1side of [r1.left, r1.right]) {
-          for (const r2side of [r2.left, r2.right]) {
+        for (const r1side of r1.endpoints) {
+          for (const r2side of r2.endpoints) {
             if (!sharesL2Segment(r1side, r2side)) continue;
-            const r2OtherSide = r2side === r2.left ? r2.right : r2.left;
             for (const nexthop of r2side.ipaddrs) {
-              for (const peerAddr of r2OtherSide.ipaddrs) {
-                if (!isSameFamily(nexthop, peerAddr)) continue;
-                nodes.push(
-                  routeToIR(
-                    r1,
-                    peerAddr.network(),
-                    nexthop,
-                    false,
-                    domain.name,
-                  ),
-                );
+              for (const other of r2.endpoints) {
+                if (other === r2side) continue;
+                for (const peerAddr of other.ipaddrs) {
+                  if (!isSameFamily(nexthop, peerAddr)) continue;
+                  nodes.push(
+                    routeToIR(
+                      r1,
+                      peerAddr.network(),
+                      nexthop,
+                      false,
+                      domain.name,
+                    ),
+                  );
+                }
               }
             }
           }
@@ -1004,8 +1010,7 @@ function viaIsOnSegment(
 function serviceNodes(network: NetworkDefinition): IRNode[] {
   const hosts = new Map<Service, string>();
   for (const router of network.allRouters) {
-    for (const side of ["left", "right"] as const) {
-      const endpoint = router[side];
+    for (const endpoint of router.endpoints) {
       if (endpoint.kind !== "ovn") continue;
       for (const entry of endpoint.services ?? []) {
         if (entry.kind !== "service.attach") continue;
@@ -1013,9 +1018,9 @@ function serviceNodes(network: NetworkDefinition): IRNode[] {
         const hostName = endpoint.ifaces?.[0]?.host.name;
         if (!hostName) {
           throw new Error(
-            `service "${service.name}": attached at ${router.name} (${side}) ` +
-              `but that endpoint has no ifaces to name the host running the ` +
-              `container`,
+            `service "${service.name}": attached at ${router.name} ` +
+              `(${endpoint.name}) but that endpoint has no ifaces to name ` +
+              `the host running the container`,
           );
         }
         const known = hosts.get(service);
@@ -1064,8 +1069,7 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
   }
 
   for (const router of network.allRouters) {
-    for (const side of ["left", "right"] as const) {
-      const endpoint = router[side];
+    for (const endpoint of router.endpoints) {
       if (endpoint.kind !== "ovn") {
         // KernelRouterEndpoint (types.ts) — no emission strategy built
         // for this kind yet (nothing in this codebase constructs one
@@ -1073,11 +1077,11 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
         // config author actually declares one, this says so loudly
         // instead of quietly producing an incomplete IR.
         throw new Error(
-          `router "${router.name}": ${side} endpoint is kind "${endpoint.kind}" — ` +
-            `toIR() has no emission strategy for it yet`,
+          `router "${router.name}": endpoint "${endpoint.name}" is kind ` +
+            `"${endpoint.kind}" — toIR() has no emission strategy for it yet`,
         );
       }
-      const node = routerEndpointToIR(router, side, endpoint);
+      const node = routerEndpointToIR(router, endpoint);
       nodes[node.id] = node;
     }
   }
@@ -1131,5 +1135,13 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
     nodes[node.id] = node;
   }
 
-  return nodes;
+  // Deterministic output order: sorted by node id. The caller (cli.ts's
+  // generate-ir) serializes Object.values(nodes) as-is, so insertion
+  // order IS the JSON order — sorting here makes the whole IR
+  // diff-stable run to run, independent of declaration/registration
+  // order. Code-unit compare, deliberately not localeCompare (which is
+  // locale-dependent).
+  return Object.fromEntries(
+    Object.entries(nodes).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)),
+  );
 }

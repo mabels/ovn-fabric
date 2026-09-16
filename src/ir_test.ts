@@ -11,7 +11,24 @@ import { toIR } from "./ir.ts";
 import type { IRNode } from "./ir.ts";
 import { IPv4, IPv6 } from "./ip.ts";
 import { deriveEndpointName } from "./router-endpoints.ts";
-import type { CollisionDomain, Service } from "./types.ts";
+import type {
+  CollisionDomain,
+  OvnRouterEndpoint,
+  Router,
+  Service,
+} from "./types.ts";
+
+// Endpoints are an ARRAY now, addressed by their own `name` rather than
+// by position — tests pick one out by the CollisionDomain name it binds.
+function endpointOn(router: Router, domainName: string): OvnRouterEndpoint {
+  const found = router.endpoints.find((e) => e.l2Segment.name === domainName);
+  if (!found) {
+    throw new Error(
+      `router "${router.name}" has no endpoint on domain "${domainName}"`,
+    );
+  }
+  return found;
+}
 
 // shortIfaceName now lives on each interface entry (`iface.shortName`),
 // not on the ovn.ls node's own `data` (2026-08-12 — see
@@ -44,16 +61,20 @@ function networkWithBoundDomain(domainName: string) {
     const other = net.collisionDomain(`${domainName}-other`);
     const host = net.localHost("chassis-1");
     const r1 = net.defineOvnRouter(`router-${domainName}`, (router) => {
-      router.left = router.ovnRouterEndpoint({
-        l2Segment: domain,
-        ipaddrs: [IPv4.parse("192.168.1.1/24")],
-        ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
-      });
-      router.right = router.ovnRouterEndpoint({
-        l2Segment: other,
-        ipaddrs: [IPv4.parse("192.168.2.1/24")],
-      });
-      return { routingDomains: [] };
+      return {
+        routingDomains: [],
+        endpoints: [
+          router.ovnRouterEndpoint({
+            l2Segment: domain,
+            ipaddrs: [IPv4.parse("192.168.1.1/24")],
+            ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: other,
+            ipaddrs: [IPv4.parse("192.168.2.1/24")],
+          }),
+        ],
+      };
     });
     return { routers: [r1] };
   });
@@ -101,22 +122,29 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
-      router.left = router.kernelRouterEndpoint({
-        host,
-        transit: transitNetwork(
-          IPv4.parse("10.12.80.1/28"),
-          IPv6.parse("fd00::10:12:80:1/124"),
-        ),
-        ipaddrs: [IPv4.parse("192.168.132.93/24")],
-        ifaces: [
-          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
+      return {
+        routingDomains: [],
+        endpoints: [
+          router.kernelRouterEndpoint({
+            host,
+            transit: transitNetwork(
+              IPv4.parse("10.12.80.1/28"),
+              IPv6.parse("fd00::10:12:80:1/124"),
+            ),
+            ipaddrs: [IPv4.parse("192.168.132.93/24")],
+            ifaces: [
+              {
+                host,
+                iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 },
+              },
+            ],
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.12.80/16")],
+          }),
         ],
-      });
-      router.right = router.ovnRouterEndpoint({
-        l2Segment: backbone,
-        ipaddrs: [IPv4.parse("172.22.12.80/16")],
-      });
-      return { routingDomains: [] };
+      };
     });
     return { routers: [r1] };
   });
@@ -188,30 +216,40 @@ Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes 
     const backbone = net.collisionDomain("backbone");
     const domain = net.routingDomain("test-domain");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
-      router.left = router.kernelRouterEndpoint({
-        host,
-        transit: transitNetwork(
-          IPv4.parse("10.12.80.1/28"),
-          IPv6.parse("fd00::10:12:80:1/124"),
-        ),
-        ipaddrs: [IPv4.parse("192.168.132.93/24")],
-        routes: [
-          { dst: IPv4.parse("0.0.0.0/0"), via: IPv4.parse("192.168.132.1") },
-          { dst: IPv6.parse("::/0") },
+      return {
+        routingDomains: [domain],
+        endpoints: [
+          router.kernelRouterEndpoint({
+            host,
+            transit: transitNetwork(
+              IPv4.parse("10.12.80.1/28"),
+              IPv6.parse("fd00::10:12:80:1/124"),
+            ),
+            ipaddrs: [IPv4.parse("192.168.132.93/24")],
+            routes: [
+              {
+                dst: IPv4.parse("0.0.0.0/0"),
+                via: IPv4.parse("192.168.132.1"),
+              },
+              { dst: IPv6.parse("::/0") },
+            ],
+            services: [
+              { kind: "kernel.ipv4.masq" },
+              { kind: "kernel.ipv6.masq" },
+            ],
+            ifaces: [
+              {
+                host,
+                iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 },
+              },
+            ],
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.12.80/16")],
+          }),
         ],
-        services: [
-          { kind: "kernel.ipv4.masq" },
-          { kind: "kernel.ipv6.masq" },
-        ],
-        ifaces: [
-          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
-        ],
-      });
-      router.right = router.ovnRouterEndpoint({
-        l2Segment: backbone,
-        ipaddrs: [IPv4.parse("172.22.12.80/16")],
-      });
-      return { routingDomains: [domain] };
+      };
     });
     return { routers: [r1] };
   });
@@ -223,7 +261,12 @@ Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes 
   // own `right` (asserted by the sibling test above). And no ipv6_ra
   // configs: the kernel.* services were split off, never reaching the
   // OVN endpoint's RA handling.
-  const leftLrp = node(nodes, "ovnrouter:router-wan|lrp:left");
+  const leftLrp = node(
+    nodes,
+    `ovnrouter:router-wan|lrp:${
+      endpointOn(network.allRouters[0]!, "transit-router-wan").name
+    }`,
+  );
   assertEquals(leftLrp.data["addresses"], [
     "10.12.80.1/28",
     "fd00::10:12:80:1/124",
@@ -264,27 +307,34 @@ Deno.test("kernelRouterEndpoint: explicit security group wins, masq services are
     const backbone = net.collisionDomain("backbone");
     const out = net.securityGroup("wan-out", (g) => g.masq("ipv4"));
     const r1 = net.defineOvnRouter("router-wan", (router) => {
-      router.left = router.kernelRouterEndpoint({
-        host,
-        transit: transitNetwork(
-          IPv4.parse("10.12.80.1/28"),
-          IPv6.parse("fd00::10:12:80:1/124"),
-        ),
-        ipaddrs: [IPv4.parse("192.168.132.93/24")],
-        services: [
-          { kind: "kernel.ipv4.masq" },
-          { kind: "kernel.ipv6.masq" },
+      return {
+        routingDomains: [],
+        endpoints: [
+          router.kernelRouterEndpoint({
+            host,
+            transit: transitNetwork(
+              IPv4.parse("10.12.80.1/28"),
+              IPv6.parse("fd00::10:12:80:1/124"),
+            ),
+            ipaddrs: [IPv4.parse("192.168.132.93/24")],
+            services: [
+              { kind: "kernel.ipv4.masq" },
+              { kind: "kernel.ipv6.masq" },
+            ],
+            securityGroup: out,
+            ifaces: [
+              {
+                host,
+                iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 },
+              },
+            ],
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.12.80/16")],
+          }),
         ],
-        securityGroup: out,
-        ifaces: [
-          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
-        ],
-      });
-      router.right = router.ovnRouterEndpoint({
-        l2Segment: backbone,
-        ipaddrs: [IPv4.parse("172.22.12.80/16")],
-      });
-      return { routingDomains: [] };
+      };
     });
     return { routers: [r1] };
   });
@@ -316,23 +366,30 @@ Deno.test("kernelRouterEndpoint: unregistered security group is rejected", () =>
       const host = net.localHost("chassis-1");
       const backbone = net.collisionDomain("backbone");
       const r1 = net.defineOvnRouter("router-wan", (router) => {
-        router.left = router.kernelRouterEndpoint({
-          host,
-          transit: transitNetwork(
-            IPv4.parse("10.12.80.1/28"),
-            IPv6.parse("fd00::10:12:80:1/124"),
-          ),
-          ipaddrs: [IPv4.parse("192.168.132.93/24")],
-          securityGroup: foreign,
-          ifaces: [
-            { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
+        return {
+          routingDomains: [],
+          endpoints: [
+            router.kernelRouterEndpoint({
+              host,
+              transit: transitNetwork(
+                IPv4.parse("10.12.80.1/28"),
+                IPv6.parse("fd00::10:12:80:1/124"),
+              ),
+              ipaddrs: [IPv4.parse("192.168.132.93/24")],
+              securityGroup: foreign,
+              ifaces: [
+                {
+                  host,
+                  iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 },
+                },
+              ],
+            }),
+            router.ovnRouterEndpoint({
+              l2Segment: backbone,
+              ipaddrs: [IPv4.parse("172.22.12.80/16")],
+            }),
           ],
-        });
-        router.right = router.ovnRouterEndpoint({
-          l2Segment: backbone,
-          ipaddrs: [IPv4.parse("172.22.12.80/16")],
-        });
-        return { routingDomains: [] };
+        };
       });
       return { routers: [r1] };
     });
@@ -379,23 +436,30 @@ Deno.test("kernelRouterEndpoint: kernel.app services resolve to app descriptors 
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
-      router.left = router.kernelRouterEndpoint({
-        host,
-        transit: transitNetwork(
-          IPv4.parse("10.12.80.1/28"),
-          IPv6.parse("fd00::10:12:80:1/124"),
-        ),
-        ipaddrs: [],
-        services: [{ kind: "kernel.app.dhcp-client", style: "dhcpcd" }],
-        ifaces: [
-          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
+      return {
+        routingDomains: [],
+        endpoints: [
+          router.kernelRouterEndpoint({
+            host,
+            transit: transitNetwork(
+              IPv4.parse("10.12.80.1/28"),
+              IPv6.parse("fd00::10:12:80:1/124"),
+            ),
+            ipaddrs: [],
+            services: [{ kind: "kernel.app.dhcp-client", style: "dhcpcd" }],
+            ifaces: [
+              {
+                host,
+                iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 },
+              },
+            ],
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.12.80/16")],
+          }),
         ],
-      });
-      router.right = router.ovnRouterEndpoint({
-        l2Segment: backbone,
-        ipaddrs: [IPv4.parse("172.22.12.80/16")],
-      });
-      return { routingDomains: [] };
+      };
     });
     return { routers: [r1] };
   });
@@ -420,7 +484,12 @@ Deno.test("kernelRouterEndpoint: kernel.app services resolve to app descriptors 
   );
   // The kernel.app service was split off, never becoming an RA config.
   assertEquals(
-    node(nodes, "ovnrouter:router-wan|lrp:left").data["ipv6RaConfigs"],
+    node(
+      nodes,
+      `ovnrouter:router-wan|lrp:${
+        endpointOn(network.allRouters[0]!, "transit-router-wan").name
+      }`,
+    ).data["ipv6RaConfigs"],
     undefined,
   );
 });
@@ -436,31 +505,38 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker resolves router-prefixed name
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
-      router.left = router.kernelRouterEndpoint({
-        host,
-        transit: transitNetwork(
-          IPv4.parse("10.12.80.1/28"),
-          IPv6.parse("fd00::10:12:80:1/124"),
-        ),
-        ipaddrs: [],
-        services: [
-          {
-            kind: "kernel.app.docker",
-            name: "test-docker",
-            image: "ubuntu",
-            cmd: "sleep 86400",
-            ipaddrs: [IPv4.parse("10.200.0.2/24")],
-          },
+      return {
+        routingDomains: [],
+        endpoints: [
+          router.kernelRouterEndpoint({
+            host,
+            transit: transitNetwork(
+              IPv4.parse("10.12.80.1/28"),
+              IPv6.parse("fd00::10:12:80:1/124"),
+            ),
+            ipaddrs: [],
+            services: [
+              {
+                kind: "kernel.app.docker",
+                name: "test-docker",
+                image: "ubuntu",
+                cmd: "sleep 86400",
+                ipaddrs: [IPv4.parse("10.200.0.2/24")],
+              },
+            ],
+            ifaces: [
+              {
+                host,
+                iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 },
+              },
+            ],
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.12.80/16")],
+          }),
         ],
-        ifaces: [
-          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
-        ],
-      });
-      router.right = router.ovnRouterEndpoint({
-        l2Segment: backbone,
-        ipaddrs: [IPv4.parse("172.22.12.80/16")],
-      });
-      return { routingDomains: [] };
+      };
     });
     return { routers: [r1] };
   });
@@ -490,23 +566,30 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker without ip gets a determinist
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
-      router.left = router.kernelRouterEndpoint({
-        host,
-        transit: transitNetwork(
-          IPv4.parse("10.12.80.1/28"),
-          IPv6.parse("fd00::10:12:80:1/124"),
-        ),
-        ipaddrs: [],
-        services: [{ kind: "kernel.app.docker", image: "ubuntu" }],
-        ifaces: [
-          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
+      return {
+        routingDomains: [],
+        endpoints: [
+          router.kernelRouterEndpoint({
+            host,
+            transit: transitNetwork(
+              IPv4.parse("10.12.80.1/28"),
+              IPv6.parse("fd00::10:12:80:1/124"),
+            ),
+            ipaddrs: [],
+            services: [{ kind: "kernel.app.docker", image: "ubuntu" }],
+            ifaces: [
+              {
+                host,
+                iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 },
+              },
+            ],
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.12.80/16")],
+          }),
         ],
-      });
-      router.right = router.ovnRouterEndpoint({
-        l2Segment: backbone,
-        ipaddrs: [IPv4.parse("172.22.12.80/16")],
-      });
-      return { routingDomains: [] };
+      };
     });
     return { routers: [r1] };
   });
@@ -535,26 +618,33 @@ Deno.test("kernelRouterEndpoint: builder function + buildAppDocker, image defaul
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
-      router.left = router.kernelRouterEndpoint((endpoint) => {
-        endpoint.host = host;
-        endpoint.transit = transitNetwork(
-          IPv4.parse("10.12.80.1/28"),
-          IPv6.parse("fd00::10:12:80:1/124"),
-        );
-        endpoint.ipaddrs = [IPv4.parse("192.168.140.93/24")];
-        endpoint.ifaces = [
-          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
-        ];
-        endpoint.buildAppDocker("dhcpcd", (app) => {
-          app.cmd("/sbin/dhcpcd");
-          app.build({ from: "alpine:latest", packages: ["dhcpcd"] });
-        });
-      });
-      router.right = router.ovnRouterEndpoint({
-        l2Segment: backbone,
-        ipaddrs: [IPv4.parse("172.22.12.80/16")],
-      });
-      return { routingDomains: [] };
+      return {
+        routingDomains: [],
+        endpoints: [
+          router.kernelRouterEndpoint((endpoint) => {
+            endpoint.host = host;
+            endpoint.transit = transitNetwork(
+              IPv4.parse("10.12.80.1/28"),
+              IPv6.parse("fd00::10:12:80:1/124"),
+            );
+            endpoint.ipaddrs = [IPv4.parse("192.168.140.93/24")];
+            endpoint.ifaces = [
+              {
+                host,
+                iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 },
+              },
+            ];
+            endpoint.buildAppDocker("dhcpcd", (app) => {
+              app.cmd("/sbin/dhcpcd");
+              app.build({ from: "alpine:latest", packages: ["dhcpcd"] });
+            });
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.12.80/16")],
+          }),
+        ],
+      };
     });
     return { routers: [r1] };
   });
@@ -588,73 +678,88 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
     const neighborRoute = net.routingDomain("Neighbor-defaultRoute");
     const vodaRoute = net.routingDomain("Voda-defaultRoute");
     const r1 = net.defineOvnRouter("router-mullvad-de", (router) => {
-      router.left = router.tunnelRouterEndpoint({
-        routingDomains: [neighborRoute],
-        host,
-        transit: transitNetwork(
-          IPv4.parse("10.12.81.1/28"),
-          IPv6.parse("fd00::10:12:81:1/124"),
-        ),
-        upstream: transitNetwork(
-          IPv4.parse("10.12.82.1/28"),
-          IPv6.parse("fd00::10:12:82:1/124"),
-        ),
-        routes: [{ dst: IPv4.parse("0.0.0.0/0") }],
-        services: [
-          {
-            kind: "wireguard",
-            ifaceName: "mullvad-de",
-            config: {
-              privateKey: "k",
-              address: "10.64.56.207/32",
-              peer: {
-                publicKey: "p",
-                allowedIps: "0.0.0.0/0",
-                endpoint: "1.2.3.4:51820",
+      return {
+        routingDomains: [],
+        endpoints: [
+          router.tunnelRouterEndpoint({
+            routingDomains: [neighborRoute],
+            host,
+            transit: transitNetwork(
+              IPv4.parse("10.12.81.1/28"),
+              IPv6.parse("fd00::10:12:81:1/124"),
+            ),
+            upstream: transitNetwork(
+              IPv4.parse("10.12.82.1/28"),
+              IPv6.parse("fd00::10:12:82:1/124"),
+            ),
+            routes: [{ dst: IPv4.parse("0.0.0.0/0") }],
+            services: [
+              {
+                kind: "wireguard",
+                ifaceName: "mullvad-de",
+                config: {
+                  privateKey: "k",
+                  address: "10.64.56.207/32",
+                  peer: {
+                    publicKey: "p",
+                    allowedIps: "0.0.0.0/0",
+                    endpoint: "1.2.3.4:51820",
+                  },
+                },
+                masq: ["ipv4", "ipv6"],
               },
+            ],
+            upstreamBackbone: {
+              l2Segment: backbone,
+              ipaddrs: [IPv4.parse("172.22.0.150/16")],
             },
-            masq: ["ipv4", "ipv6"],
-          },
+          }),
+          router.ovnRouterEndpoint({
+            routingDomains: [vodaRoute],
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.0.140/16")],
+          }),
         ],
-        upstreamBackbone: {
-          l2Segment: backbone,
-          ipaddrs: [IPv4.parse("172.22.0.150/16")],
-        },
-      });
-      router.right = router.ovnRouterEndpoint({
-        routingDomains: [vodaRoute],
-        l2Segment: backbone,
-        ipaddrs: [IPv4.parse("172.22.0.140/16")],
-      });
-      return { routingDomains: [] };
+      };
     });
     // A neighbor participant on the backbone, in the neighbor domain.
     const r2 = net.defineOvnRouter("router-neighbor", (router) => {
-      router.left = router.ovnRouterEndpoint({
-        l2Segment: net.collisionDomain("neighbor"),
-        ipaddrs: [IPv4.parse("192.168.130.1/24")],
-      });
-      router.right = router.ovnRouterEndpoint({
-        l2Segment: backbone,
-        ipaddrs: [IPv4.parse("172.22.0.130/16")],
-      });
-      return { routingDomains: [neighborRoute] };
+      return {
+        routingDomains: [neighborRoute],
+        endpoints: [
+          router.ovnRouterEndpoint({
+            l2Segment: net.collisionDomain("neighbor"),
+            ipaddrs: [IPv4.parse("192.168.130.1/24")],
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.0.130/16")],
+          }),
+        ],
+      };
     });
     // A voda participant on the backbone (so the tunnel's right side
     // learns the voda default; the tunnel's left default must NOT leak).
     const r3 = net.defineOvnRouter("router-voda", (router) => {
-      router.left = router.ovnRouterEndpoint({
-        l2Segment: net.collisionDomain("voda"),
-        ipaddrs: [IPv4.parse("192.168.132.1/24")],
-        routes: [
-          { dst: IPv4.parse("0.0.0.0/0"), via: IPv4.parse("192.168.132.1") },
+      return {
+        routingDomains: [vodaRoute],
+        endpoints: [
+          router.ovnRouterEndpoint({
+            l2Segment: net.collisionDomain("voda"),
+            ipaddrs: [IPv4.parse("192.168.132.1/24")],
+            routes: [
+              {
+                dst: IPv4.parse("0.0.0.0/0"),
+                via: IPv4.parse("192.168.132.1"),
+              },
+            ],
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.12.80/16")],
+          }),
         ],
-      });
-      router.right = router.ovnRouterEndpoint({
-        l2Segment: backbone,
-        ipaddrs: [IPv4.parse("172.22.12.80/16")],
-      });
-      return { routingDomains: [vodaRoute] };
+      };
     });
     return { routers: [r1, r2, r3] };
   });
@@ -697,35 +802,39 @@ Deno.test("tunnelRouterEndpoint: zerotier carries via-less tunnel routes onto it
     const backbone = net.collisionDomain("backbone");
     const zt = net.routingDomain("Zerotier-route");
     const r1 = net.defineOvnRouter("router-zerotier", (router) => {
-      router.left = router.tunnelRouterEndpoint({
-        routingDomains: [zt],
-        host,
-        transit: transitNetwork(
-          IPv4.parse("10.12.85.1/28"),
-          IPv6.parse("fd00::10:12:85:1/124"),
-        ),
-        upstream: transitNetwork(
-          IPv4.parse("10.12.86.1/28"),
-          IPv6.parse("fd00::10:12:86:1/124"),
-        ),
-        routes: [{ dst: IPv4.parse("192.168.0.0/16") }],
-        services: [
-          {
-            kind: "zerotier",
-            networkId: "02cfbec15c2319ff",
-            instanceDir: "/var/lib/zerotier-one-uplink-zerotier",
-          },
+      return {
+        routingDomains: [],
+        endpoints: [
+          router.tunnelRouterEndpoint({
+            routingDomains: [zt],
+            host,
+            transit: transitNetwork(
+              IPv4.parse("10.12.85.1/28"),
+              IPv6.parse("fd00::10:12:85:1/124"),
+            ),
+            upstream: transitNetwork(
+              IPv4.parse("10.12.86.1/28"),
+              IPv6.parse("fd00::10:12:86:1/124"),
+            ),
+            routes: [{ dst: IPv4.parse("192.168.0.0/16") }],
+            services: [
+              {
+                kind: "zerotier",
+                networkId: "02cfbec15c2319ff",
+                instanceDir: "/var/lib/zerotier-one-uplink-zerotier",
+              },
+            ],
+            upstreamBackbone: {
+              l2Segment: backbone,
+              ipaddrs: [IPv4.parse("172.22.0.152/16")],
+            },
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.0.142/16")],
+          }),
         ],
-        upstreamBackbone: {
-          l2Segment: backbone,
-          ipaddrs: [IPv4.parse("172.22.0.152/16")],
-        },
-      });
-      router.right = router.ovnRouterEndpoint({
-        l2Segment: backbone,
-        ipaddrs: [IPv4.parse("172.22.0.142/16")],
-      });
-      return { routingDomains: [] };
+      };
     });
     return { routers: [r1] };
   });
@@ -754,21 +863,25 @@ Deno.test("tunnelRouterEndpoint: zerotier instanceDir is derived from the router
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-zt", (router) => {
-      router.left = router.tunnelRouterEndpoint({
-        host,
-        transit: transitNetwork(IPv4.parse("10.12.85.1/28")),
-        upstream: transitNetwork(IPv4.parse("10.12.86.1/28")),
-        services: [{ kind: "zerotier", networkId: "02cfbec15c2319ff" }],
-        upstreamBackbone: {
-          l2Segment: backbone,
-          ipaddrs: [IPv4.parse("172.22.0.152/16")],
-        },
-      });
-      router.right = router.ovnRouterEndpoint({
-        l2Segment: backbone,
-        ipaddrs: [IPv4.parse("172.22.0.142/16")],
-      });
-      return { routingDomains: [] };
+      return {
+        routingDomains: [],
+        endpoints: [
+          router.tunnelRouterEndpoint({
+            host,
+            transit: transitNetwork(IPv4.parse("10.12.85.1/28")),
+            upstream: transitNetwork(IPv4.parse("10.12.86.1/28")),
+            services: [{ kind: "zerotier", networkId: "02cfbec15c2319ff" }],
+            upstreamBackbone: {
+              l2Segment: backbone,
+              ipaddrs: [IPv4.parse("172.22.0.152/16")],
+            },
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.0.142/16")],
+          }),
+        ],
+      };
     });
     return { routers: [r1] };
   });
@@ -793,25 +906,32 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
     );
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
-      router.left = router.kernelRouterEndpoint({
-        host,
-        transit: transitNetwork(
-          IPv4.parse("10.12.80.1/28"),
-          IPv6.parse("fd00::10:12:80:1/124"),
-        ),
-        ipaddrs: [IPv4.parse("192.168.132.93/24")],
-        services: [
-          { kind: "kernel.app.dhcp-client", style: "dhclient" },
+      return {
+        routingDomains: [],
+        endpoints: [
+          router.kernelRouterEndpoint({
+            host,
+            transit: transitNetwork(
+              IPv4.parse("10.12.80.1/28"),
+              IPv6.parse("fd00::10:12:80:1/124"),
+            ),
+            ipaddrs: [IPv4.parse("192.168.132.93/24")],
+            services: [
+              { kind: "kernel.app.dhcp-client", style: "dhclient" },
+            ],
+            ifaces: [
+              {
+                host,
+                iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 },
+              },
+            ],
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.12.80/16")],
+          }),
         ],
-        ifaces: [
-          { host, iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 } },
-        ],
-      });
-      router.right = router.ovnRouterEndpoint({
-        l2Segment: backbone,
-        ipaddrs: [IPv4.parse("172.22.12.80/16")],
-      });
-      return { routingDomains: [] };
+      };
     });
     return { routers: [r1] };
   });
@@ -830,10 +950,10 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
 });
 
 // defineOvnRouter object form (OvnRouterSpec): routingDomains is declared
-// up-front and left/right are kind-tagged endpoint specs resolved by the
-// builder — a fully declarative alternative to the builder-function form
-// (2026-09-08).
-Deno.test("defineOvnRouter object form: declarative OvnRouterSpec resolves left/right", () => {
+// up-front and `endpoints` is an array of kind-tagged endpoint specs
+// resolved by the builder — a fully declarative alternative to the
+// builder-function form (2026-09-08, array 2026-09-16).
+Deno.test("defineOvnRouter object form: declarative OvnRouterSpec resolves endpoints", () => {
   const network = defineNetwork("test-net", (net) => {
     const host = net.localHost("chassis-1");
     const a = net.collisionDomain("seg-a");
@@ -844,17 +964,19 @@ Deno.test("defineOvnRouter object form: declarative OvnRouterSpec resolves left/
       routers: [
         net.defineOvnRouter("router-x", {
           routingDomains: [d],
-          left: {
-            kind: "ovn",
-            l2Segment: a,
-            ipaddrs: [IPv4.parse("192.168.1.1/24")],
-            ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
-          },
-          right: {
-            kind: "ovn",
-            l2Segment: b,
-            ipaddrs: [IPv4.parse("192.168.2.1/24")],
-          },
+          endpoints: [
+            {
+              kind: "ovn",
+              l2Segment: a,
+              ipaddrs: [IPv4.parse("192.168.1.1/24")],
+              ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+            },
+            {
+              kind: "ovn",
+              l2Segment: b,
+              ipaddrs: [IPv4.parse("192.168.2.1/24")],
+            },
+          ],
         }),
       ],
     };
@@ -864,10 +986,12 @@ Deno.test("defineOvnRouter object form: declarative OvnRouterSpec resolves left/
   if (!r) throw new Error("expected one router");
   assertEquals(r.name, "router-x");
   assertEquals(r.routingDomains?.[0]?.name, "Route-D");
-  assertEquals(r.left.l2Segment.name, "seg-a");
-  assertEquals(r.right.l2Segment.name, "seg-b");
-  const firstAddr = r.left.ipaddrs[0];
-  if (!firstAddr) throw new Error("expected one left ipaddr");
+  assertEquals(
+    r.endpoints.map((e) => e.l2Segment.name).sort(),
+    ["seg-a", "seg-b"],
+  );
+  const firstAddr = endpointOn(r, "seg-a").ipaddrs[0];
+  if (!firstAddr) throw new Error("expected one seg-a ipaddr");
   assertEquals(firstAddr.to_string(), "192.168.1.1/24");
 });
 
@@ -886,19 +1010,25 @@ Deno.test("net.service + ep.attachTo -> kernel.service node + endpoint serviceRe
       hosts: [host],
       routers: [
         net.defineOvnRouter("router-x", (router) => {
-          router.left = router.ovnRouterEndpoint((ep) => ({
-            l2Segment: a,
-            ipaddrs: [IPv4.parse("192.168.1.1/24")],
-            ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
-            services: [
-              ep.attachTo(dns, { ipaddrs: [IPv4.parse("192.168.1.53/24")] }),
+          return {
+            routingDomains: [],
+            endpoints: [
+              router.ovnRouterEndpoint((ep) => ({
+                l2Segment: a,
+                ipaddrs: [IPv4.parse("192.168.1.1/24")],
+                ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+                services: [
+                  ep.attachTo(dns, {
+                    ipaddrs: [IPv4.parse("192.168.1.53/24")],
+                  }),
+                ],
+              })),
+              router.ovnRouterEndpoint({
+                l2Segment: b,
+                ipaddrs: [IPv4.parse("192.168.2.1/24")],
+              }),
             ],
-          }));
-          router.right = router.ovnRouterEndpoint({
-            l2Segment: b,
-            ipaddrs: [IPv4.parse("192.168.2.1/24")],
-          });
-          return { routingDomains: [] };
+          };
         }),
       ],
     };
@@ -911,13 +1041,21 @@ Deno.test("net.service + ep.attachTo -> kernel.service node + endpoint serviceRe
     cmd: ["/usr/sbin/dnsmasq", "--no-daemon"],
   });
   // …and the ENDPOINT references it (its NIC on that segment).
-  assertEquals(node(nodes, "ovnrouter:router-x|lrp:left").data["serviceRefs"], [
-    {
-      service: "kernel.app.container:dns",
-      name: "seg-a",
-      ipaddrs: ["192.168.1.53/24"],
-    },
-  ]);
+  assertEquals(
+    node(
+      nodes,
+      `ovnrouter:router-x|lrp:${
+        endpointOn(network.allRouters[0]!, "seg-a").name
+      }`,
+    ).data["serviceRefs"],
+    [
+      {
+        service: "kernel.app.container:dns",
+        name: "seg-a",
+        ipaddrs: ["192.168.1.53/24"],
+      },
+    ],
+  );
 });
 
 // A container's route via must be on the face's segment — an off-segment
@@ -935,25 +1073,29 @@ Deno.test("attached service route via must be on the endpoint's segment", () => 
         hosts: [host],
         routers: [
           net.defineOvnRouter("router-x", (router) => {
-            router.left = router.ovnRouterEndpoint((ep) => ({
-              l2Segment: a,
-              ipaddrs: [IPv4.parse("192.168.1.1/24")],
-              ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
-              services: [
-                ep.attachTo(dns, {
-                  ipaddrs: [IPv4.parse("192.168.1.53/24")],
-                  routes: [{
-                    dst: IPv4.parse("0.0.0.0/0"),
-                    via: IPv4.parse(via),
-                  }],
+            return {
+              routingDomains: [],
+              endpoints: [
+                router.ovnRouterEndpoint((ep) => ({
+                  l2Segment: a,
+                  ipaddrs: [IPv4.parse("192.168.1.1/24")],
+                  ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+                  services: [
+                    ep.attachTo(dns, {
+                      ipaddrs: [IPv4.parse("192.168.1.53/24")],
+                      routes: [{
+                        dst: IPv4.parse("0.0.0.0/0"),
+                        via: IPv4.parse(via),
+                      }],
+                    }),
+                  ],
+                })),
+                router.ovnRouterEndpoint({
+                  l2Segment: b,
+                  ipaddrs: [IPv4.parse("192.168.2.1/24")],
                 }),
               ],
-            }));
-            router.right = router.ovnRouterEndpoint({
-              l2Segment: b,
-              ipaddrs: [IPv4.parse("192.168.2.1/24")],
-            });
-            return { routingDomains: [] };
+            };
           }),
         ],
       };
@@ -985,17 +1127,21 @@ Deno.test("multiple services attached across endpoints -> one service node each"
       v4: string,
     ) =>
       net.defineOvnRouter(router, (r) => {
-        r.left = r.ovnRouterEndpoint((ep) => ({
-          l2Segment: l2,
-          ipaddrs: [IPv4.parse(v4)],
-          ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
-          services: [ep.attachTo(svc, { ipaddrs: [IPv4.parse(v4)] })],
-        }));
-        r.right = r.ovnRouterEndpoint({
-          l2Segment: backbone,
-          ipaddrs: [IPv4.parse("172.22.0.9/16")],
-        });
-        return { routingDomains: [] };
+        return {
+          routingDomains: [],
+          endpoints: [
+            r.ovnRouterEndpoint((ep) => ({
+              l2Segment: l2,
+              ipaddrs: [IPv4.parse(v4)],
+              ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+              services: [ep.attachTo(svc, { ipaddrs: [IPv4.parse(v4)] })],
+            })),
+            r.ovnRouterEndpoint({
+              l2Segment: backbone,
+              ipaddrs: [IPv4.parse("172.22.0.9/16")],
+            }),
+          ],
+        };
       });
     return {
       hosts: [host],
@@ -1004,26 +1150,30 @@ Deno.test("multiple services attached across endpoints -> one service node each"
         seg("router-home-v2", seg128, dns128, "192.168.128.5/24"),
         seg("router-management-v2", seg129, dns129, "192.168.129.5/24"),
         net.defineOvnRouter("router-control-plane-v2", (r) => {
-          r.left = r.ovnRouterEndpoint((ep) => ({
-            l2Segment: cp,
-            ipaddrs: [IPv4.parse("10.43.0.1/24")],
-            ifaces: [{ host, iface: { kind: "physical", name: "eth1" } }],
-            services: [
-              ep.attachTo(dns128, {
-                ipaddrs: [IPv4.parse("10.43.0.128/24")],
-                primary: true,
-              }),
-              ep.attachTo(dns129, {
-                ipaddrs: [IPv4.parse("10.43.0.129/24")],
-                primary: true,
+          return {
+            routingDomains: [],
+            endpoints: [
+              r.ovnRouterEndpoint((ep) => ({
+                l2Segment: cp,
+                ipaddrs: [IPv4.parse("10.43.0.1/24")],
+                ifaces: [{ host, iface: { kind: "physical", name: "eth1" } }],
+                services: [
+                  ep.attachTo(dns128, {
+                    ipaddrs: [IPv4.parse("10.43.0.128/24")],
+                    primary: true,
+                  }),
+                  ep.attachTo(dns129, {
+                    ipaddrs: [IPv4.parse("10.43.0.129/24")],
+                    primary: true,
+                  }),
+                ],
+              })),
+              r.ovnRouterEndpoint({
+                l2Segment: backbone,
+                ipaddrs: [IPv4.parse("172.22.0.2/16")],
               }),
             ],
-          }));
-          r.right = r.ovnRouterEndpoint({
-            l2Segment: backbone,
-            ipaddrs: [IPv4.parse("172.22.0.2/16")],
-          });
-          return { routingDomains: [] };
+          };
         }),
       ],
     };
@@ -1038,7 +1188,15 @@ Deno.test("multiple services attached across endpoints -> one service node each"
     ],
   );
   assertEquals(
-    node(nodes, "ovnrouter:router-home-v2|lrp:left").data[
+    node(
+      nodes,
+      `ovnrouter:router-home-v2|lrp:${
+        endpointOn(
+          network.allRouters.find((r) => r.name === "router-home-v2")!,
+          "home-v2",
+        ).name
+      }`,
+    ).data[
       "serviceRefs"
     ],
     [
@@ -1049,7 +1207,15 @@ Deno.test("multiple services attached across endpoints -> one service node each"
       },
     ],
   );
-  const cpRefs = (node(nodes, "ovnrouter:router-control-plane-v2|lrp:left")
+  const cpRefs = (node(
+    nodes,
+    `ovnrouter:router-control-plane-v2|lrp:${
+      endpointOn(
+        network.allRouters.find((r) => r.name === "router-control-plane-v2")!,
+        "control-plane",
+      ).name
+    }`,
+  )
     .data as {
       serviceRefs?: { service: string }[];
     }).serviceRefs ?? [];
@@ -1071,24 +1237,28 @@ Deno.test("endpoint builder injects `endpoint` into every service entry", () => 
       hosts: [host],
       routers: [
         net.defineOvnRouter("router-x", (router) => {
-          router.left = router.ovnRouterEndpoint((_ep) => ({
-            l2Segment: a,
-            ipaddrs: [IPv4.parse("192.168.1.1/24")],
-            ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
-            services: [{ kind: "ipv6.slaac" }],
-          }));
-          router.right = router.ovnRouterEndpoint({
-            l2Segment: b,
-            ipaddrs: [IPv4.parse("192.168.2.1/24")],
-          });
-          return { routingDomains: [] };
+          return {
+            routingDomains: [],
+            endpoints: [
+              router.ovnRouterEndpoint((_ep) => ({
+                l2Segment: a,
+                ipaddrs: [IPv4.parse("192.168.1.1/24")],
+                ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+                services: [{ kind: "ipv6.slaac" }],
+              })),
+              router.ovnRouterEndpoint({
+                l2Segment: b,
+                ipaddrs: [IPv4.parse("192.168.2.1/24")],
+              }),
+            ],
+          };
         }),
       ],
     };
   });
   const firstRouter = network.allRouters[0];
   if (!firstRouter) throw new Error("expected one router");
-  const left = firstRouter.left;
+  const left = endpointOn(firstRouter, "seg-a");
   const svc = left.services?.[0] as unknown as {
     kind: string;
     endpoint: {
@@ -1118,37 +1288,45 @@ Deno.test("attachTo records endpointRefs on the service", () => {
       hosts: [host],
       routers: [
         net.defineOvnRouter("router-a", (router) => {
-          router.left = router.ovnRouterEndpoint((ep) => ({
-            l2Segment: a,
-            ipaddrs: [IPv4.parse("192.168.1.1/24")],
-            ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
-            services: [
-              ep.attachTo(dns, { ipaddrs: [IPv4.parse("192.168.1.5/24")] }),
-            ],
-          }));
-          router.right = router.ovnRouterEndpoint({
-            l2Segment: b,
-            ipaddrs: [IPv4.parse("192.168.2.1/24")],
-          });
-          return { routingDomains: [] };
-        }),
-        net.defineOvnRouter("router-cp", (router) => {
-          router.left = router.ovnRouterEndpoint((ep) => ({
-            l2Segment: cp,
-            ipaddrs: [IPv4.parse("10.43.0.1/24")],
-            ifaces: [{ host, iface: { kind: "physical", name: "eth1" } }],
-            services: [
-              ep.attachTo(dns, {
-                ipaddrs: [IPv4.parse("10.43.0.5/24")],
-                primary: true,
+          return {
+            routingDomains: [],
+            endpoints: [
+              router.ovnRouterEndpoint((ep) => ({
+                l2Segment: a,
+                ipaddrs: [IPv4.parse("192.168.1.1/24")],
+                ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+                services: [
+                  ep.attachTo(dns, { ipaddrs: [IPv4.parse("192.168.1.5/24")] }),
+                ],
+              })),
+              router.ovnRouterEndpoint({
+                l2Segment: b,
+                ipaddrs: [IPv4.parse("192.168.2.1/24")],
               }),
             ],
-          }));
-          router.right = router.ovnRouterEndpoint({
-            l2Segment: b,
-            ipaddrs: [IPv4.parse("172.22.0.2/16")],
-          });
-          return { routingDomains: [] };
+          };
+        }),
+        net.defineOvnRouter("router-cp", (router) => {
+          return {
+            routingDomains: [],
+            endpoints: [
+              router.ovnRouterEndpoint((ep) => ({
+                l2Segment: cp,
+                ipaddrs: [IPv4.parse("10.43.0.1/24")],
+                ifaces: [{ host, iface: { kind: "physical", name: "eth1" } }],
+                services: [
+                  ep.attachTo(dns, {
+                    ipaddrs: [IPv4.parse("10.43.0.5/24")],
+                    primary: true,
+                  }),
+                ],
+              })),
+              router.ovnRouterEndpoint({
+                l2Segment: b,
+                ipaddrs: [IPv4.parse("172.22.0.2/16")],
+              }),
+            ],
+          };
         }),
       ],
     };
@@ -1195,27 +1373,34 @@ Deno.test("defineOvnRouter: each endpoint gets its own derived name", () => {
       hosts: [host],
       routers: [
         net.defineOvnRouter("router-x", (router) => {
-          router.left = router.ovnRouterEndpoint({
-            l2Segment: a,
-            ipaddrs: [IPv4.parse("192.168.1.1/24")],
-          });
-          router.right = router.ovnRouterEndpoint({
-            l2Segment: b,
-            ipaddrs: [IPv4.parse("192.168.2.1/24")],
-          });
-          return { routingDomains: [] };
+          return {
+            routingDomains: [],
+            endpoints: [
+              router.ovnRouterEndpoint({
+                l2Segment: a,
+                ipaddrs: [IPv4.parse("192.168.1.1/24")],
+              }),
+              router.ovnRouterEndpoint({
+                l2Segment: b,
+                ipaddrs: [IPv4.parse("192.168.2.1/24")],
+              }),
+            ],
+          };
         }),
       ],
     };
   });
   const r = network.allRouters[0];
   if (!r) throw new Error("expected one router");
-  assertEquals(r.left.name, deriveEndpointName({}, "router-x", "ovn", "seg-a"));
   assertEquals(
-    r.right.name,
+    endpointOn(r, "seg-a").name,
+    deriveEndpointName({}, "router-x", "ovn", "seg-a"),
+  );
+  assertEquals(
+    endpointOn(r, "seg-b").name,
     deriveEndpointName({}, "router-x", "ovn", "seg-b"),
   );
-  assertNotEquals(r.left.name, r.right.name);
+  assertNotEquals(endpointOn(r, "seg-a").name, endpointOn(r, "seg-b").name);
 });
 
 Deno.test("defineOvnRouter: an explicit name overrides the derived name", () => {
@@ -1227,21 +1412,27 @@ Deno.test("defineOvnRouter: an explicit name overrides the derived name", () => 
       hosts: [host],
       routers: [
         net.defineOvnRouter("router-x", (router) => {
-          router.left = router.ovnRouterEndpoint({
-            name: "lrp-home",
-            l2Segment: a,
-            ipaddrs: [IPv4.parse("192.168.1.1/24")],
-          });
-          router.right = router.ovnRouterEndpoint({
-            l2Segment: b,
-            ipaddrs: [IPv4.parse("192.168.2.1/24")],
-          });
-          return { routingDomains: [] };
+          return {
+            routingDomains: [],
+            endpoints: [
+              router.ovnRouterEndpoint({
+                name: "lrp-home",
+                l2Segment: a,
+                ipaddrs: [IPv4.parse("192.168.1.1/24")],
+              }),
+              router.ovnRouterEndpoint({
+                l2Segment: b,
+                ipaddrs: [IPv4.parse("192.168.2.1/24")],
+              }),
+            ],
+          };
         }),
       ],
     };
   });
-  assertEquals(network.allRouters[0]?.left.name, "lrp-home");
+  const explicit = network.allRouters[0];
+  if (!explicit) throw new Error("expected one router");
+  assertEquals(endpointOn(explicit, "seg-a").name, "lrp-home");
 });
 
 Deno.test("defineOvnRouter: two endpoints with the same explicit name are rejected", () => {
@@ -1255,22 +1446,74 @@ Deno.test("defineOvnRouter: two endpoints with the same explicit name are reject
           hosts: [host],
           routers: [
             net.defineOvnRouter("router-x", (router) => {
-              router.left = router.ovnRouterEndpoint({
-                name: "dup",
-                l2Segment: a,
-                ipaddrs: [IPv4.parse("192.168.1.1/24")],
-              });
-              router.right = router.ovnRouterEndpoint({
-                name: "dup",
-                l2Segment: b,
-                ipaddrs: [IPv4.parse("192.168.2.1/24")],
-              });
-              return { routingDomains: [] };
+              return {
+                routingDomains: [],
+                endpoints: [
+                  router.ovnRouterEndpoint({
+                    name: "dup",
+                    l2Segment: a,
+                    ipaddrs: [IPv4.parse("192.168.1.1/24")],
+                  }),
+                  router.ovnRouterEndpoint({
+                    name: "dup",
+                    l2Segment: b,
+                    ipaddrs: [IPv4.parse("192.168.2.1/24")],
+                  }),
+                ],
+              };
             }),
           ],
         };
       }),
     Error,
     "same name",
+  );
+});
+
+Deno.test("defineOvnRouter: one explicit endpoint name across two routers is rejected", () => {
+  assertThrows(
+    () =>
+      defineNetwork("test-net", (net) => {
+        const host = net.localHost("chassis-1");
+        const a = net.collisionDomain("seg-a");
+        const b = net.collisionDomain("seg-b");
+        const c = net.collisionDomain("seg-c");
+        const d = net.collisionDomain("seg-d");
+        return {
+          hosts: [host],
+          routers: [
+            net.defineOvnRouter("router-a", (router) => ({
+              routingDomains: [],
+              endpoints: [
+                router.ovnRouterEndpoint({
+                  name: "lrp-shared",
+                  l2Segment: a,
+                  ipaddrs: [IPv4.parse("192.168.1.1/24")],
+                }),
+                router.ovnRouterEndpoint({
+                  l2Segment: b,
+                  ipaddrs: [IPv4.parse("192.168.2.1/24")],
+                }),
+              ],
+            })),
+            net.defineOvnRouter("router-b", (router) => ({
+              routingDomains: [],
+              endpoints: [
+                router.ovnRouterEndpoint({
+                  name: "lrp-shared",
+                  l2Segment: c,
+                  ipaddrs: [IPv4.parse("192.168.3.1/24")],
+                }),
+                router.ovnRouterEndpoint({
+                  l2Segment: d,
+                  ipaddrs: [IPv4.parse("192.168.4.1/24")],
+                }),
+              ],
+            })),
+          ],
+        };
+      }),
+    Error,
+    "unique across the whole network",
   );
 });

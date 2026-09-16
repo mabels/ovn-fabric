@@ -45,9 +45,9 @@ RAW_OVN_LS = {
 }
 
 RAW_OVN_LRP = {
-    "id": "ovnrouter:router-home|lrp:left",
+    "id": "ovnrouter:router-home|lrp:lrp-home",
     "kind": "ovn.lrp",
-    "key": {"ovnrouter": "router-home", "side": "left"},
+    "key": {"ovnrouter": "router-home", "name": "lrp-home"},
     "data": {
         "l2Segment": "ls:home",
         "addresses": ["192.168.1.1/24"],
@@ -95,7 +95,7 @@ class HydrateOvnLrpTest(unittest.TestCase):
         node = mod.hydrate_node(RAW_OVN_LRP)
         self.assertIsInstance(node, pt.OvnLrpNode)
         self.assertEqual(node.key.ovnrouter, "router-home")
-        self.assertEqual(node.key.side, pt.Side.left)
+        self.assertEqual(node.key.name, "lrp-home")
         self.assertEqual(node.data.mac, "00:00:00:00:01:01")
         self.assertEqual(node.data.gatewayChassis, "host:chassis-1")
 

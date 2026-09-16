@@ -33,24 +33,26 @@ export const network = defineNetwork("minimal", (net) => {
   const lan = net.collisionDomain("lan");
   const upstream = net.collisionDomain("upstream");
 
-  const router = net.defineOvnRouter("router-lan", (router) => {
-    router.left = router.ovnRouterEndpoint({
-      l2Segment: lan,
-      ipaddrs: [IPv4.parse("192.168.10.1/24")],
-      ifaces: [
-        {
-          host: chassis,
-          iface: { kind: "vlan", vlanParent: "eth1", vlanId: 10 },
-        },
-      ],
-      services: [{ kind: "ipv6.slaac" }, { kind: "ipv6.ra" }],
-    });
-    router.right = router.ovnRouterEndpoint({
-      l2Segment: upstream,
-      ipaddrs: [IPv4.parse("10.0.0.2/30")],
-    });
-    return { routingDomains: [] };
-  });
+  const router = net.defineOvnRouter("router-lan", (router) => ({
+    routingDomains: [],
+    endpoints: [
+      router.ovnRouterEndpoint({
+        l2Segment: lan,
+        ipaddrs: [IPv4.parse("192.168.10.1/24")],
+        ifaces: [
+          {
+            host: chassis,
+            iface: { kind: "vlan", vlanParent: "eth1", vlanId: 10 },
+          },
+        ],
+        services: [{ kind: "ipv6.slaac" }, { kind: "ipv6.ra" }],
+      }),
+      router.ovnRouterEndpoint({
+        l2Segment: upstream,
+        ipaddrs: [IPv4.parse("10.0.0.2/30")],
+      }),
+    ],
+  }));
 
   return { hosts: [central, chassis], routers: [router] };
 });

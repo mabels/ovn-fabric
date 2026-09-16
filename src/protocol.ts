@@ -85,7 +85,11 @@ export const OvnLsNode = type({
 
 export const OvnLrpKey = type({
   ovnrouter: "string",
-  side: "'left'|'right'",
+  // The endpoint's own identity (EndpointBase.name, src/types.ts) — the
+  // SAME key shape the reconciler uses for a live port
+  // (`ovnrouter:<router>|lrp:<port name>`, reconciler/ovn/reconcile.py),
+  // which is what makes desired-vs-live merge possible at all.
+  name: "string",
 });
 // (KernelRouterRoute + ServiceRef live here, before OvnLrpData, because
 // OvnLrpData.serviceRefs uses ServiceRef at module-eval time.)

@@ -414,8 +414,8 @@ export interface EndpointDefinition {
 }
 
 /** The INTERNAL half of the same contract: `name` is REQUIRED. Every
- * endpoint a Router actually stores (Router.left/right, and the future
- * endpoints[]) satisfies this, whichever builder produced it. */
+ * endpoint a Router actually stores (its `endpoints[]`) satisfies this,
+ * whichever builder produced it. */
 export interface EndpointBase extends EndpointDefinition {
   /** The endpoint's OVN port name AND its identity: `lrp-<fnv1a64>`
    * unless an explicit `name` was given. This is the ovn.lrp key/name
@@ -975,14 +975,23 @@ export interface Router {
   // input is consumed into a plain OvnRouterEndpoint by its builder (the
   // KernelRouter/TunnelRouterEndpoint shapes are INPUT types, never a
   // stored Router's own endpoint).
-  readonly left: OvnRouterEndpoint;
-  readonly right: OvnRouterEndpoint;
+  //
+  // A router owns an ARRAY of endpoints, not a fixed left/right pair
+  // (2026-09-16) — every port, addressed by its own EndpointBase.name
+  // rather than by its position. At least two are required
+  // (defineOvnRouter() rejects a lone endpoint: a router exists to join
+  // domains, one leg joins nothing). Stored SORTED by `name`, so the IR
+  // and the deployer emit deterministically regardless of declaration
+  // order.
+  readonly endpoints: readonly OvnRouterEndpoint[];
   /** RoutingDomains (net.routingDomain()) this router participates in
    * — object references, not names, matching every other cross-
    * reference in this file (l2Segment, gatewayChassis, ...), not a
    * string that could typo/drift out of sync with what was actually
    * declared. See RoutingDomain's own doc comment for how a domain's
-   * routes actually resolve per-router. */
+   * routes actually resolve per-router. A router participates if THIS
+   * names it OR any endpoint's own RouterEndpointBase.routingDomains
+   * does (per-endpoint membership, 2026-08-23). */
   readonly routingDomains?: readonly RoutingDomain[];
   /** Routers this router IMPLIES (derived, not author-declared) — e.g. a
    * tunnelRouterEndpoint's internally-created `<name>-upstream` peer.

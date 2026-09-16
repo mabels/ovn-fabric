@@ -72,21 +72,23 @@ export const network = defineNetwork("minimal", (net) => {
   const lan = net.collisionDomain("lan");
   const upstream = net.collisionDomain("upstream");
 
-  const router = net.defineOvnRouter("router-lan", (router) => {
-    router.left = router.ovnRouterEndpoint({
-      l2Segment: lan,
-      ipaddrs: [IPv4.parse("192.168.10.1/24")],
-      ifaces: [
-        { host: chassis, iface: { kind: "vlan", vlanParent: "eth1", vlanId: 10 } },
-      ],
-      services: [{ kind: "ipv6.slaac" }, { kind: "ipv6.ra" }],
-    });
-    router.right = router.ovnRouterEndpoint({
-      l2Segment: upstream,
-      ipaddrs: [IPv4.parse("10.0.0.2/30")],
-    });
-    return { routingDomains: [] };
-  });
+  const router = net.defineOvnRouter("router-lan", (router) => ({
+    routingDomains: [],
+    endpoints: [
+      router.ovnRouterEndpoint({
+        l2Segment: lan,
+        ipaddrs: [IPv4.parse("192.168.10.1/24")],
+        ifaces: [
+          { host: chassis, iface: { kind: "vlan", vlanParent: "eth1", vlanId: 10 } },
+        ],
+        services: [{ kind: "ipv6.slaac" }, { kind: "ipv6.ra" }],
+      }),
+      router.ovnRouterEndpoint({
+        l2Segment: upstream,
+        ipaddrs: [IPv4.parse("10.0.0.2/30")],
+      }),
+    ],
+  }));
 
   return { hosts: [central, chassis], routers: [router] };
 });
@@ -127,11 +129,13 @@ non-shebang line would break that.
   cluster-wide backbone switch. Every router endpoint names the domain its
   port binds into.
 - **Router / RouterEndpoint** — an OVN `Logical_Router`
-  (`net.defineOvnRouter(name, (router) => {...})`) with a `left`/`right`
-  endpoint. An `ovnRouterEndpoint` carries explicit `ipaddrs`, the
-  `l2Segment` it joins, optional `ifaces` (the real NIC/VLAN it bridges),
-  routing-domain membership, and `services` (`ipv6.slaac`/`ipv6.ra`, or an
-  `attachTo(...)` workload NIC).
+  (`net.defineOvnRouter(name, (router) => ({ routingDomains, endpoints }))`)
+  with an **array** of endpoints (at least two; no fixed left/right — a
+  port is identified by its own derived `name`, not its position). An
+  `ovnRouterEndpoint` carries explicit `ipaddrs`, the `l2Segment` it joins,
+  optional `ifaces` (the real NIC/VLAN it bridges), routing-domain
+  membership, and `services` (`ipv6.slaac`/`ipv6.ra`, or an `attachTo(...)`
+  workload NIC).
 - **KernelRouter** — a real Linux netns forwarding between two real
   interfaces (a router endpoint whose other side is a **KernelRouter**):
   `kernelRouterEndpoint()` for a WAN/uplink, or `tunnelRouterEndpoint()`

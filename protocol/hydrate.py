@@ -56,7 +56,7 @@ def _hydrate_ovn_lrp(raw: dict) -> pt.OvnLrpNode:
     return pt.OvnLrpNode(
         id=raw["id"],
         kind=raw["kind"],
-        key=pt.OvnLrpKey(ovnrouter=raw["key"]["ovnrouter"], side=pt.Side(raw["key"]["side"])),
+        key=pt.OvnLrpKey(ovnrouter=raw["key"]["ovnrouter"], name=raw["key"]["name"]),
         data=pt.OvnLrpData(
             l2Segment=data["l2Segment"],
             addresses=data["addresses"],
