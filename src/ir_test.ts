@@ -5,11 +5,12 @@
 // the translator only ever applies an already-resolved fact).
 
 import { assertEquals, assertNotEquals, assertThrows } from "jsr:@std/assert@1";
-import { fnv1a32, transitNetwork } from "./addressing.ts";
+import { fnv1a32, fnv1a64, transitNetwork } from "./addressing.ts";
 import { defineNetwork } from "./define.ts";
 import { toIR } from "./ir.ts";
 import type { IRNode } from "./ir.ts";
 import { IPv4, IPv6 } from "./ip.ts";
+import { deriveEndpointName } from "./router-endpoints.ts";
 import type { CollisionDomain, Service } from "./types.ts";
 
 // shortIfaceName now lives on each interface entry (`iface.shortName`),
@@ -1159,5 +1160,117 @@ Deno.test("attachTo records endpointRefs on the service", () => {
   assertEquals(
     dns.endpointRefs.find((r) => r.primary)?.endpoint.l2Segment.name,
     "control-plane",
+  );
+});
+
+// ── endpoint identity (EndpointBase.name) ────────────────────────────
+Deno.test("fnv1a64: canonical FNV-1a 64 test vectors, fixed 16-hex width", () => {
+  assertEquals(fnv1a64(""), "cbf29ce484222325");
+  assertEquals(fnv1a64("a"), "af63dc4c8601ec8c");
+  assertEquals(fnv1a64("foobar"), "85944171f73967e8");
+});
+
+Deno.test("deriveEndpointName: stable, role- and domain-sensitive, explicit name wins", () => {
+  const base = deriveEndpointName({}, "router-x", "ovn", "seg-a");
+  // Deterministic: same inputs, same name.
+  assertEquals(base, deriveEndpointName({}, "router-x", "ovn", "seg-a"));
+  assertEquals(base.startsWith("lrp-"), true);
+  // A different router, role or attachment domain is a different identity.
+  assertNotEquals(base, deriveEndpointName({}, "router-y", "ovn", "seg-a"));
+  assertNotEquals(base, deriveEndpointName({}, "router-x", "kernel", "seg-a"));
+  assertNotEquals(base, deriveEndpointName({}, "router-x", "ovn", "seg-b"));
+  // An explicit name overrides the derivation outright.
+  assertEquals(
+    deriveEndpointName({ name: "lrp-home" }, "router-x", "ovn", "seg-a"),
+    "lrp-home",
+  );
+});
+
+Deno.test("defineOvnRouter: each endpoint gets its own derived name", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const a = net.collisionDomain("seg-a");
+    const b = net.collisionDomain("seg-b");
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-x", (router) => {
+          router.left = router.ovnRouterEndpoint({
+            l2Segment: a,
+            ipaddrs: [IPv4.parse("192.168.1.1/24")],
+          });
+          router.right = router.ovnRouterEndpoint({
+            l2Segment: b,
+            ipaddrs: [IPv4.parse("192.168.2.1/24")],
+          });
+          return { routingDomains: [] };
+        }),
+      ],
+    };
+  });
+  const r = network.allRouters[0];
+  if (!r) throw new Error("expected one router");
+  assertEquals(r.left.name, deriveEndpointName({}, "router-x", "ovn", "seg-a"));
+  assertEquals(
+    r.right.name,
+    deriveEndpointName({}, "router-x", "ovn", "seg-b"),
+  );
+  assertNotEquals(r.left.name, r.right.name);
+});
+
+Deno.test("defineOvnRouter: an explicit name overrides the derived name", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const a = net.collisionDomain("seg-a");
+    const b = net.collisionDomain("seg-b");
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-x", (router) => {
+          router.left = router.ovnRouterEndpoint({
+            name: "lrp-home",
+            l2Segment: a,
+            ipaddrs: [IPv4.parse("192.168.1.1/24")],
+          });
+          router.right = router.ovnRouterEndpoint({
+            l2Segment: b,
+            ipaddrs: [IPv4.parse("192.168.2.1/24")],
+          });
+          return { routingDomains: [] };
+        }),
+      ],
+    };
+  });
+  assertEquals(network.allRouters[0]?.left.name, "lrp-home");
+});
+
+Deno.test("defineOvnRouter: two endpoints with the same explicit name are rejected", () => {
+  assertThrows(
+    () =>
+      defineNetwork("test-net", (net) => {
+        const host = net.localHost("chassis-1");
+        const a = net.collisionDomain("seg-a");
+        const b = net.collisionDomain("seg-b");
+        return {
+          hosts: [host],
+          routers: [
+            net.defineOvnRouter("router-x", (router) => {
+              router.left = router.ovnRouterEndpoint({
+                name: "dup",
+                l2Segment: a,
+                ipaddrs: [IPv4.parse("192.168.1.1/24")],
+              });
+              router.right = router.ovnRouterEndpoint({
+                name: "dup",
+                l2Segment: b,
+                ipaddrs: [IPv4.parse("192.168.2.1/24")],
+              });
+              return { routingDomains: [] };
+            }),
+          ],
+        };
+      }),
+    Error,
+    "same name",
   );
 });

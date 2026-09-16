@@ -20,6 +20,7 @@
 // `module.exports = hash`), so a cast through `unknown` is honest here,
 // not a workaround for a real type mismatch.
 import fnv1aModule from "fnv1a";
+import fnv1aIdentity from "@sindresorhus/fnv1a";
 const hash = fnv1aModule as unknown as (s: string, h?: number) => number;
 import type { IPv4, IPv6 } from "./ip.ts";
 
@@ -87,4 +88,31 @@ export function macFromV4(ipv4: IPv4): string {
 // same input always yields the same name across runs and hosts.
 export function fnv1a32(s: string): number {
   return hash(s);
+}
+
+// ── deterministic identity hash (64-bit FNV-1a) ─────────────────────
+// fnv1a32 above stays the right tool for COSMETIC short names
+// (bridge/veth/container), where a collision is visible and merely
+// renames an interface. This one is for facts that are a MERGE KEY — an
+// endpoint's identity (deriveEndpointName, router-endpoints.ts) — where a
+// 32-bit birthday bound (~65k inputs) is too weak: a collision there
+// silently aliases two distinct ports.
+//
+// Delegated to @sindresorhus/fnv1a rather than hand-rolled: pure ESM,
+// zero dependencies, no `node:` builtins (its only global is
+// `globalThis.TextEncoder`), and — the point — the bit size is an
+// option, so widening the identity (128/256) later is a one-line change
+// here, not a new algorithm. Synchronous, so the topology-facing API
+// (defineNetwork/defineOvnRouter) never has to `await` just to derive an
+// id. Returns BigInt, hence the hex conversion below. UTF-8 bytes, so
+// the digest is reproducible from the same string.
+const FNV1A_IDENTITY_SIZE = 64;
+
+/** Fixed-width (16 lowercase hex chars at size 64) so an id's own length
+ * never depends on its input — see deriveEndpointName
+ * (router-endpoints.ts). */
+export function fnv1a64(s: string): string {
+  return fnv1aIdentity(s, { size: FNV1A_IDENTITY_SIZE })
+    .toString(16)
+    .padStart(FNV1A_IDENTITY_SIZE / 4, "0");
 }

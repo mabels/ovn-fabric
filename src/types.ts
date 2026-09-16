@@ -400,18 +400,44 @@ export interface HostInterface {
   readonly iface: InterfaceKind;
 }
 
+/** The INPUT (topology-definition) half of the endpoint identity
+ * contract, shared by every endpoint implementation: `name` is OPTIONAL.
+ * An author may pin one, but it is normally derived from configuration by
+ * the builder (deriveEndpointName, router-endpoints.ts). Optional (not
+ * absent) precisely because a KernelRouterEndpoint/TunnelRouterEndpoint
+ * INPUT cannot know the enclosing router's derived transit domain, yet
+ * still must conform to the same contract as the OVN endpoint it resolves
+ * into. */
+export interface EndpointDefinition {
+  /** Optional explicit port name — overrides the derived one. */
+  readonly name?: string;
+}
+
+/** The INTERNAL half of the same contract: `name` is REQUIRED. Every
+ * endpoint a Router actually stores (Router.left/right, and the future
+ * endpoints[]) satisfies this, whichever builder produced it. */
+export interface EndpointBase extends EndpointDefinition {
+  /** The endpoint's OVN port name AND its identity: `lrp-<fnv1a64>`
+   * unless an explicit `name` was given. This is the ovn.lrp key/name
+   * across the TS/Python boundary — the reconciler keys a real port by
+   * its own name (reconciler/ovn/reconcile.py), so this must be stable
+   * under endpoint reordering and derivable from configuration, never
+   * positional (no array index) and never from mutable state. */
+  readonly name: string;
+}
+
 // ── RouterEndpoint: OVN-side or kernel-side, discriminated by `kind` ──
 // Everything a router endpoint needs REGARDLESS of which world its
 // OTHER side touches (an OVN CollisionDomain, or — not yet built, see
 // the netnsBridge/KernelRouterEndpoint design discussion, 2026-08-12 —
-// a Linux kernel netns) lives on the shared base below. `kind` lets
+// a Linux kernel netns) lives on the shared INPUT base below. `kind` lets
 // generation code (src/ir.ts's toIR()) branch to a different emission
 // strategy per side, instead of a structural ("does it have l2Segment")
 // check — same discriminated-union pattern InterfaceKind already uses
 // in this file.
-interface RouterEndpointBase<
+export interface RouterEndpointInputBase<
   S = RouterEndpointService,
-> {
+> extends EndpointDefinition {
   /** A router port's own addresses — plain parsed IPv4/IPv6 values, one
    * array entry per address (IPv4.parse(...), IPv6.parse(...)). A
    * router endpoint has no segment/uplink identity for a fold rule to
@@ -472,6 +498,19 @@ interface RouterEndpointBase<
   readonly routingDomains?: readonly RoutingDomain[];
 }
 
+/** The RESOLVED (stored) endpoint base — RouterEndpointInputBase plus
+ * the one thing that cannot be optional on it: the stable,
+ * configuration-derived `name` (the merge key). Every endpoint a Router
+ * stores satisfies EndpointBase; the INPUT shapes
+ * (KernelRouterEndpoint/TunnelRouterEndpoint/OvnRouterEndpointSpec) only
+ * satisfy EndpointDefinition, since the builder computes their name with
+ * the enclosing router's name and the endpoint's role. */
+export interface RouterEndpointBase<
+  S = RouterEndpointService,
+> extends RouterEndpointInputBase<S> {
+  readonly name: string;
+}
+
 /** Today's ONLY concrete shape — adds the one field that's actually
  * OVN-specific: which CollisionDomain (Logical_Switch) this LRP binds
  * into. */
@@ -492,7 +531,7 @@ export interface OvnRouterEndpoint
  * (`kernel.*.masq` services) and apps still land here; real-interface
  * discovery is not modeled yet beyond "create the netns, assign it
  * these addresses" (see KernelRouter's own doc comment). */
-export interface KernelRouterEndpoint extends RouterEndpointBase {
+export interface KernelRouterEndpoint extends RouterEndpointInputBase {
   readonly kind: "kernel";
   readonly host: Host;
   readonly transit: TransitNetwork;
@@ -526,7 +565,7 @@ export interface KernelRouterEndpoint extends RouterEndpointBase {
  * tunnelRouterEndpoint() into a plain OvnRouterEndpoint — the tunnel
  * itself is never an IR endpoint, only the netns + wireguard app it
  * builds. */
-export interface TunnelRouterEndpoint {
+export interface TunnelRouterEndpoint extends EndpointDefinition {
   readonly kind: "tunnel";
   readonly host: Host;
   /** The mesh-side transit (left, veth-krn-* style) — same mechanics as
@@ -862,10 +901,16 @@ export type EndpointService<T> = T & {
 /** The AUTHOR-facing endpoint spec (before the builder injects `endpoint`
  * into each service): same as OvnRouterEndpoint but `services` is the plain
  * union. define.ts's buildOvnRouterEndpoint turns a spec into the stored
- * OvnRouterEndpoint by injecting the endpoint into every service. */
-export type OvnRouterEndpointSpec = Omit<OvnRouterEndpoint, "services"> & {
-  readonly services?: readonly RouterEndpointService[];
-};
+ * OvnRouterEndpoint by injecting the endpoint into every service. `id` is
+ * omitted too — it's derived by the builder, never authored (an author who
+ * wants a specific name sets `name` instead). */
+export type OvnRouterEndpointSpec =
+  & Omit<OvnRouterEndpoint, "services" | "name">
+  & {
+    /** Optional explicit port name — see EndpointDefinition. */
+    readonly name?: string;
+    readonly services?: readonly RouterEndpointService[];
+  };
 
 /** One route entry declared directly on the RouterEndpoint that IS the
  * anchor for it — `dst` reachable via `via`, optionally NAT'd. Moved

@@ -312,7 +312,7 @@ export class NetworkBuilder implements RouterEndpointContext {
   ): OvnRouterEndpoint {
     if (spec.kind === "ovn") {
       const { kind: _kind, ...rest } = spec;
-      return buildOvnRouterEndpoint(rest);
+      return buildOvnRouterEndpoint(rest, { routerName, role: "ovn" });
     }
     if (spec.kind === "kernel") {
       const { kind: _kind, ...rest } = spec;
@@ -343,7 +343,8 @@ export class NetworkBuilder implements RouterEndpointContext {
     // router and the sub-router is flattened at IR time (2026-09-08).
     const subRouters: Router[] = [];
     const router: RouterBuilder = {
-      ovnRouterEndpoint: (input) => buildOvnRouterEndpoint(input),
+      ovnRouterEndpoint: (input) =>
+        buildOvnRouterEndpoint(input, { routerName: name, role: "ovn" }),
       // Router-level routingDomains is only known from the callback's
       // RETURN value (read after the callback runs) — so it can't be
       // passed in at endpoint-call time anymore. Each endpoint may carry
@@ -383,6 +384,17 @@ export class NetworkBuilder implements RouterEndpointContext {
     }
     this.checkRouterEndpoint(name, router.left);
     this.checkRouterEndpoint(name, router.right);
+    // Endpoint names are the merge key (EndpointBase.name, types.ts) — two
+    // endpoints of one router sharing one would silently alias on the
+    // Python side. The derived form can't collide (it folds the router
+    // name and the attachment domain, and two endpoints can't share a
+    // domain), so only an explicit `name` override can reach this.
+    if (router.left.name === router.right.name) {
+      throw new Error(
+        `router "${name}": both endpoints resolve to the same name ` +
+          `"${router.left.name}" — give one an explicit \`name\``,
+      );
+    }
     for (const domain of routingDomains) {
       if (this.routingDomainsByName.get(domain.name) !== domain) {
         throw new Error(

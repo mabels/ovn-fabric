@@ -4,7 +4,7 @@
 // implies. Split out of define.ts (2026-09-08); state stays in
 // NetworkBuilder, reached through the small RouterEndpointContext below.
 
-import { fnv1a32 } from "./addressing.ts";
+import { fnv1a32, fnv1a64 } from "./addressing.ts";
 import { IPv4, IPv6 } from "./ip.ts";
 import {
   endpointBuilder,
@@ -59,8 +59,33 @@ export interface RouterEndpointContext {
   securityGroupDeclared(group: SecurityGroup): boolean;
 }
 
+/** Which builder produced an endpoint — part of its identity (see
+ * deriveEndpointName below), so a kernel/tunnel endpoint never shares a
+ * name with a plain ovn one that happens to sit on the same derived
+ * transit domain. */
+export type EndpointRole = "ovn" | "kernel" | "tunnel";
+
+/** The endpoint's stable identity — see EndpointBase.name (types.ts).
+ * Folded ONLY from immutable, identity-defining configuration: the
+ * enclosing router, the role that produced it, and the collision domain
+ * it binds. Deliberately NOT from addresses, mac, ifaces, services, routes
+ * or routingDomains: those are STATE of an already-identified port, and
+ * folding them in would turn every address/service edit into a
+ * delete+create at reconcile time. An explicit `name` (the input half of
+ * the contract, EndpointDefinition) wins outright. */
+export function deriveEndpointName(
+  endpoint: { readonly name?: string },
+  routerName: string,
+  role: EndpointRole,
+  attachmentDomain: string,
+): string {
+  if (endpoint.name) return endpoint.name;
+  return `lrp-${fnv1a64(`${routerName}\n${role}\n${attachmentDomain}`)}`;
+}
+
 /** Tags a plain input object as the `kind: "ovn"` RouterEndpoint —
- * no real transformation, just keeps `kind: "ovn"` from ever being
+ * no real transformation beyond stamping the derived `name`, just keeps
+ * `kind: "ovn"` from ever being
  * hand-typed at a net.ovnRouter() call site. Private: only reachable
  * as `router.ovnRouterEndpoint()` inside an ovnRouter() callback
  * (2026-08-12) — matches kernelRouterEndpoint() below, which
@@ -69,9 +94,20 @@ export interface RouterEndpointContext {
  * it for symmetry rather than being reachable a different way. */
 export function buildOvnRouterEndpoint(
   input: Omit<OvnRouterEndpointSpec, "kind"> | OvnEndpointFn,
+  context: { readonly routerName: string; readonly role: EndpointRole },
 ): OvnRouterEndpoint {
   const spec = typeof input === "function" ? input(endpointBuilder()) : input;
-  const base = { kind: "ovn" as const, ...spec };
+  const name = deriveEndpointName(
+    spec,
+    context.routerName,
+    context.role,
+    spec.l2Segment.name,
+  );
+  // `name` LAST: an input spec may carry an explicit (optional) `name`,
+  // but the resolved endpoint's name is always the derived/pinned value —
+  // a spread of `spec` after it would otherwise write `name: undefined`
+  // back when the spec left it unset.
+  const base = { ...spec, kind: "ovn" as const, name };
   // Inject THIS endpoint into every service entry (EndpointService<T> =
   // T & { endpoint }) so the generator can read the endpoint's
   // l2Segment/ipaddrs/routes per service (2026-09-08). The endpoint
@@ -382,7 +418,7 @@ export function buildKernelRouterEndpoint(
     // (confirmed live, 2026-08-21).
     ipaddrs: ovnSideAddrs,
     ifaces: [{ host, iface: transitVeth }],
-  });
+  }, { routerName, role: "kernel" });
 }
 
 /** The generic "ANY TUNNEL" router (2026-08-23 design discussion) —
@@ -542,11 +578,11 @@ export function buildTunnelRouterEndpoint(
         l2Segment: backdoorDomain,
         ipaddrs: upstreamPeerAddrs,
         ifaces: [{ host, iface: upstreamVeth }],
-      });
+      }, { routerName: `${routerName}-upstream`, role: "ovn" });
       router.right = buildOvnRouterEndpoint({
         l2Segment: upstreamBackbone.l2Segment,
         ipaddrs: upstreamBackbone.ipaddrs,
-      });
+      }, { routerName: `${routerName}-upstream`, role: "ovn" });
       return { routingDomains: upstreamDomains ?? [] };
     },
   );
@@ -578,5 +614,5 @@ export function buildTunnelRouterEndpoint(
     ...(ovnServices && ovnServices.length > 0 ? { services: ovnServices } : {}),
     ipaddrs: ovnSideAddrs,
     ifaces: [{ host, iface: transitVeth }],
-  });
+  }, { routerName, role: "tunnel" });
 }
