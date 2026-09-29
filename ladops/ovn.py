@@ -76,7 +76,7 @@ def list_lrps() -> list[dict]:
 
 
 def lrp_add_argv(router: str, name: str, mac: str, networks: list[str]) -> list[str]:
-    return [*_NBCTL, "lrp-add", router, name, mac, *networks]
+    return [*_NBCTL, "--may-exist", "lrp-add", router, name, mac, *networks]
 
 
 def lrp_del_argv(name: str) -> list[str]:
@@ -84,7 +84,7 @@ def lrp_del_argv(name: str) -> list[str]:
 
 
 def lr_add_argv(router: str) -> list[str]:
-    return [*_NBCTL, "lr-add", router]
+    return [*_NBCTL, "--may-exist", "lr-add", router]
 
 
 def lr_del_argv(router: str) -> list[str]:
@@ -97,12 +97,11 @@ def lr_del_argv(router: str) -> list[str]:
 
 def lr_route_add_argv(router: str, prefix: str, nexthop: str) -> list[str]:
     # No separate lr_route_del_argv/delete needed: lr_del_argv above
-    # already cascades a router's own static routes away with it (same
-    # strong-reference reasoning as its LRPs) — a route only ever needs
-    # deleting on its own when the ROUTE changes but the router doesn't,
-    # which is deployer/ir_to_shell.py's "unconditional add, no
-    # --may-exist" territory, not a delete-mode concern.
-    return [*_NBCTL, "lr-route-add", router, prefix, nexthop]
+    # already cascades a router's own static routes away with it — a
+    # route only ever needs deleting on its own when the ROUTE changes
+    # but the router doesn't. --may-exist makes a re-run of the blunt
+    # create pass tolerate a route that's already there (2026-09-19).
+    return [*_NBCTL, "--may-exist", "lr-route-add", router, prefix, nexthop]
 
 
 def lrp_set_gateway_chassis_argv(lrp: str, chassis: str, priority: int = 100) -> list[str]:
@@ -111,6 +110,18 @@ def lrp_set_gateway_chassis_argv(lrp: str, chassis: str, priority: int = 100) ->
 
 def lrp_set_redirect_chassis_argv(lrp: str) -> list[str]:
     return [*_NBCTL, "set", "logical_router_port", lrp, "options:reside-on-redirect-chassis=true"]
+
+
+def sb_chassis_id_by_hostname_argv(hostname: str) -> list[str]:
+    """The `Chassis.name` (the OVS `system-id`) of the chassis whose
+    reported `hostname` equals `hostname` — resolved AT RUNTIME, because
+    the system-id is generated on the host and can't be baked into the
+    generated script. `lrp-set-gateway-chassis` matches against
+    `Chassis.name`, never the hostname (confirmed live 2026-09-19), so
+    the cluster pass must translate the IR's host name through this
+    lookup first. `--bare --columns=name find` prints just the value(s),
+    one per line; the deployer trims and uses the first."""
+    return [*_SBCTL, "--bare", "--columns=name", "find", "Chassis", f"hostname={hostname}"]
 
 
 def lrp_set_ipv6_ra_config_argv(lrp: str, key: str, value: str) -> list[str]:
@@ -133,7 +144,7 @@ def delete_lrp(name: str) -> None:
 
 
 def ls_add_argv(name: str) -> list[str]:
-    return [*_NBCTL, "ls-add", name]
+    return [*_NBCTL, "--may-exist", "ls-add", name]
 
 
 def ls_del_argv(name: str) -> list[str]:
@@ -150,7 +161,7 @@ def lsp_add_router_argv(switch: str, lsp: str, lrp: str) -> list[list[str]]:
     future live deployer) can't accidentally emit one without the
     others and leave a half-bound port."""
     return [
-        [*_NBCTL, "lsp-add", switch, lsp],
+        [*_NBCTL, "--may-exist", "lsp-add", switch, lsp],
         [*_NBCTL, "lsp-set-type", lsp, "router"],
         [*_NBCTL, "lsp-set-addresses", lsp, "router"],
         [*_NBCTL, "lsp-set-options", lsp, f"router-port={lrp}"],
@@ -165,7 +176,7 @@ def lsp_add_localnet_argv(switch: str, lsp: str, network_name: str) -> list[list
     deployer/ir_to_shell.py's host-script side) — same bundling
     reasoning as lsp_add_router_argv above."""
     return [
-        [*_NBCTL, "lsp-add", switch, lsp],
+        [*_NBCTL, "--may-exist", "lsp-add", switch, lsp],
         [*_NBCTL, "lsp-set-type", lsp, "localnet"],
         [*_NBCTL, "lsp-set-addresses", lsp, "unknown"],
         [*_NBCTL, "lsp-set-options", lsp, f"network_name={network_name}"],

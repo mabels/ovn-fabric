@@ -116,3 +116,23 @@ export class IPv6 extends IPAddress {
     return IPv6.from(super.last());
   }
 }
+
+/** `addr`'s NETWORK base + `offset` hosts, same family and prefix — e.g.
+ * 10.99.77.1/24 + 10 → 10.99.77.10/24. The underlying IPAddress has no
+ * integer addition (`add()` aggregates networks), so this walks `inc()`;
+ * `inc()` keeps the prefix. Throws past the network's last address rather
+ * than wrapping. */
+export function addHostOffset(addr: IPv4 | IPv6, offset: number): IPv4 | IPv6 {
+  let out: IPAddress = addr.network();
+  for (let i = 0; i < offset; i++) {
+    const next = out.inc();
+    if (next === null) {
+      throw new Error(
+        `addHostOffset: ${addr.to_s()} + ${offset} runs past the network's ` +
+          `last address`,
+      );
+    }
+    out = next;
+  }
+  return addr.is_ipv4() ? IPv4.from(out) : IPv6.from(out);
+}

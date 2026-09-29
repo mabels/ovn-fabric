@@ -70,8 +70,20 @@ def _hydrate_ovn_lrp(raw: dict) -> pt.OvnLrpNode:
                         name=r["name"],
                         ipaddrs=[a for a in r["ipaddrs"]] if r.get("ipaddrs") else None,
                         routes=(
-                            [pt.Route(dst=x["dst"], via=x.get("via")) for x in r["routes"]]
+                            [
+                                pt.Route(
+                                    dst=x["dst"],
+                                    via=x.get("via"),
+                                    metric=x.get("metric"),
+                                )
+                                for x in r["routes"]
+                            ]
                             if r.get("routes")
+                            else None
+                        ),
+                        resolver=(
+                            pt.Resolver(nameservers=[n for n in r["resolver"]["nameservers"]])
+                            if r.get("resolver")
                             else None
                         ),
                     )
@@ -122,7 +134,10 @@ def _hydrate_kernel_router(raw: dict) -> pt.KernelRouterNode:
             host=data["host"],
             ipaddrs=data.get("ipaddrs"),
             routes=(
-                [pt.Route(dst=r["dst"], via=r["via"]) for r in routes]
+                [
+                    pt.Route(dst=r["dst"], via=r.get("via"), metric=r.get("metric"))
+                    for r in routes
+                ]
                 if routes is not None
                 else None
             ),
@@ -192,6 +207,12 @@ def _hydrate_kernel_app_container(raw: dict) -> pt.KernelAppContainerNode:
             image=data["image"],
             cmd=[c for c in data["cmd"]] if data.get("cmd") else None,
             deps=[d for d in data["deps"]] if data.get("deps") else None,
+            env=dict(data["env"]) if data.get("env") else None,
+            files=(
+                [pt.File(path=f["path"], content=f["content"]) for f in data["files"]]
+                if data.get("files")
+                else None
+            ),
             build=(
                 pt.Build(
                     from_=build_raw["from"],

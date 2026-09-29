@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from typing import Any
 
 from .netns import run as run_in_netns
@@ -109,10 +110,17 @@ def delete_addr_argv(addr: str, dev: str) -> list[str]:
     return ["ip", "addr", "del", addr, "dev", dev]
 
 
-def add_route_argv(prefix: str, dev: str, nexthop: str | None) -> list[str]:
+def add_route_argv(
+    prefix: str, dev: str, nexthop: str | None, metric: float | None = None
+) -> list[str]:
     args = ["ip", "route", "add", prefix, "dev", dev]
     if nexthop and nexthop != dev:
         args += ["via", nexthop]
+    if metric is not None:
+        # `metric` only decides between EQUAL-prefix routes: the workload's
+        # default-egress preference (lower wins). Connected routes are more
+        # specific, so they always win regardless (2026-09-19).
+        args += ["metric", str(int(metric))]
     return args
 
 
@@ -145,6 +153,23 @@ def delete_route(prefix: str, dev: str, netns: str | None) -> None:
 
 def add_vlan_argv(parent: str, name: str, vlan_id: int) -> list[str]:
     return ["ip", "link", "add", "link", parent, "name", name, "type", "vlan", "id", str(vlan_id)]
+
+
+def ensure_vlan_argv(parent: str, name: str, vlan_id: int) -> list[str]:
+    """Create the VLAN subinterface only if it's missing — `ip link add`
+    has no `--may-exist`, so a host-level VLAN that survived from a
+    previous run would abort the whole create pass (confirmed live
+    2026-09-19). The guard rides inside one `sh -c` (the same idiom as
+    the zerotier installer and set_sysctl_file_argv) so it stays a single
+    argv operation for BOTH front-ends: the shell backend prints it as a
+    normal line, the Python backend shlex-splits it back to `sh -c
+    '<script>'` and the shell runs the `||`."""
+    script = (
+        f"ip link show {shlex.quote(name)} >/dev/null 2>&1 || "
+        f"ip link add link {shlex.quote(parent)} name {shlex.quote(name)} "
+        f"type vlan id {vlan_id}"
+    )
+    return ["sh", "-c", script]
 
 
 # A real, addressable stand-in for a KernelRouterSide's own device — see

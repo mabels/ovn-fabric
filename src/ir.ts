@@ -38,6 +38,7 @@ import type {
   Host,
   KernelRouter,
   OvnRouterEndpoint,
+  Resolver,
   Router,
   RouterEndpointService,
   RoutingDomain,
@@ -52,6 +53,14 @@ export interface IRNode {
   readonly key: Record<string, unknown>;
   readonly data: Record<string, unknown>;
 }
+
+// The platform's control-plane leg + resolved global resolver — what a
+// workload attachment on that domain inherits when it declares none
+// (2026-09-19).
+type PlatformControlPlaneResolver = {
+  readonly collisionDomain: CollisionDomain;
+  readonly resolver?: Resolver;
+};
 
 // RouterEndpoint.ipaddrs is a flat (IPv4 | IPv6)[], one entry per
 // address (see RouterEndpoint, types.ts). to_string() (not to_s()) is
@@ -84,14 +93,16 @@ function resolveEncapIp(host: Host): string | undefined {
 
 // The ABSTRACT dependencies this Host needs (2026-08-23), derived from
 // what the topology puts on it — ABSTRACT names, deliberately not
-// distro package names, so the IR stays OS-agnostic: an OVN-cluster
-// host needs `ovn`+`ovs`, any kernel router's netns needs `ip`+
-// `iptables`, and the apps need their own (dhclient/dhcpcd,
-// wireguard, zerotier, docker). The deployer maps each abstract
-// dependency to the host OS's concrete package/install form; there is
-// deliberately NO deinstall.
+// distro package names, so the IR stays OS-agnostic: every host gets the
+// base tooling (`arp`/net-tools, `ping`, `traceroute`, `curl` — the
+// everyday debugging commands, and curl is also what the zerotier
+// installer needs), an OVN-cluster host needs `ovn`+`ovs`, any kernel
+// router's netns needs `ip`+`iptables`, and the apps need their own
+// (dhclient/dhcpcd, wireguard, zerotier, docker). The deployer maps each
+// abstract dependency to the host OS's concrete package/install form;
+// there is deliberately NO deinstall.
 function hostDependencies(host: Host, network: NetworkDefinition): string[] {
-  const deps = new Set<string>();
+  const deps = new Set<string>(["arp", "ping", "traceroute", "curl"]);
   if (host.ovn) {
     deps.add("ovn");
     deps.add("ovs");
@@ -613,6 +624,7 @@ function routerEndpointToIR(
   router: Router,
   endpoint: OvnRouterEndpoint,
   dstsByDomain: ReadonlyMap<string, ReadonlySet<string>>,
+  platformCp?: PlatformControlPlaneResolver,
 ): IRNode {
   const scope = `ovnrouter:${router.name}`;
   const id = `${scope}|lrp:${endpoint.name}`;
@@ -632,7 +644,12 @@ function routerEndpointToIR(
         ? `host:${endpoint.gatewayChassis.name}`
         : undefined,
       ipv6RaConfigs: resolveIpv6RaConfigs(endpoint.services),
-      serviceRefs: resolveServiceRefs(router, endpoint, dstsByDomain),
+      serviceRefs: resolveServiceRefs(
+        router,
+        endpoint,
+        dstsByDomain,
+        platformCp,
+      ),
     },
   };
 }
@@ -652,11 +669,19 @@ function isDefaultDst(dst: IPv4 | IPv6): boolean {
 function domainDsts(
   domain: RoutingDomain,
   dstsByDomain: ReadonlyMap<string, ReadonlySet<string>>,
-): readonly string[] {
+): readonly { dst: string; metric?: number }[] {
+  // Only a RoutingDomainRoute's OWN metric is returned here; the
+  // attachment's and the domain's own metric are applied by
+  // workloadDomainRoutes so the full precedence (route > attachment >
+  // domain) stays in one place (2026-09-19).
   if (domain.routes && domain.routes.length > 0) {
-    return domain.routes.map((r) => r.dst.to_string());
+    return domain.routes.map((r) =>
+      r.metric !== undefined
+        ? { dst: r.dst.to_string(), metric: r.metric }
+        : { dst: r.dst.to_string() }
+    );
   }
-  return [...(dstsByDomain.get(domain.name) ?? [])];
+  return [...(dstsByDomain.get(domain.name) ?? [])].map((dst) => ({ dst }));
 }
 
 // The routes a workload NIC inherits at the WORKLOAD layer: the calculated
@@ -665,18 +690,20 @@ function domainDsts(
 // gateway (the address a container on this segment must use). A dst the
 // endpoint is already ON-LINK for is skipped — the connected route already
 // covers it. Explicit attachment routes (ref.routes) win outright; see
-// resolveServiceRefs below — this is the ONLY source of a workload's
-// routes (there is no per-attachment "primary" flag).
+// resolveServiceRefs below. Each route carries the resolved metric (route >
+// domain > attachment), the deployer's ranking of a workload's default
+// routes (2026-09-19).
 function workloadDomainRoutes(
   router: Router,
   endpoint: OvnRouterEndpoint,
   attachmentAddrs: readonly (IPv4 | IPv6)[],
   dstsByDomain: ReadonlyMap<string, ReadonlySet<string>>,
-): { dst: string; via: string }[] {
+  attachmentMetric?: number,
+): { dst: string; via: string; metric?: number }[] {
   const domains = endpoint.routingDomains ?? router.routingDomains ?? [];
-  const out: { dst: string; via: string }[] = [];
+  const out: { dst: string; via: string; metric?: number }[] = [];
   for (const domain of domains) {
-    for (const dst of domainDsts(domain, dstsByDomain)) {
+    for (const { dst, metric } of domainDsts(domain, dstsByDomain)) {
       const isV4 = !dst.includes(":");
       // The NIC can only use a next hop of a family it actually has an
       // address for — the ATTACHMENT's addresses, not the endpoint's: a
@@ -691,7 +718,16 @@ function workloadDomainRoutes(
       );
       if (onLink) continue;
       if (out.some((r) => r.dst === dst)) continue;
-      out.push({ dst, via: gateway.to_s() });
+      // Metric precedence: the route's own metric, else THIS attachment's
+      // (per-NIC) metric, else the routing domain's. Whole egress paths are
+      // ranked by routing domain, a single NIC overrides that, and one
+      // route overrides the NIC (2026-09-19).
+      const resolved = metric ?? attachmentMetric ?? domain.metric;
+      out.push({
+        dst,
+        via: gateway.to_s(),
+        ...(resolved !== undefined ? { metric: resolved } : {}),
+      });
     }
   }
   return out;
@@ -707,15 +743,22 @@ function resolveServiceRefs(
   router: Router,
   endpoint: OvnRouterEndpoint,
   dstsByDomain: ReadonlyMap<string, ReadonlySet<string>>,
+  platformCp?: PlatformControlPlaneResolver,
 ): {
   service: string;
   ipaddrs?: string[];
-  routes?: { dst: string; via?: string }[];
+  routes?: { dst: string; via?: string; metric?: number }[];
+  resolver?: { nameservers: string[] };
 }[] | undefined {
   const refs = (endpoint.services ?? []).filter((s) =>
     s.kind === "service.attach"
   );
   if (refs.length === 0) return undefined;
+  // The control-plane attachment this endpoint represents, if any: an
+  // attachment THERE with no resolver of its own is fed the platform's
+  // GLOBAL resolver (controlPlane.resolver, else the CoreDNS address).
+  const onControlPlane = platformCp !== undefined &&
+    endpoint.l2Segment.name === platformCp.collisionDomain.name;
   return refs.map((ref) => {
     const routes = ref.routes && ref.routes.length > 0
       ? ref.routes.map((r) => {
@@ -729,12 +772,27 @@ function resolveServiceRefs(
               }); a container next-hop must be reachable on its own L2`,
           );
         }
+        // Route metric wins, else this ATTACHMENT's metric (the NIC-level
+        // default), else unset — the generator fills the execution-order
+        // fallback in assignFallbackRouteMetrics below (2026-09-19).
+        const metric = r.metric ?? ref.metric;
         return {
           dst: r.dst.to_string(),
           ...(r.via ? { via: r.via.to_s() } : {}),
+          ...(metric !== undefined ? { metric } : {}),
         };
       })
-      : workloadDomainRoutes(router, endpoint, ref.ipaddrs, dstsByDomain);
+      : workloadDomainRoutes(
+        router,
+        endpoint,
+        ref.ipaddrs,
+        dstsByDomain,
+        ref.metric,
+      );
+    // Resolver precedence (innermost wins): the attachment's own, else the
+    // platform's global control-plane resolver (2026-09-19).
+    const resolver = ref.resolver ??
+      (onControlPlane ? platformCp?.resolver : undefined);
     return {
       service: `kernel.app.container:${ref.srvRef.name}`,
       // The in-container NIC name — resolved HERE (generator side), not by
@@ -745,6 +803,11 @@ function resolveServiceRefs(
         ? { ipaddrs: ref.ipaddrs.map((a) => a.to_string()) }
         : {}),
       ...(routes.length > 0 ? { routes: orderRoutes(routes) } : {}),
+      ...(resolver
+        ? {
+          resolver: { nameservers: resolver.nameservers.map((n) => n.to_s()) },
+        }
+        : {}),
     };
   });
 }
@@ -757,8 +820,8 @@ function resolveServiceRefs(
 // v4 default first makes that failure survivable; sorting the rest keeps
 // the IR diff-stable.
 function orderRoutes(
-  routes: readonly { dst: string; via?: string }[],
-): { dst: string; via?: string }[] {
+  routes: readonly { dst: string; via?: string; metric?: number }[],
+): { dst: string; via?: string; metric?: number }[] {
   const key = (dst: string): [number, number, string] => [
     dst.includes(":") ? 1 : 0, // IPv4 before IPv6
     dst === "0.0.0.0/0" || dst === "::/0" ? 0 : 1, // default before the rest
@@ -1168,10 +1231,69 @@ function serviceNodes(network: NetworkDefinition): IRNode[] {
         image: service.image,
         ...(service.cmd ? { cmd: service.cmd } : {}),
         ...(service.build ? { build: service.build } : {}),
+        // Environment variables — keys sorted so the IR is diff-stable
+        // regardless of declaration order.
+        ...(service.env && Object.keys(service.env).length > 0
+          ? {
+            env: Object.fromEntries(
+              Object.entries(service.env).sort((
+                [a],
+                [b],
+              ) => (a < b ? -1 : a > b ? 1 : 0)),
+            ),
+          }
+          : {}),
+        // The in-memory filesystem — sorted by path so the IR is
+        // diff-stable regardless of declaration order.
+        ...(service.files && service.files.length > 0
+          ? {
+            files: [...service.files].sort((a, b) =>
+              a.path < b.path ? -1 : a.path > b.path ? 1 : 0
+            ),
+          }
+          : {}),
       },
     } as IRNode);
   }
   return out;
+}
+
+// Metric fallback when neither a route, its attachment, nor its routing
+// domain declares one: assign by EXECUTION ORDER — a workload's first NIC
+// gets the lowest metric (most preferred), each subsequent NIC +100. The
+// GENERATOR owns this (the deployer never invents a metric; it only applies
+// what the IR carries). Lower wins among equal-prefix routes (2026-09-19).
+const _DEFAULT_ROUTE_METRIC_BASE = 100;
+const _DEFAULT_ROUTE_METRIC_STEP = 100;
+
+function assignFallbackRouteMetrics(nodes: Record<string, IRNode>): void {
+  // Per SERVICE (each workload is its own netns/routing tables, so ranks
+  // are independent per workload). Nodes are walked in declaration order
+  // (router → endpoint → attachment), which IS the execution order the
+  // deployer would have used.
+  const rankByService = new Map<string, number>();
+  for (const node of Object.values(nodes)) {
+    if (node.kind !== "ovn.lrp") continue;
+    const refs = node.data["serviceRefs"] as
+      | {
+        service: string;
+        routes?: { dst: string; via?: string; metric?: number }[];
+      }[]
+      | undefined;
+    if (!refs) continue;
+    for (const ref of refs) {
+      const routes = ref.routes;
+      if (!routes || routes.length === 0) continue;
+      if (!routes.some((r) => r.metric === undefined)) continue;
+      const rank = rankByService.get(ref.service) ?? 0;
+      const fallback = _DEFAULT_ROUTE_METRIC_BASE +
+        rank * _DEFAULT_ROUTE_METRIC_STEP;
+      for (const route of routes) {
+        if (route.metric === undefined) route.metric = fallback;
+      }
+      rankByService.set(ref.service, rank + 1);
+    }
+  }
 }
 
 export function toIR(network: NetworkDefinition): Record<string, IRNode> {
@@ -1238,7 +1360,12 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
             `"${endpoint.kind}" — toIR() has no emission strategy for it yet`,
         );
       }
-      const node = routerEndpointToIR(router, endpoint, dstsByDomain);
+      const node = routerEndpointToIR(
+        router,
+        endpoint,
+        dstsByDomain,
+        network.platformControlPlane,
+      );
       nodes[node.id] = node;
     }
   }
@@ -1291,6 +1418,10 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
     const node = securityGroupToIR(group);
     nodes[node.id] = node;
   }
+
+  // Resolve any route metric the topology left implicit, so the IR always
+  // carries a concrete value (2026-09-19).
+  assignFallbackRouteMetrics(nodes);
 
   // Deterministic output order: sorted by node id. The caller (cli.ts's
   // generate-ir) serializes Object.values(nodes) as-is, so insertion

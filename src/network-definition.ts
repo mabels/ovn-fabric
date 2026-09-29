@@ -8,6 +8,7 @@ import type {
   Host,
   KernelRouter,
   OvnClusterOptions,
+  Resolver,
   Router,
   RoutingDomain,
   SecurityGroup,
@@ -54,4 +55,12 @@ export interface NetworkDefinition {
    * Undefined means "OVN defaults for everything," not "no OVN
    * cluster" (that's whether any Host has an `ovn` role at all). */
   readonly ovnGlobal?: OvnClusterOptions;
+  /** The platform's CONTROL-PLANE leg, registered by createPlatform: its
+   * collision domain plus the resolved GLOBAL resolver. A workload
+   * attachment on this domain with no `resolver` of its own is fed this
+   * one (2026-09-19). */
+  readonly platformControlPlane?: {
+    readonly collisionDomain: CollisionDomain;
+    readonly resolver?: Resolver;
+  };
 }

@@ -93,7 +93,18 @@ export const OvnLrpKey = type({
 });
 // (KernelRouterRoute + ServiceRef live here, before OvnLrpData, because
 // OvnLrpData.serviceRefs uses ServiceRef at module-eval time.)
-export const KernelRouterRoute = type({ dst: "string", "via?": "string" });
+export const KernelRouterRoute = type({
+  dst: "string",
+  "via?": "string",
+  // Preference among equal-prefix routes (lower wins) — resolved by the
+  // generator from the route/domain/attachment metric, or left unset for
+  // the deployer's execution-order fallback (2026-09-19).
+  "metric?": "number",
+});
+// A workload NIC's DNS resolver, already resolved by the generator
+// (attachment > control-plane global > CoreDNS). The deployer renders it as
+// `docker run --dns …` (2026-09-19).
+export const Resolver = type({ nameservers: "string[]" });
 export const ServiceRef = type({
   service: "string",
   // The in-container NIC name — RESOLVED by the generator (src/ir.ts's
@@ -102,6 +113,7 @@ export const ServiceRef = type({
   name: "string",
   "ipaddrs?": "string[]",
   "routes?": KernelRouterRoute.array(),
+  "resolver?": Resolver,
 });
 export const OvnLrpData = type({
   // `ls:<name>` — the referenced ovn.ls node's own id, not the bare
@@ -334,23 +346,36 @@ export const KernelServiceKey = type({ name: "string" });
 //
 // `kernel.app.container` — a docker container the host runs; the deployer
 // performs the netns magic (veth injection) on it.
+// A workload's in-memory FILESYSTEM entry — {path, content}. Shared by both
+// app kinds: containers (Service.files, materialised into the container) and
+// services (files written before `up`). CONFIG, not secrets — it travels
+// through the IR as plain JSON.
+export const KernelAppServiceFile = type({
+  path: "string",
+  // A string, or its LINES — an array diffs far better in the IR (one
+  // changed line vs one long escaped string), so generated config uses it.
+  content: "string | string[]",
+});
+// Environment variables for a workload (Service.env) — CONFIG, not
+// secrets, since it travels through the IR as plain JSON.
+export const AppEnv = type({
+  "[string]": "string",
+});
 export const KernelAppContainerData = type({
   host: "string",
   image: "string",
   "cmd?": "string[]",
+  // Environment variables, e.g. ADMIN_PASSWORD / DNS_SERVER_DOMAIN.
+  "env?": AppEnv,
+  // Files put into the container's filesystem (Service.files); the deployer
+  // writes them on the host and bind-mounts each one read-only.
+  "files?": KernelAppServiceFile.array(),
   "build?": {
     from: "string",
     "packages?": "string[]",
     "dockerfile?": "string",
   },
   "deps?": "string[]",
-});
-// `kernel.app.service` — a netns + a NAMED PROCESS to start/stop. Generic:
-// the command, its stop counterpart, any config FILES to write first, and
-// its abstract `deps` are all data — no wireguard/zerotier knowledge here.
-export const KernelAppServiceFile = type({
-  path: "string",
-  content: "string",
 });
 export const KernelAppServiceData = type({
   host: "string",
@@ -441,6 +466,7 @@ export function buildJsonSchema(): Record<string, unknown> {
     ServiceRef: ServiceRef.toJsonSchema(),
     KernelServiceKey: KernelServiceKey.toJsonSchema(),
     KernelAppServiceFile: KernelAppServiceFile.toJsonSchema(),
+    AppEnv: AppEnv.toJsonSchema(),
     KernelAppContainerData: KernelAppContainerData.toJsonSchema(),
     KernelAppServiceData: KernelAppServiceData.toJsonSchema(),
     KernelAppContainerNode: nodeSchema(

@@ -66,13 +66,16 @@ def remove_external_id(key: str) -> None:
 
 # ── bridges + ports (real-world binding for ovn.ls collision domains —
 # deployer/ir_to_shell.py's per-host script) ─────────────────────────
-# add-br has no --may-exist here (matches ladops.ovn's own no-may-exist
-# rule for adds); del-br uses --if-exists and cascades its own ports —
-# same reasoning as ladops.ovn.ls_del_argv.
+# Both adds take --may-exist: the create pass is re-run as a blunt
+# "make it so" (README's idempotency guarantee), and an existing bridge/
+# port is the expected state on every run after the first — without the
+# flag `ovs-vsctl add-br` aborts the whole pass (confirmed live
+# 2026-09-19). del-br/del-port use --if-exists and cascade, same
+# reasoning as ladops.ovn.ls_del_argv.
 
 
 def add_br_argv(bridge: str) -> list[str]:
-    return [*_VSCTL, "add-br", bridge]
+    return [*_VSCTL, "--may-exist", "add-br", bridge]
 
 
 def del_br_argv(bridge: str) -> list[str]:
@@ -84,7 +87,7 @@ def set_bridge_fail_mode_argv(bridge: str, mode: str = "standalone") -> list[str
 
 
 def add_port_argv(bridge: str, port: str) -> list[str]:
-    return [*_VSCTL, "add-port", bridge, port]
+    return [*_VSCTL, "--may-exist", "add-port", bridge, port]
 
 
 def del_port_argv(bridge: str, port: str) -> list[str]:

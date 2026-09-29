@@ -13,7 +13,10 @@ import { IPv4, IPv6 } from "./ip.ts";
 import { deriveEndpointName } from "./router-endpoints.ts";
 import type {
   CollisionDomain,
+  DnsProvider,
   OvnRouterEndpoint,
+  Platform,
+  Publish,
   Router,
   Service,
 } from "./types.ts";
@@ -939,6 +942,10 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
   const nodes = toIR(network);
   const hostNode = node(nodes, "host:chassis-1");
   assertEquals(hostNode.data["dependencies"], [
+    "arp",
+    "ping",
+    "traceroute",
+    "curl",
     "ovn",
     "ovs",
     "ip",
@@ -1056,6 +1063,302 @@ Deno.test("net.service + ep.attachTo -> kernel.service node + endpoint serviceRe
       },
     ],
   );
+});
+
+// Metric precedence for a workload's kernel routes: a route's own metric,
+// else its attachment's (per-NIC) metric, else the routing domain's
+// (2026-09-19). Lower wins in the deployer — this is how one asks for
+// management-v2 over a control-plane fallback.
+Deno.test("route metrics: domain, attachment and per-route precedence", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const a = net.collisionDomain("seg-a");
+    const b = net.collisionDomain("seg-b");
+    const domain = net.routingDomain("Dom", {
+      metric: 500,
+      routes: [{ dst: IPv4.parse("10.9.0.0/24") }],
+    });
+    const dns = net.service("dns", (svc) => {
+      svc.image = "x";
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-x", (router) => {
+          return {
+            routingDomains: [domain],
+            endpoints: [
+              router.ovnRouterEndpoint((ep) => ({
+                l2Segment: a,
+                ipaddrs: [IPv4.parse("192.168.1.1/24")],
+                ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+                services: [
+                  ep.attachTo(dns, {
+                    ipaddrs: [IPv4.parse("192.168.1.53/24")],
+                    metric: 700,
+                    routes: [
+                      {
+                        dst: IPv4.parse("10.10.0.0/24"),
+                        via: IPv4.parse("192.168.1.1"),
+                        metric: 900,
+                      },
+                      {
+                        dst: IPv4.parse("10.11.0.0/24"),
+                        via: IPv4.parse("192.168.1.1"),
+                      },
+                    ],
+                  }),
+                ],
+              })),
+              router.ovnRouterEndpoint((ep) => ({
+                l2Segment: b,
+                ipaddrs: [IPv4.parse("192.168.2.1/24")],
+                ifaces: [{ host, iface: { kind: "physical", name: "eth1" } }],
+                services: [
+                  // No explicit routes → inherits the domain's 10.9.0.0/24;
+                  // metric comes from the ATTACHMENT (300), more specific
+                  // than the domain's 500.
+                  ep.attachTo(dns, {
+                    ipaddrs: [IPv4.parse("192.168.2.53/24")],
+                    metric: 300,
+                  }),
+                ],
+              })),
+            ],
+          };
+        }),
+      ],
+    };
+  });
+  const nodes = toIR(network);
+  const refsOn = (seg: string) =>
+    (node(
+      nodes,
+      `ovnrouter:router-x|lrp:${endpointOn(network.allRouters[0]!, seg).name}`,
+    ).data["serviceRefs"] as {
+      routes?: { dst: string; via?: string; metric?: number }[];
+    }[])[0]!;
+  const segA = Object.fromEntries(
+    (refsOn("seg-a").routes ?? []).map((r) => [r.dst, r]),
+  );
+  const segB = Object.fromEntries(
+    (refsOn("seg-b").routes ?? []).map((r) => [r.dst, r]),
+  );
+  // A route's OWN metric wins.
+  assertEquals(segA["10.10.0.0/24"]!.metric, 900);
+  // A route with none takes the ATTACHMENT's metric.
+  assertEquals(segA["10.11.0.0/24"]!.metric, 700);
+  // An inherited domain route ALSO takes the attachment's metric (300),
+  // which outranks the domain's 500.
+  assertEquals(segB["10.9.0.0/24"]!.metric, 300);
+  assertEquals(segB["10.9.0.0/24"]!.via, "192.168.2.1");
+});
+
+// Neither the route, the attachment nor the domain declares a metric → the
+// generator assigns one by execution order: the workload's FIRST NIC is
+// lowest (most preferred), each subsequent +100 (2026-09-19).
+Deno.test("route metrics fall back to execution order (first NIC lowest)", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const a = net.collisionDomain("seg-a");
+    const b = net.collisionDomain("seg-b");
+    const domain = net.routingDomain("Dom", {
+      routes: [{ dst: IPv4.parse("10.9.0.0/24") }],
+    });
+    const svc = net.service("svc", (s) => {
+      s.image = "x";
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-x", (router) => ({
+          routingDomains: [domain],
+          endpoints: [
+            router.ovnRouterEndpoint((ep) => ({
+              l2Segment: a,
+              ipaddrs: [IPv4.parse("192.168.1.1/24")],
+              ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+              services: [
+                ep.attachTo(svc, { ipaddrs: [IPv4.parse("192.168.1.5/24")] }),
+              ],
+            })),
+            router.ovnRouterEndpoint((ep) => ({
+              l2Segment: b,
+              ipaddrs: [IPv4.parse("192.168.2.1/24")],
+              ifaces: [{ host, iface: { kind: "physical", name: "eth1" } }],
+              services: [
+                ep.attachTo(svc, { ipaddrs: [IPv4.parse("192.168.2.5/24")] }),
+              ],
+            })),
+          ],
+        })),
+      ],
+    };
+  });
+  const nodes = toIR(network);
+  const metricOn = (seg: string): number | undefined => {
+    const lrp = node(
+      nodes,
+      `ovnrouter:router-x|lrp:${endpointOn(network.allRouters[0]!, seg).name}`,
+    );
+    const refs = lrp.data["serviceRefs"] as {
+      routes?: { dst: string; metric?: number }[];
+    }[];
+    return (refs[0]!.routes ?? [])[0]!.metric;
+  };
+  assertEquals(metricOn("seg-a"), 100);
+  assertEquals(metricOn("seg-b"), 200);
+});
+
+// A control-plane attachment with no resolver of its own is fed the
+// platform's GLOBAL resolver — controlPlane.resolver, else the CoreDNS
+// address. CoreDNS gets it too (harmless: its Corefile sets an explicit
+// forwarder, so it never resolves via resolv.conf), and an explicit
+// attachment.resolver wins (2026-09-19).
+Deno.test("resolver: control-plane attachments inherit the platform resolver", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const controlPlane = net.collisionDomain("control-plane");
+    const bb = net.collisionDomain("bb");
+    const app = net.service("app", (s) => {
+      s.image = "x";
+    });
+    const platform = net.createPlatform("plat", {
+      controlPlane: {
+        collisionDomain: controlPlane,
+        hosts: [host],
+        ipaddrs: [IPv4.parse("10.43.0.1/24")],
+        ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+      },
+      zones: [],
+    });
+    platform.addEgress({
+      l2Segment: bb,
+      ipaddrs: [IPv4.parse("172.16.0.1/16")],
+    });
+    platform.addService({ service: app });
+    return { hosts: [host], routers: [] };
+  });
+  const refsOf = (seg: string) => {
+    const router = network.allRouters.find((r) =>
+      r.endpoints.some((e) => e.l2Segment.name === seg)
+    )!;
+    const lrp = node(
+      toIR(network),
+      `ovnrouter:${router.name}|lrp:${endpointOn(router, seg).name}`,
+    );
+    return lrp.data["serviceRefs"] as {
+      service: string;
+      ipaddrs?: string[];
+      resolver?: { nameservers: string[] };
+    }[];
+  };
+  const refs = refsOf("control-plane");
+  const coredns = refs.find((r) =>
+    r.service === "kernel.app.container:platform.dns"
+  )!;
+  const appRef = refs.find((r) => r.service === "kernel.app.container:app")!;
+  const corednsAddr = coredns.ipaddrs![0]!.split("/")[0]!;
+  // The app NIC is fed the CoreDNS address...
+  assertEquals(appRef.resolver, { nameservers: [corednsAddr] });
+  // ...and so is CoreDNS itself — harmless, its Corefile forwarder is what
+  // it resolves with, not resolv.conf.
+  assertEquals(coredns.resolver, { nameservers: [corednsAddr] });
+  // The registry on the network carries the same global resolver.
+  assertEquals(
+    network.platformControlPlane?.resolver?.nameservers.map((n) => n.to_s()),
+    [corednsAddr],
+  );
+});
+
+// An explicit controlPlane.resolver overrides the CoreDNS default.
+Deno.test("resolver: controlPlane.resolver overrides the CoreDNS default", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const controlPlane = net.collisionDomain("control-plane");
+    const bb = net.collisionDomain("bb");
+    const app = net.service("app", (s) => {
+      s.image = "x";
+    });
+    const platform = net.createPlatform("plat", {
+      controlPlane: {
+        collisionDomain: controlPlane,
+        hosts: [host],
+        ipaddrs: [IPv4.parse("10.43.0.1/24")],
+        ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+        resolver: { nameservers: [IPv4.parse("9.9.9.9")] },
+      },
+      zones: [],
+    });
+    platform.addEgress({
+      l2Segment: bb,
+      ipaddrs: [IPv4.parse("172.16.0.1/16")],
+    });
+    platform.addService({ service: app });
+    return { hosts: [host], routers: [] };
+  });
+  const router = network.allRouters.find((r) =>
+    r.endpoints.some((e) => e.l2Segment.name === "control-plane")
+  )!;
+  const lrp = node(
+    toIR(network),
+    `ovnrouter:${router.name}|lrp:${endpointOn(router, "control-plane").name}`,
+  );
+  const refs = lrp.data["serviceRefs"] as {
+    service: string;
+    resolver?: { nameservers: string[] };
+  }[];
+  assertEquals(
+    refs.find((r) => r.service === "kernel.app.container:app")!.resolver,
+    { nameservers: ["9.9.9.9"] },
+  );
+});
+
+// An attachment's own resolver wins over the control-plane default.
+Deno.test("resolver: attachment resolver is emitted for a plain segment NIC", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const a = net.collisionDomain("seg-a");
+    const b = net.collisionDomain("seg-b");
+    const svc = net.service("svc", (s) => {
+      s.image = "x";
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-x", (router) => ({
+          routingDomains: [],
+          endpoints: [
+            router.ovnRouterEndpoint((ep) => ({
+              l2Segment: a,
+              ipaddrs: [IPv4.parse("192.168.1.1/24")],
+              ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+              services: [
+                ep.attachTo(svc, {
+                  ipaddrs: [IPv4.parse("192.168.1.5/24")],
+                  resolver: { nameservers: [IPv4.parse("8.8.8.8")] },
+                }),
+              ],
+            })),
+            router.ovnRouterEndpoint({
+              l2Segment: b,
+              ipaddrs: [IPv4.parse("192.168.2.1/24")],
+            }),
+          ],
+        })),
+      ],
+    };
+  });
+  const network2 = network;
+  const router = network2.allRouters[0]!;
+  const lrp = node(
+    toIR(network2),
+    `ovnrouter:router-x|lrp:${endpointOn(router, "seg-a").name}`,
+  );
+  const refs = lrp.data["serviceRefs"] as {
+    resolver?: { nameservers: string[] };
+  }[];
+  assertEquals(refs[0]!.resolver, { nameservers: ["8.8.8.8"] });
 });
 
 // A container's route via must be on the face's segment — an off-segment
@@ -1644,7 +1947,7 @@ Deno.test("routingDomain: explicit routes replace the calculated set", () => {
     .serviceRefs ?? [];
   // Exactly the declared prefix — no default alongside it.
   assertEquals(refs[0]?.routes, [
-    { dst: "192.168.129.0/24", via: "10.0.0.1" },
+    { dst: "192.168.129.0/24", via: "10.0.0.1", metric: 100 },
   ]);
 });
 
@@ -1765,4 +2068,628 @@ Deno.test("workload routes: a prefix reached from two NICs stays on both (per-NI
     return (refs[0]?.routes ?? []).some((r) => r.dst === "10.5.0.0/24");
   });
   assertEquals(withRoute.length, 2);
+});
+
+// ── platform builders (dnsProvider real; certIssuer/createPlatform stubs) ──
+Deno.test("platform: dnsProvider is a plain object, unique by name", () => {
+  let provider: DnsProvider | undefined;
+  defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    provider = net.dnsProvider("cloudflare", {
+      kind: "cloudflare",
+      token: "cf-token",
+    });
+    assertThrows(
+      () =>
+        net.dnsProvider("cloudflare", { kind: "cloudflare", token: "other" }),
+      Error,
+      "declared more than once",
+    );
+    return { hosts: [host], routers: [] };
+  });
+  assertEquals(provider?.name, "cloudflare");
+  assertEquals(provider?.spec, { kind: "cloudflare", token: "cf-token" });
+});
+
+Deno.test("platform: createPlatform is a dummy carrying ingressService + publish", () => {
+  let platform: Platform | undefined;
+  defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const controlPlane = net.collisionDomain("control-plane");
+    platform = net.createPlatform("mam-hh-platform", {
+      controlPlane: { collisionDomain: controlPlane, hosts: [host] },
+      zones: [],
+    });
+    return { hosts: [host], routers: [] };
+  });
+  assertEquals(platform?.name, "mam-hh-platform");
+  assertEquals(platform?.ingressService.name, "mam-hh-platform-ingress");
+  const published = platform?.publish({
+    host: "ui.adviser.com",
+    port: "webui",
+  });
+  assertEquals(published?.host, "ui.adviser.com");
+  assertEquals(published?.platform, platform);
+});
+
+Deno.test("platform: attachTo(ingressService) injects endpoint + service into publish", () => {
+  let platform: Platform | undefined;
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const management = net.collisionDomain("management-v2");
+    const bb = net.collisionDomain("bb");
+    const controlPlane = net.collisionDomain("control-plane");
+    platform = net.createPlatform("plat", {
+      controlPlane: { collisionDomain: controlPlane, hosts: [host] },
+      zones: [],
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-management-v2", (r) => ({
+          routingDomains: [],
+          endpoints: [
+            r.ovnRouterEndpoint((ep) => ({
+              l2Segment: management,
+              ipaddrs: [IPv4.parse("192.168.129.1/24")],
+              services: [
+                ep.attachTo(platform!.ingressService, {
+                  ipaddrs: [IPv4.parse("192.168.129.33/24")],
+                  publish: [
+                    platform!.publish({
+                      host: "ui.adviser.com",
+                      port: "webui",
+                    }),
+                  ],
+                }),
+              ],
+            })),
+            r.ovnRouterEndpoint({
+              l2Segment: bb,
+              ipaddrs: [IPv4.parse("172.16.0.1/16")],
+            }),
+          ],
+        })),
+      ],
+    };
+  });
+  const router = network.allRouters[0];
+  if (!router) throw new Error("expected one router");
+  const lrp = endpointOn(router, "management-v2");
+  const attach = (lrp.services ?? []).find((s) => s.kind === "service.attach");
+  const publish = (attach as { publish?: readonly Publish[] } | undefined)
+    ?.publish;
+  assertEquals(publish?.[0]?.host, "ui.adviser.com");
+  // The injected endpoint is the pre-`services` base (same object
+  // EndpointService.endpoint carries), so compare by identity-of-name.
+  assertEquals(publish?.[0]?.endpoint?.name, lrp.name);
+  assertEquals(publish?.[0]?.service?.name, "plat-ingress");
+  // The reusable service records the attachment back-reference.
+  assertEquals(platform?.ingressService.endpointRefs.length, 1);
+});
+
+// ── endpoint identity (EndpointBase.name) ────────────────────────────
+Deno.test("fnv1a64: canonical FNV-1a 64 test vectors, fixed 16-hex width", () => {
+  assertEquals(fnv1a64(""), "cbf29ce484222325");
+  assertEquals(fnv1a64("a"), "af63dc4c8601ec8c");
+  assertEquals(fnv1a64("foobar"), "85944171f73967e8");
+});
+
+Deno.test("deriveEndpointName: stable, role- and domain-sensitive, explicit name wins", () => {
+  const base = deriveEndpointName({}, "router-x", "ovn", "seg-a");
+  // Deterministic: same inputs, same name.
+  assertEquals(base, deriveEndpointName({}, "router-x", "ovn", "seg-a"));
+  assertEquals(base.startsWith("lrp-"), true);
+  // A different router, role or attachment domain is a different identity.
+  assertNotEquals(base, deriveEndpointName({}, "router-y", "ovn", "seg-a"));
+  assertNotEquals(base, deriveEndpointName({}, "router-x", "kernel", "seg-a"));
+  assertNotEquals(base, deriveEndpointName({}, "router-x", "ovn", "seg-b"));
+  // An explicit name overrides the derivation outright.
+  assertEquals(
+    deriveEndpointName({ name: "lrp-home" }, "router-x", "ovn", "seg-a"),
+    "lrp-home",
+  );
+});
+
+Deno.test("defineOvnRouter: each endpoint gets its own derived name", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const a = net.collisionDomain("seg-a");
+    const b = net.collisionDomain("seg-b");
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-x", (router) => {
+          return {
+            routingDomains: [],
+            endpoints: [
+              router.ovnRouterEndpoint({
+                l2Segment: a,
+                ipaddrs: [IPv4.parse("192.168.1.1/24")],
+              }),
+              router.ovnRouterEndpoint({
+                l2Segment: b,
+                ipaddrs: [IPv4.parse("192.168.2.1/24")],
+              }),
+            ],
+          };
+        }),
+      ],
+    };
+  });
+  const r = network.allRouters[0];
+  if (!r) throw new Error("expected one router");
+  assertEquals(
+    endpointOn(r, "seg-a").name,
+    deriveEndpointName({}, "router-x", "ovn", "seg-a"),
+  );
+  assertEquals(
+    endpointOn(r, "seg-b").name,
+    deriveEndpointName({}, "router-x", "ovn", "seg-b"),
+  );
+  assertNotEquals(endpointOn(r, "seg-a").name, endpointOn(r, "seg-b").name);
+});
+
+Deno.test("defineOvnRouter: an explicit name overrides the derived name", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const a = net.collisionDomain("seg-a");
+    const b = net.collisionDomain("seg-b");
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-x", (router) => {
+          return {
+            routingDomains: [],
+            endpoints: [
+              router.ovnRouterEndpoint({
+                name: "lrp-home",
+                l2Segment: a,
+                ipaddrs: [IPv4.parse("192.168.1.1/24")],
+              }),
+              router.ovnRouterEndpoint({
+                l2Segment: b,
+                ipaddrs: [IPv4.parse("192.168.2.1/24")],
+              }),
+            ],
+          };
+        }),
+      ],
+    };
+  });
+  const explicit = network.allRouters[0];
+  if (!explicit) throw new Error("expected one router");
+  assertEquals(endpointOn(explicit, "seg-a").name, "lrp-home");
+});
+
+Deno.test("defineOvnRouter: two endpoints with the same explicit name are rejected", () => {
+  assertThrows(
+    () =>
+      defineNetwork("test-net", (net) => {
+        const host = net.localHost("chassis-1");
+        const a = net.collisionDomain("seg-a");
+        const b = net.collisionDomain("seg-b");
+        return {
+          hosts: [host],
+          routers: [
+            net.defineOvnRouter("router-x", (router) => {
+              return {
+                routingDomains: [],
+                endpoints: [
+                  router.ovnRouterEndpoint({
+                    name: "dup",
+                    l2Segment: a,
+                    ipaddrs: [IPv4.parse("192.168.1.1/24")],
+                  }),
+                  router.ovnRouterEndpoint({
+                    name: "dup",
+                    l2Segment: b,
+                    ipaddrs: [IPv4.parse("192.168.2.1/24")],
+                  }),
+                ],
+              };
+            }),
+          ],
+        };
+      }),
+    Error,
+    "same name",
+  );
+});
+
+Deno.test("defineOvnRouter: one explicit endpoint name across two routers is rejected", () => {
+  assertThrows(
+    () =>
+      defineNetwork("test-net", (net) => {
+        const host = net.localHost("chassis-1");
+        const a = net.collisionDomain("seg-a");
+        const b = net.collisionDomain("seg-b");
+        const c = net.collisionDomain("seg-c");
+        const d = net.collisionDomain("seg-d");
+        return {
+          hosts: [host],
+          routers: [
+            net.defineOvnRouter("router-a", (router) => ({
+              routingDomains: [],
+              endpoints: [
+                router.ovnRouterEndpoint({
+                  name: "lrp-shared",
+                  l2Segment: a,
+                  ipaddrs: [IPv4.parse("192.168.1.1/24")],
+                }),
+                router.ovnRouterEndpoint({
+                  l2Segment: b,
+                  ipaddrs: [IPv4.parse("192.168.2.1/24")],
+                }),
+              ],
+            })),
+            net.defineOvnRouter("router-b", (router) => ({
+              routingDomains: [],
+              endpoints: [
+                router.ovnRouterEndpoint({
+                  name: "lrp-shared",
+                  l2Segment: c,
+                  ipaddrs: [IPv4.parse("192.168.3.1/24")],
+                }),
+                router.ovnRouterEndpoint({
+                  l2Segment: d,
+                  ipaddrs: [IPv4.parse("192.168.4.1/24")],
+                }),
+              ],
+            })),
+          ],
+        };
+      }),
+    Error,
+    "unique across the whole network",
+  );
+});
+
+// ── RoutingDomain.routes: calculated vs explicit override ────────────
+// A domain with no explicit routes distributes what its participants
+// actually RESOLVED (anchor + interconnect); a workload NIC on one of its
+// segments inherits that, next-hopped at the segment's gateway.
+Deno.test("routingDomain: calculated routes reach a workload via its segment gateway", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const seg = net.collisionDomain("seg-a");
+    const bseg = net.collisionDomain("seg-b");
+    const bb = net.collisionDomain("bb");
+    const d = net.routingDomain("D");
+    const svc = net.service("svc", (s) => {
+      s.image = "img";
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-a", (r) => ({
+          routingDomains: [d],
+          endpoints: [
+            r.ovnRouterEndpoint((ep) => ({
+              l2Segment: seg,
+              ipaddrs: [IPv4.parse("10.0.0.1/24")],
+              ifaces: [
+                {
+                  host,
+                  iface: { kind: "vlan", vlanParent: "eth0", vlanId: 10 },
+                },
+              ],
+              services: [
+                ep.attachTo(svc, { ipaddrs: [IPv4.parse("10.0.0.9/24")] }),
+              ],
+            })),
+            r.ovnRouterEndpoint({
+              l2Segment: bb,
+              ipaddrs: [IPv4.parse("172.16.0.1/16")],
+            }),
+          ],
+        })),
+        // The anchor: router-b's segment endpoint declares the default, so
+        // domain D resolves a default route for its participants.
+        net.defineOvnRouter("router-b", (r) => ({
+          routingDomains: [d],
+          endpoints: [
+            r.ovnRouterEndpoint({
+              l2Segment: bseg,
+              ipaddrs: [IPv4.parse("10.1.0.1/24")],
+              routes: [
+                {
+                  dst: IPv4.parse("0.0.0.0/0"),
+                  via: IPv4.parse("10.1.0.254"),
+                },
+              ],
+            }),
+            r.ovnRouterEndpoint({
+              l2Segment: bb,
+              ipaddrs: [IPv4.parse("172.16.0.2/16")],
+            }),
+          ],
+        })),
+      ],
+    };
+  });
+  const router = network.allRouters.find((r) => r.name === "router-a");
+  if (!router) throw new Error("expected router-a");
+  const lrp = node(
+    toIR(network),
+    `ovnrouter:router-a|lrp:${endpointOn(router, "seg-a").name}`,
+  );
+  const refs = (lrp.data as { serviceRefs?: { routes?: unknown }[] })
+    .serviceRefs ?? [];
+  const routes = refs[0]?.routes as { dst: string; via: string }[];
+  // D's calculated set = the anchor's default + the interconnect peer
+  // subnets; the on-link 10.0.0.0/24 is skipped. Everything is next-hopped
+  // at the segment gateway.
+  assertEquals(routes.map((r) => r.dst).sort(), ["0.0.0.0/0", "10.1.0.0/24"]);
+  assertEquals(routes.every((r) => r.via === "10.0.0.1"), true);
+});
+
+Deno.test("routingDomain: explicit routes replace the calculated set", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const seg = net.collisionDomain("seg-a");
+    const bb = net.collisionDomain("bb");
+    const d = net.routingDomain("D", {
+      routes: [{ dst: IPv4.parse("192.168.129.0/24") }],
+    });
+    const svc = net.service("svc", (s) => {
+      s.image = "img";
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-a", (r) => ({
+          routingDomains: [d],
+          endpoints: [
+            r.ovnRouterEndpoint((ep) => ({
+              l2Segment: seg,
+              ipaddrs: [IPv4.parse("10.0.0.1/24")],
+              ifaces: [
+                {
+                  host,
+                  iface: { kind: "vlan", vlanParent: "eth0", vlanId: 10 },
+                },
+              ],
+              services: [
+                ep.attachTo(svc, { ipaddrs: [IPv4.parse("10.0.0.9/24")] }),
+              ],
+            })),
+            r.ovnRouterEndpoint({
+              l2Segment: bb,
+              ipaddrs: [IPv4.parse("172.16.0.1/16")],
+            }),
+          ],
+        })),
+      ],
+    };
+  });
+  const router = network.allRouters[0];
+  if (!router) throw new Error("expected one router");
+  const lrp = node(
+    toIR(network),
+    `ovnrouter:router-a|lrp:${endpointOn(router, "seg-a").name}`,
+  );
+  const refs = (lrp.data as { serviceRefs?: { routes?: unknown }[] })
+    .serviceRefs ?? [];
+  // Exactly the declared prefix — no default alongside it.
+  assertEquals(refs[0]?.routes, [
+    { dst: "192.168.129.0/24", via: "10.0.0.1", metric: 100 },
+  ]);
+});
+
+Deno.test("routingDomain: a dst the attachment is on-link for is skipped", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const seg = net.collisionDomain("seg-a");
+    const bb = net.collisionDomain("bb");
+    const d = net.routingDomain("D", {
+      routes: [{ dst: IPv4.parse("10.0.0.0/24") }],
+    });
+    const svc = net.service("svc", (s) => {
+      s.image = "img";
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-a", (r) => ({
+          routingDomains: [d],
+          endpoints: [
+            r.ovnRouterEndpoint((ep) => ({
+              l2Segment: seg,
+              ipaddrs: [IPv4.parse("10.0.0.1/24")],
+              ifaces: [
+                {
+                  host,
+                  iface: { kind: "vlan", vlanParent: "eth0", vlanId: 10 },
+                },
+              ],
+              services: [
+                ep.attachTo(svc, { ipaddrs: [IPv4.parse("10.0.0.9/24")] }),
+              ],
+            })),
+            r.ovnRouterEndpoint({
+              l2Segment: bb,
+              ipaddrs: [IPv4.parse("172.16.0.1/16")],
+            }),
+          ],
+        })),
+      ],
+    };
+  });
+  const router = network.allRouters[0];
+  if (!router) throw new Error("expected one router");
+  const lrp = node(
+    toIR(network),
+    `ovnrouter:router-a|lrp:${endpointOn(router, "seg-a").name}`,
+  );
+  const refs = (lrp.data as { serviceRefs?: { routes?: unknown }[] })
+    .serviceRefs ?? [];
+  // On-link, so the connected route already covers it — nothing emitted.
+  assertEquals(refs[0]?.routes, undefined);
+});
+
+Deno.test("workload routes: a prefix reached from two NICs stays on both (per-NIC tables)", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const segA = net.collisionDomain("seg-a");
+    const segB = net.collisionDomain("seg-b");
+    // Both domains distribute the same destination — e.g. ControlPlane-Route
+    // and Zerotier-route both reaching the management subnet. The
+    // deployer puts each NIC's routes in their OWN table (selected by a
+    // source rule), so both are kept rather than one being dropped.
+    const d1 = net.routingDomain("D1", {
+      routes: [{ dst: IPv4.parse("10.5.0.0/24") }],
+    });
+    const d2 = net.routingDomain("D2", {
+      routes: [{ dst: IPv4.parse("10.5.0.0/24") }],
+    });
+    const svc = net.service("svc", (s) => {
+      s.image = "img";
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-a", (r) => ({
+          routingDomains: [d1, d2],
+          endpoints: [
+            r.ovnRouterEndpoint((ep) => ({
+              l2Segment: segA,
+              ipaddrs: [IPv4.parse("10.0.0.1/24")],
+              ifaces: [
+                {
+                  host,
+                  iface: { kind: "vlan", vlanParent: "eth0", vlanId: 10 },
+                },
+              ],
+              services: [
+                ep.attachTo(svc, { ipaddrs: [IPv4.parse("10.0.0.9/24")] }),
+              ],
+            })),
+            r.ovnRouterEndpoint((ep) => ({
+              l2Segment: segB,
+              ipaddrs: [IPv4.parse("10.1.0.1/24")],
+              ifaces: [
+                {
+                  host,
+                  iface: { kind: "vlan", vlanParent: "eth0", vlanId: 11 },
+                },
+              ],
+              services: [
+                ep.attachTo(svc, { ipaddrs: [IPv4.parse("10.1.0.9/24")] }),
+              ],
+            })),
+          ],
+        })),
+      ],
+    };
+  });
+  const router = network.allRouters[0];
+  if (!router) throw new Error("expected one router");
+  const nodes = toIR(network);
+  const withRoute = router.endpoints.filter((ep) => {
+    const lrp = node(nodes, `ovnrouter:router-a|lrp:${ep.name}`);
+    const refs = (lrp.data as {
+      serviceRefs?: { routes?: { dst: string }[] }[];
+    }).serviceRefs ?? [];
+    return (refs[0]?.routes ?? []).some((r) => r.dst === "10.5.0.0/24");
+  });
+  assertEquals(withRoute.length, 2);
+});
+
+// ── platform builders (dnsProvider real; certIssuer/createPlatform stubs) ──
+Deno.test("platform: dnsProvider is a plain object, unique by name", () => {
+  let provider: DnsProvider | undefined;
+  defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    provider = net.dnsProvider("cloudflare", {
+      kind: "cloudflare",
+      token: "cf-token",
+    });
+    assertThrows(
+      () =>
+        net.dnsProvider("cloudflare", { kind: "cloudflare", token: "other" }),
+      Error,
+      "declared more than once",
+    );
+    return { hosts: [host], routers: [] };
+  });
+  assertEquals(provider?.name, "cloudflare");
+  assertEquals(provider?.spec, { kind: "cloudflare", token: "cf-token" });
+});
+
+Deno.test("platform: createPlatform is a dummy carrying ingressService + publish", () => {
+  let platform: Platform | undefined;
+  defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const controlPlane = net.collisionDomain("control-plane");
+    platform = net.createPlatform("mam-hh-platform", {
+      controlPlane: { collisionDomain: controlPlane, hosts: [host] },
+      zones: [],
+    });
+    return { hosts: [host], routers: [] };
+  });
+  assertEquals(platform?.name, "mam-hh-platform");
+  assertEquals(platform?.ingressService.name, "mam-hh-platform-ingress");
+  const published = platform?.publish({
+    host: "ui.adviser.com",
+    port: "webui",
+  });
+  assertEquals(published?.host, "ui.adviser.com");
+  assertEquals(published?.platform, platform);
+});
+
+Deno.test("platform: attachTo(ingressService) injects endpoint + service into publish", () => {
+  let platform: Platform | undefined;
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const management = net.collisionDomain("management-v2");
+    const bb = net.collisionDomain("bb");
+    const controlPlane = net.collisionDomain("control-plane");
+    platform = net.createPlatform("plat", {
+      controlPlane: { collisionDomain: controlPlane, hosts: [host] },
+      zones: [],
+    });
+    return {
+      hosts: [host],
+      routers: [
+        net.defineOvnRouter("router-management-v2", (r) => ({
+          routingDomains: [],
+          endpoints: [
+            r.ovnRouterEndpoint((ep) => ({
+              l2Segment: management,
+              ipaddrs: [IPv4.parse("192.168.129.1/24")],
+              services: [
+                ep.attachTo(platform!.ingressService, {
+                  ipaddrs: [IPv4.parse("192.168.129.33/24")],
+                  publish: [
+                    platform!.publish({
+                      host: "ui.adviser.com",
+                      port: "webui",
+                    }),
+                  ],
+                }),
+              ],
+            })),
+            r.ovnRouterEndpoint({
+              l2Segment: bb,
+              ipaddrs: [IPv4.parse("172.16.0.1/16")],
+            }),
+          ],
+        })),
+      ],
+    };
+  });
+  const router = network.allRouters[0];
+  if (!router) throw new Error("expected one router");
+  const lrp = endpointOn(router, "management-v2");
+  const attach = (lrp.services ?? []).find((s) => s.kind === "service.attach");
+  const publish = (attach as { publish?: readonly Publish[] } | undefined)
+    ?.publish;
+  assertEquals(publish?.[0]?.host, "ui.adviser.com");
+  // The injected endpoint is the pre-`services` base (same object
+  // EndpointService.endpoint carries), so compare by identity-of-name.
+  assertEquals(publish?.[0]?.endpoint?.name, lrp.name);
+  assertEquals(publish?.[0]?.service?.name, "plat-ingress");
+  // The reusable service records the attachment back-reference.
+  assertEquals(platform?.ingressService.endpointRefs.length, 1);
 });

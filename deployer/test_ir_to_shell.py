@@ -24,6 +24,7 @@ import importlib
 import io
 import os
 import shlex
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -197,34 +198,76 @@ class ClusterScriptCreateTest(unittest.TestCase):
     def setUp(self) -> None:
         self.cluster, self.hosts = mod.build_scripts(NODES, "create")
 
-    def test_no_may_exist_anywhere(self) -> None:
-        self.assertNotIn("--may-exist", self.cluster)
+    def test_every_cluster_add_is_idempotent(self) -> None:
+        # The create pass must be re-runnable (README's idempotency
+        # guarantee): every add carries --may-exist so a second run
+        # doesn't abort on objects that already exist (2026-09-19).
+        self.assertIn("ovn-nbctl --may-exist ls-add home", self.cluster)
+        self.assertIn("ovn-nbctl --may-exist lr-add router-home", self.cluster)
+        self.assertIn("ovn-nbctl --may-exist lrp-add router-home", self.cluster)
+        self.assertIn("ovn-nbctl --may-exist lsp-add", self.cluster)
 
     def test_ls_add_for_every_switch(self) -> None:
-        self.assertIn("ovn-nbctl ls-add home", self.cluster)
-        self.assertIn("ovn-nbctl ls-add backbone", self.cluster)
+        self.assertIn("ovn-nbctl --may-exist ls-add home", self.cluster)
+        self.assertIn("ovn-nbctl --may-exist ls-add backbone", self.cluster)
 
     def test_lr_add_exactly_once_for_a_two_sided_router(self) -> None:
         # Regression: the removed TypeScript generator called lr-add
         # once per endpoint (left AND right), which only worked because
-        # --may-exist silently no-op'd the second call. Without it, a
-        # second unconditional lr-add on the same router would error.
-        self.assertEqual(self.cluster.count("ovn-nbctl lr-add router-home"), 1)
+        # --may-exist silently no-op'd the second call. The deployer
+        # emits it exactly once for the router.
+        self.assertEqual(self.cluster.count("ovn-nbctl --may-exist lr-add router-home"), 1)
 
     def test_gateway_chassis_pin_only_on_the_pinned_side(self) -> None:
+        # The pin names the chassis's RUNTIME system-id, resolved by an
+        # `ovn-sbctl` lookup on the hostname the host pass registered —
+        # NOT the IR host name, which `lrp-set-gateway-chassis` can never
+        # match (confirmed live 2026-09-19). The lookup runs once, before
+        # the first pin, and a `test -n` guards the empty result.
         self.assertIn(
-            "ovn-nbctl lrp-set-gateway-chassis lrp-router-home-left chassis-1 100", self.cluster
+            "OVN_CHASSIS_chassis_1=$(ovn-sbctl --bare --columns=name find Chassis hostname=chassis-1)",
+            self.cluster,
+        )
+        self.assertIn('test -n "$OVN_CHASSIS_chassis_1"', self.cluster)
+        self.assertIn(
+            'ovn-nbctl lrp-set-gateway-chassis lrp-router-home-left "$OVN_CHASSIS_chassis_1" 100',
+            self.cluster,
         )
         self.assertNotIn("lrp-set-gateway-chassis lrp-router-home-right", self.cluster)
+        # the lookup precedes the pin it feeds
+        self.assertLess(
+            self.cluster.index("find Chassis hostname=chassis-1"),
+            self.cluster.index("lrp-set-gateway-chassis lrp-router-home-left"),
+        )
+
+    def test_host_pass_registers_its_topology_hostname(self) -> None:
+        # The cluster pass's chassis lookup keys on this external_id, so
+        # the host pass must set it to the IR host name (not OVS's auto
+        # FQDN).
+        _, create_hosts = mod.build_scripts(NODES, "create")
+        self.assertIn(
+            "ovs-vsctl set open_vswitch . external-ids:hostname=chassis-1",
+            create_hosts["chassis-1"],
+        )
+        self.assertIn(
+            "ovs-vsctl set open_vswitch . external-ids:hostname=central-1",
+            create_hosts["central-1"],
+        )
+        _, delete_hosts = mod.build_scripts(NODES, "delete")
+        self.assertIn(
+            "ovs-vsctl remove open_vswitch . external-ids hostname",
+            delete_hosts["chassis-1"],
+        )
 
     def test_lrp_add_carries_mac_and_addresses(self) -> None:
         self.assertIn(
-            "ovn-nbctl lrp-add router-home lrp-router-home-left 00:00:00:00:01:01 192.168.1.1/24",
+            "ovn-nbctl --may-exist lrp-add router-home lrp-router-home-left "
+            "00:00:00:00:01:01 192.168.1.1/24",
             self.cluster,
         )
 
     def test_switch_side_lsp_bound_to_the_right_lrp(self) -> None:
-        self.assertIn("ovn-nbctl lsp-add home lsp-router-home-left", self.cluster)
+        self.assertIn("ovn-nbctl --may-exist lsp-add home lsp-router-home-left", self.cluster)
         self.assertIn(
             "ovn-nbctl lsp-set-options lsp-router-home-left router-port=lrp-router-home-left",
             self.cluster,
@@ -295,7 +338,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
         self.cluster, self.hosts = mod.build_scripts(NODES, "create")
 
     def test_localnet_lsp_emitted_only_for_the_bound_domain(self) -> None:
-        self.assertIn("ovn-nbctl lsp-add home lsp-home-localnet", self.cluster)
+        self.assertIn("ovn-nbctl --may-exist lsp-add home lsp-home-localnet", self.cluster)
         self.assertIn("ovn-nbctl lsp-set-type lsp-home-localnet localnet", self.cluster)
         self.assertIn("ovn-nbctl lsp-set-addresses lsp-home-localnet unknown", self.cluster)
         self.assertIn(
@@ -305,14 +348,17 @@ class IfaceBindingCreateTest(unittest.TestCase):
 
     def test_vlan_created_and_brought_up_on_the_owning_host(self) -> None:
         script = self.hosts["chassis-1"]
+        # The create is guarded so a re-run tolerates the VLAN already
+        # existing (`ip link add` has no --may-exist).
+        self.assertIn("ip link show eth0.129", script)
         self.assertIn("ip link add link eth0 name eth0.129 type vlan id 129", script)
         self.assertIn("ip link set eth0.129 up", script)
 
     def test_bridge_created_and_port_attached_on_the_owning_host(self) -> None:
         script = self.hosts["chassis-1"]
-        self.assertIn("ovs-vsctl add-br br-home", script)
+        self.assertIn("ovs-vsctl --may-exist add-br br-home", script)
         self.assertIn("ovs-vsctl set bridge br-home fail-mode=standalone", script)
-        self.assertIn("ovs-vsctl add-port br-home eth0.129", script)
+        self.assertIn("ovs-vsctl --may-exist add-port br-home eth0.129", script)
 
     def test_veth_root_leg_brought_up_before_joining_the_bridge(self) -> None:
         # A transit domain's ovn.ls carries the veth pair; the kernel
@@ -345,7 +391,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
         self.assertIn("ip link set veth-ovn-9adb1d up", script)
         self.assertLess(
             script.index("ip link set veth-ovn-9adb1d up"),
-            script.index("ovs-vsctl add-port br-1f5b95ad veth-ovn-9adb1d"),
+            script.index("ovs-vsctl --may-exist add-port br-1f5b95ad veth-ovn-9adb1d"),
         )
 
     def test_bridge_mapping_set_on_the_owning_host(self) -> None:
@@ -376,7 +422,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
         )
         _, hosts = mod.build_scripts(nodes, "create")
         script = hosts["chassis-1"]
-        self.assertIn("ovs-vsctl add-br br-8d8c0a55", script)
+        self.assertIn("ovs-vsctl --may-exist add-br br-8d8c0a55", script)
         self.assertIn(
             "external-ids:ovn-bridge-mappings=net-home:br-8d8c0a55",
             script,
@@ -387,8 +433,13 @@ class IfaceBindingCreateTest(unittest.TestCase):
         self.assertNotIn("add-br", script)
         self.assertNotIn("ovn-bridge-mappings", script)
 
-    def test_no_may_exist_in_binding_commands(self) -> None:
-        self.assertNotIn("--may-exist", self.hosts["chassis-1"])
+    def test_binding_adds_are_idempotent(self) -> None:
+        # Re-running the create pass must not abort on an existing
+        # bridge/port/VLAN (2026-09-19).
+        script = self.hosts["chassis-1"]
+        self.assertIn("ovs-vsctl --may-exist add-br", script)
+        self.assertIn("ovs-vsctl --may-exist add-port", script)
+        self.assertIn("ip link show eth0.129", script)
 
 
 class IfaceBindingDeleteTest(unittest.TestCase):
@@ -758,6 +809,10 @@ class KernelRouterCreateTest(unittest.TestCase):
                     data=dataclasses.replace(
                         n.data,
                         dependencies=[
+                            "arp",
+                            "ping",
+                            "traceroute",
+                            "curl",
                             "ovn",
                             "ovs",
                             "ip",
@@ -782,12 +837,71 @@ class KernelRouterCreateTest(unittest.TestCase):
         self.assertIn("apt-get install -y isc-dhcp-client", script)
         # zerotier's curl installer runs via sh -c so the pipe is argv-safe.
         self.assertIn("sh -c 'curl -s https://install.zerotier.com | bash'", script)
+        # base debugging tools come along on every host (arp/ifconfig from
+        # net-tools, ping, traceroute, curl).
+        self.assertIn("apt-get install -y net-tools", script)
+        self.assertIn("apt-get install -y iputils-ping", script)
+        self.assertIn("apt-get install -y traceroute", script)
+        self.assertIn("apt-get install -y curl", script)
         # dependencies come before any OVS/OVN work.
         self.assertLess(script.index("apt-get update"), script.index("ovs-vsctl"))
         # delete never uninstalls.
         _, delete_hosts = mod.build_scripts(nodes, "delete")
         delete_script = delete_hosts["chassis-1"]
         self.assertNotIn("apt-get install", delete_script)
+
+    def test_base_deps_from_the_generator_map_to_packages(self) -> None:
+        # The base tooling is a GENERATOR concern: src/ir.ts's
+        # hostDependencies always emits the abstract capabilities
+        # (arp/ping/traceroute/curl); the deployer only maps them to the
+        # distro packages (2026-09-19). A host the IR lists no deps for
+        # gets no apt at all.
+        nodes = [
+            (
+                dataclasses.replace(
+                    n,
+                    data=dataclasses.replace(
+                        n.data,
+                        dependencies=["arp", "ping", "traceroute", "curl"],
+                    ),
+                )
+                if n.kind == "infra.host" and n.key.host == "central-1"
+                else n
+            )
+            for n in NODES
+        ]
+        _, hosts = mod.build_scripts(nodes, "create")
+        script = hosts["central-1"]
+        self.assertIn("apt-get install -y net-tools", script)
+        self.assertIn("apt-get install -y iputils-ping", script)
+        self.assertIn("apt-get install -y traceroute", script)
+        self.assertIn("apt-get install -y curl", script)
+        self.assertNotIn("apt-get", hosts["chassis-1"])
+
+    def test_central_host_installs_both_ovn_central_and_ovn_host(self) -> None:
+        # A central chassis is ALSO a chassis: it runs OVS and must run
+        # ovn-controller (ovn-host), while additionally hosting the shared
+        # NB/SB DBs + northd (ovn-central). Installing only ovn-central
+        # left the central with no controller, so no chassis ever joined
+        # and the fabric carried no traffic (confirmed live 2026-09-19).
+        nodes = [
+            (
+                dataclasses.replace(
+                    n,
+                    data=dataclasses.replace(n.data, dependencies=["ovn"]),
+                )
+                if n.kind == "infra.host"
+                else n
+            )
+            for n in NODES
+        ]
+        _, hosts = mod.build_scripts(nodes, "create")
+        central = hosts["central-1"]
+        self.assertIn("apt-get install -y ovn-central", central)
+        self.assertIn("apt-get install -y ovn-host", central)
+        chassis = hosts["chassis-1"]
+        self.assertIn("apt-get install -y ovn-host", chassis)
+        self.assertNotIn("apt-get install -y ovn-central", chassis)
 
     def test_no_apps_emits_no_dhcp_client_commands(self) -> None:
         # The base fixture has no apps — nothing is started by default.
@@ -1244,6 +1358,48 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         ):
             self.assertIn(marker, src)
 
+    def test_default_create_runs_hosts_before_cluster(self) -> None:
+        # The dependencies-vs-commands ordering bug (2026-09-19): in the
+        # all-in-one run, create must bring up every host FIRST (each host
+        # pass installs its OS dependencies and, on the central, exposes
+        # the NB/SB DBs) and run the cluster-wide ovn-nbctl pass LAST —
+        # otherwise `ovn-nbctl ls-add ...` runs on a host that doesn't
+        # have ovn installed yet. Delete reverses: cluster first.
+        ns = self._exec_runtime()
+        order: list[str] = []
+        ns["cluster_create"] = lambda v, a: order.append("cluster:create")
+        ns["cluster_delete"] = lambda v, a: order.append("cluster:delete")
+        for name, fns in ns["HOSTS"].items():
+            fns["create"] = (lambda n: lambda v, a: order.append(f"host:{n}:create"))(name)
+            fns["delete"] = (lambda n: lambda v, a: order.append(f"host:{n}:delete"))(name)
+
+        with mock.patch.object(sys, "argv", ["deployer", "--action", "create"]):
+            ns["main"]()
+        self.assertEqual(order[-1], "cluster:create")
+        self.assertEqual(
+            sorted(order[:-1]),
+            sorted(f"host:{n}:create" for n in ns["HOSTS"]),
+        )
+
+        order.clear()
+        with mock.patch.object(sys, "argv", ["deployer", "--action", "delete"]):
+            ns["main"]()
+        self.assertEqual(order[0], "cluster:delete")
+        self.assertEqual(
+            sorted(order[1:]),
+            sorted(f"host:{n}:delete" for n in ns["HOSTS"]),
+        )
+
+    def test_cluster_selector_runs_only_the_cluster_pass(self) -> None:
+        ns = self._exec_runtime()
+        order: list[str] = []
+        ns["cluster_create"] = lambda v, a: order.append("cluster:create")
+        for name, fns in ns["HOSTS"].items():
+            fns["create"] = (lambda n: lambda v, a: order.append(f"host:{n}:create"))(name)
+        with mock.patch.object(sys, "argv", ["deployer", "--cluster"]):
+            ns["main"]()
+        self.assertEqual(order, ["cluster:create"])
+
     def test_run_cmd_warns_for_delete_and_aborts_for_create(self) -> None:
         ns = self._exec_runtime()
         stderr = io.StringIO()
@@ -1363,7 +1519,7 @@ class KernelServiceDeployTest(unittest.TestCase):
                 service="kernel.app.container:dns",
                 name="control-plane",
                 ipaddrs=["10.43.0.5/24"],
-                routes=[pt.Route(dst="0.0.0.0/0", via="10.43.0.1")],
+                routes=[pt.Route(dst="0.0.0.0/0", via="10.43.0.1", metric=200)],
             ),
         )
         nodes = list(NODES) + [seg, cp, svc, lrp_seg, lrp_cp]
@@ -1384,10 +1540,17 @@ class KernelServiceDeployTest(unittest.TestCase):
         )
         # Per-NIC source-based policy routing: the route goes into its own
         # table, selected by a rule matching the NIC's own source prefix.
+        # A DEFAULT is additionally placed in `main` (with a metric) so
+        # locally-originated traffic can pick a source at all (2026-09-19).
         self.assertRegex(
             create,
             r'ip netns exec "\$container" ip -4 route add 0\.0\.0\.0/0'
-            r" via 10\.43\.0\.1 table 100\d",
+            r" via 10\.43\.0\.1 metric \d+ table 100\d",
+        )
+        self.assertRegex(
+            create,
+            r'ip netns exec "\$container" ip -4 route add 0\.0\.0\.0/0'
+            r" via 10\.43\.0\.1 metric \d+\n",
         )
         self.assertRegex(
             create,
@@ -1408,6 +1571,36 @@ class KernelServiceDeployTest(unittest.TestCase):
         _, delete_hosts = mod.build_scripts(nodes, "delete")
         delete = delete_hosts["chassis-1"]
         self.assertIn("systemctl disable --now ovn-kernel-service-dns.service", delete)
+
+    def test_service_resolver_renders_docker_dns_flags(self) -> None:
+        # A resolved ServiceRef.resolver becomes `docker run --dns …` (Docker
+        # writes /etc/resolv.conf; nothing is bind-mounted over it).
+        seg = self._ls("container-seg", "br-cont", 1130)
+        svc = pt.KernelAppContainerNode(
+            id="kernel.app.container:dns",
+            kind="kernel.app.container",
+            key=pt.KernelServiceKey(name="dns"),
+            data=pt.KernelAppContainerData(
+                host="host:chassis-1",
+                image="ovn-fabric-dns",
+                cmd=["/usr/sbin/dnsmasq", "--no-daemon"],
+            ),
+        )
+        lrp = self._lrp(
+            "router-x",
+            "left",
+            "container-seg",
+            pt.ServiceRef(
+                service="kernel.app.container:dns",
+                name="container-seg",
+                ipaddrs=["192.168.50.53/24"],
+                resolver=pt.Resolver(nameservers=["10.43.0.10", "1.1.1.1"]),
+            ),
+        )
+        nodes = list(NODES) + [seg, svc, lrp]
+        _, create_hosts = mod.build_scripts(nodes, "create")
+        create = create_hosts["chassis-1"]
+        self.assertIn("--dns 10.43.0.10 --dns 1.1.1.1", create)
 
     def test_kernel_service_ipv6_routes_use_the_v6_family(self) -> None:
         cp = self._ls("control-plane", "br-cp", 1143)
@@ -1430,10 +1623,11 @@ class KernelServiceDeployTest(unittest.TestCase):
                 name="control-plane",
                 ipaddrs=["10.43.0.5/24", "2600:70ff:b3c0::cb:5/112"],
                 routes=[
-                    pt.Route(dst="192.168.129.0/24", via="10.43.0.1"),
+                    pt.Route(dst="192.168.129.0/24", via="10.43.0.1", metric=100),
                     pt.Route(
                         dst="2600:70ff:b3c0:129::/64",
                         via="2600:70ff:b3c0::cb:1",
+                        metric=100,
                     ),
                 ],
             ),
@@ -1447,7 +1641,7 @@ class KernelServiceDeployTest(unittest.TestCase):
         self.assertRegex(
             create,
             r'ip netns exec "\$container" ip -6 route add 2600:70ff:b3c0:129::/64'
-            r" via 2600:70ff:b3c0::cb:1 table 100\d",
+            r" via 2600:70ff:b3c0::cb:1 metric \d+ table 100\d",
         )
         self.assertRegex(
             create,
@@ -1639,7 +1833,9 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                             "service": "kernel.app.container:dns-129",
                             "name": "control-plane",
                             "ipaddrs": ["10.43.0.129/24"],
-                            "routes": [{"dst": "0.0.0.0/0", "via": "10.43.0.1"}],
+                            "routes": [
+                                {"dst": "0.0.0.0/0", "via": "10.43.0.1", "metric": 200}
+                            ],
                         }
                     ],
                 },
@@ -1663,7 +1859,14 @@ class DnsServiceEndToEndTest(unittest.TestCase):
         self.assertRegex(
             s,
             r'ip netns exec "\$container" ip -4 route add 0\.0\.0\.0/0'
-            r" via 10\.43\.0\.1 table 100\d",
+            r" via 10\.43\.0\.1 metric \d+ table 100\d",
+        )
+        # ...and the same default ALSO in `main` (no table), so unbound
+        # traffic can source-select (2026-09-19).
+        self.assertRegex(
+            s,
+            r'ip netns exec "\$container" ip -4 route add 0\.0\.0\.0/0'
+            r" via 10\.43\.0\.1 metric \d+\n",
         )
         self.assertRegex(
             s,

@@ -11,11 +11,14 @@ import type {
   KernelRouterEndpoint,
   OvnRouterEndpoint,
   OvnRouterEndpointSpec,
+  Publish,
+  Resolver,
   RouterEndpointRoute,
   RouterEndpointService,
   RoutingDomain,
   SecurityGroup,
   Service,
+  ServiceFile,
   TunnelRouterEndpoint,
 } from "./types.ts";
 
@@ -134,6 +137,17 @@ export interface EndpointBuilder {
     attachment: {
       readonly ipaddrs: readonly (IPv4 | IPv6)[];
       readonly routes?: readonly RouterEndpointRoute[];
+      /** Default metric for THIS NIC's routes (lower wins) — ranks a
+       * workload's default routes, e.g. management-v2 over a control-plane
+       * fallback. A route's own `metric` still wins; neither set → the
+       * generator assigns one by execution order (2026-09-19). */
+      readonly metric?: number;
+      /** DNS resolver for this NIC (wins over the control-plane default).
+       * See Resolver (types.ts). */
+      readonly resolver?: Resolver;
+      /** Name + cert bindings, created via platform.publish(...). The
+       * builder injects `endpoint` + `service` at attach time. */
+      readonly publish?: readonly Publish[];
     },
   ): Extract<RouterEndpointService, { kind: "service.attach" }>;
 }
@@ -157,6 +171,10 @@ export type OvnEndpointFn = (
 export interface ServiceBuilder {
   image: string;
   cmd?: string | readonly string[];
+  /** Files put into the workload's filesystem — see Service.files. */
+  files?: readonly ServiceFile[];
+  /** Environment variables for the container — see Service.env. */
+  env?: Readonly<Record<string, string>>;
   build?: {
     readonly from: string;
     readonly packages?: readonly string[];

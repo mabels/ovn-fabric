@@ -121,7 +121,18 @@ export function buildOvnRouterEndpoint(
       // the service — the wired entry itself ({ ...service, endpoint }) —
       // so the service points back at the endpoints that attach it.
       if (entry.kind === "service.attach") {
-        entry.srvRef.endpointRefs.push(entry);
+        // Inject the ENDPOINT and its SERVICE into every publish this
+        // attachment carries (same pattern as EndpointService.endpoint):
+        // a publish is authored as platform.publish(spec) — carrying the
+        // platform — and only learns where it is attached HERE.
+        const publish = entry.publish?.map((item) => ({
+          ...item,
+          endpoint,
+          service: entry.srvRef,
+        }));
+        const attached = publish ? { ...entry, publish } : entry;
+        entry.srvRef.endpointRefs.push(attached);
+        return attached;
       }
       return entry;
     }),

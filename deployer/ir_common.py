@@ -39,11 +39,14 @@
 # infra.host facts (chassis registration) are inherently per-host —
 # those go in that host's own script, run ON that host.
 #
-# action="create": plain adds (ladops.ovn.lr_add_argv/ls_add_argv/
-# lrp_add_argv/lsp_add_router_argv — none of them take --may-exist). A
-# caller that doesn't know whether an object already exists should diff
-# against live state first (the reconciler's job), not paper over it
-# with an idempotency flag baked into the generated script.
+# action="create": idempotent adds — ladops' builders carry --may-exist
+# (ls-add/lr-add/lrp-add/lsp-add/lr-route-add) and the host side carries
+# it on ovs-vsctl add-br/add-port, with a `ip link show || ip link add`
+# guard for host-level VLANs. The create pass is meant to be re-run as a
+# blunt "make it so" (README's idempotency guarantee): a second run used
+# to abort on the first object that already existed (confirmed live
+# 2026-09-19). Diffing real drift is still the reconciler's job; the
+# generated pass just never errors on "already there".
 # action="delete": ladops' own --if-exists deletes (lr_del_argv/
 # ls_del_argv — both cascade their own ports, see ladops/ovn.py) — a
 # delete-everything pass naturally revisits objects an earlier pass
@@ -92,6 +95,34 @@ Action = str  # "create" | "delete"
 _BINDABLE_IFACE_KINDS = {"vlan", "physical", "veth"}
 
 
+class Ref:
+    """A runtime VARIABLE reference inside an emitted command's argv —
+    e.g. a chassis id resolved at runtime via `ovs-vsctl`/`ovn-sbctl`
+    (see lrp_set_gateway_chassis below). Rendering is backend-specific:
+    the shell front-end emits `$NAME`, the Python front-end emits the
+    Python variable `NAME` — never a quoted literal. Everything else in
+    an argv is a plain string."""
+
+    __slots__ = ("name",)
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+def _shell_token(token: str | Ref) -> str:
+    """One argv token for the SHELL front-end: a `Ref` becomes `"$NAME"`
+    (left for the shell to expand, double-quoted so word splitting/globbing
+    can't touch the value), anything else is quoted."""
+    return f'"${token.name}"' if isinstance(token, Ref) else shlex.quote(token)
+
+
+def _python_token(token: str | Ref) -> str:
+    """One argv token for the PYTHON front-end: a `Ref` becomes the bare
+    Python variable name, anything else a `repr` literal."""
+    return token.name if isinstance(token, Ref) else repr(token)
+
+
+
 def _sh(argv: list[str]) -> str:
     return shlex.join(argv)
 
@@ -125,11 +156,19 @@ class Emitter:
         backend has no envelope and never calls this."""
         self.lines.append(text)
 
-    def sh(self, argv: list[str], background: bool = False, optional: bool = False) -> None:
+    def sh(self, argv: list[str | Ref], background: bool = False, optional: bool = False) -> None:
         """`optional=True`: this command failing must NOT stop the rest of
         the pass — it is reported and skipped. Used for per-unit
         `systemctl enable --now` so one broken workload/router can't block
-        every other operation (2026-09-16)."""
+        every other operation (2026-09-16). An argv token may be a `Ref`
+        (see above), rendered as a runtime variable."""
+        raise NotImplementedError
+
+    def capture(self, var: str, argv: list[str]) -> None:
+        """Run `argv` and bind its trimmed stdout to the runtime variable
+        `var`, for later use as a `Ref(var)` in an argv — the only way a
+        command can consume a value that only exists on the target host
+        (e.g. a chassis's OVS `system-id`)."""
         raise NotImplementedError
 
     def append(self, path: str, content: str) -> None:
@@ -151,8 +190,8 @@ class _ShellBody(Emitter):
     appends, never Python. `background=True` is only meaningful here —
     the outer front-ends ignore it."""
 
-    def sh(self, argv: list[str], background: bool = False, optional: bool = False) -> None:
-        line = shlex.join(argv) + (" &" if background else "")
+    def sh(self, argv: list[str | Ref], background: bool = False, optional: bool = False) -> None:
+        line = " ".join(_shell_token(token) for token in argv) + (" &" if background else "")
         self.lines.append(line + (" || true" if optional else ""))
 
     def append(self, path: str, content: str) -> None:
@@ -330,7 +369,7 @@ def _emit_router(
     router: str,
     ports: list[pt.OvnLrpNode],
     routes: list[RouteNode],
-    host_names: dict[str, str],
+    chassis_refs: dict[str, Ref],
     domain_names: dict[str, str],
     emit: Emitter,
 ) -> None:
@@ -378,7 +417,10 @@ def _emit_router(
         for argv in ovn_ops.lsp_add_router_argv(domain, lsp, lrp):
             emit.sh(argv)
         if data.gatewayChassis is not None:
-            chassis = host_names[data.gatewayChassis]
+            # A runtime `Ref` to the chassis's system-id, resolved once in
+            # _emit_gateway_chassis_refs — NOT the IR host name, which
+            # lrp-set-gateway-chassis can never match.
+            chassis = chassis_refs[data.gatewayChassis]
             emit.sh(ovn_ops.lrp_set_gateway_chassis_argv(lrp, chassis))
             emit.sh(ovn_ops.lrp_set_redirect_chassis_argv(lrp))
         if data.ipv6RaConfigs is not None:
@@ -386,6 +428,50 @@ def _emit_router(
                 emit.sh(ovn_ops.lrp_set_ipv6_ra_config_argv(lrp, key, value))
     _emit_router_routes(router, routes, emit)
     emit.blank()
+
+
+def _chassis_var(host_name: str) -> str:
+    """A safe runtime-variable name for one host's chassis id (`Chassis.name`,
+    i.e. the OVS `system-id`) — see `_emit_gateway_chassis_refs`."""
+    safe = "".join(c if c.isalnum() else "_" for c in host_name)
+    return f"OVN_CHASSIS_{safe}"
+
+
+def _emit_gateway_chassis_refs(
+    nodes: list[pt.Model], host_names: dict[str, str], emit: Emitter
+) -> dict[str, Ref]:
+    """Resolve every host a router port pins as gateway chassis to its
+    RUNTIME `Chassis.name` (the OVS `system-id`), one captured variable
+    per distinct host, and return host-id -> `Ref`.
+
+    `lrp-set-gateway-chassis` matches `Chassis.name` — never the host
+    name or the reported hostname — and that name is a per-host generated
+    UUID, so it cannot be baked into the generated script (confirmed live
+    2026-09-19: every pin naming a host name silently created no SB
+    `Gateway_Chassis` row, leaving the chassis with zero local datapaths
+    and the whole localnet fabric with no flows). Each host registers
+    `external_ids:hostname=<IR host name>` (see _emit_host), so the SB
+    lookup by that hostname is what bridges the IR's stable host name to
+    the runtime system-id. The `test -n` guard makes an unregistered
+    chassis fail loudly instead of pinning an empty name."""
+    host_ids = sorted(
+        {
+            n.data.gatewayChassis
+            for n in nodes
+            if n.kind == "ovn.lrp" and n.data.gatewayChassis is not None
+        }
+    )
+    refs: dict[str, Ref] = {}
+    for host_id in host_ids:
+        host_name = host_names[host_id]
+        var = _chassis_var(host_name)
+        emit.comment(f"# --- chassis id for {host_name} (resolved on this host) ---")
+        emit.capture(var, ovn_ops.sb_chassis_id_by_hostname_argv(host_name))
+        emit.sh(["test", "-n", Ref(var)])
+        refs[host_id] = Ref(var)
+    if refs:
+        emit.blank()
+    return refs
 
 
 def _emit_cluster_body(nodes: list[pt.Model], emit: Emitter) -> None:
@@ -408,12 +494,15 @@ def _emit_cluster_body(nodes: list[pt.Model], emit: Emitter) -> None:
             _emit_logical_switch(node, emit)
             if node.key.name in bindable_domains:
                 _emit_localnet_lsp_create(node.key.name, emit)
+        # Runtime chassis-id lookups must run before any router pins a
+        # gateway chassis to them.
+        chassis_refs = _emit_gateway_chassis_refs(nodes, host_names, emit)
         for router in routers:
             _emit_router(
                 router,
                 router_groups[router],
                 routes_by_router.get(router, []),
-                host_names,
+                chassis_refs,
                 domain_names,
                 emit,
             )
@@ -423,7 +512,7 @@ def _emit_cluster_body(nodes: list[pt.Model], emit: Emitter) -> None:
                 router,
                 router_groups[router],
                 routes_by_router.get(router, []),
-                host_names,
+                {},
                 domain_names,
                 emit,
             )
@@ -532,7 +621,7 @@ def _apply_side_network(
         argv = linux_net_ops.add_addr_argv(addr, dev)
         emit.sh(netns_ops.netns_exec_argv(argv, netns))
     for route in routes or []:
-        argv = linux_net_ops.add_route_argv(route.dst, dev, route.via)
+        argv = linux_net_ops.add_route_argv(route.dst, dev, route.via, route.metric)
         emit.sh(netns_ops.netns_exec_argv(argv, netns))
     if group is not None:
         _emit_security_group_rules(group, netns, dev, emit)
@@ -1370,7 +1459,9 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
             emit.comment(f"# --- interface: {domain} on {host_name} ({real_name}) ---")
             if iface["kind"] == "vlan":
                 emit.sh(
-                    linux_net_ops.add_vlan_argv(iface["vlanParent"], real_name, iface["vlanId"])
+                    linux_net_ops.ensure_vlan_argv(
+                        iface["vlanParent"], real_name, iface["vlanId"]
+                    )
                 )
                 emit.sh(linux_net_ops.set_link_up_argv(real_name))
             elif iface["kind"] == "veth":
@@ -1406,8 +1497,9 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
 
 
 # Abstract dependency -> concrete distro package (Ubuntu/Debian apt
-# names). `ovn` is role-dependent (ovn-central vs ovn-host) and
-# `zerotier` is its curl installer — both handled specially below.
+# names). `ovn` is role-dependent (always ovn-host, plus ovn-central on
+# the central) and `zerotier` is its curl installer — both handled
+# specially below.
 _PACKAGE_BY_DEP = {
     "ovs": "openvswitch-switch",
     "ip": "iproute2",
@@ -1416,17 +1508,23 @@ _PACKAGE_BY_DEP = {
     "dhcpcd": "dhcpcd",
     "wireguard": "wireguard-tools",
     "docker": "docker.io",
+    # base tooling — abstract names the generator adds to every host
+    # (src/ir.ts's hostDependencies), mapped here like every other dep.
+    "arp": "net-tools",
+    "ping": "iputils-ping",
+    "traceroute": "traceroute",
+    "curl": "curl",
 }
 
 
 def _emit_os_dependencies(host_node: pt.InfraHostNode, emit: Emitter) -> None:
     """Install the host's ABSTRACT dependencies (the IR's `dependencies`
-    list, computed by src/ir.ts's hostDependencies — `ovn`/`ovs`/`ip`/
-    `iptables`/`dhclient`/`dhcpcd`/`wireguard`/`zerotier`/`docker`,
-    deliberately not distro packages) at the very START of the create
-    pass, mapped to the host OS's install form. Always resolved to a
-    concrete OS (assume Ubuntu when the config leaves it unset,
-    2026-08-23); no deinstall ever happens."""
+    list, computed by src/ir.ts's hostDependencies — base tooling plus
+    `ovn`/`ovs`/`ip`/`iptables`/`dhclient`/`dhcpcd`/`wireguard`/
+    `zerotier`/`docker`, deliberately not distro packages) at the very
+    START of the create pass, mapped to the host OS's install form.
+    Always resolved to a concrete OS (assume Ubuntu when the config
+    leaves it unset, 2026-08-23); no deinstall ever happens."""
     deps = host_node.data.dependencies or []
     if not deps:
         return
@@ -1440,13 +1538,28 @@ def _emit_os_dependencies(host_node: pt.InfraHostNode, emit: Emitter) -> None:
                 # pipe survives both front-ends (argv-safe).
                 emit.sh(["sh", "-c", "curl -s https://install.zerotier.com | bash"])
                 continue
-            pkg = _PACKAGE_BY_DEP.get(dep)
             if dep == "ovn":
-                pkg = "ovn-central" if host_node.data.ovnRole == pt.OvnRole.central else "ovn-host"
-            if pkg is None:
-                emit.comment(f'# unknown dependency "{dep}" — skipped')
-                continue
-            emit.sh(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", pkg])
+                # EVERY OVN host runs ovn-controller (ovn-host) — a
+                # central chassis included: it owns OVS bridges and
+                # registers as a gateway chassis too. The central one
+                # ADDITIONALLY hosts the shared NB/SB DBs + northd
+                # (ovn-central). Installing only ovn-central left the
+                # central with no ovn-controller, so no chassis ever
+                # joined the SB DB and the whole fabric carried no
+                # traffic (confirmed live 2026-09-19).
+                pkgs = (
+                    ["ovn-central", "ovn-host"]
+                    if host_node.data.ovnRole == pt.OvnRole.central
+                    else ["ovn-host"]
+                )
+            else:
+                pkg = _PACKAGE_BY_DEP.get(dep)
+                if pkg is None:
+                    emit.comment(f'# unknown dependency "{dep}" — skipped')
+                    continue
+                pkgs = [pkg]
+            for pkg in pkgs:
+                emit.sh(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", pkg])
     else:
         emit.comment(f"# unknown OS {os_name!r} — cannot install dependencies, skipping")
     emit.blank()
@@ -1508,16 +1621,60 @@ def _service_up_lines(
             f"workload is not implemented yet"
         )
     cmd_tokens = " ".join(shlex.quote(t) for t in (node.data.cmd or []))
+    # The workload's in-memory FILESYSTEM (Service.files -> IR): written on
+    # the host and bind-mounted back READ-ONLY, one mount per file — not a
+    # directory mount, so whatever else lives in that container directory
+    # isn't shadowed. Host state lives under /var/lib/ovn-fabric/<service>/
+    # and is removed on `down`.
+    file_mounts = [
+        (
+            f"/var/lib/ovn-fabric/{node.key.name}{f.path}",
+            f.path,
+            f.content,
+        )
+        for f in (node.data.files or [])
+    ]
+    file_lines: list[str] = []
+    for host_path, _container_path, content in file_mounts:
+        parent = host_path.rsplit("/", 1)[0]
+        # content is a string OR its lines (IR-side, for better diffs) —
+        # the heredoc body is the joined lines either way.
+        body = "\n".join(content) if isinstance(content, list) else content
+        file_lines += [
+            f"mkdir -p {shlex.quote(parent)}",
+            # Delimiter distinct from the outer emitters' heredoc markers.
+            f"cat > {shlex.quote(host_path)} << 'OVN_FILE'",
+            body,
+            "OVN_FILE",
+        ]
+    mount_args = "".join(f' -v "{host}:{cpath}:ro"' for host, cpath, _ in file_mounts)
+    # Environment variables (Service.env -> IR), one -e per entry, keys
+    # sorted so the emitted command is stable.
+    env_args = "".join(
+        f" -e {shlex.quote(f'{k}={v}')}" for k, v in sorted((node.data.env or {}).items())
+    )
+    # DNS resolver (ServiceRef.resolver, resolved by the generator:
+    # attachment > control-plane global > CoreDNS). Docker writes
+    # /etc/resolv.conf from --dns; we never bind-mount over it. A container
+    # has ONE resolv.conf, so the FIRST NIC that carries a resolver wins
+    # (2026-09-19).
+    dns_args = ""
+    for _, ref, _, _, _ in faces:
+        resolver = getattr(ref, "resolver", None)
+        if resolver and resolver.nameservers:
+            dns_args = "".join(f" --dns {shlex.quote(ns)}" for ns in resolver.nameservers)
+            break
     lines = [
         f'container="ovn-fabric-{node.key.name}"',
         f'image="{node.data.image}"',
         "",
+        *file_lines,
         *_docker_image_ensure_lines(node.data.build, node.data.image),
         '/usr/bin/docker rm -f "$container" 2>/dev/null || true',
         # The service IS the container's command — `docker run -d` runs it
         # in the background (no sleep + docker exec dance).
         "/usr/bin/docker run -d --privileged --network none --name "
-        f'"$container" "$image" {cmd_tokens}'.rstrip(),
+        f'"$container"{env_args}{mount_args}{dns_args} "$image" {cmd_tokens}'.rstrip(),
         "pid=$(/usr/bin/docker inspect -f '{{.State.Pid}}' \"$container\")",
         "mkdir -p /var/run/netns",
         'ln -sf "/proc/$pid/ns/net" "/var/run/netns/$container"',
@@ -1553,12 +1710,29 @@ def _service_up_lines(
             # destination/source needs an explicit `ip -6` — otherwise the
             # kernel rejects it ("Invalid source address") and `set -e`
             # aborts the rest of the wiring (hit live 2026-09-16).
-            lines += [
-                f'ip netns exec "$container" ip {"-6" if ":" in r.dst else "-4"} route add {r.dst}'
-                + (f" via {r.via}" if r.via is not None else f' dev "{nic}"')
-                + f" table {table}"
-                for r in (ref.routes or [])
-            ]
+            for r in ref.routes:
+                fam = "-6" if ":" in r.dst else "-4"
+                hop = f"via {r.via}" if r.via is not None else f'dev "{nic}"'
+                # The GENERATOR resolves the metric (route > attachment >
+                # domain > execution order) and writes it onto the route, so
+                # the deployer only applies what the IR carries (2026-09-19).
+                metric = "" if r.metric is None else f" metric {int(r.metric)}"
+                lines.append(
+                    f'ip netns exec "$container" ip {fam} route add {r.dst} {hop}'
+                    f"{metric} table {table}"
+                )
+                # A DEFAULT also goes into `main`: the source-based rules
+                # above only match once a source is chosen, and the kernel
+                # picks that source from `main` — without a default there,
+                # locally-originated traffic (dnsmasq→1.1.1.1, coredns→
+                # upstream) is simply "Network is unreachable" even when a
+                # per-NIC table has a default (confirmed live 2026-09-19).
+                # Across NICs the lowest metric wins; source-bound traffic
+                # still hits its own table via the rules.
+                if r.dst in ("0.0.0.0/0", "::/0"):
+                    lines.append(
+                        f'ip netns exec "$container" ip {fam} route add {r.dst} {hop}{metric}'
+                    )
             lines += [
                 f'ip netns exec "$container" ip '
                 f'{"-6" if ":" in n else "-4"} rule add from {n} lookup {table}'
@@ -1584,6 +1758,8 @@ def _service_down_lines(
             f'ip link delete "{dev}" 2>/dev/null || true',
         ]
     lines.append(f'rm -f "/var/run/netns/ovn-fabric-{node.key.name}"')
+    # The host-side filesystem written by `up` (bind-mounted read-only).
+    lines.append(f'rm -rf "/var/lib/ovn-fabric/{node.key.name}"')
     return lines
 
 
@@ -1672,6 +1848,49 @@ def _emit_kernel_services(host_id: str, nodes: list[pt.Model], emit: Emitter) ->
         emit.sh(["systemctl", "enable", "--now", unit], optional=True)
 
 
+def _emit_chassis_registration(
+    host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter
+) -> None:
+    """The OVS `external_ids` a chassis needs to register with OVN —
+    emitted EARLY in the create pass (right after the packages land), so
+    the just-installed `ovn-controller` has time to register while the
+    heavier kernel-router/OVS/service steps below run; the cluster pass
+    then resolves this chassis's runtime `system-id` by the `hostname`
+    set here (see _emit_gateway_chassis_refs)."""
+    data = host_node.data
+    host_name = host_node.key.host
+    if data.ovnRole == pt.OvnRole.central:
+        emit.comment("# central: expose the shared NB/SB DBs to every other chassis")
+        emit.sh(ovn_ops.nb_set_connection_argv())
+        emit.sh(ovn_ops.sb_set_connection_argv())
+        emit.sh(ovs_ops.set_external_id_argv("ovn-remote", "unix:/var/run/ovn/ovnsb_db.sock"))
+    else:
+        central = _find_central_host(nodes)
+        if central is None:
+            raise ValueError(
+                f"host {host_name}: no central chassis declared in this network — "
+                "a chassis needs one to point ovn-remote at"
+            )
+        if central.data.encapIp is None:
+            raise ValueError(
+                f"central host {central.key.host}: no encapIp/address.ipv4/"
+                "address.ipv6 to build ovn-remote from"
+            )
+        emit.sh(ovs_ops.set_external_id_argv("ovn-remote", f"tcp:{central.data.encapIp}:6642"))
+
+    # The topology's own host name (NOT the auto FQDN OVS reports): the
+    # cluster pass looks this chassis up by it to get the system-id, the
+    # only identifier `lrp-set-gateway-chassis` matches (2026-09-19).
+    emit.sh(ovs_ops.set_external_id_argv("hostname", host_name))
+
+    if data.encapIp is not None:
+        emit.sh(ovs_ops.set_external_id_argv("ovn-encap-type", "geneve"))
+        emit.sh(ovs_ops.set_external_id_argv("ovn-encap-ip", data.encapIp))
+
+    if host_name in _gateway_eligible_hosts(nodes):
+        emit.sh(ovs_ops.set_external_id_argv("ovn-cms-options", "enable-chassis-as-gw"))
+
+
 def _emit_host(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter) -> None:
     host_name = host_node.key.host
     data = host_node.data
@@ -1683,6 +1902,7 @@ def _emit_host(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter
             emit.sh(ovn_ops.sb_del_connection_argv())
 
         emit.sh(ovs_ops.remove_external_id_argv("ovn-remote"))
+        emit.sh(ovs_ops.remove_external_id_argv("hostname"))
         if data.encapIp is not None:
             emit.sh(ovs_ops.remove_external_id_argv("ovn-encap-type"))
             emit.sh(ovs_ops.remove_external_id_argv("ovn-encap-ip"))
@@ -1705,37 +1925,15 @@ def _emit_host(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter
     # Dependencies FIRST — nothing below (OVS/OVN, netns, services)
     # works without them; no deinstall ever (2026-08-23).
     _emit_os_dependencies(host_node, emit)
+    # Chassis registration RIGHT AFTER the packages, so ovn-controller
+    # registers while the heavier steps run (the cluster pass resolves
+    # this chassis by the hostname set here).
+    _emit_chassis_registration(host_node, nodes, emit)
     _emit_kernel_router(host_node.id, nodes, emit)
     # The segment bridges must exist (bound by _emit_iface_bindings) before
     # a container's veth can attach — containers come AFTER.
     _emit_iface_bindings(host_name, nodes, emit)
     _emit_kernel_services(host_node.id, nodes, emit)
-
-    if data.ovnRole == pt.OvnRole.central:
-        emit.comment("# central: expose the shared NB/SB DBs to every other chassis")
-        emit.sh(ovn_ops.nb_set_connection_argv())
-        emit.sh(ovn_ops.sb_set_connection_argv())
-        emit.sh(ovs_ops.set_external_id_argv("ovn-remote", "unix:/var/run/ovn/ovnsb_db.sock"))
-    else:
-        central = _find_central_host(nodes)
-        if central is None:
-            raise ValueError(
-                f"host {host_name}: no central chassis declared in this network — "
-                "a chassis needs one to point ovn-remote at"
-            )
-        if central.data.encapIp is None:
-            raise ValueError(
-                f"central host {central.key.host}: no encapIp/address.ipv4/"
-                "address.ipv6 to build ovn-remote from"
-            )
-        emit.sh(ovs_ops.set_external_id_argv("ovn-remote", f"tcp:{central.data.encapIp}:6642"))
-
-    if data.encapIp is not None:
-        emit.sh(ovs_ops.set_external_id_argv("ovn-encap-type", "geneve"))
-        emit.sh(ovs_ops.set_external_id_argv("ovn-encap-ip", data.encapIp))
-
-    if host_name in _gateway_eligible_hosts(nodes):
-        emit.sh(ovs_ops.set_external_id_argv("ovn-cms-options", "enable-chassis-as-gw"))
 
 
 # The shared per-host body emitter — the one entry point both front-ends

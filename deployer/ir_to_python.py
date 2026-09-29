@@ -10,8 +10,12 @@
 #   --cluster                only the cluster-wide ovn-nbctl pass
 #   --host NAME              only that host's pass
 #   --verbose                echo every command before running it
-# With neither --cluster nor --host, everything runs: cluster first,
-# then every host in declaration order.
+# With neither --cluster nor --host, everything runs in ONE order for
+# `create` — every host first (each installs its OS dependencies and, on
+# the central, exposes the NB/SB DBs), then the cluster-wide ovn-nbctl
+# pass, which needs both — and the reverse for `delete`: the cluster
+# topology first, then every host (2026-09-19). Cluster-only (`--cluster`)
+# keeps its plain meaning: run just the cluster pass.
 #
 # Unlike the shell front-end, the generated file is NOT a big shell
 # block embedded verbatim: each emitted operation becomes a direct
@@ -30,7 +34,7 @@ from typing import Callable
 
 from protocol import generated as pt
 
-from .ir_common import Action, Emitter, _emit_cluster_body, _emit_host_script
+from .ir_common import Action, Emitter, Ref, _emit_cluster_body, _emit_host_script, _python_token
 
 
 def _py_str(s: str) -> str:
@@ -59,13 +63,21 @@ class PythonEmitter(Emitter):
         self.label = label
         super().__init__(action)
 
-    def sh(self, argv: list[str], background: bool = False, optional: bool = False) -> None:
+    def sh(self, argv: list[str | Ref], background: bool = False, optional: bool = False) -> None:
         # `background` is only meaningful in the nested shell router-body
         # emitter (_ShellBody) — the Python runtime has no `&` notion.
         # `optional=True` retires the create-action abort for this one
         # command: it warns and continues (the runtime's own policy).
+        # A `Ref` token becomes the bare Python variable of that name, so
+        # the runtime passes the variable's VALUE as one argv element.
         abort = "False" if optional else "abort_on_error"
-        self.lines.append(f"run_cmd({self.label!r}, _sh({argv!r}), verbose, {abort})")
+        tokens = ", ".join(_python_token(token) for token in argv)
+        self.lines.append(f"run_cmd({self.label!r}, _sh([{tokens}]), verbose, {abort})")
+
+    def capture(self, var: str, argv: list[str]) -> None:
+        self.lines.append(
+            f"{var} = capture_cmd({self.label!r}, _sh({argv!r}), verbose, abort_on_error)"
+        )
 
     def append(self, path: str, content: str) -> None:
         self.lines.append(
@@ -80,8 +92,12 @@ _GENERATED_RUNTIME = r"""#!/usr/bin/env python3
 # action (run once, from whichever chassis reaches the shared NB DB) and
 # each per-host OVS/netns action (run on the host itself), for both
 # create and delete. Pick what to run with --action / --cluster / --host;
-# with neither --cluster nor --host, everything runs (cluster first, then
-# each host in declaration order).
+# with neither --cluster nor --host, create runs every host first (each
+# installs its OS dependencies, then brings up OVS/OVN and, on the
+# central, exposes the NB/SB DBs) and the cluster-wide ovn-nbctl pass
+# LAST — it needs ovn-nbctl installed and the central's DBs reachable, so
+# running it first on a fresh host fails (2026-09-19). Delete reverses
+# that: the cluster topology goes first, then the hosts.
 #
 # Every command/file-write is a direct Python call into run_cmd()/
 # write_file() below, each with the same error policy: create aborts on
@@ -137,6 +153,38 @@ def run_cmd(label: str, cmd: str, verbose: bool, abort_on_error: bool) -> None:
         f"{YELLOW}warning: failed in {label}: {cmd}{RESET}",
         file=sys.stderr,
     )
+
+
+def capture_cmd(label: str, cmd: str, verbose: bool, abort_on_error: bool) -> str:
+    # The Emitter.capture() operation at runtime: run `cmd` and return its
+    # trimmed stdout for a later command to use as a value (e.g. a
+    # chassis's OVS system-id). Same error policy as run_cmd(); on any
+    # failure the empty string is returned (the generated `test -n` guard
+    # right after a capture turns that into a loud, explicit failure).
+    if verbose:
+        print(f"{GREEN}{label}$ {cmd}{RESET}")
+    try:
+        proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True)
+    except OSError as exc:
+        detail = f" ({exc.strerror})" if exc.strerror else ""
+        if abort_on_error:
+            print(
+                f"{RED}error: cannot run in {label}{detail}: {cmd}{RESET}",
+                file=sys.stderr,
+            )
+            sys.exit(127)
+        print(
+            f"{YELLOW}warning: cannot run in {label}{detail}: {cmd}{RESET}",
+            file=sys.stderr,
+        )
+        return ""
+    if proc.returncode != 0:
+        if abort_on_error:
+            print(f"{RED}error: failed in {label}: {cmd}{RESET}", file=sys.stderr)
+            sys.exit(proc.returncode)
+        print(f"{YELLOW}warning: failed in {label}: {cmd}{RESET}", file=sys.stderr)
+        return ""
+    return proc.stdout.strip()
 
 
 def write_file(label: str, path: str, content: str, verbose: bool, abort_on_error: bool) -> None:
@@ -196,12 +244,23 @@ def main() -> int:
             )
             return 2
         HOSTS[args.host][args.action](args.verbose, abort_on_error)
-    else:
+    elif args.cluster:
         cluster = cluster_create if args.action == "create" else cluster_delete
         cluster(args.verbose, abort_on_error)
-        if not args.cluster:
-            for name in HOSTS:
-                HOSTS[name][args.action](args.verbose, abort_on_error)
+    elif args.action == "create":
+        # Chassis first: each host's pass installs its OS dependencies and
+        # (on the central) exposes the shared NB/SB DBs. The cluster-wide
+        # ovn-nbctl pass below needs both — running it first on a fresh
+        # host fails with ovn-nbctl missing (2026-09-19).
+        for name in HOSTS:
+            HOSTS[name]["create"](args.verbose, abort_on_error)
+        cluster_create(args.verbose, abort_on_error)
+    else:
+        # Delete reverses create: drop the logical topology first, then
+        # tear every host down.
+        cluster_delete(args.verbose, abort_on_error)
+        for name in HOSTS:
+            HOSTS[name]["delete"](args.verbose, abort_on_error)
     return 0
 
 

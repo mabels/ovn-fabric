@@ -14,7 +14,7 @@ import shlex
 
 from protocol import generated as pt
 
-from .ir_common import Action, Emitter, _emit_cluster_body, _emit_host_script
+from .ir_common import Action, Emitter, Ref, _emit_cluster_body, _emit_host_script, _shell_token
 
 # re-exported so `from deployer.ir_to_shell import generate_python_deployer`
 # (and the tests' `mod.generate_python_deployer`) keeps working without
@@ -40,9 +40,15 @@ class ShellEmitter(Emitter):
     def __init__(self, action: Action) -> None:
         super().__init__(action)
 
-    def sh(self, argv: list[str], background: bool = False, optional: bool = False) -> None:
-        line = shlex.join(argv) + (" &" if background else "")
+    def sh(self, argv: list[str | Ref], background: bool = False, optional: bool = False) -> None:
+        line = " ".join(_shell_token(token) for token in argv) + (" &" if background else "")
         self.lines.append(line + (" || true" if optional else ""))
+
+    def capture(self, var: str, argv: list[str]) -> None:
+        # `VAR=$(cmd)` — the shell expands the command substitution; the
+        # value is a runtime fact (e.g. a chassis's system-id), never
+        # known at generation time.
+        self.lines.append(f"{var}=$({shlex.join(argv)})")
 
     def append(self, path: str, content: str) -> None:
         self.lines.append(f"cat > {path} << 'OVN'")
@@ -60,6 +66,10 @@ def _cluster_script(nodes: list[pt.Model], action: Action) -> str:
     emit.raw("# this action (i.e. diffing against live state) is the")
     emit.raw("# reconciler's job, not this script's — this is one blunt")
     emit.raw(f"# {action}-everything pass.")
+    if action == "create":
+        emit.raw("# NOTE: run the host script(s) FIRST on create — they install")
+        emit.raw("# the OS dependencies (ovn/ovs) and expose the shared DBs this")
+        emit.raw("# pass needs; on a fresh host it fails before those run.")
     # A delete pass runs against whatever state IS there — a
     # missing object is expected, not fatal — so it drops `-e` and
     # keeps going past any failing command (2026-08-18). Create
