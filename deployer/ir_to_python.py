@@ -61,7 +61,28 @@ class PythonEmitter(Emitter):
 
     def __init__(self, label: str, action: Action) -> None:
         self.label = label
+        self._indent = 0
         super().__init__(action)
+
+    def _push(self, line: str) -> None:
+        # Indent by the emitter's current block depth — begin_block()/
+        # end_block() bracket the `if not skip_deps:` guard around the OS
+        # dependency commands. _python_fn adds the function body's own
+        # single level on top of this.
+        self.lines.append(("    " * self._indent + line) if line else "")
+
+    def begin_block(self, header: str) -> None:
+        self._push(header)
+        self._indent += 1
+
+    def end_block(self) -> None:
+        self._indent -= 1
+
+    def comment(self, text: str) -> None:
+        self._push(text)
+
+    def blank(self) -> None:
+        self.lines.append("")
 
     def sh(self, argv: list[str | Ref], background: bool = False, optional: bool = False) -> None:
         # `background` is only meaningful in the nested shell router-body
@@ -72,15 +93,13 @@ class PythonEmitter(Emitter):
         # the runtime passes the variable's VALUE as one argv element.
         abort = "False" if optional else "abort_on_error"
         tokens = ", ".join(_python_token(token) for token in argv)
-        self.lines.append(f"run_cmd({self.label!r}, _sh([{tokens}]), verbose, {abort})")
+        self._push(f"run_cmd({self.label!r}, _sh([{tokens}]), verbose, {abort})")
 
     def capture(self, var: str, argv: list[str]) -> None:
-        self.lines.append(
-            f"{var} = capture_cmd({self.label!r}, _sh({argv!r}), verbose, abort_on_error)"
-        )
+        self._push(f"{var} = capture_cmd({self.label!r}, _sh({argv!r}), verbose, abort_on_error)")
 
     def append(self, path: str, content: str) -> None:
-        self.lines.append(
+        self._push(
             f"write_file({self.label!r}, {path!r}, {_py_str(content)}, verbose, abort_on_error)"
         )
 
@@ -97,7 +116,9 @@ _GENERATED_RUNTIME = r"""#!/usr/bin/env python3
 # central, exposes the NB/SB DBs) and the cluster-wide ovn-nbctl pass
 # LAST — it needs ovn-nbctl installed and the central's DBs reachable, so
 # running it first on a fresh host fails (2026-09-19). Delete reverses
-# that: the cluster topology goes first, then the hosts.
+# that: the cluster topology goes first, then the hosts. --skip-deps
+# drops only the per-host package installation (apt/apk/…), for hosts
+# that already carry the packages.
 #
 # Every command/file-write is a direct Python call into run_cmd()/
 # write_file() below, each with the same error policy: create aborts on
@@ -233,6 +254,11 @@ def main() -> int:
         action="store_true",
         help="echo every command before running it",
     )
+    parser.add_argument(
+        "--skip-deps",
+        action="store_true",
+        help="skip the per-host OS dependency installation (apt/apk/…); use when already present",
+    )
     args = parser.parse_args()
     abort_on_error = args.action == "create"
 
@@ -243,7 +269,7 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
-        HOSTS[args.host][args.action](args.verbose, abort_on_error)
+        HOSTS[args.host][args.action](args.verbose, abort_on_error, args.skip_deps)
     elif args.cluster:
         cluster = cluster_create if args.action == "create" else cluster_delete
         cluster(args.verbose, abort_on_error)
@@ -251,16 +277,17 @@ def main() -> int:
         # Chassis first: each host's pass installs its OS dependencies and
         # (on the central) exposes the shared NB/SB DBs. The cluster-wide
         # ovn-nbctl pass below needs both — running it first on a fresh
-        # host fails with ovn-nbctl missing (2026-09-19).
+        # host fails with ovn-nbctl missing (2026-09-19). --skip-deps
+        # drops only the package installation, keep the rest.
         for name in HOSTS:
-            HOSTS[name]["create"](args.verbose, abort_on_error)
+            HOSTS[name]["create"](args.verbose, abort_on_error, args.skip_deps)
         cluster_create(args.verbose, abort_on_error)
     else:
         # Delete reverses create: drop the logical topology first, then
         # tear every host down.
         cluster_delete(args.verbose, abort_on_error)
         for name in HOSTS:
-            HOSTS[name]["delete"](args.verbose, abort_on_error)
+            HOSTS[name]["delete"](args.verbose, abort_on_error, args.skip_deps)
     return 0
 
 
@@ -269,14 +296,23 @@ if __name__ == "__main__":
 """
 
 
-def _python_fn(name: str, label: str, action: Action, body: Callable[[Emitter], None]) -> str:
+def _python_fn(
+    name: str,
+    label: str,
+    action: Action,
+    body: Callable[[Emitter], None],
+    extra_params: str = "",
+) -> str:
     """One generated function: run `body(emit)` through a PythonEmitter
     carrying `action` (the ONE create/delete parameter) and render its
-    lines as an indented function body."""
+    lines as an indented function body. `extra_params` appends parameters
+    after `verbose, abort_on_error` — the per-host functions take
+    `skip_deps` (see --skip-deps); the cluster pass has no dependencies,
+    so it takes none."""
     emit = PythonEmitter(label, action)
     body(emit)
     body_lines = [f"    {line}" if line else "" for line in emit.lines]
-    return f"def {name}(verbose, abort_on_error):\n" + "\n".join(body_lines) + "\n"
+    return f"def {name}(verbose, abort_on_error{extra_params}):\n" + "\n".join(body_lines) + "\n"
 
 
 def _host_fn_name(host_name: str, action: str) -> str:
@@ -300,7 +336,8 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
                     fn,
                     f"host:{host_name} ({action})",
                     action,
-                    lambda emit, n=node: _emit_host_script(n, nodes, emit),
+                    lambda emit, n=node: _emit_host_script(n, nodes, emit, guard_deps=True),
+                    extra_params=", skip_deps",
                 )
             )
         host_entries.append(

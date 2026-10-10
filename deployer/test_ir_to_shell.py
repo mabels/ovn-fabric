@@ -1340,7 +1340,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             # File writes (the router script + unit) are write_file(), not
             # commands — no-op them so the run_cmd argv stays comparable.
             ns["write_file"] = mock.Mock()
-            ns["_host_chassis_1_create"](False, True)
+            ns["_host_chassis_1_create"](False, True, False)
             argv_seen = [call.args[0] for call in run.call_args_list]
         self.assertEqual(shell_commands, argv_seen)
 
@@ -1351,12 +1351,53 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             "--cluster",
             "--host",
             "--verbose",
+            "--skip-deps",
             "def run_cmd",
             "def write_file",
             "argparse.ArgumentParser",
             'choices=["create", "delete"]',
         ):
             self.assertIn(marker, src)
+
+    def test_skip_deps_omits_only_the_os_dependency_install(self) -> None:
+        # --skip-deps (2026-10-10): the generated deployer runs against a
+        # host whose packages are already present, so the per-host OS
+        # dependency block is wrapped in `if not skip_deps:` — dropping
+        # just the apt installs, not the rest of the create pass.
+        nodes = [
+            (
+                dataclasses.replace(
+                    n,
+                    data=dataclasses.replace(
+                        n.data,
+                        dependencies=["ovn", "ovs", "ip", "iptables"],
+                    ),
+                )
+                if n.kind == "infra.host" and n.key.host == "chassis-1"
+                else n
+            )
+            for n in NODES
+        ]
+        ns: dict = {}
+        exec(mod.generate_python_deployer(nodes), ns)
+
+        def _argv(skip_deps: bool) -> list[str]:
+            seen: list[list[str]] = []
+            with mock.patch("subprocess.run") as run:
+                run.return_value.returncode = 0
+                ns["write_file"] = mock.Mock()
+                ns["_host_chassis_1_create"](False, True, skip_deps)
+                seen = [call.args[0] for call in run.call_args_list]
+            return [" ".join(argv) for argv in seen]
+
+        with_deps = _argv(False)
+        self.assertTrue(any("apt-get install" in line for line in with_deps))
+        # The rest of the create pass still runs (OVS/OVN setup).
+        self.assertTrue(any("ovs-vsctl" in line for line in with_deps))
+
+        skipped = _argv(True)
+        self.assertFalse(any("apt-get" in line for line in skipped))
+        self.assertTrue(any("ovs-vsctl" in line for line in skipped))
 
     def test_default_create_runs_hosts_before_cluster(self) -> None:
         # The dependencies-vs-commands ordering bug (2026-09-19): in the
@@ -1370,8 +1411,8 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         ns["cluster_create"] = lambda v, a: order.append("cluster:create")
         ns["cluster_delete"] = lambda v, a: order.append("cluster:delete")
         for name, fns in ns["HOSTS"].items():
-            fns["create"] = (lambda n: lambda v, a: order.append(f"host:{n}:create"))(name)
-            fns["delete"] = (lambda n: lambda v, a: order.append(f"host:{n}:delete"))(name)
+            fns["create"] = (lambda n: lambda v, a, s: order.append(f"host:{n}:create"))(name)
+            fns["delete"] = (lambda n: lambda v, a, s: order.append(f"host:{n}:delete"))(name)
 
         with mock.patch.object(sys, "argv", ["deployer", "--action", "create"]):
             ns["main"]()
@@ -1395,7 +1436,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         order: list[str] = []
         ns["cluster_create"] = lambda v, a: order.append("cluster:create")
         for name, fns in ns["HOSTS"].items():
-            fns["create"] = (lambda n: lambda v, a: order.append(f"host:{n}:create"))(name)
+            fns["create"] = (lambda n: lambda v, a, s: order.append(f"host:{n}:create"))(name)
         with mock.patch.object(sys, "argv", ["deployer", "--cluster"]):
             ns["main"]()
         self.assertEqual(order, ["cluster:create"])

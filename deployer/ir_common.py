@@ -180,6 +180,18 @@ class Emitter:
     def blank(self) -> None:
         self.lines.append("")
 
+    def begin_block(self, header: str) -> None:
+        """Open an indented block whose guard `header` is backend-specific
+        (Python: `if not skip_deps:`) — every operation emitted until the
+        matching end_block() nests one level deeper. Only the Python
+        front-end implements this (its generated file needs a real
+        conditional for `--skip-deps`); the shell front-end never calls
+        it, so its eager text stays flat."""
+        raise NotImplementedError
+
+    def end_block(self) -> None:
+        raise NotImplementedError
+
 
 class _ShellBody(Emitter):
     """A nested SHELL-ONLY emitter used to build a kernel router's
@@ -1891,7 +1903,12 @@ def _emit_chassis_registration(
         emit.sh(ovs_ops.set_external_id_argv("ovn-cms-options", "enable-chassis-as-gw"))
 
 
-def _emit_host(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter) -> None:
+def _emit_host(
+    host_node: pt.InfraHostNode,
+    nodes: list[pt.Model],
+    emit: Emitter,
+    guard_deps: bool = False,
+) -> None:
     host_name = host_node.key.host
     data = host_node.data
 
@@ -1923,8 +1940,17 @@ def _emit_host(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter
         return
 
     # Dependencies FIRST — nothing below (OVS/OVN, netns, services)
-    # works without them; no deinstall ever (2026-08-23).
-    _emit_os_dependencies(host_node, emit)
+    # works without them; no deinstall ever (2026-08-23). The Python
+    # front-end wraps this in `if not skip_deps:` so the generated
+    # deployer can run against a host whose packages are already present
+    # (`--skip-deps`); the shell front-end has no runtime flag, so its
+    # text stays flat.
+    if guard_deps and data.dependencies:
+        emit.begin_block("if not skip_deps:")
+        _emit_os_dependencies(host_node, emit)
+        emit.end_block()
+    else:
+        _emit_os_dependencies(host_node, emit)
     # Chassis registration RIGHT AFTER the packages, so ovn-controller
     # registers while the heavier steps run (the cluster pass resolves
     # this chassis by the hostname set here).
@@ -1941,5 +1967,10 @@ def _emit_host(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter
 # a PythonEmitter). The `#!/bin/sh`/`set -eu` envelope is NOT part of
 # this: that's shell-script structure, owned by the shell front-end (see
 # deployer/ir_to_shell.py); the Python front-end has no envelope.
-def _emit_host_script(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter) -> None:
-    _emit_host(host_node, nodes, emit)
+def _emit_host_script(
+    host_node: pt.InfraHostNode,
+    nodes: list[pt.Model],
+    emit: Emitter,
+    guard_deps: bool = False,
+) -> None:
+    _emit_host(host_node, nodes, emit, guard_deps)
