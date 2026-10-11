@@ -134,6 +134,7 @@ function hostDependencies(host: Host, network: NetworkDefinition): string[] {
 
 function hostToIR(host: Host, dependencies: readonly string[]): IRNode {
   const id = `host:${host.name}`;
+  const ipfix = host.monitoring?.ipfix;
   return {
     id,
     kind: "infra.host",
@@ -147,6 +148,18 @@ function hostToIR(host: Host, dependencies: readonly string[]): IRNode {
       // form; `...host.os` lets a partial override win field by field.
       os: { name: "ubuntu", version: "26.04", ...host.os },
       dependencies: dependencies.length > 0 ? dependencies : undefined,
+      // WHERE to export flows (types.ts IpfixExport -> protocol IpfixData)
+      // — the per-leg WHETHER rides each ovn.ls interface instead (see
+      // collisionDomainToIR's `flow`). `target` becomes `targets`, the
+      // OVS IPFIX column name; the API's singular reads better in config.
+      ipfix: ipfix
+        ? {
+          targets: ipfix.target,
+          sampling: ipfix.sampling,
+          cacheActiveTimeout: ipfix.cacheActiveTimeout,
+          cacheMaxFlows: ipfix.cacheMaxFlows,
+        }
+        : undefined,
     },
   };
 }
@@ -465,6 +478,20 @@ function shortIfaceName(prefix: string, name: string): string {
 // interface) pair, and every entry for this domain resolves to the
 // same value (deterministic from domain.name), so there's nothing lost
 // repeating it there instead of hoisting it out.
+// Whether flow export is OFF for one endpoint binding (types.ts
+// RouterEndpointInputBase.flow). Explicit wins both ways; otherwise a
+// TRANSIT link defaults OFF — a kernel/tunnel router's transit (and its
+// tunnel backdoor) is an internal mesh veth, not segment traffic worth
+// sampling, so its bridge stays out of IPFIX unless the author opts in
+// with `flow: true`. Segment legs (vlan/physical) default ON.
+function ifaceFlowOff(
+  endpoint: OvnRouterEndpoint,
+  iface: { readonly kind: string },
+): boolean {
+  if (endpoint.flow !== undefined) return endpoint.flow === false;
+  return iface.kind === "veth";
+}
+
 function collisionDomainToIR(
   domain: CollisionDomain,
   routers: readonly Router[],
@@ -481,7 +508,18 @@ function collisionDomainToIR(
         if (hi.iface.kind !== "veth") {
           interfaces.push({
             host: hi.host.name,
-            iface: { ...hi.iface, shortName },
+            iface: {
+              ...hi.iface,
+              shortName,
+              // Per-leg flow switch (types.ts RouterEndpointInputBase.
+              // flow): only reported when OFF — absent means "inherit".
+              // Rides the iface blob next to shortName for the same
+              // reason: it's a real-world-binding fact the deployer reads
+              // per (host, bridge), not a separate node. OFF WINS: the
+              // deployer disables a bridge if ANY entry on it carries
+              // flow:false.
+              ...(ifaceFlowOff(endpoint, hi.iface) ? { flow: false } : {}),
+            },
           });
           continue;
         }
@@ -499,6 +537,7 @@ function collisionDomainToIR(
             ifaceName: `veth-krn-${id}`,
             peerName: `veth-ovn-${id}`,
             shortName,
+            ...(ifaceFlowOff(endpoint, hi.iface) ? { flow: false } : {}),
           },
         });
       }

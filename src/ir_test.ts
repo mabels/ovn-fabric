@@ -200,6 +200,9 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
         shortName: `br-${
           fnv1a32("transit-router-wan").toString(16).padStart(8, "0")
         }`,
+        // A kernel/tunnel router transit is internal mesh plumbing, not
+        // segment traffic — flow export defaults OFF (types.ts flow).
+        flow: false,
       },
     },
   ]);
@@ -954,6 +957,87 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
   ]);
   // os not set -> assume Ubuntu (2026-08-23).
   assertEquals(hostNode.data["os"], { name: "ubuntu", version: "26.04" });
+});
+
+// Flow export (2026-10-10): Host.monitoring.ipfix becomes the host's
+// `ipfix` IR data (WHERE to export), and a leg's `flow: false` rides
+// that leg's ovn.ls interface blob as `iface.flow` (WHETHER it is
+// sampled) — only reported when OFF; absent means inherit.
+Deno.test("hostToIR: monitoring.ipfix becomes host data.ipfix", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost(
+      "chassis-1",
+      undefined,
+      { role: { kind: "chassis" } },
+      { ipfix: { target: "192.168.129.88:4739", sampling: 512 } },
+    );
+    const domain = net.collisionDomain("home");
+    const backbone = net.collisionDomain("backbone");
+    const r1 = net.defineOvnRouter("router-1", (router) => ({
+      routingDomains: [],
+      endpoints: [
+        router.ovnRouterEndpoint({
+          l2Segment: domain,
+          ipaddrs: [IPv4.parse("192.168.1.1/24")],
+          ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+        }),
+        router.ovnRouterEndpoint({
+          l2Segment: backbone,
+          ipaddrs: [IPv4.parse("172.22.0.1/16")],
+        }),
+      ],
+    }));
+    return { routers: [r1] };
+  });
+
+  const hostData = node(toIR(network), "host:chassis-1").data as Record<
+    string,
+    unknown
+  >;
+  const ipfix = hostData["ipfix"] as {
+    targets: string;
+    sampling: number;
+    cacheActiveTimeout?: number;
+  };
+  assertEquals(ipfix.targets, "192.168.129.88:4739");
+  assertEquals(ipfix.sampling, 512);
+  assertEquals(ipfix.cacheActiveTimeout, undefined);
+});
+
+Deno.test("collisionDomainToIR: flow:false rides the leg's bridge iface", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const sampled = net.collisionDomain("sampled");
+    const quiet = net.collisionDomain("quiet");
+    const r1 = net.defineOvnRouter("router-1", (router) => ({
+      routingDomains: [],
+      endpoints: [
+        router.ovnRouterEndpoint({
+          l2Segment: sampled,
+          ipaddrs: [IPv4.parse("192.168.1.1/24")],
+          ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+        }),
+        router.ovnRouterEndpoint({
+          l2Segment: quiet,
+          ipaddrs: [IPv4.parse("192.168.2.1/24")],
+          ifaces: [{ host, iface: { kind: "physical", name: "eth1" } }],
+          flow: false,
+        }),
+      ],
+    }));
+    return { routers: [r1] };
+  });
+
+  const nodes = toIR(network);
+  const quietIfaces = node(nodes, "ls:quiet").data["interfaces"] as Array<
+    { iface: Record<string, unknown> }
+  >;
+  assertEquals(quietIfaces[0]!.iface["flow"], false);
+  // No flag -> no `flow` key at all (inherit), not `flow: true`.
+  const sampledIfaces = node(nodes, "ls:sampled").data["interfaces"] as Array<
+    { iface: Record<string, unknown> }
+  >;
+  assertEquals("flow" in sampledIfaces[0]!.iface, false);
 });
 
 // defineOvnRouter object form (OvnRouterSpec): routingDomains is declared

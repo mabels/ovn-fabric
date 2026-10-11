@@ -47,6 +47,18 @@ import { type } from "arktype";
 
 export const InfraHostKey = type({ host: "string" });
 export const HostOs = type({ name: "string", version: "string" });
+// The host's IPFIX flow-export config (2026-10-10), resolved from
+// Host.monitoring.ipfix (types.ts, IpfixExport): the collector endpoint
+// every bridge on this host samples into. `targets` is the one required
+// field; the rest are OVS IPFIX table defaults when omitted. The
+// per-leg ON/OFF lives with each binding (an `iface.flow` on the
+// ovn.ls node), not here — this node says WHERE, the leg says WHETHER.
+export const IpfixData = type({
+  targets: "string",
+  "sampling?": "number",
+  "cacheActiveTimeout?": "number",
+  "cacheMaxFlows?": "number",
+});
 export const InfraHostData = type({
   connectAddress: "string",
   "ovnRole?": "'central'|'chassis'",
@@ -58,6 +70,8 @@ export const InfraHostData = type({
   // The OS packages/requirements this host needs (ovs/ovn, iproute2/
   // iptables, dhcpcd/dhclient, wireguard-tools, zerotier, docker).
   "dependencies?": "string[]",
+  // Flow export onto the collector — see IpfixData.
+  "ipfix?": IpfixData,
 });
 export const InfraHostNode = type({
   id: "string",
@@ -438,6 +452,7 @@ export function buildJsonSchema(): Record<string, unknown> {
   const defs: Record<string, unknown> = {
     InfraHostKey: InfraHostKey.toJsonSchema(),
     InfraHostData: InfraHostData.toJsonSchema(),
+    IpfixData: IpfixData.toJsonSchema(),
     InfraHostNode: nodeSchema("infra.host", "InfraHostKey", "InfraHostData"),
     OvnLsKey: OvnLsKey.toJsonSchema(),
     OvnLsData: OvnLsData.toJsonSchema(),

@@ -74,6 +74,24 @@ class HydrateInfraHostTest(unittest.TestCase):
         node = mod.hydrate_node(raw)
         self.assertIsNone(node.data.ovnRole)
         self.assertIsNone(node.data.encapIp)
+        self.assertIsNone(node.data.ipfix)
+
+    def test_ipfix_hydrates_to_the_typed_dataclass(self) -> None:
+        # Flow export (2026-10-10): WHERE to export, host-level. Only
+        # `targets` is required; the tunables stay None when omitted.
+        raw = {
+            **RAW_INFRA_HOST,
+            "data": {
+                **RAW_INFRA_HOST["data"],
+                "ipfix": {"targets": "192.168.129.88:4739", "sampling": 512},
+            },
+        }
+        node = mod.hydrate_node(raw)
+        self.assertIsInstance(node.data.ipfix, pt.Ipfix)
+        self.assertEqual(node.data.ipfix.targets, "192.168.129.88:4739")
+        self.assertEqual(node.data.ipfix.sampling, 512)
+        self.assertIsNone(node.data.ipfix.cacheActiveTimeout)
+        self.assertIsNone(node.data.ipfix.cacheMaxFlows)
 
 
 class HydrateOvnLsTest(unittest.TestCase):

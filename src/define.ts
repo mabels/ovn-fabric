@@ -42,6 +42,7 @@ import {
   type DnsProviderSpec,
   type Host,
   type HostAddress,
+  type HostMonitoring,
   type HostOs,
   type KernelRouter,
   type KernelRouterSide,
@@ -325,13 +326,19 @@ export class NetworkBuilder implements RouterEndpointContext {
     user: string,
     os?: HostOs,
     ovn?: OvnHostConfig,
+    monitoring?: HostMonitoring,
   ): Host {
-    return this.registerHost(sshHost(name, address, user, os, ovn));
+    return this.registerHost(sshHost(name, address, user, os, ovn, monitoring));
   }
 
   /** Declare the generator's own host — no SSH needed. */
-  localHost(name: string, os?: HostOs, ovn?: OvnHostConfig): Host {
-    return this.registerHost(localHost(name, os, ovn));
+  localHost(
+    name: string,
+    os?: HostOs,
+    ovn?: OvnHostConfig,
+    monitoring?: HostMonitoring,
+  ): Host {
+    return this.registerHost(localHost(name, os, ovn, monitoring));
   }
 
   /** Cluster-wide OVN settings (NB_Global) — see OvnClusterOptions,

@@ -225,7 +225,8 @@ class ClusterScriptCreateTest(unittest.TestCase):
         # match (confirmed live 2026-09-19). The lookup runs once, before
         # the first pin, and a `test -n` guards the empty result.
         self.assertIn(
-            "OVN_CHASSIS_chassis_1=$(ovn-sbctl --bare --columns=name find Chassis hostname=chassis-1)",
+            "OVN_CHASSIS_chassis_1=$(ovn-sbctl --bare --columns=name find Chassis "
+            "hostname=chassis-1)",
             self.cluster,
         )
         self.assertIn('test -n "$OVN_CHASSIS_chassis_1"', self.cluster)
@@ -1874,9 +1875,7 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                             "service": "kernel.app.container:dns-129",
                             "name": "control-plane",
                             "ipaddrs": ["10.43.0.129/24"],
-                            "routes": [
-                                {"dst": "0.0.0.0/0", "via": "10.43.0.1", "metric": 200}
-                            ],
+                            "routes": [{"dst": "0.0.0.0/0", "via": "10.43.0.1", "metric": 200}],
                         }
                     ],
                 },
@@ -1921,3 +1920,60 @@ class DnsServiceEndToEndTest(unittest.TestCase):
             s,
         )
         self.assertIn("systemctl enable --now ovn-kernel-service-dns-129.service", s)
+
+
+# Flow export (2026-10-10): WHERE to export is host-level
+# (infra.host.data.ipfix, from Host.monitoring.ipfix); WHETHER a given
+# leg is sampled rides its ovn.ls interface blob as `iface.flow` (only
+# present when a leg opts OUT). The deployer turns that into one IPFIX
+# sampler per segment bridge: attach on create, clear on delete, and
+# clear (not attach) for a bridge any of whose legs opted out.
+def _with_ipfix(nodes, flow_off_domains=frozenset()):
+    out = []
+    for n in nodes:
+        if n.kind == "infra.host" and n.key.host == "chassis-1":
+            n = dataclasses.replace(
+                n,
+                data=dataclasses.replace(
+                    n.data,
+                    ipfix=pt.Ipfix(targets="192.168.129.88:4739", sampling=512),
+                ),
+            )
+        if n.kind == "ovn.ls" and n.key.name in flow_off_domains:
+            ifaces = []
+            for entry in n.data.interfaces:
+                iface = dict(entry.iface)
+                iface["flow"] = False
+                ifaces.append(dataclasses.replace(entry, iface=iface))
+            n = dataclasses.replace(n, data=dataclasses.replace(n.data, interfaces=ifaces))
+        out.append(n)
+    return out
+
+
+class IpfixExportTest(unittest.TestCase):
+    def test_ipfix_attaches_to_the_segment_bridge_on_create(self) -> None:
+        _, hosts = mod.build_scripts(_with_ipfix(NODES), "create")
+        script = hosts["chassis-1"]
+        self.assertIn("# --- flow export (IPFIX) ---", script)
+        # Idempotent: reuse the bridge's existing IPFIX row, else create.
+        # `get` prints the empty-set literal `[]` when the bridge has no
+        # IPFIX, so the reuse test must reject that, not just empty output.
+        self.assertIn('[ "$ipfix" != "[]" ]', script)
+        # `targets` is a set-of-strings and its value has a `:`, so it must
+        # reach ovs-vsctl quoted (escaped here for the `sh -c`).
+        self.assertIn('create IPFIX targets=\\"192.168.129.88:4739\\" sampling=512', script)
+        self.assertIn("set Bridge br-home ipfix=@ipfix", script)
+
+    def test_a_leg_that_opts_out_clears_its_bridge(self) -> None:
+        _, hosts = mod.build_scripts(_with_ipfix(NODES, {"home"}), "create")
+        script = hosts["chassis-1"]
+        self.assertNotIn("create IPFIX", script)
+        self.assertIn("--if-exists clear Bridge br-home ipfix", script)
+
+    def test_delete_clears_the_sampler(self) -> None:
+        _, hosts = mod.build_scripts(_with_ipfix(NODES), "delete")
+        self.assertIn("--if-exists clear Bridge br-home ipfix", hosts["chassis-1"])
+
+    def test_no_ipfix_config_emits_nothing(self) -> None:
+        _, hosts = mod.build_scripts(NODES, "create")
+        self.assertNotIn("IPFIX", hosts["chassis-1"])

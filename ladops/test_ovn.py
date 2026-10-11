@@ -135,9 +135,7 @@ class WriteTest(unittest.TestCase):
         )
 
     def test_ls_add_is_idempotent(self) -> None:
-        self.assertEqual(
-            mod.ls_add_argv("home"), ["ovn-nbctl", "--may-exist", "ls-add", "home"]
-        )
+        self.assertEqual(mod.ls_add_argv("home"), ["ovn-nbctl", "--may-exist", "ls-add", "home"])
 
     def test_ls_del_uses_if_exists(self) -> None:
         self.assertEqual(mod.ls_del_argv("home"), ["ovn-nbctl", "--if-exists", "ls-del", "home"])

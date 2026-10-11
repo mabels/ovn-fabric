@@ -498,6 +498,21 @@ export interface RouterEndpointInputBase<
    * Voda-defaultRoute). Undefined = inherit the router's own
    * routingDomains (the pre-2026-08-23 behavior). */
   readonly routingDomains?: readonly RoutingDomain[];
+  /** Per-leg flow-export switch (2026-10-10). Undefined = default: a
+   * SEGMENT leg (an ovnRouterEndpoint with `ifaces` on a real
+   * vlan/physical interface) is sampled whenever its Host declares
+   * `monitoring.ipfix`; a TRANSIT leg (a kernel/tunnel router's transit
+   * or tunnel-backdoor veth — internal mesh plumbing, not segment
+   * traffic) defaults OFF. `true`/`false` override either way (so
+   * `flow: true` opts a transit link IN). The concrete unit is the
+   * leg's OVS bridge (`br-<shortName>`, src/ir.ts's
+   * collisionDomainToIR) — sampling attaches to a bridge, not a port,
+   * so a bridge shared by several legs is OFF if ANY of them is off
+   * (off wins). A backbone leg rides br-int and a kernel/tunnel leg's
+   * real interface lives in a netns, so neither has a per-leg bridge to
+   * switch: the flag is recorded there but has no OVS effect (a known
+   * partial-effect gap, not a silent one). */
+  readonly flow?: boolean;
 }
 
 /** The RESOLVED (stored) endpoint base — RouterEndpointInputBase plus

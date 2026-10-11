@@ -25,6 +25,7 @@ from . import generated as pt
 
 def _hydrate_infra_host(raw: dict) -> pt.InfraHostNode:
     data = raw["data"]
+    ipfix = data.get("ipfix")
     return pt.InfraHostNode(
         id=raw["id"],
         kind=raw["kind"],
@@ -35,6 +36,16 @@ def _hydrate_infra_host(raw: dict) -> pt.InfraHostNode:
             ovnRole=pt.OvnRole(data["ovnRole"]) if data.get("ovnRole") is not None else None,
             os=pt.Os(name=data["os"]["name"], version=data["os"]["version"]),
             dependencies=data.get("dependencies"),
+            ipfix=(
+                pt.Ipfix(
+                    targets=ipfix["targets"],
+                    sampling=ipfix.get("sampling"),
+                    cacheActiveTimeout=ipfix.get("cacheActiveTimeout"),
+                    cacheMaxFlows=ipfix.get("cacheMaxFlows"),
+                )
+                if ipfix is not None
+                else None
+            ),
         ),
     )
 
@@ -134,10 +145,7 @@ def _hydrate_kernel_router(raw: dict) -> pt.KernelRouterNode:
             host=data["host"],
             ipaddrs=data.get("ipaddrs"),
             routes=(
-                [
-                    pt.Route(dst=r["dst"], via=r.get("via"), metric=r.get("metric"))
-                    for r in routes
-                ]
+                [pt.Route(dst=r["dst"], via=r.get("via"), metric=r.get("metric")) for r in routes]
                 if routes is not None
                 else None
             ),
