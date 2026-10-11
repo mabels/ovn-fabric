@@ -39,14 +39,19 @@
 
 from __future__ import annotations
 
+from typing import TypeVar
+
+from . import JsonObject
 from .netns import run as run_in_netns
 from .ovsdb import list_table
+
+_Token = TypeVar("_Token")
 
 _NBCTL = ["ovn-nbctl"]
 _SBCTL = ["ovn-sbctl"]
 
 
-def list_lrps() -> list[dict]:
+def list_lrps() -> list[JsonObject]:
     """Every real Logical_Router_Port, joined back to its owning
     router's name (the join lives here, not in the reconciler, since
     it's part of "what's really there," not IR shaping)."""
@@ -87,6 +92,19 @@ def lr_add_argv(router: str) -> list[str]:
     return [*_NBCTL, "--may-exist", "lr-add", router]
 
 
+# One Logical_Router.options key — same one-call-per-key shape as
+# lrp_set_ipv6_ra_config_argv below. key/value come pre-resolved from the
+# router's own ovn.lr IR node (src/ir.ts's routerToIR): OVN's own key
+# name and an already-stringified value; this only knows the invocation
+# shape. Idempotent (`set` on a map key). Today the one key is
+# mac_binding_age_threshold: OVN's default (0) keeps a learned
+# MAC_Binding FOREVER and never re-probes it, so a neighbour that came
+# back with a different MAC is black-holed until it happens to ARP/ND the
+# router itself (confirmed live 2026-10-11).
+def lr_set_option_argv(router: str, key: str, value: str) -> list[str]:
+    return [*_NBCTL, "set", "logical_router", router, f"options:{key}={value}"]
+
+
 def lr_del_argv(router: str) -> list[str]:
     # Cascades: deleting a Logical_Router deletes its own
     # Logical_Router_Ports too (confirmed against ovn-nbctl's real
@@ -104,7 +122,13 @@ def lr_route_add_argv(router: str, prefix: str, nexthop: str) -> list[str]:
     return [*_NBCTL, "--may-exist", "lr-route-add", router, prefix, nexthop]
 
 
-def lrp_set_gateway_chassis_argv(lrp: str, chassis: str, priority: int = 100) -> list[str]:
+def lrp_set_gateway_chassis_argv(
+    lrp: str, chassis: _Token, priority: int = 100
+) -> list[str | _Token]:
+    # `chassis` is whatever token the caller's argv carries for it: a plain
+    # string here, or the deployer's runtime variable reference (the
+    # chassis id only exists on the target host — see
+    # sb_chassis_id_by_hostname_argv). It is passed through untouched.
     return [*_NBCTL, "lrp-set-gateway-chassis", lrp, chassis, str(priority)]
 
 

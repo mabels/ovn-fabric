@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import json
 
+from ladops import JsonObject
 from ladops.iptables import list_rules
 from ladops.netns import netns_scope, scope_id
 
@@ -45,10 +46,10 @@ def _canonical_key(shape: dict[str, str]) -> str:
     return json.dumps(shape, sort_keys=True, separators=(",", ":"))
 
 
-def reconcile(scope: dict, netns: str | None = None) -> dict[str, dict]:
+def reconcile(scope: JsonObject, netns: str | None = None) -> dict[str, JsonObject]:
     ns_scope = netns_scope(scope, netns)
     ns_scope_id = scope_id(ns_scope)
-    nodes: dict[str, dict] = {}
+    nodes: dict[str, JsonObject] = {}
     for rule in list_rules(netns):
         # ladops.iptables.list_rules() already only returns ip/ip6
         # families, so this mapping is exhaustive for anything reaching

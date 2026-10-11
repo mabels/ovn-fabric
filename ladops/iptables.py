@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from . import JsonObject
 from .netns import run as run_in_netns
 
 _PAYLOAD_FIELD_TO_KEY = {"saddr": "src", "daddr": "dst", "sport": "sport", "dport": "dport"}
@@ -53,7 +54,7 @@ def _format_right(right: Any) -> str:
     return str(right)
 
 
-def _parse_rule_expr(expr: list[dict]) -> tuple[dict[str, str], str]:
+def _parse_rule_expr(expr: list[JsonObject]) -> tuple[dict[str, str], str]:
     # A dimension with no real match present is omitted, not filled with
     # a "*" sentinel — "*" would be one more magic string a real value
     # could (in principle) collide with, and every unset field would
@@ -68,7 +69,8 @@ def _parse_rule_expr(expr: list[dict]) -> tuple[dict[str, str], str]:
             payload = left.get("payload")
             meta = left.get("meta")
             if isinstance(payload, dict):
-                mapped = _PAYLOAD_FIELD_TO_KEY.get(payload.get("field"))
+                field = payload.get("field")
+                mapped = _PAYLOAD_FIELD_TO_KEY.get(field) if isinstance(field, str) else None
                 if mapped:
                     fields[mapped] = _format_right(match["right"])
                     # a sport/dport match's own "protocol" says which L4
@@ -78,7 +80,8 @@ def _parse_rule_expr(expr: list[dict]) -> tuple[dict[str, str], str]:
                     if mapped in ("sport", "dport") and payload.get("protocol") in ("tcp", "udp"):
                         fields["proto"] = payload["protocol"]
             elif isinstance(meta, dict):
-                mapped = _META_KEY_TO_KEY.get(meta.get("key"))
+                key = meta.get("key")
+                mapped = _META_KEY_TO_KEY.get(key) if isinstance(key, str) else None
                 if mapped:
                     fields[mapped] = _format_right(match["right"])
             continue
@@ -92,7 +95,7 @@ def _parse_rule_expr(expr: list[dict]) -> tuple[dict[str, str], str]:
     return fields, action
 
 
-def list_rules(netns: str | None) -> list[dict]:
+def list_rules(netns: str | None) -> list[JsonObject]:
     """Every real nat/filter/mangle rule in ip/ip6 families, in real
     application order (order is per table+chain, zero-padded — see
     reconciler/iptables/reconcile.py for why this isn't real

@@ -51,6 +51,7 @@ import {
   type OvnHostConfig,
   type OvnRouterEndpoint,
   type OvnRouterEndpointSpec,
+  type OvnRouterOptions,
   type Platform,
   type PlatformEgressSpec,
   type PlatformServiceId,
@@ -60,6 +61,7 @@ import {
   type PlatformSpec,
   type Publish,
   type PublishSpec,
+  resolveOvnRouterOptions,
   type Resolver,
   type Router,
   type RoutingDomain,
@@ -669,12 +671,18 @@ export class NetworkBuilder implements RouterEndpointContext {
     // builder form returns routingDomains alongside its endpoints.
     let routingDomains: readonly RoutingDomain[];
     let resolved: readonly OvnRouterEndpoint[];
+    // Both forms may carry the router's own OVN `options`; whatever is
+    // unset (or the whole object) is defaulted, and a bad value throws
+    // here, at declaration time.
+    let options: Required<OvnRouterOptions>;
     if (typeof build === "function") {
       const result = build(router);
       routingDomains = result.routingDomains;
       resolved = result.endpoints;
+      options = resolveOvnRouterOptions(name, result.options);
     } else {
       routingDomains = build.routingDomains;
+      options = resolveOvnRouterOptions(name, build.options);
       resolved = build.endpoints.map((spec) =>
         this.resolveEndpointSpec(spec, build.routingDomains, name, subRouters)
       );
@@ -728,6 +736,7 @@ export class NetworkBuilder implements RouterEndpointContext {
         .sort(byName),
       routingDomains,
       subRouters,
+      options,
     };
     this.routersByName.set(name, built);
     return built;

@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import subprocess
 
+from . import JsonObject
+
 GLOBAL_NETNS = "*global*"
 
 
@@ -49,11 +51,11 @@ def list_netns() -> list[str]:
     return [line.split()[0] for line in out.splitlines() if line.strip()]
 
 
-def netns_scope(base_scope: dict, netns: str | None) -> dict:
+def netns_scope(base_scope: JsonObject, netns: str | None) -> JsonObject:
     return {**base_scope, "netns": netns if netns is not None else GLOBAL_NETNS}
 
 
-def scope_id(scope: dict) -> str:
+def scope_id(scope: JsonObject) -> str:
     """The flat "host:X|netns:Y" string form of a structured scope —
     used only for building a node's `id`, never for reading attributes
     back out of (that's what the structured scope/key dicts are for)."""
@@ -72,7 +74,7 @@ def netns_exec_argv(argv: list[str], netns: str | None) -> list[str]:
     return argv if netns is None else ["ip", "netns", "exec", netns, *argv]
 
 
-def run(argv: list[str], netns: str | None) -> subprocess.CompletedProcess:
+def run(argv: list[str], netns: str | None) -> subprocess.CompletedProcess[str]:
     """Run argv, inside `netns` if given (via `ip netns exec`), in the
     root/global namespace otherwise. Not `ip`-specific — iptables-save,
     ovs-vsctl etc. are all netns-sensitive commands the same way."""

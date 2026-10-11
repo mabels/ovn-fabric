@@ -11,6 +11,7 @@ import type {
   KernelRouterEndpoint,
   OvnRouterEndpoint,
   OvnRouterEndpointSpec,
+  OvnRouterOptions,
   Publish,
   Resolver,
   RouterEndpointRoute,
@@ -213,6 +214,9 @@ export interface RouterBuilder {
 export interface RouterBuildResult {
   readonly routingDomains: readonly RoutingDomain[];
   readonly endpoints: readonly OvnRouterEndpoint[];
+  /** The router's own OVN options (OvnRouterOptions, types.ts) — omitted,
+   * or any field left unset, takes its default. */
+  readonly options?: OvnRouterOptions;
 }
 
 /** A kind-tagged endpoint INPUT in the declarative object form — resolved
@@ -231,4 +235,7 @@ export type RouterEndpointSpec =
 export interface OvnRouterSpec {
   readonly routingDomains: readonly RoutingDomain[];
   readonly endpoints: readonly RouterEndpointSpec[];
+  /** The router's own OVN options (OvnRouterOptions, types.ts) — omitted,
+   * or any field left unset, takes its default. */
+  readonly options?: OvnRouterOptions;
 }

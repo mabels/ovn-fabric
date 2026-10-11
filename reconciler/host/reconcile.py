@@ -21,6 +21,8 @@ import socket
 import subprocess
 from datetime import datetime
 
+from ladops import JsonObject
+
 
 def hostname() -> str:
     return socket.gethostname()
@@ -39,7 +41,7 @@ def _reconciled_at() -> str:
     return datetime.now().astimezone().isoformat()
 
 
-def reconcile(scope: dict, netns: str | None = None) -> dict[str, dict]:
+def reconcile(scope: JsonObject, netns: str | None = None) -> dict[str, JsonObject]:
     # Host identity isn't namespace-scoped — there's exactly one of it
     # per host, not one per netns. Takes the same (scope, netns) shape
     # as every other reconciler so cli.py's orchestration loop can call

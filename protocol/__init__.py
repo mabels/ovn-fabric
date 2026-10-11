@@ -1,15 +1,15 @@
 # protocol/__init__.py — the protocol package's public surface: the
 # generated dataclasses (protocol/generated.py, from src/protocol.ts's
-# ArkType schema) plus readable aliases for the KernelApp discriminated
-# union, whose members datamodel-codegen names from the inline anyOf
-# (Apps/Apps1/Apps2/Apps3, in arbitrary order) — these mirror the TS
-# names (src/protocol.ts's DhcpClientApp/WireguardApp/ZerotierApp/DockerApp).
+# ArkType schema) plus the names the deployer has always used for the
+# kernel apps. Every generated class carries the name it has in
+# src/protocol.ts (buildJsonSchema()'s named $refs), so these are plain
+# aliases — no positional Apps/Apps1/... names to guess at anymore.
 from . import generated
 
-AppDhcpClient = generated.Apps3
-AppWireguard = generated.Apps
-AppZerotier = generated.Apps2
-AppDocker = generated.Apps1
+AppDhcpClient = generated.DhcpClientApp
+AppWireguard = generated.WireguardApp
+AppZerotier = generated.ZerotierApp
+AppDocker = generated.DockerApp
 
 # The KernelApp union itself — what KernelRouterData.apps is a list of.
-KernelApp = generated.Apps | generated.Apps1 | generated.Apps2 | generated.Apps3
+KernelApp = generated.KernelApp

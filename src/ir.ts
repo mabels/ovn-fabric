@@ -31,7 +31,7 @@
 // resolved below) both ARE covered. toIR() walks allCollisionDomains/
 // allRouters/allHosts.
 
-import { fnv1a32, macFromV4 } from "./addressing.ts";
+import { fnv1a32, macFromAddrsOrName, macFromV4 } from "./addressing.ts";
 import type { IPv4, IPv6 } from "./ip.ts";
 import type {
   CollisionDomain,
@@ -46,13 +46,26 @@ import type {
   Service,
 } from "./types.ts";
 import type { NetworkDefinition } from "./define.ts";
+import type {
+  InfraHostNode,
+  Ipv6RaConfigs,
+  IRNode,
+  KernelAppContainerNode,
+  KernelRouterNode,
+  OvnLrNode,
+  OvnLrpNode,
+  OvnLsInterface,
+  OvnLsNode,
+  RouteNode,
+  SecurityGroupNode,
+  ServiceRef,
+} from "./protocol.ts";
 
-export interface IRNode {
-  readonly id: string;
-  readonly kind: string;
-  readonly key: Record<string, unknown>;
-  readonly data: Record<string, unknown>;
-}
+// The IR node types are the ones INFERRED from the protocol schema
+// (src/protocol.ts) — not a loose `{key, data: Record<string, unknown>}`
+// envelope: every builder below declares the exact node type it returns,
+// so emitting something the protocol doesn't declare fails to compile.
+export type { IRNode } from "./protocol.ts";
 
 // The platform's control-plane leg + resolved global resolver — what a
 // workload attachment on that domain inherits when it declares none
@@ -132,7 +145,10 @@ function hostDependencies(host: Host, network: NetworkDefinition): string[] {
   return [...deps];
 }
 
-function hostToIR(host: Host, dependencies: readonly string[]): IRNode {
+function hostToIR(
+  host: Host,
+  dependencies: readonly string[],
+): InfraHostNode {
   const id = `host:${host.name}`;
   const ipfix = host.monitoring?.ipfix;
   return {
@@ -176,7 +192,7 @@ function hostToIR(host: Host, dependencies: readonly string[]): IRNode {
 // still repeated on the per-side nodes too (not removed — both sides
 // genuinely do live in the same netns/host, and the router-level node
 // is additive, not a replacement for that).
-function kernelRouterToIR(router: KernelRouter): IRNode {
+function kernelRouterToIR(router: KernelRouter): KernelRouterNode {
   const id = `kernelrouter:${router.name}`;
   return {
     id,
@@ -239,7 +255,7 @@ function transitPeer(
 function kernelRouterBackRoutes(
   kernelRouter: KernelRouter,
   routers: readonly Router[],
-  routeNodes: readonly IRNode[],
+  routeNodes: readonly RouteNode[],
 ): Array<{ dst: string; via: string }> {
   const peer = transitPeer(kernelRouter, routers);
   if (!peer) return [];
@@ -266,11 +282,11 @@ function kernelRouterBackRoutes(
   );
   const routes: Array<{ dst: string; via: string }> = [];
   for (const node of routeNodes) {
-    if (node.key["ovnrouter"] !== peer.router.name) continue;
-    if (!ownDomains.has(node.data["domain"] as string)) continue;
-    const nexthop = node.data["nexthop"] as string;
+    if (node.key.ovnrouter !== peer.router.name) continue;
+    if (!ownDomains.has(node.data.domain)) continue;
+    const nexthop = node.data.nexthop;
     if (ownAddrs.has(nexthop)) continue;
-    const prefix = node.key["prefix"] as string;
+    const prefix = node.key.prefix;
     if (rightApplied.has(prefix)) continue;
     const via = peerAddrs.find((a) => a.is_ipv4() === !prefix.includes(":"));
     if (!via) continue;
@@ -315,8 +331,8 @@ function kernelRouterSideToIR(
   router: KernelRouter,
   side: "left" | "right",
   routers: readonly Router[],
-  routeNodes: readonly IRNode[],
-): IRNode {
+  routeNodes: readonly RouteNode[],
+): KernelRouterNode {
   const id = `kernelrouter:${router.name}|side:${side}`;
   const inDomain = router.routingDomains &&
     router.routingDomains.length > 0;
@@ -339,12 +355,21 @@ function kernelRouterSideToIR(
   // (`veth-krn-<shortName>`/`veth-ovn-<shortName>`) from it
   // (deployer/ir_to_shell.py's _emit_kernel_router_create) — same
   // "generator computes the final name" boundary as shortIfaceName.
+  // It also carries the netns-side leg's `mac`, resolved HERE for the
+  // same reason an LRP's is (resolveMac): deterministic from this
+  // side's own addresses (macFromAddrsOrName, addressing.ts), so the
+  // OVN router's MAC_Binding for them survives the leg being recreated
+  // instead of pointing at the previous leg's random MAC (2026-10-11).
   const ifaces = router[side].ifaces?.map((hi) => {
     const iface = hi.iface;
     if (iface.kind !== "veth") return { host: hi.host.name, iface };
     return {
       host: hi.host.name,
-      iface: { ...iface, shortName: vethShortId(iface.ifaceName) },
+      iface: {
+        ...iface,
+        shortName: vethShortId(iface.ifaceName),
+        mac: macFromAddrsOrName(router[side].ipaddrs, iface.ifaceName),
+      },
     };
   });
   return {
@@ -410,7 +435,7 @@ function kernelRouterSideToIR(
 // (net.securityGroup(), define.ts — including the implicit `masq-<router>`
 // shortcut expansion); this function is pure serialization, it derives
 // nothing.
-function securityGroupToIR(group: SecurityGroup): IRNode {
+function securityGroupToIR(group: SecurityGroup): SecurityGroupNode {
   return {
     id: `securitygroup:${group.name}`,
     kind: "security.group",
@@ -495,10 +520,10 @@ function ifaceFlowOff(
 function collisionDomainToIR(
   domain: CollisionDomain,
   routers: readonly Router[],
-): IRNode {
+): OvnLsNode {
   const id = `ls:${domain.name}`;
   const shortName = shortIfaceName("br-", domain.name);
-  const interfaces: Array<{ host: string; iface: unknown }> = [];
+  const interfaces: OvnLsInterface[] = [];
   for (const router of routers) {
     for (const endpoint of router.endpoints) {
       if (endpoint.kind !== "ovn" || endpoint.l2Segment.name !== domain.name) {
@@ -548,6 +573,27 @@ function collisionDomainToIR(
     kind: "ovn.ls",
     key: { name: domain.name },
     data: { interfaces },
+  };
+}
+
+// ── ovn.lr ─────────────────────────────────────────────────────────
+// The Logical_Router itself — one node per Router, carrying its own OVN
+// options as the FINAL Logical_Router.options (protocol.ts's
+// OvnLrOptions — the field names are OVN's own keys). Router.options is already
+// fully resolved (defaults filled in at defineOvnRouter() time,
+// types.ts's resolveOvnRouterOptions), so this is pure serialization —
+// same "the IR carries the final fact" boundary as resolveMac /
+// resolveIpv6RaConfigs below. The deployer only applies each pair.
+function routerToIR(router: Router): OvnLrNode {
+  return {
+    id: `ovnrouter:${router.name}`,
+    kind: "ovn.lr",
+    key: { name: router.name },
+    data: {
+      options: {
+        mac_binding_age_threshold: router.options.macBindingAgeThreshold,
+      },
+    },
   };
 }
 
@@ -608,24 +654,26 @@ function resolveIpv6RaConfigs(
   services:
     | readonly RouterEndpointService[]
     | undefined,
-): Record<string, string> | undefined {
+): Ipv6RaConfigs | undefined {
   if (!services || services.length === 0) return undefined;
-  const configs: Record<string, string> = {};
+  const configs: {
+    -readonly [Key in keyof Ipv6RaConfigs]: Ipv6RaConfigs[Key];
+  } = {};
   for (const service of services) {
     // A service ATTACHMENT (endpoint.attachTo) is a workload NIC, not an
     // LRP config — a workload attachment is emitted as a serviceRef, skip here.
     if (service.kind === "service.attach") continue;
     if (service.kind === "ipv6.slaac") {
-      configs["address_mode"] = "slaac";
+      configs.address_mode = "slaac";
       continue;
     }
     if (service.kind === "ipv6.ra") {
-      configs["send_periodic"] = "true";
+      configs.send_periodic = "true";
       if (service.minInterval) {
-        configs["min_interval"] = String(service.minInterval);
+        configs.min_interval = String(service.minInterval);
       }
       if (service.maxInterval) {
-        configs["max_interval"] = String(service.maxInterval);
+        configs.max_interval = String(service.maxInterval);
       }
       continue;
     }
@@ -664,7 +712,7 @@ function routerEndpointToIR(
   endpoint: OvnRouterEndpoint,
   dstsByDomain: ReadonlyMap<string, ReadonlySet<string>>,
   platformCp?: PlatformControlPlaneResolver,
-): IRNode {
+): OvnLrpNode {
   const scope = `ovnrouter:${router.name}`;
   const id = `${scope}|lrp:${endpoint.name}`;
   return {
@@ -783,12 +831,7 @@ function resolveServiceRefs(
   endpoint: OvnRouterEndpoint,
   dstsByDomain: ReadonlyMap<string, ReadonlySet<string>>,
   platformCp?: PlatformControlPlaneResolver,
-): {
-  service: string;
-  ipaddrs?: string[];
-  routes?: { dst: string; via?: string; metric?: number }[];
-  resolver?: { nameservers: string[] };
-}[] | undefined {
+): ServiceRef[] | undefined {
   const refs = (endpoint.services ?? []).filter((s) =>
     s.kind === "service.attach"
   );
@@ -838,6 +881,14 @@ function resolveServiceRefs(
       // the deployer: the segment name when it fits IFNAMSIZ, else the fnv1a
       // short form (shortIfaceName, same rule as every other short name).
       name: shortIfaceName("", endpoint.l2Segment.name),
+      // The NIC's MAC — deterministic (macFromAddrsOrName, addressing.ts)
+      // for the same reason as a kernel router's veth leg: the container
+      // is recreated on every `up`, and the segment's OVN router would
+      // otherwise keep a MAC_Binding for the previous NIC (2026-10-11).
+      mac: macFromAddrsOrName(
+        ref.ipaddrs,
+        `${ref.srvRef.name}|${endpoint.l2Segment.name}`,
+      ),
       ...(ref.ipaddrs.length > 0
         ? { ipaddrs: ref.ipaddrs.map((a) => a.to_string()) }
         : {}),
@@ -971,7 +1022,7 @@ function routeToIR(
   nexthop: IPv4 | IPv6,
   masq: boolean,
   domain: string,
-): IRNode {
+): RouteNode {
   // Every route this module builds funnels through here — the ONE
   // place that guarantees dst and nexthop never mismatch family. A
   // mismatch can only originate from a config author's own
@@ -1008,8 +1059,8 @@ function isDomainParticipant(router: Router, domain: RoutingDomain): boolean {
     router.endpoints.some((e) => e.routingDomains?.includes(domain) === true);
 }
 
-function computeRoutes(network: NetworkDefinition): IRNode[] {
-  const nodes: IRNode[] = [];
+function computeRoutes(network: NetworkDefinition): RouteNode[] {
+  const nodes: RouteNode[] = [];
   // Anchor-outer (2026-08-23): routing-domain membership is PER ENDPOINT
   // now — an endpoint's declared routes participate in its OWN
   // routingDomains (falling back to the router-level ones), so a router
@@ -1162,8 +1213,10 @@ function computeRoutes(network: NetworkDefinition): IRNode[] {
 // owns an array): every endpoint of r2 except the one sharing the
 // domain, which for the two-endpoint case is exactly the old single
 // "other side".
-function computeInterconnectRoutes(network: NetworkDefinition): IRNode[] {
-  const nodes: IRNode[] = [];
+function computeInterconnectRoutes(
+  network: NetworkDefinition,
+): RouteNode[] {
+  const nodes: RouteNode[] = [];
   for (const domain of network.allRoutingDomains) {
     const participants = network.allRouters.filter((r) =>
       isDomainParticipant(r, domain)
@@ -1228,7 +1281,7 @@ function viaIsOnSegment(
 // endpoints that reference this service (OvnLrpData.serviceRefs,
 // resolveServiceRefs above), so the container's NICs are DERIVED from the
 // references at emit time (2026-09-08).
-function serviceNodes(network: NetworkDefinition): IRNode[] {
+function serviceNodes(network: NetworkDefinition): KernelAppContainerNode[] {
   const hosts = new Map<Service, string>();
   for (const router of network.allRouters) {
     for (const endpoint of router.endpoints) {
@@ -1257,7 +1310,7 @@ function serviceNodes(network: NetworkDefinition): IRNode[] {
     }
   }
 
-  const out: IRNode[] = [];
+  const out: KernelAppContainerNode[] = [];
   for (const [service, hostName] of hosts) {
     // A net.service is a docker container → the node kind IS the workload
     // kind (`kernel.app.container`), no `kernel.service` envelope.
@@ -1292,7 +1345,7 @@ function serviceNodes(network: NetworkDefinition): IRNode[] {
           }
           : {}),
       },
-    } as IRNode);
+    });
   }
   return out;
 }
@@ -1309,29 +1362,30 @@ function assignFallbackRouteMetrics(nodes: Record<string, IRNode>): void {
   // Per SERVICE (each workload is its own netns/routing tables, so ranks
   // are independent per workload). Nodes are walked in declaration order
   // (router → endpoint → attachment), which IS the execution order the
-  // deployer would have used.
+  // deployer would have used. An IR node is readonly, so a port whose
+  // attachments gain a metric is REPLACED under its own id (same slot,
+  // the walk order is unaffected) rather than edited in place.
   const rankByService = new Map<string, number>();
   for (const node of Object.values(nodes)) {
     if (node.kind !== "ovn.lrp") continue;
-    const refs = node.data["serviceRefs"] as
-      | {
-        service: string;
-        routes?: { dst: string; via?: string; metric?: number }[];
-      }[]
-      | undefined;
+    const refs = node.data.serviceRefs;
     if (!refs) continue;
-    for (const ref of refs) {
+    const ranked = refs.map((ref): ServiceRef => {
       const routes = ref.routes;
-      if (!routes || routes.length === 0) continue;
-      if (!routes.some((r) => r.metric === undefined)) continue;
+      if (!routes || routes.length === 0) return ref;
+      if (!routes.some((r) => r.metric === undefined)) return ref;
       const rank = rankByService.get(ref.service) ?? 0;
       const fallback = _DEFAULT_ROUTE_METRIC_BASE +
         rank * _DEFAULT_ROUTE_METRIC_STEP;
-      for (const route of routes) {
-        if (route.metric === undefined) route.metric = fallback;
-      }
       rankByService.set(ref.service, rank + 1);
-    }
+      return {
+        ...ref,
+        routes: routes.map((route) =>
+          route.metric === undefined ? { ...route, metric: fallback } : route
+        ),
+      };
+    });
+    nodes[node.id] = { ...node, data: { ...node.data, serviceRefs: ranked } };
   }
 }
 
@@ -1365,8 +1419,8 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
   }
   const dstsByDomain = new Map<string, Set<string>>();
   for (const route of [...interconnectRoutes, ...domainRoutes]) {
-    const domain = route.data["domain"] as string;
-    const prefix = route.key["prefix"] as string;
+    const domain = route.data.domain;
+    const prefix = route.key.prefix;
     if (infraPrefixes.has(prefix)) continue;
     let set = dstsByDomain.get(domain);
     if (!set) {
@@ -1387,6 +1441,8 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
   }
 
   for (const router of network.allRouters) {
+    const routerNode = routerToIR(router);
+    nodes[routerNode.id] = routerNode;
     for (const endpoint of router.endpoints) {
       if (endpoint.kind !== "ovn") {
         // KernelRouterEndpoint (types.ts) — no emission strategy built

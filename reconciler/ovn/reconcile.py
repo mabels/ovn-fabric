@@ -38,14 +38,15 @@
 
 from __future__ import annotations
 
+from ladops import JsonObject
 from ladops.ovn import list_lrps
 
 
-def reconcile(scope: dict, netns: str | None = None) -> dict[str, dict]:
+def reconcile(scope: JsonObject, netns: str | None = None) -> dict[str, JsonObject]:
     if netns is not None:
         return {}
 
-    nodes: dict[str, dict] = {}
+    nodes: dict[str, JsonObject] = {}
     for lrp in list_lrps():
         id_ = f"ovnrouter:{lrp['router']}|lrp:{lrp['name']}"
         nodes[id_] = {

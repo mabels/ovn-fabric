@@ -29,8 +29,9 @@
 
 from __future__ import annotations
 
+import functools
 import re
-from typing import Callable
+from collections.abc import Callable, Sequence
 
 from protocol import generated as pt
 
@@ -84,7 +85,9 @@ class PythonEmitter(Emitter):
     def blank(self) -> None:
         self.lines.append("")
 
-    def sh(self, argv: list[str | Ref], background: bool = False, optional: bool = False) -> None:
+    def sh(
+        self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
+    ) -> None:
         # `background` is only meaningful in the nested shell router-body
         # emitter (_ShellBody) — the Python runtime has no `&` notion.
         # `optional=True` retires the create-action abort for this one
@@ -336,7 +339,7 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
                     fn,
                     f"host:{host_name} ({action})",
                     action,
-                    lambda emit, n=node: _emit_host_script(n, nodes, emit, guard_deps=True),
+                    functools.partial(_emit_host_script, node, nodes, guard_deps=True),
                     extra_params=", skip_deps",
                 )
             )

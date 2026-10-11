@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from . import JsonObject
 from .netns import run as run_in_netns
 
 
@@ -33,7 +34,7 @@ def decode(atom: Any) -> Any:
     return atom
 
 
-def list_table(argv: list[str], table: str, netns: str | None = None) -> list[dict]:
+def list_table(argv: list[str], table: str, netns: str | None = None) -> list[JsonObject]:
     """Run `<argv> -f json list <table>` and return one plain dict per
     row, keyed by real column name, every OVSDB-tagged value decoded."""
     out = run_in_netns([*argv, "-f", "json", "list", table], netns).stdout

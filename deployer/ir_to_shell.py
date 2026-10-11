@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import shlex
+from collections.abc import Sequence
 
 from protocol import generated as pt
 
@@ -40,7 +41,9 @@ class ShellEmitter(Emitter):
     def __init__(self, action: Action) -> None:
         super().__init__(action)
 
-    def sh(self, argv: list[str | Ref], background: bool = False, optional: bool = False) -> None:
+    def sh(
+        self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
+    ) -> None:
         line = " ".join(_shell_token(token) for token in argv) + (" &" if background else "")
         self.lines.append(line + (" || true" if optional else ""))
 

@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import importlib
 import unittest
+from typing import Any
 from unittest import mock
+
+from ladops import JsonObject
 
 mod = importlib.import_module("reconciler.linux_net.reconcile")
 
@@ -45,24 +48,24 @@ FAKE_NETNS_ADDRS = [{"addr": "10.99.0.2/28", "interface": "veth-krn-0", "family"
 FAKE_NETNS_ROUTES4 = [
     {"prefix": "default", "dev": "veth-krn-0", "nexthop": "10.99.0.1", "family": "ipv4"}
 ]
-FAKE_NETNS_ROUTES6: list[dict] = []
+FAKE_NETNS_ROUTES6: list[JsonObject] = []
 
 
-def _fake_list_links(netns):
+def _fake_list_links(netns: str | None) -> list[JsonObject]:
     return FAKE_NETNS_LINKS if netns is not None else FAKE_LINKS
 
 
-def _fake_list_addrs(netns):
+def _fake_list_addrs(netns: str | None) -> list[JsonObject]:
     return FAKE_NETNS_ADDRS if netns is not None else FAKE_ADDRS
 
 
-def _fake_list_routes(netns, family):
+def _fake_list_routes(netns: str | None, family: str) -> list[JsonObject]:
     if netns is not None:
         return FAKE_NETNS_ROUTES4 if family == "-4" else FAKE_NETNS_ROUTES6
     return FAKE_ROUTES4 if family == "-4" else FAKE_ROUTES6
 
 
-def _patch_ladops():
+def _patch_ladops() -> tuple[Any, Any, Any]:
     return (
         mock.patch.object(mod, "list_links", side_effect=_fake_list_links),
         mock.patch.object(mod, "list_addrs", side_effect=_fake_list_addrs),

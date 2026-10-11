@@ -21,3 +21,17 @@ extend-exclude = [".venv-build", "protocol/generated.py"]
 # E/F: pycodestyle errors + pyflakes (real bugs, unused imports/vars).
 # I: isort — import ordering, since black doesn't sort imports itself.
 select = ["E", "F", "I"]
+
+[tool.mypy]
+# Static type check of ALL hand-written Python (tests included), strict:
+# every function annotated, no bare generics, no implicit Any. This is
+# what makes the typed IR mean something on this side — the deployer
+# reads protocol/generated.py's dataclasses, and a field the protocol
+# (src/protocol.ts) doesn't declare, or a kind-specific field read
+# without checking `kind` first, fails HERE instead of at deploy time.
+# protocol/generated.py is checked too (it is imported, and it is plain
+# dataclasses) — so run `generate-pytypes` first, it is not committed.
+strict = true
+python_version = "3.11"
+files = ["ladops", "deployer", "protocol", "reconciler"]
+exclude = ['^\.venv-build/']

@@ -82,6 +82,7 @@ import dataclasses
 import hashlib
 import ipaddress
 import shlex
+from collections.abc import Sequence
 
 from ladops import linux_net as linux_net_ops
 from ladops import netns as netns_ops
@@ -155,7 +156,9 @@ class Emitter:
         backend has no envelope and never calls this."""
         self.lines.append(text)
 
-    def sh(self, argv: list[str | Ref], background: bool = False, optional: bool = False) -> None:
+    def sh(
+        self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
+    ) -> None:
         """`optional=True`: this command failing must NOT stop the rest of
         the pass — it is reported and skipped. Used for per-unit
         `systemctl enable --now` so one broken workload/router can't block
@@ -201,7 +204,9 @@ class _ShellBody(Emitter):
     appends, never Python. `background=True` is only meaningful here —
     the outer front-ends ignore it."""
 
-    def sh(self, argv: list[str | Ref], background: bool = False, optional: bool = False) -> None:
+    def sh(
+        self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
+    ) -> None:
         line = " ".join(_shell_token(token) for token in argv) + (" &" if background else "")
         self.lines.append(line + (" || true" if optional else ""))
 
@@ -215,15 +220,29 @@ class _ShellBody(Emitter):
         self.lines.append("OVNKERNEL")
 
 
-def _iface_real_name(iface: dict) -> str:
-    if iface["kind"] == "vlan":
-        return iface.get("ifaceName") or f"{iface['vlanParent']}.{iface['vlanId']}"
-    if iface["kind"] == "veth":
+# An interface binding as either side of the IR carries it: an ovn.ls
+# `interfaces[].iface` or a kernel.router `ifaces[].iface` (protocol.ts's
+# OvnLsIface/KernelIface — the same kinds, each with its own IR-resolved
+# extras).
+Iface = pt.OvnLsIface | pt.KernelIface
+
+# The closed OVN smap records of the IR — a Logical_Router's `options`, a
+# Logical_Router_Port's `ipv6_ra_configs` (see _ovn_settings).
+OvnSettings = pt.OvnLrOptions | pt.Ipv6RaConfigs
+
+
+def _iface_real_name(iface: Iface) -> str:
+    if iface.kind == "vlan":
+        return iface.ifaceName or f"{iface.vlanParent}.{iface.vlanId}"
+    if iface.kind == "veth":
         # The ROOT-side leg — the device the transit domain's bridge
         # attaches to (the netns-side leg, `ifaceName`, is created/moved
         # by _emit_kernel_router instead).
-        return iface["peerName"]
-    return iface["name"]  # "physical"
+        return iface.peerName
+    if iface.kind == "physical":
+        return iface.name
+    # Callers only reach here for a kind in _BINDABLE_IFACE_KINDS.
+    raise ValueError(f'interface kind "{iface.kind}" has no real device name to bind')
 
 
 def _network_name(domain: str) -> str:
@@ -256,8 +275,8 @@ def _domain_name_by_id(nodes: list[pt.Model]) -> dict[str, str]:
 # collisionDomainToIR, moved there from OvnLsData 2026-08-12) — every
 # entry for the same domain resolves to the same value, so reading it
 # off whichever entry is at hand is enough, no separate per-domain map.
-def _host_bindings(nodes: list[pt.Model]) -> dict[str, list[tuple[str, dict]]]:
-    by_host: dict[str, list[tuple[str, dict]]] = {}
+def _host_bindings(nodes: list[pt.Model]) -> dict[str, list[tuple[str, pt.OvnLsIface]]]:
+    by_host: dict[str, list[tuple[str, pt.OvnLsIface]]] = {}
     for node in nodes:
         if node.kind != "ovn.ls":
             continue
@@ -271,7 +290,7 @@ def _domains_with_bindable_interfaces(nodes: list[pt.Model]) -> set[str]:
     domains: set[str] = set()
     for bindings in _host_bindings(nodes).values():
         for domain, iface in bindings:
-            if iface.get("kind") in _BINDABLE_IFACE_KINDS:
+            if iface.kind in _BINDABLE_IFACE_KINDS:
                 domains.add(domain)
     return domains
 
@@ -373,6 +392,33 @@ def _emit_router_routes(router: str, routes: list[RouteNode], emit: Emitter) -> 
             emit.sh(ovn_ops.lr_route_add_argv(router, node.key.prefix, node.data.nexthop))
 
 
+# router name -> the router's own ovn.lr node (src/ir.ts's routerToIR). A
+# router with no ovn.lr node (an IR written before that node existed)
+# simply gets no options set.
+def _router_nodes(nodes: list[pt.Model]) -> dict[str, pt.OvnLrNode]:
+    return {n.key.name: n for n in nodes if n.kind == "ovn.lr"}
+
+
+def _ovn_value(value: object) -> str:
+    """One value as OVN stores it in an smap column: `true`/`false` for a
+    boolean, the plain text of anything else."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def _ovn_settings(record: OvnSettings) -> list[tuple[str, str]]:
+    """(key, value) for every field of an OVN settings record that is set,
+    sorted by key. The record's field names ARE OVN's own keys (protocol.ts
+    declares them that way), so a setting added to the protocol is applied
+    without this module knowing its name."""
+    return [
+        (field.name, _ovn_value(getattr(record, field.name)))
+        for field in sorted(dataclasses.fields(record), key=lambda f: f.name)
+        if getattr(record, field.name) is not None
+    ]
+
+
 # One flag-taking function per object, create/delete branches adjacent
 # (2026-08-19 — the "write_interface(action)" schema): adding a create
 # command forces you to look at its delete right next to it.
@@ -382,6 +428,7 @@ def _emit_router(
     routes: list[RouteNode],
     chassis_refs: dict[str, Ref],
     domain_names: dict[str, str],
+    lr: pt.OvnLrNode | None,
     emit: Emitter,
 ) -> None:
     if emit.action == "delete":
@@ -399,6 +446,11 @@ def _emit_router(
 
     emit.comment(f"# --- router: {router} ---")
     emit.sh(ovn_ops.lr_add_argv(router))
+    # The router's own options (its ovn.lr node). lr-del cascades them
+    # away with the router — no delete twin.
+    if lr is not None:
+        for key, value in _ovn_settings(lr.data.options):
+            emit.sh(ovn_ops.lr_set_option_argv(router, key, value))
     # Sorted by the port's own name so the emitted block is stable
     # regardless of the IR's input order (the IR out of src/ir.ts is
     # already sorted, but the deployer must not depend on that).
@@ -435,7 +487,7 @@ def _emit_router(
             emit.sh(ovn_ops.lrp_set_gateway_chassis_argv(lrp, chassis))
             emit.sh(ovn_ops.lrp_set_redirect_chassis_argv(lrp))
         if data.ipv6RaConfigs is not None:
-            for key, value in data.ipv6RaConfigs.items():
+            for key, value in _ovn_settings(data.ipv6RaConfigs):
                 emit.sh(ovn_ops.lrp_set_ipv6_ra_config_argv(lrp, key, value))
     _emit_router_routes(router, routes, emit)
     emit.blank()
@@ -493,6 +545,7 @@ def _emit_cluster_body(nodes: list[pt.Model], emit: Emitter) -> None:
     switches = sorted((n for n in nodes if n.kind == "ovn.ls"), key=lambda n: n.key.name)
     router_groups = _group_router_ports(nodes)
     routes_by_router = _group_routes_by_router(nodes)
+    router_nodes = _router_nodes(nodes)
     # Resolved for both actions — _emit_router's delete branch simply
     # doesn't read them (2026-08-19, flag schema).
     host_names = _host_name_by_id(nodes)
@@ -515,6 +568,7 @@ def _emit_cluster_body(nodes: list[pt.Model], emit: Emitter) -> None:
                 routes_by_router.get(router, []),
                 chassis_refs,
                 domain_names,
+                router_nodes.get(router),
                 emit,
             )
     else:
@@ -525,6 +579,7 @@ def _emit_cluster_body(nodes: list[pt.Model], emit: Emitter) -> None:
                 routes_by_router.get(router, []),
                 {},
                 domain_names,
+                router_nodes.get(router),
                 emit,
             )
         for node in switches:
@@ -540,6 +595,15 @@ def _netns_name(name: str) -> str:
 
 def _dummy_name(side: pt.Side) -> str:
     return f"dummy-{side.value}"
+
+
+def _side(side_node: pt.KernelRouterNode) -> pt.Side:
+    """The side of a PER-SIDE kernel.router node (see
+    _kernel_router_sides). `key.side` is optional in the protocol only
+    because the router-level node of the same kind has none."""
+    if side_node.key.side is None:
+        raise ValueError(f"{side_node.id}: a per-side kernel.router node without a side")
+    return side_node.key.side
 
 
 # The router-level kernel.router node (`key.side` absent — src/ir.ts's
@@ -638,7 +702,7 @@ def _apply_side_network(
         _emit_security_group_rules(group, netns, dev, emit)
 
 
-def _docker_dockerfile(build) -> str:
+def _docker_dockerfile(build: pt.DockerBuild) -> str:
     """The Dockerfile body for a docker app's optional `build` — a full
     `dockerfile` wins; otherwise FROM <from> + install the packages with the
     manager the base image implies (apk for alpine/arch, apt otherwise)
@@ -652,7 +716,7 @@ def _docker_dockerfile(build) -> str:
     return f"FROM {base}\nRUN apt-get update && apt-get install -y {pkgs}"
 
 
-def _docker_image_ensure_lines(build, image: str) -> list[str]:
+def _docker_image_ensure_lines(build: pt.DockerBuild | None, image: str) -> list[str]:
     """The shell block that builds the docker app's image on first use (when
     the app declares a `build`), so a fresh host doesn't need a manual
     `docker build`. Empty when the app uses a prebuilt image. The build
@@ -672,7 +736,7 @@ def _docker_image_ensure_lines(build, image: str) -> list[str]:
     ]
 
 
-def _docker_wire_script(app: KernelApp, router: str, netns: str, ctx: _SideContext) -> str:
+def _docker_wire_script(app: pt.DockerApp, router: str, netns: str, ctx: _SideContext) -> str:
     """The wire script for one docker app (client mode): run the container
     with `--network none`, then inject one veth into the router netns
     (CNI/Multus-style) — the container's eth0 gets `app.ip`, the router
@@ -685,6 +749,10 @@ def _docker_wire_script(app: KernelApp, router: str, netns: str, ctx: _SideConte
     down with `docker rm -f`."""
     container = app.name or f"{router}-docker"
     veth = app.vethName or ("ve-" + hashlib.md5(container.encode()).hexdigest()[:8])
+    if app.routerIp is None:
+        # The caller only routes a docker app here once it has checked both
+        # `ip` and `routerIp` (the veth-client mode).
+        raise ValueError(f'kernel app docker "{container}": veth injection needs a `routerIp`')
     gateway = app.routerIp.split("/")[0]
     cmd_tokens = " ".join(shlex.quote(t) for t in (app.cmd or []))
     build_lines = _docker_image_ensure_lines(app.build, app.image)
@@ -743,7 +811,7 @@ class _SideContext:
     transit_routes: list[pt.KernelRouterRoute]
 
 
-def _docker_inject_script(app: KernelApp, container: str, ctx: _SideContext) -> str:
+def _docker_inject_script(app: pt.DockerApp, container: str, ctx: _SideContext) -> str:
     """The wire script for a docker app that OWNS the router's interfaces
     (signaled in the IR by the ABSENCE of veth addressing — the "container
     IS the router" mode): the container OWNS the router's
@@ -830,7 +898,7 @@ def _docker_inject_script(app: KernelApp, container: str, ctx: _SideContext) -> 
     )
 
 
-def _wg_conf_lines(app: KernelApp) -> list[str]:
+def _wg_conf_lines(app: pt.WireguardApp) -> list[str]:
     """The wg-quick conf body for a wireguard app — mirrors
     generate-netns.ts's emitWireguardInterface byte-for-byte."""
     cfg = app.config
@@ -856,7 +924,7 @@ def _wg_conf_lines(app: KernelApp) -> list[str]:
     return lines
 
 
-def _zerotier_wire_script(app: KernelApp, netns: str) -> str:
+def _zerotier_wire_script(app: pt.ZerotierApp, netns: str) -> str:
     """The zerotier app's up/down script — mirrors generate-netns.ts's
     emitZerotierInterface: start zerotier-one (its OWN instanceDir, so it
     never collides with a host-level daemon), wait for its control
@@ -1162,8 +1230,8 @@ def _emit_kernel_router_owner(
     for side_node in _kernel_router_sides(owner.key.name, nodes):
         if side_node.key.side == pt.Side.left:
             iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
-            if iface is not None and iface["kind"] == "veth":
-                transit_leg = f"veth-krn-{iface['shortName']}"
+            if iface is not None and iface.kind == "veth":
+                transit_leg = f"veth-krn-{iface.shortName}"
             transit_ipaddrs = list(side_node.data.ipaddrs or [])
             transit_routes = list(side_node.data.routes or [])
     if action == "delete":
@@ -1182,12 +1250,12 @@ def _emit_kernel_router_owner(
             # (2026-08-23).
             if side_node.data.apps:
                 dev = (
-                    f"veth-krn-{iface['shortName']}"
-                    if iface is not None and iface["kind"] == "veth"
+                    f"veth-krn-{iface.shortName}"
+                    if iface is not None and iface.kind == "veth"
                     else (
                         _iface_real_name(iface)
                         if iface is not None
-                        else _dummy_name(side_node.key.side)
+                        else _dummy_name(_side(side_node))
                     )
                 )
                 _emit_kernel_app_rules(
@@ -1209,7 +1277,7 @@ def _emit_kernel_router_owner(
                         transit_routes=transit_routes,
                     ),
                 )
-            if iface is not None and iface["kind"] == "vlan":
+            if iface is not None and iface.kind == "vlan":
                 real_name = _iface_real_name(iface)
                 emit.comment(
                     f"# --- kernel router vlan: remove {real_name} from inside the netns ---"
@@ -1222,8 +1290,8 @@ def _emit_kernel_router_owner(
         emit.sh(netns_ops.delete_netns_argv(netns))
         for side_node in _kernel_router_sides(owner.key.name, nodes):
             iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
-            if iface is not None and iface["kind"] == "veth":
-                root_leg = f"veth-ovn-{iface['shortName']}"
+            if iface is not None and iface.kind == "veth":
+                root_leg = f"veth-ovn-{iface.shortName}"
                 emit.comment(f"# --- kernel router transit veth: remove root leg {root_leg} ---")
                 emit.sh(linux_net_ops.delete_link_argv(root_leg))
         return
@@ -1250,14 +1318,14 @@ def _emit_kernel_router_owner(
     )
     for side_node in _kernel_router_sides(owner.key.name, nodes):
         iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
-        if iface is not None and iface.get("kind") not in _BINDABLE_IFACE_KINDS:
+        if iface is not None and iface.kind not in _BINDABLE_IFACE_KINDS:
             emit.comment(
-                f'# unsupported kernel router side interface kind "{iface.get("kind")}" '
-                f"for {owner.key.name} ({side_node.key.side.value}) — skipped, "
+                f'# unsupported kernel router side interface kind "{iface.kind}" '
+                f"for {owner.key.name} ({_side(side_node).value}) — skipped, "
                 "see deployer/ir_to_shell.py"
             )
             continue
-        if iface is not None and iface["kind"] == "veth":
+        if iface is not None and iface.kind == "veth":
             # The netns-side leg — `peerName` is the root-side leg
             # the transit domain's bridge attaches to (see
             # _emit_iface_bindings, which runs after this
@@ -1265,17 +1333,18 @@ def _emit_kernel_router_owner(
             # real device names come from the IFNAMSIZ-safe
             # `shortName` (src/ir.ts's kernelRouterSideToIR), not
             # the long `ifaceName`/`peerName` the model carries.
-            dev = f"veth-krn-{iface['shortName']}"
-            peer = f"veth-ovn-{iface['shortName']}"
+            dev = f"veth-krn-{iface.shortName}"
         else:
-            dev = _iface_real_name(iface) if iface is not None else _dummy_name(side_node.key.side)
-            peer = None
-        emit.comment(f"# --- kernel router side: {owner.key.name} ({side_node.key.side.value}) ---")
+            dev = _iface_real_name(iface) if iface is not None else _dummy_name(_side(side_node))
+        emit.comment(f"# --- kernel router side: {owner.key.name} ({_side(side_node).value}) ---")
         if iface is not None:
-            if iface["kind"] == "vlan":
-                emit.sh(linux_net_ops.add_vlan_argv(iface["vlanParent"], dev, iface["vlanId"]))
-            elif iface["kind"] == "veth":
-                emit.sh(linux_net_ops.add_veth_argv(peer, dev))
+            if iface.kind == "vlan":
+                emit.sh(linux_net_ops.add_vlan_argv(iface.vlanParent, dev, iface.vlanId))
+            elif iface.kind == "veth":
+                # `mac` (src/ir.ts's kernelRouterSideToIR) pins the
+                # netns-side leg's MAC so the OVN router's MAC_Binding
+                # for this side stays valid across a down/up.
+                emit.sh(linux_net_ops.add_veth_argv(f"veth-ovn-{iface.shortName}", dev, iface.mac))
             # "physical": the device must already exist in the root
             # namespace — nothing to create, only the move below.
         else:
@@ -1311,7 +1380,7 @@ def _emit_kernel_router_owner(
         )
         if side_node.data.securityGroup is not None and group is None:
             raise ValueError(
-                f"kernel router {owner.key.name} ({side_node.key.side.value}) "
+                f"kernel router {owner.key.name} ({_side(side_node).value}) "
                 f'references security group "{side_node.data.securityGroup}" '
                 f"but no such security.group node"
             )
@@ -1459,21 +1528,19 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
     if emit.action == "create":
         mappings: list[str] = []
         for domain, iface in bindings:
-            if iface.get("kind") not in _BINDABLE_IFACE_KINDS:
+            if iface.kind not in _BINDABLE_IFACE_KINDS:
                 emit.comment(
-                    f'# unsupported interface kind "{iface.get("kind")}" for domain '
+                    f'# unsupported interface kind "{iface.kind}" for domain '
                     f"{domain} on {host_name} — skipped, see deployer/ir_to_shell.py"
                 )
                 continue
             real_name = _iface_real_name(iface)
-            bridge = iface["shortName"]
+            bridge = iface.shortName
             emit.comment(f"# --- interface: {domain} on {host_name} ({real_name}) ---")
-            if iface["kind"] == "vlan":
-                emit.sh(
-                    linux_net_ops.ensure_vlan_argv(iface["vlanParent"], real_name, iface["vlanId"])
-                )
+            if iface.kind == "vlan":
+                emit.sh(linux_net_ops.ensure_vlan_argv(iface.vlanParent, real_name, iface.vlanId))
                 emit.sh(linux_net_ops.set_link_up_argv(real_name))
-            elif iface["kind"] == "veth":
+            elif iface.kind == "veth":
                 # The ROOT-side leg of the kernel router's transit veth —
                 # the kernel router block brings the netns-side leg up,
                 # but the peer stays DOWN in root until told otherwise
@@ -1490,14 +1557,14 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
     else:
         any_bound = False
         for domain, iface in bindings:
-            if iface.get("kind") not in _BINDABLE_IFACE_KINDS:
+            if iface.kind not in _BINDABLE_IFACE_KINDS:
                 continue
             any_bound = True
             real_name = _iface_real_name(iface)
-            bridge = iface["shortName"]
+            bridge = iface.shortName
             emit.comment(f"# --- interface: {domain} on {host_name} ({real_name}) ---")
             emit.sh(ovs_ops.del_br_argv(bridge))
-            if iface["kind"] == "vlan":
+            if iface.kind == "vlan":
                 emit.sh(linux_net_ops.delete_link_argv(real_name))
         if any_bound:
             emit.sh(ovs_ops.remove_external_id_argv("ovn-bridge-mappings"))
@@ -1518,18 +1585,18 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
 # can't be switched this way; that partial effect is by design.
 def _ipfix_bridge_flags(host_name: str, nodes: list[pt.Model]) -> dict[str, bool]:
     """bridge -> sampled? for this host. OFF if any bindable interface
-    bound into that bridge opted out (iface["flow"] is False); a bridge
+    bound into that bridge opted out (iface.flow is False); a bridge
     with no interfaces is absent entirely."""
     flags: dict[str, bool] = {}
     for _domain, iface in _host_bindings(nodes).get(host_name, []):
-        if iface.get("kind") not in _BINDABLE_IFACE_KINDS:
+        if iface.kind not in _BINDABLE_IFACE_KINDS:
             continue
-        bridge = iface["shortName"]
-        flags[bridge] = flags.get(bridge, True) and iface.get("flow") is not False
+        bridge = iface.shortName
+        flags[bridge] = flags.get(bridge, True) and iface.flow is not False
     return flags
 
 
-def _ipfix_setargs(ipfix) -> str:
+def _ipfix_setargs(ipfix: pt.IpfixData) -> str:
     # OVS IPFIX column=value args; only what the config set (OVS keeps
     # its own defaults for the rest). `targets` is a set-of-strings and
     # its "<ip>:<port>" value contains `:`, which OVSDB reads as the
@@ -1547,7 +1614,7 @@ def _ipfix_setargs(ipfix) -> str:
     return " ".join(args)
 
 
-def _ipfix_enable_script(bridge: str, ipfix) -> str:
+def _ipfix_enable_script(bridge: str, ipfix: pt.IpfixData) -> str:
     # Idempotent attach, run via `sh -c` (same argv-safe precedent as the
     # zerotier installer): REUSE this bridge's existing IPFIX row if it
     # has one (just update its columns), else create one and point the
@@ -1665,16 +1732,19 @@ def _segment_bridge(host_name: str, l2_segment: str, nodes: list[pt.Model]) -> s
         if ls.kind != "ovn.ls" or ls.id != l2_segment:
             continue
         for binding in ls.data.interfaces:
-            if binding.host == host_name and isinstance(binding.iface, dict):
-                short = binding.iface.get("shortName")
-                if short:
-                    return short
+            if binding.host == host_name and binding.iface.shortName:
+                return binding.iface.shortName
     raise ValueError(
         f"no ovn.ls interface on {host_name} for {l2_segment} to bind a " f"container veth to"
     )
 
 
-def _service_faces(service_name: str, host_name: str, nodes: list[pt.Model]):
+# One NIC of a workload: (index, serviceRef, bridge, root-side leg, the
+# in-container NIC name) — see _service_faces.
+Face = tuple[int, pt.ServiceRef, str, str, str]
+
+
+def _service_faces(service_name: str, host_name: str, nodes: list[pt.Model]) -> list[Face]:
     """One tuple per NIC of a workload: (index, serviceRef, bridge, dev,
     nic) — `dev` is the root-side leg; `nic` is the IN-CONTAINER interface
     name, already RESOLVED by the generator (ServiceRef.name — the deployer
@@ -1682,7 +1752,7 @@ def _service_faces(service_name: str, host_name: str, nodes: list[pt.Model]):
     service (`kernel.app.container:<name>`) — the endpoint carries the attachment."""
     service_id = f"kernel.app.container:{service_name}"
     base = hashlib.md5(service_name.encode()).hexdigest()[:8]
-    out = []
+    out: list[Face] = []
     i = 0
     for lrp in nodes:
         if lrp.kind != "ovn.lrp":
@@ -1698,7 +1768,7 @@ def _service_faces(service_name: str, host_name: str, nodes: list[pt.Model]):
 
 def _service_up_lines(
     node: pt.KernelAppContainerNode | pt.KernelAppServiceNode,
-    faces,
+    faces: list[Face],
 ) -> list[str]:
     """The `up` body: build/run the container, then for EACH NIC (from a
     referencing endpoint) move a veth into its netns, name it after the
@@ -1749,7 +1819,7 @@ def _service_up_lines(
     # (2026-09-19).
     dns_args = ""
     for _, ref, _, _, _ in faces:
-        resolver = getattr(ref, "resolver", None)
+        resolver = ref.resolver
         if resolver and resolver.nameservers:
             dns_args = "".join(f" --dns {shlex.quote(ns)}" for ns in resolver.nameservers)
             break
@@ -1784,9 +1854,16 @@ def _service_up_lines(
         # collide across containers).
         table = 1000 + i
         networks = [str(ipaddress.ip_interface(a).network) for a in (ref.ipaddrs or [])]
+        # The container-side leg's MAC, resolved by the generator
+        # (ServiceRef.mac): the container is recreated on every `up`, and
+        # with a random MAC the segment's OVN router would keep a
+        # MAC_Binding for the PREVIOUS NIC (2026-10-11). `address` after
+        # `peer name` applies to the peer leg. Absent in an older IR ->
+        # the kernel's random MAC, as before.
+        peer_mac = f" address {shlex.quote(ref.mac)}" if ref.mac else ""
         lines += [
             f"# --- NIC {nic} on {bridge} ---",
-            f'ip link add "{dev}" type veth peer name "{peer}"',
+            f'ip link add "{dev}" type veth peer name "{peer}"{peer_mac}',
             f'ip link set "{peer}" netns "$container"',
             f'ip netns exec "$container" ip link set "{peer}" name "{nic}"',
             f'ip netns exec "$container" ip link set "{nic}" up',
@@ -1836,7 +1913,7 @@ def _service_up_lines(
 
 def _service_down_lines(
     node: pt.KernelAppContainerNode | pt.KernelAppServiceNode,
-    faces,
+    faces: list[Face],
 ) -> list[str]:
     """The `down` body: remove the container (which destroys its netns and
     the moved-in NICs), then its root legs and bridge ports."""

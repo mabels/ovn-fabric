@@ -20,13 +20,14 @@
 
 from __future__ import annotations
 
+from . import JsonObject
 from .netns import run as run_in_netns
 from .ovsdb import list_table
 
 _VSCTL = ["ovs-vsctl"]
 
 
-def list_interfaces() -> list[dict]:
+def list_interfaces() -> list[JsonObject]:
     return [
         {
             "name": iface["name"],

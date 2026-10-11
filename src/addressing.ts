@@ -116,3 +116,32 @@ export function fnv1a64(s: string): string {
     .toString(16)
     .padStart(FNV1A_IDENTITY_SIZE / 4, "0");
 }
+
+// ── kernel-device MAC derivation ────────────────────────────────────
+// The MAC of a REAL kernel device this project creates on an OVN
+// segment (a kernel router's veth netns leg, a workload container's
+// NIC). Left alone, the kernel picks a RANDOM MAC every time the device
+// is recreated — and an OVN logical router keeps the MAC_Binding it
+// learned for that IP forever (no aging by default, no reachability
+// probing), so after a netns/container restart it keeps sending to the
+// OLD MAC and the kernel drops every frame as "other host" before
+// routing (confirmed live 2026-10-11: IPv4 and IPv6 black-holed on four
+// kernel-router transit legs until something made the netns emit
+// ARP/ND). Making the MAC a pure function of the device's own address
+// means a binding can never go stale, whatever gets recreated or moved.
+//
+// Same fold as an LRP (macFromV4 of the first IPv4 — resolveMac,
+// src/ir.ts). A device with no IPv4 falls back to a locally-administered
+// MAC (02:…) hashed from `name`, which must itself be stable across
+// runs (a config-derived name, never a runtime id).
+export function macFromAddrsOrName(
+  ipaddrs: readonly (IPv4 | IPv6)[],
+  name: string,
+): string {
+  const v4 = ipaddrs.find((addr): addr is IPv4 => addr.is_ipv4());
+  if (v4) return macFromV4(v4);
+  const hex = fnv1a64(name).slice(0, 10);
+  return `02:${hex.slice(0, 2)}:${hex.slice(2, 4)}:${hex.slice(4, 6)}:${
+    hex.slice(6, 8)
+  }:${hex.slice(8, 10)}`;
+}

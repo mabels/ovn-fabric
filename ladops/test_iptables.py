@@ -161,7 +161,7 @@ FAKE_RULESET = {
 }
 
 
-def _fake_run(argv, netns):
+def _fake_run(argv: list[str], netns: str | None) -> mock.Mock:
     assert argv == ["nft", "-j", "list", "ruleset"]
     return mock.Mock(stdout=json.dumps(FAKE_RULESET))
 

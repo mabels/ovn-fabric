@@ -21,9 +21,11 @@ import importlib
 import unittest
 from unittest import mock
 
+from ladops import JsonObject
+
 mod = importlib.import_module("ladops.linux_net")
 
-FAKE_LINK = [
+FAKE_LINK: list[JsonObject] = [
     {"ifname": "lo", "link_type": "loopback", "operstate": "UNKNOWN"},
     {"ifname": "ens19", "link_type": "ether", "operstate": "UP"},
     # a veth end whose peer lives in another namespace — real `ip -j
@@ -39,7 +41,7 @@ FAKE_LINK = [
     },
 ]
 
-FAKE_ADDR = [
+FAKE_ADDR: list[JsonObject] = [
     {
         "ifname": "ens19",
         "addr_info": [
@@ -49,16 +51,16 @@ FAKE_ADDR = [
     },
 ]
 
-FAKE_ROUTE4 = [
+FAKE_ROUTE4: list[JsonObject] = [
     {"dst": "default", "gateway": "192.168.129.1", "dev": "ens19"},
 ]
-FAKE_ROUTE6 = [
+FAKE_ROUTE6: list[JsonObject] = [
     {"dst": "default", "gateway": "fd00:192:168:129::1", "dev": "ens19"},
     {"dst": "fe80::/64", "dev": "ens19"},
 ]
 
 
-def _fake_run_ip_json(args, netns):
+def _fake_run_ip_json(args: list[str], netns: str | None) -> list[JsonObject]:
     if args == ["link", "show"]:
         return FAKE_LINK
     if args == ["addr", "show"]:
@@ -239,6 +241,35 @@ class DummyArgvTest(unittest.TestCase):
         self.assertEqual(
             mod.set_sysctl_argv("net.ipv4.ip_forward", "1"),
             ["sysctl", "-w", "net.ipv4.ip_forward=1"],
+        )
+
+
+class VethArgvTest(unittest.TestCase):
+    def test_add_veth_argv_builds_the_real_ip_link_command(self) -> None:
+        # No MAC given -> the kernel picks one (the pre-2026-10-11 shape).
+        self.assertEqual(
+            mod.add_veth_argv("veth-ovn-0", "veth-krn-0"),
+            ["ip", "link", "add", "veth-ovn-0", "type", "veth", "peer", "name", "veth-krn-0"],
+        )
+
+    def test_add_veth_argv_pins_the_peer_legs_mac(self) -> None:
+        # `address` AFTER `peer name` applies to the PEER leg (the one
+        # moved into the netns), not to the root-side leg named first.
+        self.assertEqual(
+            mod.add_veth_argv("veth-ovn-0", "veth-krn-0", "00:00:0a:63:00:02"),
+            [
+                "ip",
+                "link",
+                "add",
+                "veth-ovn-0",
+                "type",
+                "veth",
+                "peer",
+                "name",
+                "veth-krn-0",
+                "address",
+                "00:00:0a:63:00:02",
+            ],
         )
 
 

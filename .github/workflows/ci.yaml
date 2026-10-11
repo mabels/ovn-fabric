@@ -78,15 +78,15 @@ jobs:
       # ── Python side: ladops/reconciler/deployer/protocol ────────────
       # .venv-build/ is build-time-only tooling (never shipped to a
       # router, see pyproject.toml's own comment) — created here, once,
-      # with all three tools this job needs from it (black/ruff for the
-      # hand-written source below, datamodel-code-generator for
+      # with all the tools this job needs from it (black/ruff/mypy for
+      # the hand-written source below, datamodel-code-generator for
       # generate-pytypes next). generate-pytypes's own bootstrap
       # (ensureDatamodelCodegen(), src/cli.ts) finds this venv already
       # present and just adds datamodel-code-generator to it.
-      - name: Set up Python build venv (black, ruff)
+      - name: Set up Python build venv (black, ruff, mypy)
         run: |
           python3 -m venv .venv-build
-          .venv-build/bin/pip install --quiet black ruff
+          .venv-build/bin/pip install --quiet black ruff mypy
 
       - name: Python format check (black)
         run: .venv-build/bin/black --check ladops/ deployer/ protocol/ reconciler/
@@ -106,6 +106,12 @@ jobs:
         # with NotCapable without it even though nothing here reads an
         # env var itself.
         run: npx deno run --allow-read --allow-write --allow-run --allow-net --allow-env src/cli.ts generate-pytypes
+
+      # AFTER generate-pytypes: the deployer is typed against
+      # protocol/generated.py, which only exists once that has run.
+      # Configured in pyproject.toml ([tool.mypy], strict).
+      - name: Python type check (mypy)
+        run: .venv-build/bin/mypy
 
       - name: Python unit tests (ladops, reconciler, deployer, protocol)
         run: python3 -m unittest discover -s . -p "test_*.py" -v

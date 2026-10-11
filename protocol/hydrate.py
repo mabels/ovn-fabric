@@ -1,299 +1,264 @@
-# protocol/hydrate.py — hand-written, NOT regenerated (generated.py is
-# — this file survives every `generate-pytypes` run). Converts a raw IR
-# JSON node (dict, as loaded from generate-ir's output) into its typed
-# dataclass (generated.InfraHostNode/OvnLsNode/OvnLrpNode), dispatched
-# by `kind`.
+# protocol/hydrate.py — hand-written, NOT regenerated, but GENERIC: it
+# holds no knowledge of any node kind or field. A raw IR JSON node (dict,
+# as loaded from generate-ir's output) becomes its typed dataclass by
+# walking the type hints of protocol/generated.py — the dataclasses
+# `generate-pytypes` builds from src/protocol.ts's ArkType schema. So a
+# protocol change is made in ONE place (src/protocol.ts) and this module
+# follows it after the next `generate-pytypes`; it never needs editing
+# for a new kind or field (2026-10-11 — it used to map every field by
+# hand, which silently DROPPED any field the mapping forgot: a docker
+# app's `build`, a zerotier app's `routes`).
 #
-# A KeyError (unknown `kind`) or TypeError (a required field missing —
-# a real Python dataclass constructor call, not a hand-rolled check) IS
-# the intended failure mode for version skew: this data is internal,
-# produced by this project's own generator, not adversarial external
-# input, so what actually needs catching is a stale deployer bundle
-# receiving newer-shaped IR data, not defensive-grade validation (see
-# ADR 0002, "Type stability across the TypeScript/Python boundary").
+# What the walk understands is exactly what datamodel-codegen emits for
+# this schema: dataclasses, Enum, Literal, list[T], dict[str, T], Any,
+# unions (`T | None`, `str | list[str]`, a union of dataclasses told
+# apart by their Literal fields — e.g. the kernel apps' `kind`) and the
+# JSON primitives. An annotation outside that set raises instead of
+# passing raw data through untyped.
+#
+# The walk is STRICT, and every failure is an IRShapeError naming the
+# node id and the path: an unknown `kind`, a missing required field, a
+# value of the wrong shape, and a key the dataclass does not declare.
+# That last one is what catches drift between the generator and the
+# protocol (src/ir.ts emitting something src/protocol.ts never
+# declared) and a stale deployer bundle receiving newer-shaped IR —
+# this data is internal, produced by this project's own generator, not
+# adversarial external input, so version skew is what needs catching
+# (see ADR 0002, "Type stability across the TypeScript/Python
+# boundary").
 #
 # Every OTHER Python component (deployer/ir_to_shell.py, deployer/
 # cli.py) works with these typed nodes exclusively — this module is the
-# ONE place a raw dict is still indexed by string key, precisely so it
-# can be the one place that changes if the envelope shape ever does.
+# ONE place a raw dict is still indexed by string key.
 
 from __future__ import annotations
 
-from . import AppDhcpClient, AppDocker, AppWireguard, AppZerotier
+import dataclasses
+import enum
+import functools
+import keyword
+import types
+import typing
+from collections.abc import Mapping, Sequence
+
 from . import generated as pt
 
 
-def _hydrate_infra_host(raw: dict) -> pt.InfraHostNode:
-    data = raw["data"]
-    ipfix = data.get("ipfix")
-    return pt.InfraHostNode(
-        id=raw["id"],
-        kind=raw["kind"],
-        key=pt.InfraHostKey(host=raw["key"]["host"]),
-        data=pt.InfraHostData(
-            connectAddress=data["connectAddress"],
-            encapIp=data.get("encapIp"),
-            ovnRole=pt.OvnRole(data["ovnRole"]) if data.get("ovnRole") is not None else None,
-            os=pt.Os(name=data["os"]["name"], version=data["os"]["version"]),
-            dependencies=data.get("dependencies"),
-            ipfix=(
-                pt.Ipfix(
-                    targets=ipfix["targets"],
-                    sampling=ipfix.get("sampling"),
-                    cacheActiveTimeout=ipfix.get("cacheActiveTimeout"),
-                    cacheMaxFlows=ipfix.get("cacheMaxFlows"),
-                )
-                if ipfix is not None
-                else None
-            ),
-        ),
-    )
+class IRShapeError(ValueError):
+    """A raw IR node does not match protocol/generated.py's dataclasses."""
 
 
-def _hydrate_ovn_ls(raw: dict) -> pt.OvnLsNode:
-    data = raw["data"]
-    return pt.OvnLsNode(
-        id=raw["id"],
-        kind=raw["kind"],
-        key=pt.OvnLsKey(name=raw["key"]["name"]),
-        data=pt.OvnLsData(
-            interfaces=[pt.Interface(host=e["host"], iface=e["iface"]) for e in data["interfaces"]],
-        ),
-    )
+_NONE_TYPE = type(None)
+_UNION_ORIGINS = (typing.Union, types.UnionType)
 
 
-def _hydrate_ovn_lrp(raw: dict) -> pt.OvnLrpNode:
-    data = raw["data"]
-    return pt.OvnLrpNode(
-        id=raw["id"],
-        kind=raw["kind"],
-        key=pt.OvnLrpKey(ovnrouter=raw["key"]["ovnrouter"], name=raw["key"]["name"]),
-        data=pt.OvnLrpData(
-            l2Segment=data["l2Segment"],
-            addresses=data["addresses"],
-            mac=data["mac"],
-            gatewayChassis=data.get("gatewayChassis"),
-            ipv6RaConfigs=data.get("ipv6RaConfigs"),
-            serviceRefs=(
-                [
-                    pt.ServiceRef(
-                        service=r["service"],
-                        name=r["name"],
-                        ipaddrs=[a for a in r["ipaddrs"]] if r.get("ipaddrs") else None,
-                        routes=(
-                            [
-                                pt.Route(
-                                    dst=x["dst"],
-                                    via=x.get("via"),
-                                    metric=x.get("metric"),
-                                )
-                                for x in r["routes"]
-                            ]
-                            if r.get("routes")
-                            else None
-                        ),
-                        resolver=(
-                            pt.Resolver(nameservers=[n for n in r["resolver"]["nameservers"]])
-                            if r.get("resolver")
-                            else None
-                        ),
-                    )
-                    for r in data["serviceRefs"]
-                ]
-                if data.get("serviceRefs")
-                else None
-            ),
-        ),
-    )
+@functools.cache
+def _hints(cls: type) -> dict[str, typing.Any]:
+    # generated.py uses `from __future__ import annotations`, so a
+    # dataclass field's `.type` is a string — resolve them once per class.
+    return typing.get_type_hints(cls)
 
 
-def _route_key_and_data(raw: dict) -> tuple[pt.RouteKey, pt.RouteData]:
-    return (
-        pt.RouteKey(ovnrouter=raw["key"]["ovnrouter"], prefix=raw["key"]["prefix"]),
-        pt.RouteData(
-            nexthop=raw["data"]["nexthop"],
-            masq=raw["data"]["masq"],
-            domain=raw["data"]["domain"],
-        ),
-    )
+def _json_key(field_name: str) -> str:
+    # datamodel-codegen appends `_` to a field whose JSON key is a Python
+    # keyword (Build.from_ <- "from") — undo exactly that, nothing else.
+    if field_name.endswith("_") and keyword.iskeyword(field_name[:-1]):
+        return field_name[:-1]
+    return field_name
 
 
-def _hydrate_ipv4_route(raw: dict) -> pt.Ipv4RouteNode:
-    key, data = _route_key_and_data(raw)
-    return pt.Ipv4RouteNode(id=raw["id"], kind=raw["kind"], key=key, data=data)
+@functools.cache
+def _literal_fields(cls: type) -> dict[str, tuple[object, ...]]:
+    """JSON key -> allowed values, for every Literal-typed field of a
+    dataclass — its discriminators (a node's or an app's `kind`)."""
+    return {
+        _json_key(name): typing.get_args(hint)
+        for name, hint in _hints(cls).items()
+        if typing.get_origin(hint) is typing.Literal
+    }
 
 
-def _hydrate_ipv6_route(raw: dict) -> pt.Ipv6RouteNode:
-    key, data = _route_key_and_data(raw)
-    return pt.Ipv6RouteNode(id=raw["id"], kind=raw["kind"], key=key, data=data)
+def _is_dataclass_type(tp: object) -> typing.TypeGuard[type]:
+    # dataclasses.is_dataclass() is also true for an INSTANCE; an
+    # annotation is only ever the class.
+    return isinstance(tp, type) and dataclasses.is_dataclass(tp)
 
 
-def _hydrate_kernel_router(raw: dict) -> pt.KernelRouterNode:
-    data = raw["data"]
-    side = raw["key"].get("side")
-    routes = data.get("routes")
-    ifaces = data.get("ifaces")
-    apps = data.get("apps")
-    return pt.KernelRouterNode(
-        id=raw["id"],
-        kind=raw["kind"],
-        key=pt.KernelRouterKey(
-            name=raw["key"]["name"],
-            side=pt.Side(side) if side is not None else None,
-        ),
-        data=pt.KernelRouterData(
-            host=data["host"],
-            ipaddrs=data.get("ipaddrs"),
-            routes=(
-                [pt.Route(dst=r["dst"], via=r.get("via"), metric=r.get("metric")) for r in routes]
-                if routes is not None
-                else None
-            ),
-            ifaces=(
-                [pt.Interface(host=e["host"], iface=e["iface"]) for e in ifaces]
-                if ifaces is not None
-                else None
-            ),
-            securityGroup=data.get("securityGroup"),
-            upstreamPeerAddrs=data.get("upstreamPeerAddrs"),
-            apps=([_hydrate_app(a) for a in apps] if apps is not None else None),
-        ),
-    )
+def _is_number(value: object) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
-def _hydrate_app(raw: dict):
-    kind = raw["kind"]
-    if kind == "dhcp-client":
-        return AppDhcpClient(kind="dhcp-client", style=pt.Style(raw["style"]))
-    if kind == "wireguard":
-        config = raw["config"]
-        return AppWireguard(
-            kind=kind,
-            ifaceName=raw["ifaceName"],
-            config=pt.Config(
-                privateKey=config["privateKey"],
-                address=config["address"],
-                listenPort=config.get("listenPort"),
-                dns=config.get("dns"),
-                peer=pt.Peer(
-                    publicKey=config["peer"]["publicKey"],
-                    endpoint=config["peer"]["endpoint"],
-                    allowedIps=config["peer"]["allowedIps"],
-                    persistentKeepalive=config["peer"].get("persistentKeepalive"),
-                ),
-            ),
-            masq=[pt.MasqEnum(m) for m in raw["masq"]],
+def _shape_matches(tp: typing.Any, value: object) -> bool:
+    """Cheap top-level test used ONLY to pick a union member; the chosen
+    member is then built (and fully checked) by _build."""
+    if tp is typing.Any:
+        return True
+    origin = typing.get_origin(tp)
+    if origin is list:
+        return isinstance(value, list)
+    if origin is dict:
+        return isinstance(value, dict)
+    if origin is typing.Literal:
+        return value in typing.get_args(tp)
+    if _is_dataclass_type(tp):
+        return isinstance(value, dict) and all(
+            value.get(key) in allowed for key, allowed in _literal_fields(tp).items()
         )
-    if kind == "zerotier":
-        return AppZerotier(
-            kind="zerotier",
-            networkId=raw["networkId"],
-            instanceDir=raw["instanceDir"],
-            masq=[pt.MasqEnum(m) for m in raw["masq"]],
+    if isinstance(tp, type) and issubclass(tp, enum.Enum):
+        return value in {member.value for member in tp}
+    if tp is bool:
+        return isinstance(value, bool)
+    if tp is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if tp is float:
+        return _is_number(value)
+    if tp is str:
+        return isinstance(value, str)
+    return False
+
+
+def _build_union(members: tuple[object, ...], value: object, path: str) -> object:
+    if value is None:
+        if _NONE_TYPE in members:
+            return None
+        raise IRShapeError(f"{path}: null is not allowed here")
+    candidates = [m for m in members if m is not _NONE_TYPE]
+    if len(candidates) == 1:
+        return _build(candidates[0], value, path)
+    matches = [m for m in candidates if _shape_matches(m, value)]
+    if len(matches) == 1:
+        return _build(matches[0], value, path)
+    names = ", ".join(getattr(m, "__name__", str(m)) for m in candidates)
+    hint = f" (kind={value.get('kind')!r})" if isinstance(value, dict) else ""
+    reason = "matches none of" if not matches else "is ambiguous between"
+    raise IRShapeError(f"{path}: value{hint} {reason} {names}")
+
+
+def _build_dataclass(cls: type, value: object, path: str) -> object:
+    if not isinstance(value, dict):
+        raise IRShapeError(
+            f"{path}: expected an object for {cls.__name__}, got {type(value).__name__}"
         )
-    return AppDocker(
-        kind="docker",
-        image=raw["image"],
-        name=raw["name"],
-        cmd=raw.get("cmd"),
-        ip=raw.get("ip"),
-        routerIp=raw.get("routerIp"),
-        vethName=raw.get("vethName"),
+    hints = _hints(cls)
+    kwargs: dict[str, object] = {}
+    known: set[str] = set()
+    for field in dataclasses.fields(cls):
+        key = _json_key(field.name)
+        known.add(key)
+        if key in value:
+            kwargs[field.name] = _build(hints[field.name], value[key], f"{path}.{key}")
+        elif field.default is dataclasses.MISSING and field.default_factory is dataclasses.MISSING:
+            raise IRShapeError(f"{path}.{key}: required field is missing ({cls.__name__})")
+    unknown = sorted(set(value) - known)
+    if unknown:
+        raise IRShapeError(
+            f"{path}: {cls.__name__} has no field(s) {', '.join(unknown)} — the IR carries "
+            "something protocol/generated.py does not declare. Declare it in "
+            "src/protocol.ts and re-run generate-pytypes, or this deployer bundle is "
+            "older than the IR it was given."
+        )
+    return cls(**kwargs)
+
+
+def _build(tp: typing.Any, value: object, path: str) -> object:
+    if tp is typing.Any:
+        return value
+    origin = typing.get_origin(tp)
+    if origin in _UNION_ORIGINS:
+        return _build_union(typing.get_args(tp), value, path)
+    if origin is typing.Literal:
+        if value not in typing.get_args(tp):
+            raise IRShapeError(
+                f"{path}: expected one of {list(typing.get_args(tp))}, got {value!r}"
+            )
+        return value
+    if origin is list:
+        if not isinstance(value, list):
+            raise IRShapeError(f"{path}: expected a list, got {type(value).__name__}")
+        (item,) = typing.get_args(tp)
+        return [_build(item, v, f"{path}[{i}]") for i, v in enumerate(value)]
+    if origin is dict:
+        if not isinstance(value, dict):
+            raise IRShapeError(f"{path}: expected an object, got {type(value).__name__}")
+        _, item = typing.get_args(tp)
+        return {k: _build(item, v, f"{path}.{k}") for k, v in value.items()}
+    if _is_dataclass_type(tp):
+        return _build_dataclass(tp, value, path)
+    if isinstance(tp, type) and issubclass(tp, enum.Enum):
+        try:
+            return tp(value)
+        except ValueError:
+            allowed = [member.value for member in tp]
+            raise IRShapeError(f"{path}: expected one of {allowed}, got {value!r}") from None
+    if tp is bool:
+        if not isinstance(value, bool):
+            raise IRShapeError(f"{path}: expected a boolean, got {value!r}")
+        return value
+    if tp is int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise IRShapeError(f"{path}: expected an integer, got {value!r}")
+        return value
+    if tp is float:
+        # A JSON `number`: 200 and 200.0 are both fine.
+        if not _is_number(value):
+            raise IRShapeError(f"{path}: expected a number, got {value!r}")
+        return value
+    if tp is str:
+        if not isinstance(value, str):
+            raise IRShapeError(f"{path}: expected a string, got {value!r}")
+        return value
+    raise IRShapeError(
+        f"{path}: protocol/hydrate.py does not understand the annotation {tp!r} — "
+        "datamodel-codegen emitted a shape this walker has no rule for yet"
     )
 
 
-def _hydrate_kernel_app_container(raw: dict) -> pt.KernelAppContainerNode:
-    # The node KIND is the workload kind — the data carries no nested `kind`.
-    data = raw["data"]
-    build_raw = data.get("build")
-    return pt.KernelAppContainerNode(
-        id=raw["id"],
-        kind=raw["kind"],
-        key=pt.KernelServiceKey(name=raw["key"]["name"]),
-        data=pt.KernelAppContainerData(
-            host=data["host"],
-            image=data["image"],
-            cmd=[c for c in data["cmd"]] if data.get("cmd") else None,
-            deps=[d for d in data["deps"]] if data.get("deps") else None,
-            env=dict(data["env"]) if data.get("env") else None,
-            files=(
-                [pt.File(path=f["path"], content=f["content"]) for f in data["files"]]
-                if data.get("files")
-                else None
-            ),
-            build=(
-                pt.Build(
-                    from_=build_raw["from"],
-                    packages=(
-                        [p for p in build_raw["packages"]] if build_raw.get("packages") else None
-                    ),
-                    dockerfile=build_raw.get("dockerfile"),
+@functools.cache
+def _node_classes() -> dict[str, type]:
+    """`kind` -> node dataclass, read off generated.Model (the union of
+    every node) — each member's own `kind: Literal[...]` is its key."""
+    by_kind: dict[str, type] = {}
+    for cls in typing.get_args(pt.Model):
+        for kind in _literal_fields(cls)["kind"]:
+            if not isinstance(kind, str):
+                raise IRShapeError(f"{cls.__name__}: a node kind must be a string, got {kind!r}")
+            if kind in by_kind:
+                raise IRShapeError(
+                    f"node kind {kind!r} is declared by both {by_kind[kind].__name__} "
+                    f"and {cls.__name__} in protocol/generated.py"
                 )
-                if build_raw
-                else None
-            ),
-        ),
-    )
+            by_kind[kind] = cls
+    return by_kind
 
 
-def _hydrate_kernel_app_service(raw: dict) -> pt.KernelAppServiceNode:
-    data = raw["data"]
-    return pt.KernelAppServiceNode(
-        id=raw["id"],
-        kind=raw["kind"],
-        key=pt.KernelServiceKey(name=raw["key"]["name"]),
-        data=pt.KernelAppServiceData(
-            host=data["host"],
-            up=[a for a in data["up"]],
-            down=[a for a in data["down"]] if data.get("down") else None,
-            deps=[d for d in data["deps"]] if data.get("deps") else None,
-            files=(
-                [pt.File(path=f["path"], content=f["content"]) for f in data["files"]]
-                if data.get("files")
-                else None
-            ),
-        ),
-    )
-
-
-def _hydrate_security_group(raw: dict) -> pt.SecurityGroupNode:
-    data = raw["data"]
-    return pt.SecurityGroupNode(
-        id=raw["id"],
-        kind=raw["kind"],
-        key=pt.SecurityGroupKey(name=raw["key"]["name"]),
-        data=pt.SecurityGroupData(
-            rules=[pt.Rule(family=pt.Family(r["family"]), kind=r["kind"]) for r in data["rules"]],
-        ),
-    )
-
-
-_HYDRATORS = {
-    "infra.host": _hydrate_infra_host,
-    "ovn.ls": _hydrate_ovn_ls,
-    "ovn.lrp": _hydrate_ovn_lrp,
-    "ipv4.route": _hydrate_ipv4_route,
-    "ipv6.route": _hydrate_ipv6_route,
-    "kernel.router": _hydrate_kernel_router,
-    "security.group": _hydrate_security_group,
-    "kernel.app.container": _hydrate_kernel_app_container,
-    "kernel.app.service": _hydrate_kernel_app_service,
-}
-
-
-def hydrate_node(raw: dict) -> pt.Model:
+def hydrate_node(raw: Mapping[str, object]) -> pt.Model:
     kind = raw.get("kind")
-    hydrator = _HYDRATORS.get(kind)
-    if hydrator is None:
-        raise ValueError(
+    cls = _node_classes().get(kind) if isinstance(kind, str) else None
+    if cls is None:
+        raise IRShapeError(
             f"unknown IR node kind {kind!r} (id={raw.get('id')!r}) — protocol/generated.py "
             "has no matching dataclass for it. Either this IR JSON is from a newer "
             "ovn-fabric than this deployer bundle knows about, or generate-pytypes "
             "(deno run -A src/cli.ts generate-pytypes) needs to be re-run for a "
             "genuinely new kind."
         )
-    return hydrator(raw)
+    # `cls` is one of pt.Model's own members (_node_classes), so what the
+    # walk builds from it IS a pt.Model — the cast only tells the checker
+    # what the reflection above already guarantees.
+    return typing.cast(pt.Model, _build_dataclass(cls, raw, str(raw.get("id") or f"<{kind}>")))
 
 
-def hydrate_nodes(raw_nodes: list[dict]) -> list[pt.Model]:
+_Shape = typing.TypeVar("_Shape")
+
+
+def hydrate_as(cls: type[_Shape], raw: object, path: str = "<value>") -> _Shape:
+    """Any ONE protocol shape (a generated dataclass) from its raw JSON
+    form, under the same strict rules as a whole node — for a caller that
+    holds a fragment rather than a node (test fixtures, mostly)."""
+    if not _is_dataclass_type(cls):
+        raise IRShapeError(f"{path}: {cls!r} is not a protocol dataclass")
+    return typing.cast(_Shape, _build_dataclass(cls, raw, path))
+
+
+def hydrate_nodes(raw_nodes: Sequence[Mapping[str, object]]) -> list[pt.Model]:
     return [hydrate_node(n) for n in raw_nodes]

@@ -18,6 +18,8 @@ import importlib
 import unittest
 from unittest import mock
 
+from ladops import JsonObject
+
 mod = importlib.import_module("ladops.ovn")
 
 FAKE_ROUTERS = [
@@ -57,7 +59,7 @@ FAKE_PORTS = [
 ]
 
 
-def _fake_list_table(argv, table):
+def _fake_list_table(argv: list[str], table: str) -> list[JsonObject]:
     assert argv == ["ovn-nbctl"]
     if table == "Logical_Router":
         return FAKE_ROUTERS
@@ -114,6 +116,18 @@ class WriteTest(unittest.TestCase):
         self.assertEqual(
             mod.lr_add_argv("router-home"),
             ["ovn-nbctl", "--may-exist", "lr-add", "router-home"],
+        )
+
+    def test_lr_set_option_argv(self) -> None:
+        self.assertEqual(
+            mod.lr_set_option_argv("router-home", "mac_binding_age_threshold", "300"),
+            [
+                "ovn-nbctl",
+                "set",
+                "logical_router",
+                "router-home",
+                "options:mac_binding_age_threshold=300",
+            ],
         )
 
     def test_lr_del_uses_if_exists(self) -> None:

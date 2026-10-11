@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import unittest
 from unittest import mock
 
@@ -24,7 +25,7 @@ ns-uplink-voda-avm (id: 0)
 class ListNetnsTest(unittest.TestCase):
     def test_strips_the_id_suffix(self) -> None:
         with mock.patch.object(
-            mod.subprocess, "run", return_value=mock.Mock(stdout=FAKE_NETNS_LIST)
+            subprocess, "run", return_value=mock.Mock(stdout=FAKE_NETNS_LIST)
         ) as run:
             names = mod.list_netns()
         run.assert_called_once_with(
@@ -43,7 +44,7 @@ class ListNetnsTest(unittest.TestCase):
         )
 
     def test_empty_output_is_no_namespaces_not_one_blank_entry(self) -> None:
-        with mock.patch.object(mod.subprocess, "run", return_value=mock.Mock(stdout="")):
+        with mock.patch.object(subprocess, "run", return_value=mock.Mock(stdout="")):
             self.assertEqual(mod.list_netns(), [])
 
 
@@ -80,14 +81,14 @@ class ScopeIdTest(unittest.TestCase):
 
 class RunTest(unittest.TestCase):
     def test_global_runs_argv_directly(self) -> None:
-        with mock.patch.object(mod.subprocess, "run") as run:
+        with mock.patch.object(subprocess, "run") as run:
             mod.run(["ip", "-j", "addr", "show"], None)
         run.assert_called_once_with(
             ["ip", "-j", "addr", "show"], check=True, capture_output=True, text=True
         )
 
     def test_real_namespace_is_wrapped_in_ip_netns_exec(self) -> None:
-        with mock.patch.object(mod.subprocess, "run") as run:
+        with mock.patch.object(subprocess, "run") as run:
             mod.run(["ip", "-j", "addr", "show"], "ns-uplink-voda-avm")
         run.assert_called_once_with(
             ["ip", "netns", "exec", "ns-uplink-voda-avm", "ip", "-j", "addr", "show"],

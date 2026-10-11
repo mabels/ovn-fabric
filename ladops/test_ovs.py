@@ -10,6 +10,8 @@ import importlib
 import unittest
 from unittest import mock
 
+from ladops import JsonObject
+
 mod = importlib.import_module("ladops.ovs")
 
 FAKE_INTERFACES = [
@@ -30,7 +32,7 @@ FAKE_INTERFACES = [
 ]
 
 
-def _fake_list_table(argv, table):
+def _fake_list_table(argv: list[str], table: str) -> list[JsonObject]:
     assert argv == ["ovs-vsctl"]
     assert table == "Interface"
     return FAKE_INTERFACES

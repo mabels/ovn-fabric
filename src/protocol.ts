@@ -34,14 +34,22 @@
 //      intentional, sufficient failure mode for version skew, not a
 //      hand-written validator.
 //
-// Only the kinds toIR() actually produces today (src/ir.ts) — ovn.ls's
-// `interfaces[].iface` stays `unknown` here rather than modeling the
-// full InterfaceKind union: that shape lives entirely within the
-// TypeScript side (ovn-fabric's own config authoring), the Python side
-// never inspects it structurally (deployer/ir_to_shell.py only reads
-// `.kind`/named fields it recognizes, see _iface_real_name), so
-// pinning its exact shape into the cross-language protocol would add a
-// second place to keep in sync for no real benefit yet.
+// The IR is FULLY typed (2026-10-11): no `unknown`, and an open
+// `{[string]: string}` map only where the keys really are author-chosen
+// (a workload's env vars). Everything else — an interface binding, a
+// router's OVN options, an LRP's RA configs — is a closed shape, so:
+//   - src/ir.ts builds its nodes against the types INFERRED from these
+//     schemas (the `export type X = typeof X.infer` twins below): an IR
+//     node that doesn't match the protocol is a compile error;
+//   - protocol/hydrate.py walks the generated dataclasses strictly: a
+//     field the protocol doesn't declare is an error on the Python side;
+//   - the deployer reads attributes of generated classes, never a raw
+//     dict.
+// A nested shape that should be a NAMED Python class is exported here
+// and listed in buildJsonSchema()'s $defs; buildJsonSchema() then turns
+// every inlined copy of it into a `$ref` (ArkType inlines nested types,
+// which is what made datamodel-codegen invent positional names like
+// Apps1/ServiceRef1 and emit the same shape twice).
 
 import { type } from "arktype";
 
@@ -80,12 +88,99 @@ export const InfraHostNode = type({
   data: InfraHostData,
 });
 
-// `iface` carries `shortName` (the real, IFNAMSIZ-safe OVS bridge name
-// for this domain, src/ir.ts's own shortIfaceName() — always resolved
-// by the time toIR() emits it, never computed translator-side) among
-// its own fields — `iface` stays `unknown` here regardless (see this
-// file's header), so shortName isn't separately named in the protocol.
-export const OvnLsInterface = type({ host: "string", iface: "unknown" });
+// ── interfaces ────────────────────────────────────────────────────
+// A real-world interface binding, one variant per InterfaceKind
+// (types.ts), discriminated on `kind`. The base shapes are shared; each
+// of the two places an interface appears adds its own IR-resolved facts:
+//
+//   ovn.ls `interfaces[].iface` (OvnLsIface*) — `shortName`: the real,
+//   IFNAMSIZ-safe OVS bridge this domain binds to (src/ir.ts's
+//   shortIfaceName, always resolved by the time toIR() emits it), and
+//   `flow: false` when the leg opted out of flow export (absent = on).
+//
+//   kernel.router `ifaces[].iface` (KernelIface*) — the InterfaceKind as
+//   declared; only the transit `veth` gains `shortName` (the suffix both
+//   real leg names are built from) and `mac` (the netns leg's
+//   deterministic MAC, src/addressing.ts's macFromAddrsOrName).
+export const WireguardPeerConfig = type({
+  publicKey: "string",
+  endpoint: "string",
+  allowedIps: "string",
+  "persistentKeepalive?": "number",
+});
+export const WireguardAppConfig = type({
+  privateKey: "string",
+  address: "string",
+  "listenPort?": "number",
+  "dns?": "string",
+  peer: WireguardPeerConfig,
+});
+const ifaceVlan = {
+  kind: "'vlan'",
+  vlanParent: "string",
+  vlanId: "number.integer",
+  "ifaceName?": "string",
+} as const;
+const ifacePhysical = { kind: "'physical'", name: "string" } as const;
+const ifaceBridgePort = {
+  kind: "'bridge-port'",
+  bridge: "string",
+  port: "string",
+} as const;
+const ifaceWireguard = {
+  kind: "'wireguard'",
+  ifaceName: "string",
+  config: WireguardAppConfig,
+} as const;
+const ifaceZerotier = {
+  kind: "'zerotier'",
+  networkId: "string",
+  "instanceDir?": "string",
+} as const;
+const ifaceDummy = { kind: "'dummy'" } as const;
+const ifaceVeth = {
+  kind: "'veth'",
+  ifaceName: "string",
+  peerName: "string",
+} as const;
+
+const lsBinding = { shortName: "string", "flow?": "false" } as const;
+export const OvnLsIfaceVlan = type({ ...ifaceVlan, ...lsBinding });
+export const OvnLsIfacePhysical = type({ ...ifacePhysical, ...lsBinding });
+export const OvnLsIfaceBridgePort = type({ ...ifaceBridgePort, ...lsBinding });
+export const OvnLsIfaceWireguard = type({ ...ifaceWireguard, ...lsBinding });
+export const OvnLsIfaceZerotier = type({ ...ifaceZerotier, ...lsBinding });
+export const OvnLsIfaceDummy = type({ ...ifaceDummy, ...lsBinding });
+export const OvnLsIfaceVeth = type({ ...ifaceVeth, ...lsBinding });
+export const OvnLsIface = OvnLsIfaceVlan.or(OvnLsIfacePhysical).or(
+  OvnLsIfaceBridgePort,
+).or(OvnLsIfaceWireguard).or(OvnLsIfaceZerotier).or(OvnLsIfaceDummy).or(
+  OvnLsIfaceVeth,
+);
+export const OvnLsInterface = type({ host: "string", iface: OvnLsIface });
+
+export const KernelIfaceVlan = type(ifaceVlan);
+export const KernelIfacePhysical = type(ifacePhysical);
+export const KernelIfaceBridgePort = type(ifaceBridgePort);
+export const KernelIfaceWireguard = type(ifaceWireguard);
+export const KernelIfaceZerotier = type(ifaceZerotier);
+export const KernelIfaceDummy = type(ifaceDummy);
+export const KernelIfaceVeth = type({
+  ...ifaceVeth,
+  shortName: "string",
+  // Optional only so an IR written before the generator resolved one
+  // still validates; the deployer then leaves the kernel's random MAC.
+  "mac?": "string",
+});
+export const KernelIface = KernelIfaceVlan.or(KernelIfacePhysical).or(
+  KernelIfaceBridgePort,
+).or(KernelIfaceWireguard).or(KernelIfaceZerotier).or(KernelIfaceDummy).or(
+  KernelIfaceVeth,
+);
+export const KernelRouterInterface = type({
+  host: "string",
+  iface: KernelIface,
+});
 export const OvnLsKey = type({ name: "string" });
 export const OvnLsData = type({
   interfaces: OvnLsInterface.array(),
@@ -95,6 +190,30 @@ export const OvnLsNode = type({
   kind: "'ovn.ls'",
   key: OvnLsKey,
   data: OvnLsData,
+});
+
+// ovn.lr: the Logical_Router ITSELF (2026-10-11) — until now a router
+// only existed in the IR as the group of its ovn.lrp nodes, which left
+// nowhere to put a fact about the router as a whole. `options` are the
+// FINAL Logical_Router.options, resolved by src/ir.ts's routerToIR from
+// Router.options (types.ts): a CLOSED shape whose field names are OVN's
+// own option keys, so the deployer can apply every field as
+// `options:<field>=<value>` without knowing any of them, and an option
+// the protocol doesn't declare can't reach `ovn-nbctl`. The id
+// (`ovnrouter:<name>`) is the prefix every ovn.lrp/route id of that
+// router already starts with.
+export const OvnLrKey = type({ name: "string" });
+export const OvnLrOptions = type({
+  mac_binding_age_threshold: "number.integer",
+});
+export const OvnLrData = type({
+  options: OvnLrOptions,
+});
+export const OvnLrNode = type({
+  id: "string",
+  kind: "'ovn.lr'",
+  key: OvnLrKey,
+  data: OvnLrData,
 });
 
 export const OvnLrpKey = type({
@@ -125,9 +244,25 @@ export const ServiceRef = type({
   // shortIfaceName/fnv1a32: the segment name when it fits IFNAMSIZ, else a
   // hashed short form). The deployer uses it verbatim, never shortens.
   name: "string",
+  // The NIC's MAC — RESOLVED by the generator (src/ir.ts,
+  // macFromAddrsOrName): a pure function of the NIC's own address, so
+  // the segment router's MAC_Binding survives the container being
+  // recreated. Optional only so an IR written by an older build still
+  // validates; the deployer leaves the kernel's random MAC when absent.
+  "mac?": "string",
   "ipaddrs?": "string[]",
   "routes?": KernelRouterRoute.array(),
   "resolver?": Resolver,
+});
+// Logical_Router_Port.ipv6_ra_configs — a CLOSED shape whose field names
+// are OVN's own keys and whose values are already the strings OVN stores
+// (src/ir.ts's resolveIpv6RaConfigs); the deployer applies every field
+// that is set as `ipv6_ra_configs:<field>=<value>`.
+export const Ipv6RaConfigs = type({
+  "address_mode?": "'slaac'",
+  "send_periodic?": "'true'",
+  "min_interval?": "string",
+  "max_interval?": "string",
 });
 export const OvnLrpData = type({
   // `ls:<name>` — the referenced ovn.ls node's own id, not the bare
@@ -143,11 +278,11 @@ export const OvnLrpData = type({
   // `host:<name>` — the referenced infra.host node's own id, same
   // reasoning as l2Segment above.
   "gatewayChassis?": "string",
-  // Already-resolved ipv6_ra_configs key/value pairs (src/ir.ts's own
+  // Already-resolved ipv6_ra_configs (src/ir.ts's own
   // resolveIpv6RaConfigs, from RouterEndpoint.services — see
   // RouterEndpointService, types.ts) — undefined means no RA service
   // was declared, not "set zero keys."
-  "ipv6RaConfigs?": { "[string]": "string" },
+  "ipv6RaConfigs?": Ipv6RaConfigs,
   // Workloads ATTACHED at this endpoint (endpoint.attachTo) — each is one
   // NIC for the referenced kernel.app.container on this endpoint's segment
   // (2026-09-08).
@@ -217,18 +352,13 @@ export const KernelRouterKey = type({
 // exactly its own fields, so a docker app can't accidentally gain a
 // `style` and a dhcp-client can't carry `image` (the flat-schema shape
 // before this couldn't express that).
-export const WireguardPeerConfig = type({
-  publicKey: "string",
-  endpoint: "string",
-  allowedIps: "string",
-  "persistentKeepalive?": "number",
-});
-export const WireguardAppConfig = type({
-  privateKey: "string",
-  address: "string",
-  "listenPort?": "number",
-  "dns?": "string",
-  peer: WireguardPeerConfig,
+// (WireguardPeerConfig/WireguardAppConfig live with the interface
+// shapes above — a "wireguard" interface carries the same config.)
+// A docker image the deployer builds on first use when it is missing.
+export const DockerBuild = type({
+  from: "string",
+  "packages?": "string[]",
+  "dockerfile?": "string",
 });
 export const DhcpClientApp = type({
   kind: "'dhcp-client'",
@@ -253,11 +383,7 @@ export const ZerotierApp = type({
 export const DockerApp = type({
   kind: "'docker'",
   image: "string",
-  "build?": {
-    from: "string",
-    "packages?": "string[]",
-    "dockerfile?": "string",
-  },
+  "build?": DockerBuild,
   name: "string",
   "cmd?": "string[]",
   "ip?": "string",
@@ -271,11 +397,7 @@ export const DockerApp = type({
 export const KernelAppDockerService = type({
   kind: "'kernel.app.docker'",
   "image?": "string",
-  "build?": {
-    from: "string",
-    "packages?": "string[]",
-    "dockerfile?": "string",
-  },
+  "build?": DockerBuild,
   "name?": "string",
   "cmd?": "string | string[]",
 });
@@ -286,15 +408,12 @@ export const KernelRouterData = type({
   host: "string",
   "ipaddrs?": "string[]",
   "routes?": KernelRouterRoute.array(),
-  // Real physical attachment(s) for this side — same {host, iface}
-  // shape as OvnLsInterface (iface stays `unknown`, structurally
-  // unmodeled — src/ir.ts's kernelRouterSideToIR emits the raw
-  // InterfaceKind object; see OvnLsInterface's own comment above).
-  // Present on the `right` side node today (2026-08-18 — the OVN-side
-  // endpoint keeps its own copy so the transit domain's bridge binding
-  // survives, see buildKernelRouterEndpoint); absent = bind to a dummy
-  // device.
-  "ifaces?": OvnLsInterface.array(),
+  // Real physical attachment(s) for this side — {host, iface}, the
+  // iface a KernelIface (see the interface shapes above). Present on the
+  // `right` side node today (2026-08-18 — the OVN-side endpoint keeps
+  // its own copy so the transit domain's bridge binding survives, see
+  // buildKernelRouterEndpoint); absent = bind to a dummy device.
+  "ifaces?": KernelRouterInterface.array(),
   // The `security.group` node's name (`masq-<router>` for the masq
   // shortcut) attached to THIS side's interface (right side only in
   // practice) — the attachment point for the rules that group carries;
@@ -384,11 +503,7 @@ export const KernelAppContainerData = type({
   // Files put into the container's filesystem (Service.files); the deployer
   // writes them on the host and bind-mounts each one read-only.
   "files?": KernelAppServiceFile.array(),
-  "build?": {
-    from: "string",
-    "packages?": "string[]",
-    "dockerfile?": "string",
-  },
+  "build?": DockerBuild,
   "deps?": "string[]",
 });
 export const KernelAppServiceData = type({
@@ -415,19 +530,142 @@ export const KernelAppServiceNode = type({
   data: KernelAppServiceData,
 });
 
-export const IRNode = InfraHostNode.or(OvnLsNode).or(OvnLrpNode).or(
-  Ipv4RouteNode,
-).or(
-  Ipv6RouteNode,
-).or(
-  KernelRouterNode,
-).or(
-  SecurityGroupNode,
-).or(
-  KernelAppContainerNode,
-).or(
-  KernelAppServiceNode,
-);
+export const IRNode = InfraHostNode.or(OvnLsNode).or(OvnLrNode).or(OvnLrpNode)
+  .or(
+    Ipv4RouteNode,
+  ).or(
+    Ipv6RouteNode,
+  ).or(
+    KernelRouterNode,
+  ).or(
+    SecurityGroupNode,
+  ).or(
+    KernelAppContainerNode,
+  ).or(
+    KernelAppServiceNode,
+  );
+
+// ── the IR, as TypeScript types ───────────────────────────────────
+// Inferred from the schemas above — the types src/ir.ts builds its nodes
+// against, so the generator cannot drift from the protocol without a
+// compile error. Deeply readonly: an IR node is a finished fact, never
+// edited in place. (Type aliases, not interfaces: they are derived from
+// the schema values and IRNode is a union.)
+type DeepReadonly<T> = T extends readonly (infer Item)[]
+  ? readonly DeepReadonly<Item>[]
+  : T extends object ? { readonly [Key in keyof T]: DeepReadonly<T[Key]> }
+  : T;
+export type InfraHostNode = DeepReadonly<typeof InfraHostNode.infer>;
+export type OvnLsNode = DeepReadonly<typeof OvnLsNode.infer>;
+export type OvnLsIface = DeepReadonly<typeof OvnLsIface.infer>;
+export type OvnLsInterface = DeepReadonly<typeof OvnLsInterface.infer>;
+export type OvnLrNode = DeepReadonly<typeof OvnLrNode.infer>;
+export type OvnLrpNode = DeepReadonly<typeof OvnLrpNode.infer>;
+export type Ipv6RaConfigs = DeepReadonly<typeof Ipv6RaConfigs.infer>;
+export type ServiceRef = DeepReadonly<typeof ServiceRef.infer>;
+export type KernelRouterRoute = DeepReadonly<typeof KernelRouterRoute.infer>;
+export type Ipv4RouteNode = DeepReadonly<typeof Ipv4RouteNode.infer>;
+export type Ipv6RouteNode = DeepReadonly<typeof Ipv6RouteNode.infer>;
+export type RouteNode = Ipv4RouteNode | Ipv6RouteNode;
+export type KernelRouterNode = DeepReadonly<typeof KernelRouterNode.infer>;
+export type KernelIface = DeepReadonly<typeof KernelIface.infer>;
+export type KernelRouterInterface = DeepReadonly<
+  typeof KernelRouterInterface.infer
+>;
+export type KernelApp = DeepReadonly<typeof KernelApp.infer>;
+export type SecurityGroupNode = DeepReadonly<typeof SecurityGroupNode.infer>;
+export type KernelAppContainerNode = DeepReadonly<
+  typeof KernelAppContainerNode.infer
+>;
+export type KernelAppServiceNode = DeepReadonly<
+  typeof KernelAppServiceNode.infer
+>;
+export type IRNode =
+  | InfraHostNode
+  | OvnLsNode
+  | OvnLrNode
+  | OvnLrpNode
+  | RouteNode
+  | KernelRouterNode
+  | SecurityGroupNode
+  | KernelAppContainerNode
+  | KernelAppServiceNode;
+
+// ── JSON Schema ────────────────────────────────────────────────────
+type JsonSchema = { readonly [key: string]: JsonValue };
+type JsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | readonly JsonValue[]
+  | JsonSchema;
+
+function isSchemaObject(value: JsonValue): value is JsonSchema {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+// Key-order-independent text of a schema — two shapes are "the same
+// shape" exactly when this is equal.
+function canonical(value: JsonValue): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (isSchemaObject(value)) {
+    return `{${
+      Object.keys(value).sort().map((key) =>
+        `${JSON.stringify(key)}:${canonical(value[key]!)}`
+      ).join(",")
+    }}`;
+  }
+  return JSON.stringify(value);
+}
+
+// ArkType's toJsonSchema() INLINES every nested type, so a shape used in
+// three places is emitted three times and datamodel-codegen has to
+// invent a class name for each copy. Give every named shape back its
+// name: wherever a def's own schema appears inside ANOTHER def, replace
+// that copy with a `$ref` to it. Matching runs top-down against the
+// ORIGINAL (fully inlined) schemas, so the outermost named shape wins and
+// a def nested in a def is still found inside it.
+//
+// Two defs may share one shape (every `{name}` key does) — each keeps its
+// own name at the top level. Only a NESTED copy of such a shape has no
+// single name to point at, and that throws rather than picking one.
+function refNamedShapes(
+  shapes: Readonly<Record<string, JsonSchema>>,
+): Record<string, JsonSchema> {
+  const namesByShape = new Map<string, string[]>();
+  for (const [name, schema] of Object.entries(shapes)) {
+    const key = canonical(schema);
+    namesByShape.set(key, [...(namesByShape.get(key) ?? []), name]);
+  }
+  const walk = (value: JsonValue, owner: string, top: boolean): JsonValue => {
+    if (Array.isArray(value)) {
+      return value.map((item) => walk(item, owner, false));
+    }
+    if (!isSchemaObject(value)) return value;
+    const names = top ? undefined : namesByShape.get(canonical(value));
+    if (names !== undefined) {
+      if (names.length > 1) {
+        throw new Error(
+          `protocol: a shape nested in "${owner}" matches ${
+            names.join(" and ")
+          } — give it one exported name, or it cannot become one Python class`,
+        );
+      }
+      return { "$ref": `#/$defs/${names[0]}` };
+    }
+    return Object.fromEntries(
+      Object.entries(value).map((
+        [key, item],
+      ) => [key, walk(item, owner, false)]),
+    );
+  };
+  return Object.fromEntries(
+    Object.entries(shapes).map((
+      [name, schema],
+    ) => [name, walk(schema, name, true) as JsonSchema]),
+  );
+}
 
 // Every node kind's envelope has the exact same shape (id: string,
 // kind: const, key: $ref, data: $ref) — generated once here instead of
@@ -446,44 +684,95 @@ function nodeSchema(kind: string, keyDef: string, dataDef: string) {
   };
 }
 
+// One named shape's own JSON Schema — without the `$schema` marker
+// ArkType puts on every root (a nested copy carries none, so it would
+// never compare equal to its own definition).
+function shape(schema: { toJsonSchema(): unknown }): JsonSchema {
+  const { $schema: _dialect, ...rest } = schema.toJsonSchema() as {
+    readonly $schema?: string;
+    readonly [key: string]: JsonValue | undefined;
+  };
+  return rest as JsonSchema;
+}
+
 /** The full protocol as JSON Schema (draft 2020-12), named $defs
  * throughout — see this file's header comment for why. */
 export function buildJsonSchema(): Record<string, unknown> {
+  // Every shape that becomes its OWN Python class (or alias), under the
+  // name it has in this file — the generated class carries that name.
+  const shapes = refNamedShapes({
+    InfraHostKey: shape(InfraHostKey),
+    HostOs: shape(HostOs),
+    IpfixData: shape(IpfixData),
+    InfraHostData: shape(InfraHostData),
+    WireguardPeerConfig: shape(WireguardPeerConfig),
+    WireguardAppConfig: shape(WireguardAppConfig),
+    OvnLsIfaceVlan: shape(OvnLsIfaceVlan),
+    OvnLsIfacePhysical: shape(OvnLsIfacePhysical),
+    OvnLsIfaceBridgePort: shape(OvnLsIfaceBridgePort),
+    OvnLsIfaceWireguard: shape(OvnLsIfaceWireguard),
+    OvnLsIfaceZerotier: shape(OvnLsIfaceZerotier),
+    OvnLsIfaceDummy: shape(OvnLsIfaceDummy),
+    OvnLsIfaceVeth: shape(OvnLsIfaceVeth),
+    OvnLsIface: shape(OvnLsIface),
+    OvnLsInterface: shape(OvnLsInterface),
+    OvnLsKey: shape(OvnLsKey),
+    OvnLsData: shape(OvnLsData),
+    OvnLrKey: shape(OvnLrKey),
+    OvnLrOptions: shape(OvnLrOptions),
+    OvnLrData: shape(OvnLrData),
+    OvnLrpKey: shape(OvnLrpKey),
+    KernelRouterRoute: shape(KernelRouterRoute),
+    Resolver: shape(Resolver),
+    ServiceRef: shape(ServiceRef),
+    Ipv6RaConfigs: shape(Ipv6RaConfigs),
+    OvnLrpData: shape(OvnLrpData),
+    RouteKey: shape(RouteKey),
+    RouteData: shape(RouteData),
+    KernelRouterKey: shape(KernelRouterKey),
+    KernelIfaceVlan: shape(KernelIfaceVlan),
+    KernelIfacePhysical: shape(KernelIfacePhysical),
+    KernelIfaceBridgePort: shape(KernelIfaceBridgePort),
+    KernelIfaceWireguard: shape(KernelIfaceWireguard),
+    KernelIfaceZerotier: shape(KernelIfaceZerotier),
+    KernelIfaceDummy: shape(KernelIfaceDummy),
+    KernelIfaceVeth: shape(KernelIfaceVeth),
+    KernelIface: shape(KernelIface),
+    KernelRouterInterface: shape(KernelRouterInterface),
+    DockerBuild: shape(DockerBuild),
+    DhcpClientApp: shape(DhcpClientApp),
+    WireguardApp: shape(WireguardApp),
+    ZerotierApp: shape(ZerotierApp),
+    DockerApp: shape(DockerApp),
+    KernelApp: shape(KernelApp),
+    KernelRouterData: shape(KernelRouterData),
+    SecurityGroupKey: shape(SecurityGroupKey),
+    SecurityGroupRule: shape(SecurityGroupRule),
+    SecurityGroupData: shape(SecurityGroupData),
+    KernelServiceKey: shape(KernelServiceKey),
+    KernelAppServiceFile: shape(KernelAppServiceFile),
+    AppEnv: shape(AppEnv),
+    KernelAppContainerData: shape(KernelAppContainerData),
+    KernelAppServiceData: shape(KernelAppServiceData),
+  });
   const defs: Record<string, unknown> = {
-    InfraHostKey: InfraHostKey.toJsonSchema(),
-    InfraHostData: InfraHostData.toJsonSchema(),
-    IpfixData: IpfixData.toJsonSchema(),
+    ...shapes,
     InfraHostNode: nodeSchema("infra.host", "InfraHostKey", "InfraHostData"),
-    OvnLsKey: OvnLsKey.toJsonSchema(),
-    OvnLsData: OvnLsData.toJsonSchema(),
     OvnLsNode: nodeSchema("ovn.ls", "OvnLsKey", "OvnLsData"),
-    OvnLrpKey: OvnLrpKey.toJsonSchema(),
-    OvnLrpData: OvnLrpData.toJsonSchema(),
+    OvnLrNode: nodeSchema("ovn.lr", "OvnLrKey", "OvnLrData"),
     OvnLrpNode: nodeSchema("ovn.lrp", "OvnLrpKey", "OvnLrpData"),
-    RouteKey: RouteKey.toJsonSchema(),
-    RouteData: RouteData.toJsonSchema(),
     Ipv4RouteNode: nodeSchema("ipv4.route", "RouteKey", "RouteData"),
     Ipv6RouteNode: nodeSchema("ipv6.route", "RouteKey", "RouteData"),
-    KernelRouterKey: KernelRouterKey.toJsonSchema(),
-    KernelRouterData: KernelRouterData.toJsonSchema(),
     KernelRouterNode: nodeSchema(
       "kernel.router",
       "KernelRouterKey",
       "KernelRouterData",
     ),
-    SecurityGroupKey: SecurityGroupKey.toJsonSchema(),
-    SecurityGroupData: SecurityGroupData.toJsonSchema(),
     SecurityGroupNode: nodeSchema(
       "security.group",
       "SecurityGroupKey",
       "SecurityGroupData",
     ),
-    ServiceRef: ServiceRef.toJsonSchema(),
-    KernelServiceKey: KernelServiceKey.toJsonSchema(),
-    KernelAppServiceFile: KernelAppServiceFile.toJsonSchema(),
-    AppEnv: AppEnv.toJsonSchema(),
-    KernelAppContainerData: KernelAppContainerData.toJsonSchema(),
-    KernelAppServiceData: KernelAppServiceData.toJsonSchema(),
     KernelAppContainerNode: nodeSchema(
       "kernel.app.container",
       "KernelServiceKey",
@@ -501,6 +790,7 @@ export function buildJsonSchema(): Record<string, unknown> {
     "oneOf": [
       "InfraHostNode",
       "OvnLsNode",
+      "OvnLrNode",
       "OvnLrpNode",
       "Ipv4RouteNode",
       "Ipv6RouteNode",

@@ -58,6 +58,7 @@
 
 from __future__ import annotations
 
+from ladops import JsonObject
 from ladops.linux_net import list_addrs, list_links, list_routes
 from ladops.netns import netns_scope, scope_id
 
@@ -70,7 +71,7 @@ def _route_kind(family: str) -> str:
     return "ipv6.route" if family == "ipv6" else "ipv4.route"
 
 
-def reconcile(scope: dict, netns: str | None = None) -> dict[str, dict]:
+def reconcile(scope: JsonObject, netns: str | None = None) -> dict[str, JsonObject]:
     """Reconcile one namespace's real interfaces/addresses/routes into
     IR nodes — `netns=None` means the root/global namespace, scoped
     "*global*"; a real name means that `ip netns`, reached via `ip netns
@@ -78,7 +79,7 @@ def reconcile(scope: dict, netns: str | None = None) -> dict[str, dict]:
     ADR's node-kind table) — {scope}|netns:{name}|{kind}:{identity}."""
     ns_scope = netns_scope(scope, netns)
     ns_scope_id = scope_id(ns_scope)
-    nodes: dict[str, dict] = {}
+    nodes: dict[str, JsonObject] = {}
 
     links = list_links(netns)
     for link in links:

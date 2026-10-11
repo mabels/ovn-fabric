@@ -17,15 +17,16 @@
 
 from __future__ import annotations
 
+from ladops import JsonObject
 from ladops.netns import scope_id
 from ladops.ovs import list_interfaces
 
 
-def reconcile(scope: dict, netns: str | None = None) -> dict[str, dict]:
+def reconcile(scope: JsonObject, netns: str | None = None) -> dict[str, JsonObject]:
     if netns is not None:
         return {}
 
-    nodes: dict[str, dict] = {}
+    nodes: dict[str, JsonObject] = {}
     for iface in list_interfaces():
         id_ = f"{scope_id(scope)}|ovsiface:{iface['name']}"
         nodes[id_] = {

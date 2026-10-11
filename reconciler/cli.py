@@ -27,6 +27,7 @@ import json
 import sys
 from typing import Callable
 
+from ladops import JsonObject
 from ladops.netns import list_netns
 
 from .host import hostname as host_hostname
@@ -36,7 +37,7 @@ from .linux_net import reconcile as linux_net_reconcile
 from .ovn import reconcile as ovn_reconcile
 from .ovs import reconcile as ovs_reconcile
 
-ReconcileFn = Callable[[dict, "str | None"], dict[str, dict]]
+ReconcileFn = Callable[[JsonObject, "str | None"], dict[str, JsonObject]]
 
 _RECONCILERS: dict[str, ReconcileFn] = {
     "host": host_reconcile,
@@ -47,7 +48,7 @@ _RECONCILERS: dict[str, ReconcileFn] = {
 }
 
 
-def _serialize(nodes: dict[str, dict], nice: bool) -> str:
+def _serialize(nodes: dict[str, JsonObject], nice: bool) -> str:
     # A JSON array of nodes, not an object keyed by node id: every node
     # already carries its own "id" field, so a dict wrapper would just
     # repeat that same string twice on the wire for no reason. The dict
@@ -61,14 +62,14 @@ def _serialize(nodes: dict[str, dict], nice: bool) -> str:
     return json.dumps(array, separators=(",", ":"))
 
 
-def reconcile_all(kinds: list[str], scope: dict, *, strict: bool) -> dict[str, dict]:
+def reconcile_all(kinds: list[str], scope: JsonObject, *, strict: bool) -> dict[str, JsonObject]:
     # strict=True (an explicit --kind was requested): a stub reconciler
     # raising NotImplementedError is a real failure, propagate it.
     # strict=False (default: every known kind): skip a still-stub kind
     # with a warning instead of losing the real output from every kind
     # that *does* work — confirmed necessary by a real run on the actual
     # router, which hard-crashed on the first stub (iptables) reached.
-    nodes: dict[str, dict] = {}
+    nodes: dict[str, JsonObject] = {}
     for netns in [None, *list_netns()]:
         for kind in kinds:
             try:

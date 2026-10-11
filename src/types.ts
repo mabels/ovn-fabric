@@ -1265,6 +1265,46 @@ export interface RoutingDomain {
   readonly routes?: readonly RoutingDomainRoute[];
 }
 
+// ── OVN per-router (Logical_Router.options) options ─────────────────
+// The author-facing half of a router's own OVN options
+// (net.defineOvnRouter()'s `options`). Every field is optional; what is
+// left unset is defaulted by resolveOvnRouterOptions below, so a stored
+// Router always carries the FINAL value (Router.options).
+export interface OvnRouterOptions {
+  /** Seconds without traffic after which the router forgets a learned
+   * MAC_Binding and re-resolves it (OVN's
+   * Logical_Router.options:mac_binding_age_threshold). OVN's own default
+   * is 0 — keep a binding FOREVER, never re-probe it — which black-holes
+   * a neighbour that came back with a different MAC (confirmed live
+   * 2026-10-11). Defaults to DEFAULT_MAC_BINDING_AGE_THRESHOLD; an
+   * explicit 0 restores OVN's keep-forever behaviour. */
+  readonly macBindingAgeThreshold?: number;
+}
+
+export const DEFAULT_MAC_BINDING_AGE_THRESHOLD = 300;
+
+/** Fill every unset OvnRouterOptions field with its default — also when
+ * `options` itself is omitted — and fail fast on a value OVN would
+ * reject (the column is an integer in 0..4294967295). */
+export function resolveOvnRouterOptions(
+  routerName: string,
+  options?: OvnRouterOptions,
+): Required<OvnRouterOptions> {
+  const macBindingAgeThreshold = options?.macBindingAgeThreshold ??
+    DEFAULT_MAC_BINDING_AGE_THRESHOLD;
+  if (
+    !Number.isInteger(macBindingAgeThreshold) ||
+    macBindingAgeThreshold < 0 || macBindingAgeThreshold > 0xffffffff
+  ) {
+    throw new Error(
+      `router "${routerName}": options.macBindingAgeThreshold must be an ` +
+        `integer number of seconds in 0..4294967295, got ` +
+        `${macBindingAgeThreshold}`,
+    );
+  }
+  return { macBindingAgeThreshold };
+}
+
 export interface Router {
   readonly name: string;
   // Always the OVN side — even a kernelRouterEndpoint()/tunnelRouterEndpoint()
@@ -1296,6 +1336,10 @@ export interface Router {
    * flattens each router's subRouters when assembling allRouters, so a
    * tunnel's upstream peer never needs listing (2026-09-08). */
   readonly subRouters: readonly Router[];
+  /** This router's OVN options, FULLY RESOLVED (defaults filled in by
+   * resolveOvnRouterOptions at defineOvnRouter() time) — serialized into
+   * the router's own `ovn.lr` IR node (src/ir.ts's routerToIR). */
+  readonly options: Required<OvnRouterOptions>;
 }
 
 /** The [Peer] stanza of a wg-quick conf — see InterfaceKind's

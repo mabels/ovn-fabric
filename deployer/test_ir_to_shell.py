@@ -27,12 +27,28 @@ import shlex
 import sys
 import tempfile
 import unittest
+from collections.abc import Collection
+from typing import Any
 from unittest import mock
 
 from protocol import AppDhcpClient, AppDocker, AppWireguard, AppZerotier
 from protocol import generated as pt
+from protocol.hydrate import hydrate_as
 
 mod = importlib.import_module("deployer.ir_to_shell")
+
+
+# Interface fixtures are written the way the IR carries them (a raw
+# `iface` object) and hydrated through the SAME strict walk a real run
+# uses, so a fixture that isn't a valid protocol shape fails here instead
+# of exercising the deployer with data the generator can never emit.
+def _ls_interface(host: str, iface: dict[str, object]) -> pt.OvnLsInterface:
+    return hydrate_as(pt.OvnLsInterface, {"host": host, "iface": iface})
+
+
+def _kr_interface(host: str, iface: dict[str, object]) -> pt.KernelRouterInterface:
+    return hydrate_as(pt.KernelRouterInterface, {"host": host, "iface": iface})
+
 
 NODES: list[pt.Model] = [
     pt.InfraHostNode(
@@ -43,7 +59,7 @@ NODES: list[pt.Model] = [
             connectAddress="10.0.0.1",
             ovnRole=pt.OvnRole.central,
             encapIp="10.0.0.1",
-            os=pt.Os(name="ubuntu", version="26.04"),
+            os=pt.HostOs(name="ubuntu", version="26.04"),
         ),
     ),
     pt.InfraHostNode(
@@ -54,7 +70,7 @@ NODES: list[pt.Model] = [
             connectAddress="10.0.0.2",
             ovnRole=pt.OvnRole.chassis,
             encapIp="10.0.0.2",
-            os=pt.Os(name="ubuntu", version="26.04"),
+            os=pt.HostOs(name="ubuntu", version="26.04"),
         ),
     ),
     pt.OvnLsNode(
@@ -63,7 +79,7 @@ NODES: list[pt.Model] = [
         key=pt.OvnLsKey(name="home"),
         data=pt.OvnLsData(
             interfaces=[
-                pt.Interface(
+                _ls_interface(
                     host="chassis-1",
                     iface={
                         "kind": "vlan",
@@ -80,6 +96,12 @@ NODES: list[pt.Model] = [
         kind="ovn.ls",
         key=pt.OvnLsKey(name="backbone"),
         data=pt.OvnLsData(interfaces=[]),
+    ),
+    pt.OvnLrNode(
+        id="ovnrouter:router-home",
+        kind="ovn.lr",
+        key=pt.OvnLrKey(name="router-home"),
+        data=pt.OvnLrData(options=pt.OvnLrOptions(mac_binding_age_threshold=300)),
     ),
     pt.OvnLrpNode(
         id="ovnrouter:router-home|lrp:lrp-router-home-left",
@@ -122,9 +144,9 @@ NODES: list[pt.Model] = [
         data=pt.KernelRouterData(
             host="host:chassis-1",
             ipaddrs=["192.168.132.93/24"],
-            routes=[pt.Route(dst="0.0.0.0/0", via="192.168.132.1")],
+            routes=[pt.KernelRouterRoute(dst="0.0.0.0/0", via="192.168.132.1")],
             ifaces=[
-                pt.Interface(
+                _kr_interface(
                     host="chassis-1",
                     iface={"kind": "vlan", "vlanParent": "eth0", "vlanId": 2280},
                 ),
@@ -134,7 +156,7 @@ NODES: list[pt.Model] = [
 ]
 
 
-def _replace_home_ls(nodes: list[pt.Model], **changes: object) -> list[pt.Model]:
+def _replace_home_ls(nodes: list[pt.Model], **changes: Any) -> list[pt.Model]:
     return [
         (dataclasses.replace(n, **changes) if n.kind == "ovn.ls" and n.key.name == "home" else n)
         for n in nodes
@@ -217,6 +239,41 @@ class ClusterScriptCreateTest(unittest.TestCase):
         # --may-exist silently no-op'd the second call. The deployer
         # emits it exactly once for the router.
         self.assertEqual(self.cluster.count("ovn-nbctl --may-exist lr-add router-home"), 1)
+
+    def test_router_options_come_from_the_ovn_lr_node(self) -> None:
+        # The router's own ovn.lr node carries its FINAL Logical_Router
+        # options (src/ir.ts's routerToIR); the deployer applies each pair
+        # right after the router exists. mac_binding_age_threshold is the
+        # one that matters today: OVN keeps a learned MAC_Binding forever
+        # by default, and a neighbour that came back with another MAC
+        # stayed black-holed (confirmed live 2026-10-11).
+        add = "ovn-nbctl --may-exist lr-add router-home"
+        age = "ovn-nbctl set logical_router router-home options:mac_binding_age_threshold=300"
+        self.assertIn(age, self.cluster)
+        self.assertLess(self.cluster.index(add), self.cluster.index(age))
+
+    def test_router_option_value_is_whatever_the_ir_carries(self) -> None:
+        nodes = [
+            (
+                dataclasses.replace(
+                    n, data=pt.OvnLrData(options=pt.OvnLrOptions(mac_binding_age_threshold=0))
+                )
+                if n.kind == "ovn.lr"
+                else n
+            )
+            for n in NODES
+        ]
+        cluster, _ = mod.build_scripts(nodes, "create")
+        self.assertIn("options:mac_binding_age_threshold=0", cluster)
+        self.assertNotIn("options:mac_binding_age_threshold=300", cluster)
+
+    def test_router_without_an_ovn_lr_node_gets_no_options(self) -> None:
+        # An IR written before the ovn.lr node existed still deploys — the
+        # deployer has no default of its own.
+        nodes = [n for n in NODES if n.kind != "ovn.lr"]
+        cluster, _ = mod.build_scripts(nodes, "create")
+        self.assertIn("ovn-nbctl --may-exist lr-add router-home", cluster)
+        self.assertNotIn("set logical_router router-home", cluster)
 
     def test_gateway_chassis_pin_only_on_the_pinned_side(self) -> None:
         # The pin names the chassis's RUNTIME system-id, resolved by an
@@ -374,7 +431,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
                 key=pt.OvnLsKey(name="transit-router-wan"),
                 data=pt.OvnLsData(
                     interfaces=[
-                        pt.Interface(
+                        _ls_interface(
                             host="chassis-1",
                             iface={
                                 "kind": "veth",
@@ -409,7 +466,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
             NODES,
             data=pt.OvnLsData(
                 interfaces=[
-                    pt.Interface(
+                    _ls_interface(
                         host="chassis-1",
                         iface={
                             "kind": "vlan",
@@ -581,7 +638,7 @@ class KernelRouterCreateTest(unittest.TestCase):
                         host="host:chassis-1",
                         ipaddrs=["10.99.0.2/28"],
                         ifaces=[
-                            pt.Interface(
+                            _kr_interface(
                                 host="chassis-1",
                                 iface={
                                     "kind": "veth",
@@ -601,10 +658,51 @@ class KernelRouterCreateTest(unittest.TestCase):
         _, hosts = mod.build_scripts(nodes, "create")
         script = hosts["chassis-1"]
         self.assertIn("ip link add veth-ovn-0 type veth peer name veth-krn-0", script)
+        # No `mac` in the iface blob (an older IR) -> no `address`.
+        self.assertNotIn("peer name veth-krn-0 address", script)
         self.assertNotIn("ip netns exec ns-kernel-0 ip link add veth-ovn-0", script)
         self.assertIn("ip link set veth-krn-0 netns ns-kernel-0", script)
         self.assertIn("ip netns exec ns-kernel-0 ip addr add 10.99.0.2/28 dev veth-krn-0", script)
         self.assertNotIn("ip link add dummy-left type dummy", script)
+
+    def test_veth_netns_leg_gets_the_generator_resolved_mac(self) -> None:
+        # The generator resolves the netns-side leg's MAC from the side's
+        # own address (src/ir.ts) so it is identical on every recreation
+        # — an OVN router never ages a learned MAC_Binding, so a random
+        # MAC after a down/up black-holed the leg (confirmed live
+        # 2026-10-11). The deployer only applies it: `address` after
+        # `peer name` lands on the PEER (netns) leg.
+        nodes = [
+            (
+                dataclasses.replace(
+                    n,
+                    data=pt.KernelRouterData(
+                        host="host:chassis-1",
+                        ipaddrs=["10.99.0.2/28"],
+                        ifaces=[
+                            _kr_interface(
+                                host="chassis-1",
+                                iface={
+                                    "kind": "veth",
+                                    "ifaceName": "veth-krn-0",
+                                    "peerName": "veth-ovn-0",
+                                    "shortName": "0",
+                                    "mac": "00:00:0a:63:00:02",
+                                },
+                            ),
+                        ],
+                    ),
+                )
+                if n.kind == "kernel.router" and n.key.side == pt.Side.left
+                else n
+            )
+            for n in NODES
+        ]
+        _, hosts = mod.build_scripts(nodes, "create")
+        self.assertIn(
+            "ip link add veth-ovn-0 type veth peer name veth-krn-0 address 00:00:0a:63:00:02",
+            hosts["chassis-1"],
+        )
 
     def test_masq_services_emit_security_group_rules_on_the_wan_iface(self) -> None:
         # A kernelRouterEndpoint's kernel.* masq services (define.ts)
@@ -623,8 +721,8 @@ class KernelRouterCreateTest(unittest.TestCase):
                 key=pt.SecurityGroupKey(name="sg-kernel-0"),
                 data=pt.SecurityGroupData(
                     rules=[
-                        pt.Rule(family=pt.Family.ipv4, kind="masq"),
-                        pt.Rule(family=pt.Family.ipv6, kind="masq"),
+                        pt.SecurityGroupRule(family=pt.Family.ipv4, kind="masq"),
+                        pt.SecurityGroupRule(family=pt.Family.ipv6, kind="masq"),
                     ]
                 ),
             ),
@@ -735,7 +833,7 @@ class KernelRouterCreateTest(unittest.TestCase):
             host="host:chassis-1",
             ipaddrs=["10.12.80.14/28"],
             ifaces=[
-                pt.Interface(
+                _kr_interface(
                     host="chassis-1",
                     iface={
                         "kind": "veth",
@@ -765,7 +863,9 @@ class KernelRouterCreateTest(unittest.TestCase):
                                         image="ovn-fabric-kernel-0",
                                         name="kernel-0-dhcpcd",
                                         cmd=["/sbin/dhcpcd"],
-                                        build=pt.Build(from_="alpine:latest", packages=["dhcpcd"]),
+                                        build=pt.DockerBuild(
+                                            from_="alpine:latest", packages=["dhcpcd"]
+                                        ),
                                     )
                                 ],
                             ),
@@ -926,10 +1026,10 @@ class KernelRouterCreateTest(unittest.TestCase):
                         host="host:chassis-1",
                         ipaddrs=["10.12.82.14/28"],
                         routes=[
-                            pt.Route(dst="0.0.0.0/0", via="10.12.82.1"),
+                            pt.KernelRouterRoute(dst="0.0.0.0/0", via="10.12.82.1"),
                         ],
                         ifaces=[
-                            pt.Interface(
+                            _kr_interface(
                                 host="chassis-1",
                                 iface={
                                     "kind": "veth",
@@ -1060,10 +1160,10 @@ class KernelRouterCreateTest(unittest.TestCase):
                                 AppWireguard(
                                     kind="wireguard",
                                     ifaceName="mullvad-de",
-                                    config=pt.Config(
+                                    config=pt.WireguardAppConfig(
                                         privateKey="k",
                                         address="10.64.56.207/32",
-                                        peer=pt.Peer(
+                                        peer=pt.WireguardPeerConfig(
                                             publicKey="p",
                                             allowedIps="0.0.0.0/0",
                                             endpoint="146.70.117.130:51820",
@@ -1140,7 +1240,7 @@ class KernelRouterCreateTest(unittest.TestCase):
                                     networkId="02cfbec15c2319ff",
                                     instanceDir="/var/lib/zerotier-one-uplink-zerotier",
                                     masq=[pt.MasqEnum.ipv4],
-                                    routes=[pt.Route(dst="192.168.0.0/16")],
+                                    routes=[pt.KernelRouterRoute(dst="192.168.0.0/16")],
                                 )
                             ],
                         ),
@@ -1213,7 +1313,7 @@ class KernelRouterDeleteTest(unittest.TestCase):
                         host="host:chassis-1",
                         ipaddrs=["10.99.0.2/28"],
                         ifaces=[
-                            pt.Interface(
+                            _kr_interface(
                                 host="chassis-1",
                                 iface={
                                     "kind": "veth",
@@ -1258,7 +1358,9 @@ class UnsupportedIfaceKindTest(unittest.TestCase):
         nodes = _replace_home_ls(
             NODES,
             data=pt.OvnLsData(
-                interfaces=[pt.Interface(host="chassis-1", iface={"kind": "dummy"})],
+                interfaces=[
+                    _ls_interface(host="chassis-1", iface={"kind": "dummy", "shortName": "br-home"})
+                ],
             ),
         )
         cluster, hosts = mod.build_scripts(nodes, "create")
@@ -1285,8 +1387,8 @@ class InvalidActionTest(unittest.TestCase):
 
 
 class GeneratePythonDeployerTest(unittest.TestCase):
-    def _exec_runtime(self) -> dict:
-        ns: dict = {}
+    def _exec_runtime(self) -> dict[str, Any]:
+        ns: dict[str, Any] = {}
         exec(mod.generate_python_deployer(NODES), ns)
         return ns
 
@@ -1379,7 +1481,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             )
             for n in NODES
         ]
-        ns: dict = {}
+        ns: dict[str, Any] = {}
         exec(mod.generate_python_deployer(nodes), ns)
 
         def _argv(skip_deps: bool) -> list[str]:
@@ -1493,14 +1595,14 @@ if __name__ == "__main__":
 # A kernel.service node (a workload) renders ONE container, with one veth
 # per REFERENCING ovn.lrp (each lrp carries a serviceRef — its NIC).
 class KernelServiceDeployTest(unittest.TestCase):
-    def _ls(self, name: str, short: str, vlan: int) -> object:
+    def _ls(self, name: str, short: str, vlan: int) -> pt.OvnLsNode:
         return pt.OvnLsNode(
             id=f"ls:{name}",
             kind="ovn.ls",
             key=pt.OvnLsKey(name=name),
             data=pt.OvnLsData(
                 interfaces=[
-                    pt.Interface(
+                    _ls_interface(
                         host="chassis-1",
                         iface={
                             "kind": "vlan",
@@ -1513,7 +1615,7 @@ class KernelServiceDeployTest(unittest.TestCase):
             ),
         )
 
-    def _lrp(self, router: str, side: str, seg: str, ref: object) -> object:
+    def _lrp(self, router: str, side: str, seg: str, ref: pt.ServiceRef) -> pt.OvnLrpNode:
         # Endpoint identity is its own `name` (no more positional side);
         # keep the historical lrp-<router>-<side> shape so the emitted
         # lrp/lsp names (and the assertions on them) stay unchanged.
@@ -1561,7 +1663,7 @@ class KernelServiceDeployTest(unittest.TestCase):
                 service="kernel.app.container:dns",
                 name="control-plane",
                 ipaddrs=["10.43.0.5/24"],
-                routes=[pt.Route(dst="0.0.0.0/0", via="10.43.0.1", metric=200)],
+                routes=[pt.KernelRouterRoute(dst="0.0.0.0/0", via="10.43.0.1", metric=200)],
             ),
         )
         nodes = list(NODES) + [seg, cp, svc, lrp_seg, lrp_cp]
@@ -1614,6 +1716,53 @@ class KernelServiceDeployTest(unittest.TestCase):
         delete = delete_hosts["chassis-1"]
         self.assertIn("systemctl disable --now ovn-kernel-service-dns.service", delete)
 
+    def test_kernel_service_nic_gets_the_generator_resolved_mac(self) -> None:
+        # The container is recreated on every `up`; a NIC with a random
+        # MAC would leave the segment's OVN router holding a MAC_Binding
+        # for the PREVIOUS NIC. ServiceRef.mac (resolved by the generator)
+        # pins the container-side leg; a ref without one (an older IR)
+        # keeps the plain `ip link add`.
+        seg = self._ls("container-seg", "br-cont", 1130)
+        cp = self._ls("control-plane", "br-cp", 1143)
+        svc = pt.KernelAppContainerNode(
+            id="kernel.app.container:dns",
+            kind="kernel.app.container",
+            key=pt.KernelServiceKey(name="dns"),
+            data=pt.KernelAppContainerData(host="host:chassis-1", image="ovn-fabric-dns"),
+        )
+        lrp_seg = self._lrp(
+            "router-x",
+            "left",
+            "container-seg",
+            pt.ServiceRef(
+                service="kernel.app.container:dns",
+                name="container-seg",
+                mac="00:00:c0:a8:32:35",
+                ipaddrs=["192.168.50.53/24"],
+            ),
+        )
+        lrp_cp = self._lrp(
+            "router-cp",
+            "left",
+            "control-plane",
+            pt.ServiceRef(
+                service="kernel.app.container:dns",
+                name="control-plane",
+                ipaddrs=["10.43.0.5/24"],
+            ),
+        )
+        nodes = list(NODES) + [seg, cp, svc, lrp_seg, lrp_cp]
+        _, create_hosts = mod.build_scripts(nodes, "create")
+        create = create_hosts["chassis-1"]
+        links = [line for line in create.splitlines() if line.startswith('ip link add "sc-')]
+        self.assertEqual(len(links), 2)
+        pinned = [line for line in links if " address " in line]
+        self.assertEqual(len(pinned), 1)
+        self.assertRegex(
+            pinned[0],
+            r'^ip link add "(sc-[^"]+)" type veth peer name "\1c" address 00:00:c0:a8:32:35$',
+        )
+
     def test_service_resolver_renders_docker_dns_flags(self) -> None:
         # A resolved ServiceRef.resolver becomes `docker run --dns …` (Docker
         # writes /etc/resolv.conf; nothing is bind-mounted over it).
@@ -1665,8 +1814,8 @@ class KernelServiceDeployTest(unittest.TestCase):
                 name="control-plane",
                 ipaddrs=["10.43.0.5/24", "2600:70ff:b3c0::cb:5/112"],
                 routes=[
-                    pt.Route(dst="192.168.129.0/24", via="10.43.0.1", metric=100),
-                    pt.Route(
+                    pt.KernelRouterRoute(dst="192.168.129.0/24", via="10.43.0.1", metric=100),
+                    pt.KernelRouterRoute(
                         dst="2600:70ff:b3c0:129::/64",
                         via="2600:70ff:b3c0::cb:1",
                         metric=100,
@@ -1702,7 +1851,7 @@ class MultiServiceDeployTest(unittest.TestCase):
             key=pt.OvnLsKey(name="seg-a"),
             data=pt.OvnLsData(
                 interfaces=[
-                    pt.Interface(
+                    _ls_interface(
                         host="chassis-1",
                         iface={
                             "kind": "vlan",
@@ -1720,7 +1869,7 @@ class MultiServiceDeployTest(unittest.TestCase):
             key=pt.OvnLsKey(name="seg-b"),
             data=pt.OvnLsData(
                 interfaces=[
-                    pt.Interface(
+                    _ls_interface(
                         host="chassis-1",
                         iface={
                             "kind": "vlan",
@@ -1733,7 +1882,7 @@ class MultiServiceDeployTest(unittest.TestCase):
             ),
         )
 
-        def svc(n: str):
+        def svc(n: str) -> pt.KernelAppContainerNode:
             return pt.KernelAppContainerNode(
                 id=f"kernel.app.container:{n}",
                 kind="kernel.app.container",
@@ -1741,7 +1890,7 @@ class MultiServiceDeployTest(unittest.TestCase):
                 data=pt.KernelAppContainerData(host="host:chassis-1", image=f"img-{n}"),
             )
 
-        def lrp(router: str, seg_name: str, service: str):
+        def lrp(router: str, seg_name: str, service: str) -> pt.OvnLrpNode:
             name = f"lrp-{router}-left"
             return pt.OvnLrpNode(
                 id=f"ovnrouter:{router}|lrp:{name}",
@@ -1928,22 +2077,23 @@ class DnsServiceEndToEndTest(unittest.TestCase):
 # present when a leg opts OUT). The deployer turns that into one IPFIX
 # sampler per segment bridge: attach on create, clear on delete, and
 # clear (not attach) for a bridge any of whose legs opted out.
-def _with_ipfix(nodes, flow_off_domains=frozenset()):
-    out = []
+def _with_ipfix(
+    nodes: list[pt.Model], flow_off_domains: Collection[str] = frozenset()
+) -> list[pt.Model]:
+    out: list[pt.Model] = []
     for n in nodes:
         if n.kind == "infra.host" and n.key.host == "chassis-1":
             n = dataclasses.replace(
                 n,
                 data=dataclasses.replace(
                     n.data,
-                    ipfix=pt.Ipfix(targets="192.168.129.88:4739", sampling=512),
+                    ipfix=pt.IpfixData(targets="192.168.129.88:4739", sampling=512),
                 ),
             )
         if n.kind == "ovn.ls" and n.key.name in flow_off_domains:
             ifaces = []
             for entry in n.data.interfaces:
-                iface = dict(entry.iface)
-                iface["flow"] = False
+                iface = dataclasses.replace(entry.iface, flow=False)
                 ifaces.append(dataclasses.replace(entry, iface=iface))
             n = dataclasses.replace(n, data=dataclasses.replace(n.data, interfaces=ifaces))
         out.append(n)

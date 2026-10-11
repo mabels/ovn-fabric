@@ -25,6 +25,7 @@ import json
 import shlex
 from typing import Any
 
+from . import JsonObject
 from .netns import run as run_in_netns
 
 
@@ -33,7 +34,7 @@ def _run_ip_json(args: list[str], netns: str | None) -> Any:
     return json.loads(out)
 
 
-def list_links(netns: str | None) -> list[dict]:
+def list_links(netns: str | None) -> list[JsonObject]:
     # peerInOtherNetns: real `ip -j link show` sets `link_netnsid` on a
     # device whose `link` (parent/peer, e.g. a veth's other end, or a
     # VLAN sub-interface's parent NIC) lives in a different namespace —
@@ -65,7 +66,7 @@ def list_links(netns: str | None) -> list[dict]:
     ]
 
 
-def list_addrs(netns: str | None) -> list[dict]:
+def list_addrs(netns: str | None) -> list[JsonObject]:
     # Deliberately unfiltered — every address including fe80:: link-local
     # ones is returned. Reporting a complete, faithful record of what's
     # real is this module's job; deciding what's relevant (autoconfigured
@@ -81,7 +82,7 @@ def list_addrs(netns: str | None) -> list[dict]:
     return out
 
 
-def list_routes(netns: str | None, family: str) -> list[dict]:
+def list_routes(netns: str | None, family: str) -> list[JsonObject]:
     # Family comes from which command produced the entry, not from
     # sniffing the value for ":" — the destination is literally the bare
     # string "default" for BOTH families (confirmed against a real
@@ -185,8 +186,20 @@ def add_dummy_argv(name: str) -> list[str]:
 # domain's OVS bridge), `peer` the leg moved into the kernel router's
 # netns by deployer/ir_to_shell.py's _emit_kernel_router_create. Run from
 # the root namespace (2026-08-18).
-def add_veth_argv(name: str, peer: str) -> list[str]:
-    return ["ip", "link", "add", name, "type", "veth", "peer", "name", peer]
+#
+# `peer_mac` pins the PEER leg's MAC (`address` after `peer name` applies
+# to the peer, not to `name`). The generator derives it from the leg's
+# own address (src/addressing.ts's macFromAddrsOrName) so it is the SAME
+# on every recreation: an OVN logical router never ages or re-probes a
+# learned MAC_Binding, so a leg that came back with a new random MAC kept
+# receiving frames addressed to the old one, which the kernel drops as
+# "other host" (confirmed live 2026-10-11). None keeps the kernel's
+# random MAC (an IR written before the generator resolved one).
+def add_veth_argv(name: str, peer: str, peer_mac: str | None = None) -> list[str]:
+    argv = ["ip", "link", "add", name, "type", "veth", "peer", "name", peer]
+    if peer_mac is not None:
+        argv += ["address", peer_mac]
+    return argv
 
 
 def set_link_up_argv(name: str) -> list[str]:
