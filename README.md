@@ -105,6 +105,22 @@ npx -p @adviser/ovn-fabric ovn-fabric generate topology.ts       # sanity-check 
 npx -p @adviser/ovn-fabric ovn-fabric generate-ir topology.ts    # emit the desired-state IR
 ```
 
+A topology can take parameters from the run that loads it. Both commands
+accept a repeatable `--runtime key=val`, and the topology reads them — and
+the process environment — through `runtime()`:
+
+```ts
+import { runtime } from "@adviser/ovn-fabric";
+
+const rt = runtime();
+const debug = rt.args["debug"] === "1"; // --runtime debug=1
+const site = rt.env["SITE"] ?? "hh"; // SITE=... in the environment
+```
+
+```sh
+npx -p @adviser/ovn-fabric ovn-fabric generate-ir --runtime debug=1 topology.ts
+```
+
 Then hand the IR to the Python deployer, which emits the per-host script(s):
 
 ```sh

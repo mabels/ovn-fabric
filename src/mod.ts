@@ -23,3 +23,7 @@ export {
   type TransitNetwork,
   transitNetwork,
 } from "./addressing.ts";
+// runtime() — how a topology reads the environment and the CLI's
+// `--runtime key=val` arguments (src/runtime.ts). setRuntimeArgs() is for
+// whoever loads a topology, e.g. a test of a parameterised config.
+export { type Runtime, runtime, setRuntimeArgs } from "./runtime.ts";

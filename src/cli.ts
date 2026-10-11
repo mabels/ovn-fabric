@@ -9,7 +9,10 @@
 // separately named re-export of the same data would just be duplication.
 
 import {
+  array,
   command,
+  extendType,
+  multioption,
   positional,
   run,
   string,
@@ -19,6 +22,7 @@ import { pathToFileURL } from "node:url";
 
 import { toIR } from "./ir.ts";
 import { buildJsonSchema } from "./protocol.ts";
+import { parseRuntimeArgs, setRuntimeArgs } from "./runtime.ts";
 import type { NetworkDefinition } from "./define.ts";
 import type { Host, InterfaceKind } from "./types.ts";
 
@@ -66,7 +70,27 @@ function isNetworkDefinition(value: unknown): value is NetworkDefinition {
   );
 }
 
-async function loadConfig(configPath: string): Promise<NetworkDefinition> {
+// `--runtime key=val`, repeatable — parameters for the topology being
+// loaded, which reads them back through runtime().args (src/runtime.ts).
+// Parsed as part of the option's own type, so a malformed pair is
+// reported like any other bad argument, before anything is loaded.
+const runtimeArgs = multioption({
+  long: "runtime",
+  description: "A parameter for the topology, read there via " +
+    "runtime().args — repeat the option for several",
+  type: extendType(array(string), {
+    displayName: "key=val",
+    from: (pairs) => Promise.resolve(parseRuntimeArgs(pairs)),
+  }),
+});
+
+async function loadConfig(
+  configPath: string,
+  args: Readonly<Record<string, string>>,
+): Promise<NetworkDefinition> {
+  // BEFORE the import: a topology is evaluated as it is imported, and
+  // that is when it calls runtime().
+  setRuntimeArgs(args);
   const resolved = await Deno.realPath(configPath);
   // pathToFileURL (not a hand-rolled "file://" + string template) is
   // deliberate: something in the JSR publish pipeline appears to
@@ -101,9 +125,10 @@ const generate = command({
       displayName: "config-path",
       description: "Path to a topology config module (e.g. config/topology.ts)",
     }),
+    runtime: runtimeArgs,
   },
-  handler: async ({ configPath }) => {
-    const net = await loadConfig(configPath);
+  handler: async ({ configPath, runtime }) => {
+    const net = await loadConfig(configPath, runtime);
 
     console.log(`Loaded network: ${net.name} (from ${configPath})`);
     console.log(`  hosts: ${net.allHosts.length}`);
@@ -151,9 +176,10 @@ const generateIr = command({
       displayName: "config-path",
       description: "Path to a topology config module (e.g. config/topology.ts)",
     }),
+    runtime: runtimeArgs,
   },
-  handler: async ({ configPath }) => {
-    const net = await loadConfig(configPath);
+  handler: async ({ configPath, runtime }) => {
+    const net = await loadConfig(configPath, runtime);
     const nodes = toIR(net);
     console.log(JSON.stringify(Object.values(nodes), null, 2));
   },
