@@ -36,6 +36,8 @@ import type { IPv4, IPv6 } from "./ip.ts";
 import type {
   CollisionDomain,
   Host,
+  InterfaceKind,
+  InterfaceParent,
   KernelRouter,
   OvnRouterEndpoint,
   Resolver,
@@ -44,6 +46,8 @@ import type {
   RoutingDomain,
   SecurityGroup,
   Service,
+  XdpIface,
+  XdpMode,
 } from "./types.ts";
 import type { NetworkDefinition } from "./define.ts";
 import type {
@@ -368,6 +372,25 @@ function kernelRouterSideToIR(
   // instead of pointing at the previous leg's random MAC (2026-10-11).
   const ifaces = router[side].ifaces?.map((hi) => {
     const iface = hi.iface;
+    // An AF_XDP port is owned by OVS's userspace datapath; a kernel
+    // router's netns cannot take it. Same for a VLAN riding one.
+    if (iface.kind === "xdp") {
+      throw new Error(
+        `kernel router ${router.name} side ${side}: an "xdp" interface is ` +
+          `OVS-owned and cannot be moved into a netns`,
+      );
+    }
+    if (iface.kind === "vlan") {
+      const vlanParent = resolveParent(iface.vlanParent);
+      if (vlanParent.kind === "xdp") {
+        throw new Error(
+          `kernel router ${router.name} side ${side}: VLAN ${iface.vlanId} ` +
+            `rides an "xdp" parent, but kernel-router VLANs need a ` +
+            `physical parent`,
+        );
+      }
+      return { host: hi.host.name, iface: { ...iface, vlanParent } };
+    }
     if (iface.kind !== "veth") return { host: hi.host.name, iface };
     return {
       host: hi.host.name,
@@ -523,6 +546,53 @@ function ifaceFlowOff(
   return iface.kind === "veth";
 }
 
+// ── interface resolution ─────────────────────────────────────────────
+// The DSL leaves AF_XDP's `mode`/`nRxq` optional and accepts a bare
+// string as a VLAN parent (every pre-XDP topology). The IR carries the
+// FINAL fact, so both are resolved here — same boundary as shortName,
+// mac and the LRP options above.
+const XDP_MODE_DEFAULT: XdpMode = "best-effort";
+const XDP_NRXQ_DEFAULT = 1;
+
+type ResolvedXdp = {
+  kind: "xdp";
+  name: string;
+  mode: XdpMode;
+  nRxq: number;
+};
+type ResolvedParent = { kind: "physical"; name: string } | ResolvedXdp;
+type ResolvedIface =
+  | Exclude<InterfaceKind, { kind: "vlan" } | { kind: "xdp" }>
+  | (Omit<Extract<InterfaceKind, { kind: "vlan" }>, "vlanParent"> & {
+    vlanParent: ResolvedParent;
+  })
+  | ResolvedXdp;
+
+function resolveXdp(
+  iface: Pick<XdpIface, "name" | "mode" | "nRxq">,
+): ResolvedXdp {
+  return {
+    kind: "xdp",
+    name: iface.name,
+    mode: iface.mode ?? XDP_MODE_DEFAULT,
+    nRxq: iface.nRxq ?? XDP_NRXQ_DEFAULT,
+  };
+}
+
+function resolveParent(parent: InterfaceParent): ResolvedParent {
+  if (typeof parent === "string") return { kind: "physical", name: parent };
+  if (parent.kind === "xdp") return resolveXdp(parent);
+  return { kind: "physical", name: parent.name };
+}
+
+function resolveIface(iface: InterfaceKind): ResolvedIface {
+  if (iface.kind === "vlan") {
+    return { ...iface, vlanParent: resolveParent(iface.vlanParent) };
+  }
+  if (iface.kind === "xdp") return resolveXdp(iface);
+  return iface;
+}
+
 function collisionDomainToIR(
   domain: CollisionDomain,
   routers: readonly Router[],
@@ -540,7 +610,7 @@ function collisionDomainToIR(
           interfaces.push({
             host: hi.host.name,
             iface: {
-              ...hi.iface,
+              ...resolveIface(hi.iface),
               shortName,
               // Per-leg flow switch (types.ts RouterEndpointInputBase.
               // flow): only reported when OFF — absent means "inherit".

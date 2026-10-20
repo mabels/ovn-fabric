@@ -38,11 +38,18 @@ function describeAccess(host: Host): string {
 
 function describeInterface(ifc: InterfaceKind): string {
   switch (ifc.kind) {
-    case "vlan":
-      return `vlan ${ifc.vlanId} on ${ifc.vlanParent}` +
+    case "vlan": {
+      const parent = typeof ifc.vlanParent === "string"
+        ? ifc.vlanParent
+        : ifc.vlanParent.name;
+      return `vlan ${ifc.vlanId} on ${parent}` +
         (ifc.ifaceName ? ` (as ${ifc.ifaceName})` : "");
+    }
     case "physical":
       return `physical ${ifc.name}`;
+    case "xdp":
+      return `xdp ${ifc.name}` +
+        (ifc.mode ? ` (${ifc.mode})` : "");
     case "bridge-port":
       return `bridge-port ${ifc.port} on ${ifc.bridge}`;
     case "veth":

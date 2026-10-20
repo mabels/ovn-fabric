@@ -211,7 +211,11 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
   assertEquals(right.data["ifaces"], [
     {
       host: "chassis-1",
-      iface: { kind: "vlan", vlanParent: "eth0", vlanId: 2280 },
+      iface: {
+        kind: "vlan",
+        vlanParent: { kind: "physical", name: "eth0" },
+        vlanId: 2280,
+      },
     },
   ]);
 
@@ -267,6 +271,114 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
       },
     },
   ]);
+});
+
+Deno.test("iface resolution: a VLAN on an xdp parent carries the resolved AF_XDP settings", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const home = net.collisionDomain("home");
+    const xdp = {
+      kind: "xdp",
+      name: "ovnxdp",
+      mode: "generic",
+      nRxq: 1,
+    } as const;
+    const r1 = net.defineOvnRouter("router-xdp", (router) => ({
+      routingDomains: [],
+      endpoints: [
+        router.ovnRouterEndpoint({
+          l2Segment: home,
+          ipaddrs: [IPv4.parse("192.168.128.1/24")],
+          ifaces: [
+            { host, iface: { kind: "vlan", vlanParent: xdp, vlanId: 1128 } },
+          ],
+        }),
+        router.ovnRouterEndpoint({
+          l2Segment: net.collisionDomain("backbone"),
+          ipaddrs: [IPv4.parse("172.22.0.1/16")],
+        }),
+      ],
+    }));
+    return { routers: [r1] };
+  });
+
+  const ls = node(toIR(network), "ls:home");
+  assertEquals(ls.data.interfaces, [
+    {
+      host: "chassis-1",
+      iface: {
+        kind: "vlan",
+        vlanParent: {
+          kind: "xdp",
+          name: "ovnxdp",
+          mode: "generic",
+          nRxq: 1,
+        },
+        vlanId: 1128,
+        shortName: "br-home",
+      },
+    },
+  ]);
+});
+
+Deno.test("iface resolution: a bare xdp iface defaults to best-effort/1; an explicit physical parent stays physical", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const backbone = net.collisionDomain("backbone");
+    const r1 = net.defineOvnRouter("router-xdp-defaults", (router) => ({
+      routingDomains: [],
+      endpoints: [
+        router.ovnRouterEndpoint({
+          l2Segment: net.collisionDomain("home"),
+          ipaddrs: [IPv4.parse("192.168.128.1/24")],
+          ifaces: [{ host, iface: { kind: "xdp", name: "ovnxdp" } }],
+        }),
+        router.ovnRouterEndpoint({
+          l2Segment: backbone,
+          ipaddrs: [IPv4.parse("172.22.0.1/16")],
+        }),
+      ],
+    }));
+    const r2 = net.defineOvnRouter("router-physical-parent", (router) => ({
+      routingDomains: [],
+      endpoints: [
+        router.ovnRouterEndpoint({
+          l2Segment: net.collisionDomain("dmz"),
+          ipaddrs: [IPv4.parse("192.168.129.1/24")],
+          ifaces: [
+            {
+              host,
+              iface: {
+                kind: "vlan",
+                vlanParent: { kind: "physical", name: "eth2" },
+                vlanId: 129,
+              },
+            },
+          ],
+        }),
+        router.ovnRouterEndpoint({
+          l2Segment: backbone,
+          ipaddrs: [IPv4.parse("172.22.0.2/16")],
+        }),
+      ],
+    }));
+    return { routers: [r1, r2] };
+  });
+
+  const nodes = toIR(network);
+  assertEquals(node(nodes, "ls:home").data.interfaces[0]!.iface, {
+    kind: "xdp",
+    name: "ovnxdp",
+    mode: "best-effort",
+    nRxq: 1,
+    shortName: "br-home",
+  });
+  assertEquals(node(nodes, "ls:dmz").data.interfaces[0]!.iface, {
+    kind: "vlan",
+    vlanParent: { kind: "physical", name: "eth2" },
+    vlanId: 129,
+    shortName: "br-dmz",
+  });
 });
 
 // buildKernelRouterEndpoint must NOT put the WAN-facing `ipaddrs` on the

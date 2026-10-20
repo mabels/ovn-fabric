@@ -172,6 +172,18 @@ def ensure_vlan_argv(parent: str, name: str, vlan_id: int) -> list[str]:
     return ["sh", "-c", script]
 
 
+def ensure_veth_argv(name: str, peer: str) -> list[str]:
+    """Create a veth pair only if the `name` side is missing — `ip link
+    add` has no --may-exist, same reasoning as ensure_vlan_argv above.
+    Used for the per-segment legs between the XDP trunk bridge and the
+    segment bridge (deployer/ir_common.py's _emit_xdp_leg)."""
+    script = (
+        f"ip link show {shlex.quote(name)} >/dev/null 2>&1 || "
+        f"ip link add {shlex.quote(name)} type veth peer name {shlex.quote(peer)}"
+    )
+    return ["sh", "-c", script]
+
+
 # A real, addressable stand-in for a KernelRouterSide's own device — see
 # that type's own doc comment (types.ts): no real iface binding yet
 # ("iface mappings into the namespace" is its own next step), so a

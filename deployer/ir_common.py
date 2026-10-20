@@ -86,6 +86,7 @@ import json
 import pathlib
 import shlex
 from collections.abc import Sequence
+from typing import Protocol
 
 from ladops import linux_net as linux_net_ops
 from ladops import netns as netns_ops
@@ -98,7 +99,7 @@ from .install_queue import QUEUE_DIR, Job
 
 Action = str  # "create" | "delete"
 
-_BINDABLE_IFACE_KINDS = {"vlan", "physical", "veth"}
+_BINDABLE_IFACE_KINDS = {"vlan", "physical", "veth", "xdp"}
 
 
 class Ref:
@@ -255,7 +256,12 @@ OvnSettings = pt.OvnLrOptions | pt.Ipv6RaConfigs
 
 def _iface_real_name(iface: Iface) -> str:
     if iface.kind == "vlan":
-        return iface.ifaceName or f"{iface.vlanParent}.{iface.vlanId}"
+        return iface.ifaceName or f"{iface.vlanParent.name}.{iface.vlanId}"
+    if iface.kind == "xdp":
+        # The AF_XDP port is the real netdev; there is no kernel
+        # `<parent>.<vlan>` device when a VLAN rides it (see
+        # _emit_xdp_leg, which creates the per-segment veth instead).
+        return iface.name
     if iface.kind == "veth":
         # The ROOT-side leg — the device the transit domain's bridge
         # attaches to (the netns-side leg, `ifaceName`, is created/moved
@@ -1361,7 +1367,7 @@ def _emit_kernel_router_owner(
         emit.comment(f"# --- kernel router side: {owner.key.name} ({_side(side_node).value}) ---")
         if iface is not None:
             if iface.kind == "vlan":
-                emit.sh(linux_net_ops.add_vlan_argv(iface.vlanParent, dev, iface.vlanId))
+                emit.sh(linux_net_ops.add_vlan_argv(iface.vlanParent.name, dev, iface.vlanId))
             elif iface.kind == "veth":
                 # `mac` (src/ir.ts's kernelRouterSideToIR) pins the
                 # netns-side leg's MAC so the OVN router's MAC_Binding
@@ -1555,20 +1561,120 @@ def _emit_kernel_router(host_id: str, nodes: list[pt.Model], emit: Emitter) -> N
 # del-port call — same reasoning as ladops.ovn.ls_del_argv), plus an
 # explicit vlan link delete, and removes the ovn-bridge-mappings entry.
 # Create/delete branches adjacent, 2026-08-19 (flag schema).
-def _emit_iface_bindings(
-    host_name: str, nodes: list[pt.Model], emit: Emitter, boot: bool = False
-) -> None:
-    """`boot=True` renders the body of the per-host bindings unit
-    (ovn-fabric-bindings.service), which runs BEFORE the kernel
-    router/service units. The transit veths do not exist yet at that
-    point — their own units create them (and up the root leg themselves,
-    see _emit_kernel_router_owner), so the `veth` case here only ensures
-    the OVS port row and skips `ip link set` on a device that is not
-    there yet."""
+# ── XDP trunk ────────────────────────────────────────────────────────
+# One netdev bridge per host owns every AF_XDP port. A single AF_XDP
+# port can only live on ONE bridge, so it cannot also be the per-domain
+# segment bridge (there is one of those per collision domain): each
+# segment instead gets a veth pair, tagged on the trunk side, whose
+# other end is the segment bridge — which therefore stays `system` and
+# keeps its patch to `br-int`. The VLAN split lives in OVS (`tag=`), not
+# in the kernel: an xdp parent has no `<parent>.<vlan>` device.
+_XDP_TRUNK_BRIDGE = "br-xdp"
+# The per-segment veths are kernel netdevs; OVS's netdev datapath accepts
+# kernel netdevs (the same pattern as its `br-phy` underlay bridge), so
+# only this one bridge is netdev and the rest of the fabric stays `system`.
+
+
+def _short_suffix(name: str) -> str:
+    """FNV-1a 32 of `name`, first 6 hex chars — the IFNAMSIZ-safe suffix
+    for the per-segment legs (`veth-xdp-<6>` / `veth-seg-<6>`, 15 chars
+    each). Same fold src/ir.ts uses for over-long bridge names."""
+    h = 0x811C9DC5
+    for byte in name.encode():
+        h ^= byte
+        h = (h * 0x01000193) & 0xFFFFFFFF
+    return f"{h:08x}"[:6]
+
+
+class _XdpPort(Protocol):
+    """What an AF_XDP port looks like to this module, whether it arrives
+    as a VLAN parent (`generated.VlanParent`) or as a standalone
+    `ovn.ls` iface (`generated.OvnLsIface1` — datamodel-codegen's name
+    for the anonymous `OvnLsIfaceXdp` component). Structural so the
+    emitter never depends on that generated class name."""
+
+    name: str
+    mode: pt.Mode
+    nRxq: int
+
+
+def _xdp_trunks(
+    bindings: list[tuple[str, pt.OvnLsIface]],
+) -> dict[str, list[int]]:
+    """VLAN ids each AF_XDP parent must trunk. The parent is a trunk (the
+    wire's tagged frames arrive on it); the per-segment veth legs are the
+    access ports (`tag=<vid>`)."""
+    trunks: dict[str, list[int]] = {}
+    for _domain, iface in bindings:
+        if iface.kind == "vlan" and iface.vlanParent.kind == "xdp":
+            trunks.setdefault(iface.vlanParent.name, []).append(iface.vlanId)
+    return trunks
+
+
+def _xdp_ports(
+    bindings: list[tuple[str, pt.OvnLsIface]],
+) -> dict[str, _XdpPort]:
+    """Every AF_XDP port this host owns, keyed by netdev name — one
+    entry whether the port appears as a VLAN parent or as a standalone
+    `xdp` interface. Deduping here is what makes "five segments, one
+    port" possible."""
+    ports: dict[str, _XdpPort] = {}
+    for _domain, iface in bindings:
+        if iface.kind == "vlan" and iface.vlanParent.kind == "xdp":
+            ports.setdefault(iface.vlanParent.name, iface.vlanParent)
+        elif iface.kind == "xdp":
+            ports.setdefault(iface.name, iface)
+    return ports
+
+
+def _emit_xdp_leg(segment_bridge: str, vlan_id: int | None, emit: Emitter) -> None:
+    suffix = _short_suffix(segment_bridge)
+    trunk_leg = f"veth-xdp-{suffix}"
+    seg_leg = f"veth-seg-{suffix}"
+    emit.sh(linux_net_ops.ensure_veth_argv(trunk_leg, seg_leg))
+    emit.sh(linux_net_ops.set_link_up_argv(trunk_leg))
+    emit.sh(linux_net_ops.set_link_up_argv(seg_leg))
+    emit.sh(ovs_ops.add_port_argv(_XDP_TRUNK_BRIDGE, trunk_leg))
+    if vlan_id is not None:
+        emit.sh(ovs_ops.set_port_tag_argv(trunk_leg, vlan_id))
+    emit.sh(ovs_ops.add_port_argv(segment_bridge, seg_leg))
+
+
+def _emit_xdp_leg_delete(segment_bridge: str, emit: Emitter) -> None:
+    suffix = _short_suffix(segment_bridge)
+    trunk_leg = f"veth-xdp-{suffix}"
+    seg_leg = f"veth-seg-{suffix}"
+    emit.sh(ovs_ops.del_port_argv(segment_bridge, seg_leg))
+    emit.sh(ovs_ops.del_port_argv(_XDP_TRUNK_BRIDGE, trunk_leg))
+    # Deleting one end removes the pair.
+    emit.sh(linux_net_ops.delete_link_argv(trunk_leg))
+    emit.sh(ovs_ops.del_br_argv(segment_bridge))
+
+
+def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -> None:
+    """Same body for the deploy pass and the boot bindings unit. It only
+    ensures the OVS bridge/port rows and the netdevices it OWNS (kernel
+    VLANs, XDP veth legs); the transit veths are created and upped by
+    their kernel-router units, which may not have run yet here."""
     before = len(emit.lines)
     bindings = _host_bindings(nodes).get(host_name, [])
     if emit.action == "create":
         mappings: list[str] = []
+        xdp_ports = _xdp_ports(bindings)
+        xdp_trunks = _xdp_trunks(bindings)
+        if xdp_ports:
+            emit.comment("# --- XDP trunk: userspace datapath, one port for all segments ---")
+            emit.sh(ovs_ops.add_br_argv(_XDP_TRUNK_BRIDGE))
+            emit.sh(ovs_ops.set_bridge_datapath_argv(_XDP_TRUNK_BRIDGE, "netdev"))
+            emit.sh(ovs_ops.set_bridge_fail_mode_argv(_XDP_TRUNK_BRIDGE))
+            for name, port in xdp_ports.items():
+                emit.sh(
+                    ovs_ops.add_afxdp_port_argv(_XDP_TRUNK_BRIDGE, name, port.mode.value, port.nRxq)
+                )
+                trunk_vlans = sorted(set(xdp_trunks.get(name, [])))
+                if trunk_vlans:
+                    emit.sh(ovs_ops.set_port_trunks_argv(name, trunk_vlans))
+            emit.blank()
         for domain, iface in bindings:
             if iface.kind not in _BINDABLE_IFACE_KINDS:
                 emit.comment(
@@ -1576,40 +1682,66 @@ def _emit_iface_bindings(
                     f"{domain} on {host_name} — skipped, see deployer/ir_common.py"
                 )
                 continue
-            real_name = _iface_real_name(iface)
             bridge = iface.shortName
-            emit.comment(f"# --- interface: {domain} on {host_name} ({real_name}) ---")
-            if iface.kind == "vlan":
-                emit.sh(linux_net_ops.ensure_vlan_argv(iface.vlanParent, real_name, iface.vlanId))
-                emit.sh(linux_net_ops.set_link_up_argv(real_name))
-            elif iface.kind == "veth" and not boot:
-                # The ROOT-side leg of the kernel router's transit veth —
-                # the kernel router block brings the netns-side leg up,
-                # but the peer stays DOWN in root until told otherwise
-                # (confirmed live, 2026-08-19: `ip l | grep 9adb1d`
-                # showed state DOWN until `ip l set dev veth-ovn-... up`),
-                # so bring it up before it becomes the bridge's port.
-                # At boot the router unit owns it (and creates it), so
-                # there is nothing to up here yet.
-                emit.sh(linux_net_ops.set_link_up_argv(real_name))
+            is_xdp = iface.kind == "xdp" or (
+                iface.kind == "vlan" and iface.vlanParent.kind == "xdp"
+            )
+            if iface.kind == "xdp":
+                label = iface.name
+            elif iface.kind == "vlan" and iface.vlanParent.kind == "xdp":
+                label = f"{iface.vlanParent.name} vlan {iface.vlanId}"
+            else:
+                label = _iface_real_name(iface)
+            emit.comment(f"# --- interface: {domain} on {host_name} ({label}) ---")
+            if iface.kind == "vlan" and not is_xdp:
+                emit.sh(
+                    linux_net_ops.ensure_vlan_argv(
+                        iface.vlanParent.name, _iface_real_name(iface), iface.vlanId
+                    )
+                )
+                emit.sh(linux_net_ops.set_link_up_argv(_iface_real_name(iface)))
+            # A transit veth's ROOT leg is created AND upped by its own
+            # kernel-router unit (_emit_kernel_router_owner). This block
+            # must not touch it: the boot restore pass runs before those
+            # units, so `ip link set` here failed with "Cannot find
+            # device" and took the whole restore down (confirmed live,
+            # 2026-10-20).
             emit.sh(ovs_ops.add_br_argv(bridge))
             emit.sh(ovs_ops.set_bridge_fail_mode_argv(bridge))
-            emit.sh(ovs_ops.add_port_argv(bridge, real_name))
+            if is_xdp:
+                vlan_id = iface.vlanId if iface.kind == "vlan" else None
+                _emit_xdp_leg(bridge, vlan_id, emit)
+            else:
+                emit.sh(ovs_ops.add_port_argv(bridge, _iface_real_name(iface)))
             mappings.append(f"{_network_name(domain)}:{bridge}")
         if mappings:
             emit.sh(ovs_ops.set_external_id_argv("ovn-bridge-mappings", ",".join(mappings)))
     else:
         any_bound = False
+        xdp_ports = _xdp_ports(bindings)
         for domain, iface in bindings:
             if iface.kind not in _BINDABLE_IFACE_KINDS:
                 continue
             any_bound = True
-            real_name = _iface_real_name(iface)
             bridge = iface.shortName
-            emit.comment(f"# --- interface: {domain} on {host_name} ({real_name}) ---")
-            emit.sh(ovs_ops.del_br_argv(bridge))
-            if iface.kind == "vlan":
-                emit.sh(linux_net_ops.delete_link_argv(real_name))
+            is_xdp = iface.kind == "xdp" or (
+                iface.kind == "vlan" and iface.vlanParent.kind == "xdp"
+            )
+            if iface.kind == "xdp":
+                label = iface.name
+            elif iface.kind == "vlan" and iface.vlanParent.kind == "xdp":
+                label = f"{iface.vlanParent.name} vlan {iface.vlanId}"
+            else:
+                label = _iface_real_name(iface)
+            emit.comment(f"# --- interface: {domain} on {host_name} ({label}) ---")
+            if is_xdp:
+                _emit_xdp_leg_delete(bridge, emit)
+            else:
+                emit.sh(ovs_ops.del_br_argv(bridge))
+                if iface.kind == "vlan":
+                    emit.sh(linux_net_ops.delete_link_argv(_iface_real_name(iface)))
+        if xdp_ports:
+            emit.sh(ovs_ops.del_br_argv(_XDP_TRUNK_BRIDGE))
         if any_bound:
             emit.sh(ovs_ops.remove_external_id_argv("ovn-bridge-mappings"))
     if len(emit.lines) > before:
@@ -1633,12 +1765,12 @@ _BINDINGS_UNIT_PATH = f"/etc/systemd/system/{_BINDINGS_UNIT}"
 
 def _bindings_script(host_name: str, nodes: list[pt.Model]) -> str:
     body = _ShellBody("create")
-    _emit_iface_bindings(host_name, nodes, body, boot=True)
+    _emit_iface_bindings(host_name, nodes, body)
     return "\n".join(
         [
             "#!/bin/sh",
             f"# ovn-fabric host bindings ({host_name}): recreate the real",
-            "# segment interfaces (VLAN sub-interfaces) and their OVS",
+            "# segment interfaces (kernel VLANs, XDP trunk legs) and their OVS",
             "# bridges/ports at boot. OVS keeps its rows across a reboot, the",
             "# netdevices they reference do not. The kernel routers' transit",
             "# veths are created by their own units, which run AFTER this one.",

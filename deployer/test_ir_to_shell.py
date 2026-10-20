@@ -52,6 +52,7 @@ from .ir_common import (
     _emit_cluster_body,
     _emit_host_script,
     _shell_token,
+    _short_suffix,
 )
 
 mod = importlib.import_module("deployer.ir_to_python")
@@ -154,7 +155,7 @@ NODES: list[pt.Model] = [
                     host="chassis-1",
                     iface={
                         "kind": "vlan",
-                        "vlanParent": "eth0",
+                        "vlanParent": {"kind": "physical", "name": "eth0"},
                         "vlanId": 129,
                         "shortName": "br-home",
                     },
@@ -219,7 +220,11 @@ NODES: list[pt.Model] = [
             ifaces=[
                 _kr_interface(
                     host="chassis-1",
-                    iface={"kind": "vlan", "vlanParent": "eth0", "vlanId": 2280},
+                    iface={
+                        "kind": "vlan",
+                        "vlanParent": {"kind": "physical", "name": "eth0"},
+                        "vlanId": 2280,
+                    },
                 ),
             ],
         ),
@@ -516,12 +521,13 @@ class IfaceBindingCreateTest(unittest.TestCase):
         self.assertIn("ovs-vsctl set bridge br-home fail-mode=standalone", script)
         self.assertIn("ovs-vsctl --may-exist add-port br-home eth0.129", script)
 
-    def test_veth_root_leg_brought_up_before_joining_the_bridge(self) -> None:
-        # A transit domain's ovn.ls carries the veth pair; the kernel
-        # router block brings the netns-side leg up, but the ROOT leg
-        # stays DOWN until told otherwise (confirmed live, 2026-08-19) —
-        # so the binding block brings it up before it becomes a bridge
-        # port.
+    def test_veth_root_leg_is_left_to_its_router_unit(self) -> None:
+        # The binding block attaches the root-side peer to the bridge,
+        # but the kernel-router unit creates AND ups the device (the
+        # reboot fix, 2026-10-20). It must not `ip link set` it here:
+        # the boot restore pass runs before those units, so the line
+        # failed with "Cannot find device" and took the restore down
+        # (confirmed live, 2026-10-20).
         nodes = NODES + [
             pt.OvnLsNode(
                 id="ls:transit-router-wan",
@@ -544,14 +550,8 @@ class IfaceBindingCreateTest(unittest.TestCase):
         ]
         _, hosts = build_scripts(nodes, "create")
         script = hosts["chassis-1"]
-        self.assertIn("ip link set veth-ovn-9adb1d up", script)
-        # The LIVE create block must up the root leg before adding it as
-        # a port. (The boot bindings block above it also adds the port,
-        # before any veth exists — the router unit creates and ups it —
-        # so start the search at the live block's `up`.)
-        up = script.index("ip link set veth-ovn-9adb1d up")
-        port = script.index("ovs-vsctl --may-exist add-port br-1f5b95ad veth-ovn-9adb1d", up)
-        self.assertLess(up, port)
+        self.assertIn("ovs-vsctl --may-exist add-port br-1f5b95ad veth-ovn-9adb1d", script)
+        self.assertNotIn("ip link set veth-ovn-9adb1d up", script)
 
     def test_bridge_mapping_set_on_the_owning_host(self) -> None:
         self.assertIn("external-ids:ovn-bridge-mappings=net-home:br-home", self.hosts["chassis-1"])
@@ -571,7 +571,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
                         host="chassis-1",
                         iface={
                             "kind": "vlan",
-                            "vlanParent": "eth0",
+                            "vlanParent": {"kind": "physical", "name": "eth0"},
                             "vlanId": 129,
                             "shortName": "br-8d8c0a55",
                         },
@@ -622,6 +622,153 @@ class IfaceBindingDeleteTest(unittest.TestCase):
             "ovs-vsctl remove open_vswitch . external-ids ovn-bridge-mappings",
             self.hosts["chassis-1"],
         )
+
+
+_XDP_HOSTS: list[pt.InfraHostNode] = [n for n in NODES if isinstance(n, pt.InfraHostNode)]
+
+
+def _xdp_ls(iface: dict[str, object], domain: str = "home") -> pt.OvnLsNode:
+    return pt.OvnLsNode(
+        id=f"ls:{domain}",
+        kind="ovn.ls",
+        key=pt.OvnLsKey(name=domain),
+        data=pt.OvnLsData(
+            interfaces=[_ls_interface(host="chassis-1", iface=iface)],
+        ),
+    )
+
+
+class XdpBindingTest(unittest.TestCase):
+    """An AF_XDP parent cannot be a kernel VLAN parent and cannot be on
+    more than one bridge. The deployer gives it one netdev trunk bridge
+    (`br-xdp`, `datapath_type=netdev`) and feeds each segment through a
+    veth pair, `tag=<vlan>` on the trunk side — so the per-domain segment
+    bridge stays `system` and keeps its `br-int` patch."""
+
+    def test_vlan_on_an_xdp_parent_becomes_an_ovs_tagged_trunk_leg(self) -> None:
+        nodes: list[pt.Model] = [
+            *_XDP_HOSTS,
+            _xdp_ls(
+                {
+                    "kind": "vlan",
+                    "vlanParent": {
+                        "kind": "xdp",
+                        "name": "ovnxdp",
+                        "mode": "generic",
+                        "nRxq": 1,
+                    },
+                    "vlanId": 1128,
+                    "shortName": "br-home",
+                }
+            ),
+        ]
+        script = build_scripts(nodes, "create")[1]["chassis-1"]
+
+        # One netdev trunk bridge, one AF_XDP port, options from the IR.
+        self.assertIn("ovs-vsctl --may-exist add-br br-xdp", script)
+        self.assertIn("ovs-vsctl set bridge br-xdp datapath_type=netdev", script)
+        self.assertIn(
+            "ovs-vsctl --may-exist add-port br-xdp ovnxdp -- set Interface "
+            "ovnxdp type=afxdp options:xdp-mode=generic options:n_rxq=1",
+            script,
+        )
+        # The parent is the TRUNK; without trunks= OVS treats it as
+        # untagged and drops every tagged frame from the wire.
+        self.assertIn("ovs-vsctl set port ovnxdp trunks=1128", script)
+
+        # No kernel child device: the VLAN split happens in OVS.
+        self.assertNotIn("ip link add link ovnxdp", script)
+        self.assertNotIn("ovnxdp.1128", script)
+        suffix = _short_suffix("br-home")
+        trunk = f"veth-xdp-{suffix}"
+        seg = f"veth-seg-{suffix}"
+        self.assertIn(f"ovs-vsctl --may-exist add-port br-xdp {trunk}", script)
+        self.assertIn(f"ovs-vsctl set port {trunk} tag=1128", script)
+        self.assertIn(f"ovs-vsctl --may-exist add-port br-home {seg}", script)
+        self.assertIn("ovs-vsctl --may-exist add-br br-home", script)
+
+    def test_one_xdp_parent_trunks_every_segment_it_carries(self) -> None:
+        nodes: list[pt.Model] = [
+            *_XDP_HOSTS,
+            _xdp_ls(
+                {
+                    "kind": "vlan",
+                    "vlanParent": {
+                        "kind": "xdp",
+                        "name": "ovnxdp",
+                        "mode": "generic",
+                        "nRxq": 1,
+                    },
+                    "vlanId": 1128,
+                    "shortName": "br-home",
+                }
+            ),
+            _xdp_ls(
+                {
+                    "kind": "vlan",
+                    "vlanParent": {
+                        "kind": "xdp",
+                        "name": "ovnxdp",
+                        "mode": "generic",
+                        "nRxq": 1,
+                    },
+                    "vlanId": 2143,
+                    "shortName": "br-cp",
+                },
+                domain="control-plane",
+            ),
+        ]
+        script = build_scripts(nodes, "create")[1]["chassis-1"]
+        self.assertIn("ovs-vsctl set port ovnxdp trunks=1128,2143", script)
+
+    def test_a_standalone_xdp_iface_is_an_untagged_trunk_leg(self) -> None:
+        nodes: list[pt.Model] = [
+            *_XDP_HOSTS,
+            _xdp_ls(
+                {
+                    "kind": "xdp",
+                    "name": "ovnxdp",
+                    "mode": "best-effort",
+                    "nRxq": 1,
+                    "shortName": "br-home",
+                }
+            ),
+        ]
+        script = build_scripts(nodes, "create")[1]["chassis-1"]
+        self.assertIn(
+            "ovs-vsctl --may-exist add-port br-xdp ovnxdp -- set Interface "
+            "ovnxdp type=afxdp options:xdp-mode=best-effort options:n_rxq=1",
+            script,
+        )
+        suffix = _short_suffix("br-home")
+        self.assertIn(f"ovs-vsctl --may-exist add-port br-xdp veth-xdp-{suffix}", script)
+        self.assertIn(f"ovs-vsctl --may-exist add-port br-home veth-seg-{suffix}", script)
+        # No VLAN, no tag.
+        self.assertNotIn(f"ovs-vsctl set port veth-xdp-{suffix} tag=", script)
+
+    def test_delete_removes_the_trunk_leg_then_the_trunk_bridge(self) -> None:
+        nodes: list[pt.Model] = [
+            *_XDP_HOSTS,
+            _xdp_ls(
+                {
+                    "kind": "vlan",
+                    "vlanParent": {
+                        "kind": "xdp",
+                        "name": "ovnxdp",
+                        "mode": "generic",
+                        "nRxq": 1,
+                    },
+                    "vlanId": 1128,
+                    "shortName": "br-home",
+                }
+            ),
+        ]
+        script = build_scripts(nodes, "delete")[1]["chassis-1"]
+        suffix = _short_suffix("br-home")
+        self.assertIn(f"ovs-vsctl --if-exists del-port br-home veth-seg-{suffix}", script)
+        self.assertIn(f"ovs-vsctl --if-exists del-port br-xdp veth-xdp-{suffix}", script)
+        self.assertIn(f"ip link delete veth-xdp-{suffix}", script)
+        self.assertIn("ovs-vsctl --if-exists del-br br-xdp", script)
 
 
 class BootBindingsTest(unittest.TestCase):
@@ -2307,7 +2454,7 @@ class KernelServiceDeployTest(unittest.TestCase):
                         host="chassis-1",
                         iface={
                             "kind": "vlan",
-                            "vlanParent": "eth0",
+                            "vlanParent": {"kind": "physical", "name": "eth0"},
                             "vlanId": vlan,
                             "shortName": short,
                         },
@@ -2556,7 +2703,7 @@ class MultiServiceDeployTest(unittest.TestCase):
                         host="chassis-1",
                         iface={
                             "kind": "vlan",
-                            "vlanParent": "eth0",
+                            "vlanParent": {"kind": "physical", "name": "eth0"},
                             "vlanId": 1128,
                             "shortName": "br-a",
                         },
@@ -2574,7 +2721,7 @@ class MultiServiceDeployTest(unittest.TestCase):
                         host="chassis-1",
                         iface={
                             "kind": "vlan",
-                            "vlanParent": "eth0",
+                            "vlanParent": {"kind": "physical", "name": "eth0"},
                             "vlanId": 1129,
                             "shortName": "br-b",
                         },
@@ -2653,7 +2800,7 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                             "host": "chassis-1",
                             "iface": {
                                 "kind": "vlan",
-                                "vlanParent": "eth0",
+                                "vlanParent": {"kind": "physical", "name": "eth0"},
                                 "vlanId": 1129,
                                 "shortName": "br-management-v2",
                             },
@@ -2671,7 +2818,7 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                             "host": "chassis-1",
                             "iface": {
                                 "kind": "vlan",
-                                "vlanParent": "eth0",
+                                "vlanParent": {"kind": "physical", "name": "eth0"},
                                 "vlanId": 1143,
                                 "shortName": "br-control-plane",
                             },

@@ -1372,13 +1372,46 @@ export interface WireguardInterfaceConfig {
   readonly peer: WireguardPeer;
 }
 
+/** How OVS's userspace datapath drives an AF_XDP port. `src/ir.ts`
+ * resolves the default ("best-effort": try zero-copy, then native copy,
+ * then generic) before anything reaches the IR. */
+export type XdpMode =
+  | "best-effort"
+  | "native-with-zerocopy"
+  | "native"
+  | "generic";
+
+/** A real, untagged NIC/port — also usable as a VLAN's parent. */
+export interface PhysicalIface {
+  readonly kind: "physical";
+  readonly name: string;
+}
+
+/** A NIC owned by OVS's userspace datapath via AF_XDP. `mode`/`nRxq` are
+ * optional at the DSL level; `src/ir.ts` resolves them to
+ * "best-effort"/1 so the IR always carries the final fact. A NIC used
+ * this way cannot also parent kernel VLANs: XDP runs before the kernel's
+ * VLAN stack (see ADR 0005). */
+export interface XdpIface {
+  readonly kind: "xdp";
+  readonly name: string;
+  readonly mode?: XdpMode;
+  readonly nRxq?: number;
+}
+
+/** A VLAN's parent. A bare string is accepted as shorthand for
+ * `{ kind: "physical", name }` (every pre-XDP topology); an explicit
+ * `physical` keeps the kernel `.${vlanId}` sub-interface, an `xdp` parent
+ * moves the VLAN split into OVS. */
+export type InterfaceParent = string | PhysicalIface | XdpIface;
+
 export type InterfaceKind =
   | {
     kind: "vlan";
-    vlanParent: string;
+    vlanParent: InterfaceParent;
     vlanId: number;
     /** Override the kernel subinterface name — defaults to
-     * `${vlanParent}.${vlanId}` when omitted. Needed whenever that
+     * `<parent name>.${vlanId}` when omitted. Needed whenever that
      * default name is already in use for something else on the same
      * VLAN tag (e.g. VLAN 129 already carries this host's own
      * management IP on `ens18.129` via netplan/networkd — a second,
@@ -1388,7 +1421,8 @@ export type InterfaceKind =
      * vlan netdevice for a given (parent, vlanId) pair, not just one). */
     ifaceName?: string;
   }
-  | { kind: "physical"; name: string } // a real, untagged NIC/port
+  | PhysicalIface // a real, untagged NIC/port
+  | XdpIface // a real NIC driven by OVS's userspace datapath (AF_XDP)
   | { kind: "bridge-port"; bridge: string; port: string }
   /** A real WireGuard tunnel, managed via `wg-quick` rather than
    * hand-rolled `wg setconf`/`ip link` calls — wg-quick's own fwmark +

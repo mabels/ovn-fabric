@@ -41,7 +41,7 @@ RAW_OVN_LS: dict[str, Any] = {
                 "host": "chassis-1",
                 "iface": {
                     "kind": "vlan",
-                    "vlanParent": "eth0",
+                    "vlanParent": {"kind": "physical", "name": "eth0"},
                     "vlanId": 129,
                     "shortName": "br-home",
                 },
@@ -118,7 +118,11 @@ class HydrateOvnLsTest(unittest.TestCase):
     def test_an_iface_missing_its_bridge_name_raises(self) -> None:
         # ovn.ls bindings REQUIRE `shortName` (the OVS bridge) — the
         # deployer would otherwise name a bridge "None".
-        raw_iface = {"kind": "vlan", "vlanParent": "eth0", "vlanId": 129}
+        raw_iface = {
+            "kind": "vlan",
+            "vlanParent": {"kind": "physical", "name": "eth0"},
+            "vlanId": 129,
+        }
         raw = {
             **RAW_OVN_LS,
             "data": {"interfaces": [{"host": "chassis-1", "iface": raw_iface}]},
@@ -235,7 +239,11 @@ class HydrateKernelRouterTest(unittest.TestCase):
             "ifaces": [
                 {
                     "host": "chassis-1",
-                    "iface": {"kind": "vlan", "vlanParent": "eth0", "vlanId": 2280},
+                    "iface": {
+                        "kind": "vlan",
+                        "vlanParent": {"kind": "physical", "name": "eth0"},
+                        "vlanId": 2280,
+                    },
                 },
             ],
         },

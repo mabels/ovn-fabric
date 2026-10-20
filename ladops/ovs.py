@@ -87,6 +87,58 @@ def set_bridge_fail_mode_argv(bridge: str, mode: str = "standalone") -> list[str
     return [*_VSCTL, "set", "bridge", bridge, f"fail-mode={mode}"]
 
 
+def set_bridge_datapath_argv(bridge: str, datapath_type: str) -> list[str]:
+    """`system` (kernel) is OVS's default; `netdev` is the userspace
+    datapath DPDK/AF_XDP/vhost-user ports require."""
+    return [*_VSCTL, "set", "bridge", bridge, f"datapath_type={datapath_type}"]
+
+
+def set_port_tag_argv(port: str, tag: int) -> list[str]:
+    """OVS access-port VLAN tag — the netdev datapath's replacement for a
+    kernel `<parent>.<vlan>` sub-interface."""
+    return [*_VSCTL, "set", "port", port, f"tag={tag}"]
+
+
+def set_port_trunks_argv(port: str, vlan_ids: list[int]) -> list[str]:
+    """Mark a port as a TRUNK for `vlan_ids`. An AF_XDP parent carrying
+    several VLANs must be a trunk: without `trunks` OVS treats the port
+    as untagged (VLAN 0), and every tagged frame from the wire is
+    dropped before it can reach the `tag=<vid>` access legs (confirmed
+    live, 2026-10-20 — `trunks: []` on `ovnxdp`, nothing forwarded)."""
+    return [
+        *_VSCTL,
+        "set",
+        "port",
+        port,
+        "trunks=" + ",".join(str(vid) for vid in vlan_ids),
+    ]
+
+
+def add_afxdp_port_argv(
+    bridge: str,
+    port: str,
+    mode: str,
+    n_rxq: int,
+) -> list[str]:
+    """An AF_XDP port on a netdev bridge. `mode` is one of OVS's own
+    options:xdp-mode values (`best-effort`, `native-with-zerocopy`,
+    `native`, `generic`); `n_rxq` its queue count."""
+    return [
+        *_VSCTL,
+        "--may-exist",
+        "add-port",
+        bridge,
+        port,
+        "--",
+        "set",
+        "Interface",
+        port,
+        "type=afxdp",
+        f"options:xdp-mode={mode}",
+        f"options:n_rxq={n_rxq}",
+    ]
+
+
 def add_port_argv(bridge: str, port: str) -> list[str]:
     return [*_VSCTL, "--may-exist", "add-port", bridge, port]
 

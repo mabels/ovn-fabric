@@ -115,13 +115,30 @@ export const WireguardAppConfig = type({
   "dns?": "string",
   peer: WireguardPeerConfig,
 });
+// OVS Interface options:xdp-mode / options:n_rxq. src/ir.ts resolves the
+// DSL's optional fields to their defaults before emitting the IR, so the
+// IR always carries the final fact (same boundary as shortName/mac).
+export const XdpMode = type(
+  "'best-effort' | 'native-with-zerocopy' | 'native' | 'generic'",
+);
+const ifaceParentPhysical = { kind: "'physical'", name: "string" } as const;
+const ifaceParentXdp = {
+  kind: "'xdp'",
+  name: "string",
+  mode: XdpMode,
+  nRxq: "number.integer",
+} as const;
+// A VLAN parent: a plain NIC (kernel `.${vlanId}` sub-interface) or an
+// AF_XDP port (the VLAN split happens in OVS; no kernel child device).
+const ifaceParent = type(ifaceParentPhysical).or(type(ifaceParentXdp));
 const ifaceVlan = {
   kind: "'vlan'",
-  vlanParent: "string",
+  vlanParent: ifaceParent,
   vlanId: "number.integer",
   "ifaceName?": "string",
 } as const;
-const ifacePhysical = { kind: "'physical'", name: "string" } as const;
+const ifacePhysical = ifaceParentPhysical;
+const ifaceXdp = ifaceParentXdp;
 const ifaceBridgePort = {
   kind: "'bridge-port'",
   bridge: "string",
@@ -147,19 +164,25 @@ const ifaceVeth = {
 const lsBinding = { shortName: "string", "flow?": "false" } as const;
 export const OvnLsIfaceVlan = type({ ...ifaceVlan, ...lsBinding });
 export const OvnLsIfacePhysical = type({ ...ifacePhysical, ...lsBinding });
+export const OvnLsIfaceXdp = type({ ...ifaceXdp, ...lsBinding });
 export const OvnLsIfaceBridgePort = type({ ...ifaceBridgePort, ...lsBinding });
 export const OvnLsIfaceWireguard = type({ ...ifaceWireguard, ...lsBinding });
 export const OvnLsIfaceZerotier = type({ ...ifaceZerotier, ...lsBinding });
 export const OvnLsIfaceDummy = type({ ...ifaceDummy, ...lsBinding });
 export const OvnLsIfaceVeth = type({ ...ifaceVeth, ...lsBinding });
 export const OvnLsIface = OvnLsIfaceVlan.or(OvnLsIfacePhysical).or(
-  OvnLsIfaceBridgePort,
-).or(OvnLsIfaceWireguard).or(OvnLsIfaceZerotier).or(OvnLsIfaceDummy).or(
-  OvnLsIfaceVeth,
-);
+  OvnLsIfaceXdp,
+).or(OvnLsIfaceBridgePort).or(OvnLsIfaceWireguard).or(OvnLsIfaceZerotier)
+  .or(OvnLsIfaceDummy).or(OvnLsIfaceVeth);
 export const OvnLsInterface = type({ host: "string", iface: OvnLsIface });
 
-export const KernelIfaceVlan = type(ifaceVlan);
+// A kernel router's VLANs live in a netns, so their parent is always a
+// plain kernel NIC — an AF_XDP port is OVS-owned and cannot be moved
+// there.
+export const KernelIfaceVlan = type({
+  ...ifaceVlan,
+  vlanParent: ifaceParentPhysical,
+});
 export const KernelIfacePhysical = type(ifacePhysical);
 export const KernelIfaceBridgePort = type(ifaceBridgePort);
 export const KernelIfaceWireguard = type(ifaceWireguard);
