@@ -1,9 +1,16 @@
 # deployer/test_ir_to_shell.py — stdlib unittest, no pytest, matching
 # ladops's own test style. Fixtures are protocol.generated's typed
 # dataclasses directly (InfraHostNode/OvnLsNode/OvnLrpNode) — the same
-# shape a real run gets from protocol/hydrate.py, not raw dicts — so
-# these tests exercise ir_to_shell.py exactly as deployer/cli.py
-# actually calls it.
+# shape a real run gets from protocol/hydrate.py, not raw dicts.
+#
+# What is under test is deployer/ir_common.py's emitters: WHICH
+# operations a set of IR nodes turns into, and in what order. They are
+# read through build_scripts() below — a test-only TRACE of the emitted
+# operations as text, one cluster trace plus one per host (the file keeps
+# its name from the shell-script generator this trace format comes from;
+# that generator is gone, the Python deployer is the only front-end).
+# GeneratePythonDeployerTest covers the real front-end, including that it
+# issues exactly the commands the trace shows.
 #
 # Two hosts (one central, one chassis), two logical switches (one with
 # a real VLAN interface bound on the chassis host, one with none), one
@@ -14,7 +21,7 @@
 # unbound logical switch).
 #
 # Never runs anything for real — build_scripts() only ever returns
-# text; nothing here mocks subprocess because nothing here calls it.
+# text; only the generated-deployer tests mock subprocess.
 
 from __future__ import annotations
 
@@ -22,12 +29,14 @@ import contextlib
 import dataclasses
 import importlib
 import io
+import json
 import os
+import pathlib
 import shlex
 import sys
 import tempfile
 import unittest
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from typing import Any
 from unittest import mock
 
@@ -35,7 +44,58 @@ from protocol import AppDhcpClient, AppDocker, AppWireguard, AppZerotier
 from protocol import generated as pt
 from protocol.hydrate import hydrate_as
 
-mod = importlib.import_module("deployer.ir_to_shell")
+from . import install_queue
+from .ir_common import (
+    Action,
+    Emitter,
+    Ref,
+    _emit_cluster_body,
+    _emit_host_script,
+    _shell_token,
+)
+
+mod = importlib.import_module("deployer.ir_to_python")
+
+
+class _TraceEmitter(Emitter):
+    """The emitted operations as readable text, one per line: a command
+    as its shlex-joined argv (` &` when backgrounded, ` || true` when
+    optional), a capture as `VAR=$(argv)`, a file write as a
+    `cat > path << 'OVN'` block — a queued file too, with `<queued-at>`
+    where the deployer puts the time it runs at. A test fixture, not a
+    deployable script — it carries no envelope and nothing ever runs it."""
+
+    def sh(
+        self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
+    ) -> None:
+        line = " ".join(_shell_token(token) for token in argv) + (" &" if background else "")
+        self.lines.append(line + (" || true" if optional else ""))
+
+    def capture(self, var: str, argv: list[str]) -> None:
+        self.lines.append(f"{var}=$({shlex.join(argv)})")
+
+    def append(self, path: str, content: str) -> None:
+        self.lines.append(f"cat > {path} << 'OVN'")
+        self.lines.append(content)
+        self.lines.append("OVN")
+
+    def enqueue(self, directory: str, name: str, content: str) -> None:
+        self.append(f"{directory}/<queued-at>-{name}", content)
+
+
+def build_scripts(nodes: list[pt.Model], action: Action) -> tuple[str, dict[str, str]]:
+    """(the cluster pass, {host name: that host's pass}) for `action`, each
+    as a trace of the operations the emitters produce."""
+    cluster = _TraceEmitter(action)
+    _emit_cluster_body(nodes, cluster)
+    hosts: dict[str, str] = {}
+    for node in nodes:
+        if node.kind != "infra.host":
+            continue
+        host = _TraceEmitter(action)
+        _emit_host_script(node, nodes, host)
+        hosts[node.key.host] = "\n".join(host.lines)
+    return "\n".join(cluster.lines), hosts
 
 
 # Interface fixtures are written the way the IR carries them (a raw
@@ -188,10 +248,37 @@ def _router_branches(router_script: str) -> tuple[str, str]:
     return "\n".join(lines[up_start + 1 : up_end]), "\n".join(lines[down_start + 1 : down_end])
 
 
-# The command lines a host script RUNS directly, excluding every file it
-# writes (heredocs: `cat > path << 'DELIM'` through the closing `DELIM`)
-# and the `#`/`set ` envelope — the Python front-end's run_cmd() argv
-# must match exactly these (file writes are write_file(), not commands).
+# The body of the `cat > path << 'OVN'` block a trace writes `path` with.
+def _written_file(script: str, path: str) -> str:
+    lines = script.splitlines()
+    start = lines.index(f"cat > {path} << 'OVN'") + 1
+    return "\n".join(lines[start : lines.index("OVN", start)])
+
+
+_QUEUED = "cat > /var/spool/ovn-fabric/install/<queued-at>-"
+
+
+# The install queue a host trace fills, in the order it is queued:
+# (the file's name after its timestamp, the job it holds).
+def _queued_jobs(script: str) -> list[tuple[str, dict[str, Any]]]:
+    queued: list[tuple[str, dict[str, Any]]] = []
+    lines = script.splitlines()
+    for index, line in enumerate(lines):
+        if line.startswith(_QUEUED):
+            name = line[len(_QUEUED) :].removesuffix(" << 'OVN'")
+            body = "\n".join(lines[index + 1 : lines.index("OVN", index)])
+            queued.append((name, json.loads(body)))
+    return queued
+
+
+def _queued_packages(script: str) -> list[dict[str, Any]]:
+    return [job for _, job in _queued_jobs(script) if job["kind"] == "package"]
+
+
+# The command lines of a host trace, excluding every file it writes
+# (`cat > path << 'DELIM'` through the closing `DELIM`) and comments — the
+# generated deployer's run_cmd() argv must match exactly these (file
+# writes are write_file(), not commands).
 def _shell_command_lines(script: str) -> list[list[str]]:
     commands: list[list[str]] = []
     in_heredoc: str | None = None
@@ -218,7 +305,7 @@ def _shell_command_lines(script: str) -> list[list[str]]:
 
 class ClusterScriptCreateTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.cluster, self.hosts = mod.build_scripts(NODES, "create")
+        self.cluster, self.hosts = build_scripts(NODES, "create")
 
     def test_every_cluster_add_is_idempotent(self) -> None:
         # The create pass must be re-runnable (README's idempotency
@@ -263,15 +350,15 @@ class ClusterScriptCreateTest(unittest.TestCase):
             )
             for n in NODES
         ]
-        cluster, _ = mod.build_scripts(nodes, "create")
+        cluster, _ = build_scripts(nodes, "create")
         self.assertIn("options:mac_binding_age_threshold=0", cluster)
         self.assertNotIn("options:mac_binding_age_threshold=300", cluster)
 
     def test_router_without_an_ovn_lr_node_gets_no_options(self) -> None:
         # An IR written before the ovn.lr node existed still deploys — the
         # deployer has no default of its own.
-        nodes = [n for n in NODES if n.kind != "ovn.lr"]
-        cluster, _ = mod.build_scripts(nodes, "create")
+        nodes: list[pt.Model] = [n for n in NODES if n.kind != "ovn.lr"]
+        cluster, _ = build_scripts(nodes, "create")
         self.assertIn("ovn-nbctl --may-exist lr-add router-home", cluster)
         self.assertNotIn("set logical_router router-home", cluster)
 
@@ -302,7 +389,7 @@ class ClusterScriptCreateTest(unittest.TestCase):
         # The cluster pass's chassis lookup keys on this external_id, so
         # the host pass must set it to the IR host name (not OVS's auto
         # FQDN).
-        _, create_hosts = mod.build_scripts(NODES, "create")
+        _, create_hosts = build_scripts(NODES, "create")
         self.assertIn(
             "ovs-vsctl set open_vswitch . external-ids:hostname=chassis-1",
             create_hosts["chassis-1"],
@@ -311,7 +398,7 @@ class ClusterScriptCreateTest(unittest.TestCase):
             "ovs-vsctl set open_vswitch . external-ids:hostname=central-1",
             create_hosts["central-1"],
         )
-        _, delete_hosts = mod.build_scripts(NODES, "delete")
+        _, delete_hosts = build_scripts(NODES, "delete")
         self.assertIn(
             "ovs-vsctl remove open_vswitch . external-ids hostname",
             delete_hosts["chassis-1"],
@@ -337,7 +424,7 @@ class ClusterScriptCreateTest(unittest.TestCase):
 
 class ClusterScriptDeleteTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.cluster, _ = mod.build_scripts(NODES, "delete")
+        self.cluster, _ = build_scripts(NODES, "delete")
 
     def test_lr_del_and_ls_del_use_if_exists(self) -> None:
         self.assertIn("ovn-nbctl --if-exists lr-del router-home", self.cluster)
@@ -351,7 +438,7 @@ class ClusterScriptDeleteTest(unittest.TestCase):
 
 class HostScriptTest(unittest.TestCase):
     def setUp(self) -> None:
-        _, self.hosts = mod.build_scripts(NODES, "create")
+        _, self.hosts = build_scripts(NODES, "create")
 
     def test_central_exposes_nb_and_sb_connections(self) -> None:
         script = self.hosts["central-1"]
@@ -379,7 +466,7 @@ class HostScriptTest(unittest.TestCase):
 
 class HostScriptDeleteTest(unittest.TestCase):
     def setUp(self) -> None:
-        _, self.hosts = mod.build_scripts(NODES, "delete")
+        _, self.hosts = build_scripts(NODES, "delete")
 
     def test_central_drops_its_connections(self) -> None:
         script = self.hosts["central-1"]
@@ -393,7 +480,7 @@ class HostScriptDeleteTest(unittest.TestCase):
 
 class IfaceBindingCreateTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.cluster, self.hosts = mod.build_scripts(NODES, "create")
+        self.cluster, self.hosts = build_scripts(NODES, "create")
 
     def test_localnet_lsp_emitted_only_for_the_bound_domain(self) -> None:
         self.assertIn("ovn-nbctl --may-exist lsp-add home lsp-home-localnet", self.cluster)
@@ -444,7 +531,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
                 ),
             ),
         ]
-        _, hosts = mod.build_scripts(nodes, "create")
+        _, hosts = build_scripts(nodes, "create")
         script = hosts["chassis-1"]
         self.assertIn("ip link set veth-ovn-9adb1d up", script)
         self.assertLess(
@@ -478,7 +565,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
                 ],
             ),
         )
-        _, hosts = mod.build_scripts(nodes, "create")
+        _, hosts = build_scripts(nodes, "create")
         script = hosts["chassis-1"]
         self.assertIn("ovs-vsctl --may-exist add-br br-8d8c0a55", script)
         self.assertIn(
@@ -502,7 +589,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
 
 class IfaceBindingDeleteTest(unittest.TestCase):
     def setUp(self) -> None:
-        self.cluster, self.hosts = mod.build_scripts(NODES, "delete")
+        self.cluster, self.hosts = build_scripts(NODES, "delete")
 
     def test_no_localnet_lsp_add_in_delete_mode(self) -> None:
         # ls-del already cascades the localnet LSP away with the switch.
@@ -525,7 +612,7 @@ class IfaceBindingDeleteTest(unittest.TestCase):
 
 class KernelRouterCreateTest(unittest.TestCase):
     def setUp(self) -> None:
-        _, self.hosts = mod.build_scripts(NODES, "create")
+        _, self.hosts = build_scripts(NODES, "create")
 
     def test_netns_created_once_on_the_owning_host(self) -> None:
         script = self.hosts["chassis-1"]
@@ -655,7 +742,7 @@ class KernelRouterCreateTest(unittest.TestCase):
             )
             for n in NODES
         ]
-        _, hosts = mod.build_scripts(nodes, "create")
+        _, hosts = build_scripts(nodes, "create")
         script = hosts["chassis-1"]
         self.assertIn("ip link add veth-ovn-0 type veth peer name veth-krn-0", script)
         # No `mac` in the iface blob (an older IR) -> no `address`.
@@ -698,7 +785,7 @@ class KernelRouterCreateTest(unittest.TestCase):
             )
             for n in NODES
         ]
-        _, hosts = mod.build_scripts(nodes, "create")
+        _, hosts = build_scripts(nodes, "create")
         self.assertIn(
             "ip link add veth-ovn-0 type veth peer name veth-krn-0 address 00:00:0a:63:00:02",
             hosts["chassis-1"],
@@ -738,7 +825,7 @@ class KernelRouterCreateTest(unittest.TestCase):
                 for n in NODES
             ],
         ]
-        _, hosts = mod.build_scripts(nodes, "create")
+        _, hosts = build_scripts(nodes, "create")
         script = hosts["chassis-1"]
         self.assertIn(
             "ip netns exec ns-kernel-0 iptables -t nat -A POSTROUTING -o eth0.2280 -j MASQUERADE",
@@ -752,7 +839,7 @@ class KernelRouterCreateTest(unittest.TestCase):
     def test_no_security_group_attached_emits_no_nat_commands(self) -> None:
         # The base fixture has no security.group attached — a side must
         # opt in via data.securityGroup, nothing is emitted by default.
-        _, hosts = mod.build_scripts(NODES, "create")
+        _, hosts = build_scripts(NODES, "create")
         script = hosts["chassis-1"]
         self.assertNotIn("MASQUERADE", script)
         self.assertNotIn("iptables", script)
@@ -789,7 +876,7 @@ class KernelRouterCreateTest(unittest.TestCase):
         # dhcpcd is NOT a dhcp-client app anymore — it resolves to a generic
         # docker app that OWNS the router's interfaces, covered by the docker
         # tests.
-        _, create_hosts = mod.build_scripts(with_app(), "create")
+        _, create_hosts = build_scripts(with_app(), "create")
         create_script = create_hosts["chassis-1"]
         # The one router service is installed + started.
         self.assertIn(
@@ -815,7 +902,7 @@ class KernelRouterCreateTest(unittest.TestCase):
             down,
         )
         self.assertNotIn("ovn-kernel-kernel-0-dhcp-client", create_script)
-        _, delete_hosts = mod.build_scripts(with_app(), "delete")
+        _, delete_hosts = build_scripts(with_app(), "delete")
         delete_script = delete_hosts["chassis-1"]
         self.assertIn(
             "systemctl disable --now ovn-kernel-kernel-0.service",
@@ -877,7 +964,7 @@ class KernelRouterCreateTest(unittest.TestCase):
                 for n in NODES
             ]
 
-        _, create_hosts = mod.build_scripts(with_dhcpcd(), "create")
+        _, create_hosts = build_scripts(with_dhcpcd(), "create")
         router = _router_script(create_hosts["chassis-1"])
         up, _ = _router_branches(router)
         # The transit veth is moved into the container AND gets its own
@@ -897,11 +984,13 @@ class KernelRouterCreateTest(unittest.TestCase):
         self.assertIn('rm -rf "$d"', up)
         self.assertNotIn("/usr/local/lib", up)
 
-    def test_os_dependencies_are_installed_at_the_start_of_create(self) -> None:
+    def test_dependencies_are_queued_at_the_start_of_create(self) -> None:
         # The IR's ABSTRACT dependencies (ovn/ovs/ip/iptables/dhclient/
-        # zerotier...) are installed at the very START of the create pass,
-        # mapped to the host OS's package form (Ubuntu/Debian apt +
-        # ovn-host for a chassis role); zerotier is its curl installer.
+        # zerotier...) are mapped to the host OS's package form
+        # (Ubuntu/Debian apt + ovn-host for a chassis role; zerotier is its
+        # curl installer) — but NOT installed inline anymore: deploying a
+        # router can cut the host's internet, so the pass QUEUES one job
+        # file per dependency for the queue's consumer (2026-10-11).
         # No deinstall ever (2026-08-23).
         nodes = [
             (
@@ -928,35 +1017,267 @@ class KernelRouterCreateTest(unittest.TestCase):
             )
             for n in NODES
         ]
-        _, hosts = mod.build_scripts(nodes, "create")
+        _, hosts = build_scripts(nodes, "create")
         script = hosts["chassis-1"]
-        self.assertIn("apt-get update", script)
-        self.assertIn("apt-get install -y ovn-host", script)
-        self.assertIn("apt-get install -y openvswitch-switch", script)
-        self.assertIn("apt-get install -y iproute2", script)
-        self.assertIn("apt-get install -y iptables", script)
-        self.assertIn("apt-get install -y isc-dhcp-client", script)
-        # zerotier's curl installer runs via sh -c so the pipe is argv-safe.
-        self.assertIn("sh -c 'curl -s https://install.zerotier.com | bash'", script)
-        # base debugging tools come along on every host (arp/ifconfig from
-        # net-tools, ping, traceroute, curl).
-        self.assertIn("apt-get install -y net-tools", script)
-        self.assertIn("apt-get install -y iputils-ping", script)
-        self.assertIn("apt-get install -y traceroute", script)
-        self.assertIn("apt-get install -y curl", script)
-        # dependencies come before any OVS/OVN work.
-        self.assertLess(script.index("apt-get update"), script.index("ovs-vsctl"))
-        # delete never uninstalls.
-        _, delete_hosts = mod.build_scripts(nodes, "delete")
-        delete_script = delete_hosts["chassis-1"]
-        self.assertNotIn("apt-get install", delete_script)
+        packages = _queued_packages(script)
+        installs = {job["name"]: " ".join(job["install"]) for job in packages}
+        apt = "env DEBIAN_FRONTEND=noninteractive apt-get install -y "
+        self.assertEqual(
+            installs,
+            {
+                # base debugging tools come along on every host (arp/ifconfig
+                # from net-tools, ping, traceroute, curl).
+                "arp": apt + "net-tools",
+                "ping": apt + "iputils-ping",
+                "traceroute": apt + "traceroute",
+                "curl": apt + "curl",
+                "ovn": apt + "ovn-host",
+                "ovs": apt + "openvswitch-switch",
+                "ip": apt + "iproute2",
+                "iptables": apt + "iptables",
+                "dhclient": apt + "isc-dhcp-client",
+                # zerotier's curl installer runs via sh -c so the pipe is
+                # argv-safe.
+                "zerotier": "sh -c curl -s https://install.zerotier.com | bash",
+            },
+        )
+        # One file per dependency, queued in the IR's order (curl before
+        # the zerotier installer that needs it).
+        self.assertEqual(
+            [name for name, _ in _queued_jobs(script)][:4],
+            [
+                "package-arp.json",
+                "package-ping.json",
+                "package-traceroute.json",
+                "package-curl.json",
+            ],
+        )
+        by_name = {job["name"]: job for job in packages}
+        # Done-ness is decided per dpkg package, with no network. WHEN a
+        # job may be tried is not the generator's business: the consumer
+        # decides whether the host is online.
+        self.assertEqual(
+            by_name["ovs"],
+            {
+                "kind": "package",
+                "name": "ovs",
+                "packages": ["openvswitch-switch"],
+                "install": (apt + "openvswitch-switch").split(),
+                "apt": True,
+            },
+        )
+        self.assertEqual(by_name["zerotier"]["packages"], ["zerotier-one"])
+        self.assertFalse(by_name["zerotier"]["apt"])
+        # Nothing touches the network inline: the queue is filled and its
+        # consumer asked once, before any OVS/OVN work.
+        commands = [" ".join(argv) for argv in _shell_command_lines(script)]
+        self.assertFalse(any("apt-get" in c or "curl" in c for c in commands))
+        self.assertLess(
+            commands.index("/usr/local/sbin/ovn-fabric-install --once"),
+            next(i for i, c in enumerate(commands) if c.startswith("ovs-vsctl")),
+        )
+        # delete never uninstalls — and queues nothing.
+        _, delete_hosts = build_scripts(nodes, "delete")
+        self.assertNotIn("apt-get", delete_hosts["chassis-1"])
+        self.assertEqual(_queued_jobs(delete_hosts["chassis-1"]), [])
+
+    def test_every_queued_job_is_one_the_consumer_accepts(self) -> None:
+        # The generator and the consumer share the job types
+        # (install_queue.Job); this is the same contract at runtime: what
+        # is written into a queue file passes the consumer's own check.
+        nodes = [
+            (
+                dataclasses.replace(
+                    n, data=dataclasses.replace(n.data, dependencies=["ovs", "zerotier", "docker"])
+                )
+                if n.kind == "infra.host"
+                else n
+            )
+            for n in NODES
+        ]
+        _, hosts = build_scripts(nodes, "create")
+        queued = _queued_jobs(hosts["chassis-1"])
+        self.assertEqual(
+            [job["kind"] for _, job in queued], ["package", "package", "package", "unit"]
+        )
+        for _, job in queued:
+            self.assertEqual(install_queue.parse_job(job), job)
+
+    def test_the_queue_consumer_is_installed_run_once_and_left_running(self) -> None:
+        _, hosts = build_scripts(NODES, "create")
+        script = hosts["chassis-1"]
+        commands = [" ".join(argv) for argv in _shell_command_lines(script)]
+        # First: the consumer and its unit, an empty queue for THIS
+        # deploy, one go in the foreground (which may fail or find the host
+        # offline — never fatal), then the service, which polls the queue
+        # from then on.
+        self.assertEqual(
+            commands[:7],
+            [
+                "chmod +x /usr/local/sbin/ovn-fabric-install",
+                "systemctl daemon-reload",
+                "rm -rf /var/spool/ovn-fabric/install",
+                "mkdir -p /var/spool/ovn-fabric/install",
+                "/usr/local/sbin/ovn-fabric-install --once",
+                "systemctl enable ovn-fabric-install.service",
+                # restart: a consumer an earlier deploy left running is
+                # replaced by the one just written.
+                "systemctl restart ovn-fabric-install.service",
+            ],
+        )
+        # A create stops nothing — on a fresh host there is no such unit
+        # to stop.
+        self.assertNotIn("systemctl stop", script)
+        # ...and the consumer's own steps may not stop the deploy.
+        for optional in (
+            "/usr/local/sbin/ovn-fabric-install --once",
+            "systemctl enable ovn-fabric-install.service",
+            "systemctl restart ovn-fabric-install.service",
+        ):
+            self.assertIn(f"{optional} || true", script)
+        # What is installed IS deployer/install_queue.py, not a copy of
+        # its logic: the consumer on the host is the tested file.
+        source = pathlib.Path(install_queue.__file__).read_text(encoding="utf-8")
+        self.assertEqual(
+            _written_file(script, "/usr/local/sbin/ovn-fabric-install"), source.rstrip("\n")
+        )
+        unit = _written_file(script, "/etc/systemd/system/ovn-fabric-install.service")
+        self.assertIn("ExecStart=/usr/local/sbin/ovn-fabric-install\n", unit)
+        self.assertIn("Restart=on-failure", unit)
+        self.assertIn("WantedBy=multi-user.target", unit)
+        # It waits for the internet itself — it must not wait for systemd
+        # to think the network is up.
+        self.assertNotIn("network-online", unit)
+
+    def test_units_are_queued_last(self) -> None:
+        # The fabric's units are queued once they exist — the END of the
+        # pass, nothing after it — so they sort behind the packages and
+        # images queued when the pass began. Nothing is started for them:
+        # the consumer polls.
+        _, hosts = build_scripts(NODES, "create")
+        script = hosts["chassis-1"]
+        self.assertEqual(
+            _queued_jobs(script),
+            [
+                (
+                    "unit-ovn-kernel-kernel-0.service.json",
+                    {"kind": "unit", "unit": "ovn-kernel-kernel-0.service"},
+                )
+            ],
+        )
+        lines = script.splitlines()
+        queued_at = lines.index(f"{_QUEUED}unit-ovn-kernel-kernel-0.service.json << 'OVN'")
+        self.assertGreater(
+            queued_at, lines.index("systemctl enable --now ovn-kernel-kernel-0.service || true")
+        )
+        self.assertEqual(_shell_command_lines("\n".join(lines[queued_at:])), [])
+
+    def test_the_images_of_a_hosts_units_are_queued_before_the_units(self) -> None:
+        # The consumer restarts the fabric's OWN units that are not up,
+        # and provides their docker images first — so a restart needs no
+        # network (a unit that is the uplink is not torn down to fail
+        # again).
+        workload = pt.KernelAppContainerNode(
+            id="kernel.app.container:dns",
+            kind="kernel.app.container",
+            key=pt.KernelServiceKey(name="dns"),
+            data=pt.KernelAppContainerData(host="host:chassis-1", image="coredns/coredns:latest"),
+        )
+        nodes = [
+            (
+                dataclasses.replace(
+                    n,
+                    data=dataclasses.replace(
+                        n.data,
+                        apps=[
+                            AppDocker(
+                                kind="docker",
+                                image="ovn-fabric-kernel-0",
+                                name="kernel-0-dhcpcd",
+                                cmd=["/sbin/dhcpcd"],
+                                build=pt.DockerBuild(from_="alpine:latest", packages=["dhcpcd"]),
+                            ),
+                            AppDocker(kind="docker", image="ubuntu", name="kernel-0-tool"),
+                        ],
+                    ),
+                )
+                if n.kind == "kernel.router" and n.key.side == pt.Side.right
+                else n
+            )
+            for n in NODES
+        ] + [workload]
+        _, hosts = build_scripts(nodes, "create")
+        self.assertEqual(
+            _queued_jobs(hosts["chassis-1"]),
+            [
+                (
+                    # A registry path is not a file name.
+                    "image-coredns_coredns_latest.json",
+                    {
+                        "kind": "image",
+                        "image": "coredns/coredns:latest",
+                        # No build declared: the image is pulled.
+                        "dockerfile": None,
+                    },
+                ),
+                (
+                    "image-ovn-fabric-kernel-0.json",
+                    {
+                        "kind": "image",
+                        "image": "ovn-fabric-kernel-0",
+                        "dockerfile": "FROM alpine:latest\nRUN apk add --no-cache dhcpcd",
+                    },
+                ),
+                (
+                    "image-ubuntu.json",
+                    {"kind": "image", "image": "ubuntu", "dockerfile": None},
+                ),
+                (
+                    "unit-ovn-kernel-kernel-0.service.json",
+                    {"kind": "unit", "unit": "ovn-kernel-kernel-0.service"},
+                ),
+                (
+                    "unit-ovn-kernel-service-dns.service.json",
+                    {"kind": "unit", "unit": "ovn-kernel-service-dns.service"},
+                ),
+            ],
+        )
+        # The images are in the queue before the consumer's foreground go.
+        lines = hosts["chassis-1"].splitlines()
+        self.assertLess(
+            lines.index(f"{_QUEUED}image-ubuntu.json << 'OVN'"),
+            lines.index("/usr/local/sbin/ovn-fabric-install --once || true"),
+        )
+
+    def test_delete_removes_the_install_queue_before_anything_else(self) -> None:
+        # Its consumer must not restart a unit the delete pass is tearing
+        # down.
+        _, hosts = build_scripts(NODES, "delete")
+        commands = [" ".join(argv) for argv in _shell_command_lines(hosts["chassis-1"])]
+        self.assertEqual(
+            commands[:5],
+            [
+                "systemctl disable --now ovn-fabric-install.service",
+                "rm -f /usr/local/sbin/ovn-fabric-install",
+                "rm -f /etc/systemd/system/ovn-fabric-install.service",
+                "rm -rf /var/spool/ovn-fabric/install",
+                "systemctl daemon-reload",
+            ],
+        )
+
+    def test_a_host_with_nothing_to_install_or_restart_gets_no_queue(self) -> None:
+        # central-1 in the base fixture declares no dependencies and owns
+        # no kernel router or workload.
+        for action in ("create", "delete"):
+            _, hosts = build_scripts(NODES, action)
+            self.assertNotIn("ovn-fabric-install", hosts["central-1"])
 
     def test_base_deps_from_the_generator_map_to_packages(self) -> None:
         # The base tooling is a GENERATOR concern: src/ir.ts's
         # hostDependencies always emits the abstract capabilities
         # (arp/ping/traceroute/curl); the deployer only maps them to the
         # distro packages (2026-09-19). A host the IR lists no deps for
-        # gets no apt at all.
+        # has no package queued.
         nodes = [
             (
                 dataclasses.replace(
@@ -971,13 +1292,12 @@ class KernelRouterCreateTest(unittest.TestCase):
             )
             for n in NODES
         ]
-        _, hosts = mod.build_scripts(nodes, "create")
-        script = hosts["central-1"]
-        self.assertIn("apt-get install -y net-tools", script)
-        self.assertIn("apt-get install -y iputils-ping", script)
-        self.assertIn("apt-get install -y traceroute", script)
-        self.assertIn("apt-get install -y curl", script)
-        self.assertNotIn("apt-get", hosts["chassis-1"])
+        _, hosts = build_scripts(nodes, "create")
+        self.assertEqual(
+            [job["packages"] for job in _queued_packages(hosts["central-1"])],
+            [["net-tools"], ["iputils-ping"], ["traceroute"], ["curl"]],
+        )
+        self.assertEqual(_queued_packages(hosts["chassis-1"]), [])
 
     def test_central_host_installs_both_ovn_central_and_ovn_host(self) -> None:
         # A central chassis is ALSO a chassis: it runs OVS and must run
@@ -996,17 +1316,36 @@ class KernelRouterCreateTest(unittest.TestCase):
             )
             for n in NODES
         ]
-        _, hosts = mod.build_scripts(nodes, "create")
-        central = hosts["central-1"]
-        self.assertIn("apt-get install -y ovn-central", central)
-        self.assertIn("apt-get install -y ovn-host", central)
-        chassis = hosts["chassis-1"]
-        self.assertIn("apt-get install -y ovn-host", chassis)
-        self.assertNotIn("apt-get install -y ovn-central", chassis)
+        _, hosts = build_scripts(nodes, "create")
+        (central,) = _queued_packages(hosts["central-1"])
+        # `ovn` is done only when BOTH packages are installed.
+        self.assertEqual(central["packages"], ["ovn-central", "ovn-host"])
+        self.assertEqual(central["install"][-2:], ["ovn-central", "ovn-host"])
+        (chassis,) = _queued_packages(hosts["chassis-1"])
+        self.assertEqual(chassis["packages"], ["ovn-host"])
+
+    def test_an_unknown_os_or_dependency_is_noted_not_guessed(self) -> None:
+        def with_host(**changes: Any) -> str:
+            nodes = [
+                (
+                    dataclasses.replace(n, data=dataclasses.replace(n.data, **changes))
+                    if n.kind == "infra.host" and n.key.host == "chassis-1"
+                    else n
+                )
+                for n in NODES
+            ]
+            return build_scripts(nodes, "create")[1]["chassis-1"]
+
+        unknown_dep = with_host(dependencies=["ovs", "quantum-vpn"])
+        self.assertIn('# unknown dependency "quantum-vpn" — skipped', unknown_dep)
+        self.assertEqual([job["name"] for job in _queued_packages(unknown_dep)], ["ovs"])
+        unknown_os = with_host(dependencies=["ovs"], os=pt.HostOs(name="plan9", version="4"))
+        self.assertIn("# unknown OS 'plan9' — cannot install dependencies, skipping", unknown_os)
+        self.assertEqual(_queued_packages(unknown_os), [])
 
     def test_no_apps_emits_no_dhcp_client_commands(self) -> None:
         # The base fixture has no apps — nothing is started by default.
-        _, hosts = mod.build_scripts(NODES, "create")
+        _, hosts = build_scripts(NODES, "create")
         script = hosts["chassis-1"]
         self.assertNotIn("dhclient", script)
         self.assertNotIn("dhcpcd", script)
@@ -1047,7 +1386,7 @@ class KernelRouterCreateTest(unittest.TestCase):
             )
             for n in NODES
         ]
-        _, hosts = mod.build_scripts(nodes, "create")
+        _, hosts = build_scripts(nodes, "create")
         script = hosts["chassis-1"]
         self.assertIn("ip link add veth-ovn-0 type veth peer name veth-krn-0", script)
         self.assertIn("ip link set veth-krn-0 netns ns-kernel-0", script)
@@ -1095,7 +1434,7 @@ class KernelRouterCreateTest(unittest.TestCase):
             ]
 
         wire = "/usr/local/sbin/ovn-kernel-kernel-0-docker-wire.sh"
-        _, create_hosts = mod.build_scripts(with_docker(), "create")
+        _, create_hosts = build_scripts(with_docker(), "create")
         create_script = create_hosts["chassis-1"]
         # The container's wire script lives inside the router's up script
         # (a nested OVNKERNEL heredoc), and the router up runs it in the
@@ -1135,7 +1474,7 @@ class KernelRouterCreateTest(unittest.TestCase):
             down.index("/usr/bin/docker rm -f kernel-0-test-docker"),
             down.index("ip netns delete ns-kernel-0"),
         )
-        _, delete_hosts = mod.build_scripts(with_docker(), "delete")
+        _, delete_hosts = build_scripts(with_docker(), "delete")
         delete_script = delete_hosts["chassis-1"]
         self.assertIn(
             "systemctl disable --now ovn-kernel-kernel-0.service",
@@ -1180,7 +1519,7 @@ class KernelRouterCreateTest(unittest.TestCase):
                 for n in NODES
             ]
 
-        _, create_hosts = mod.build_scripts(with_wireguard(), "create")
+        _, create_hosts = build_scripts(with_wireguard(), "create")
         create_script = create_hosts["chassis-1"]
         router = _router_script(create_script)
         up, down = _router_branches(router)
@@ -1213,7 +1552,7 @@ class KernelRouterCreateTest(unittest.TestCase):
             "ip netns exec ns-kernel-0 iptables -t nat -D POSTROUTING -o mullvad-de -j MASQUERADE",
             down,
         )
-        _, delete_hosts = mod.build_scripts(with_wireguard(), "delete")
+        _, delete_hosts = build_scripts(with_wireguard(), "delete")
         delete_script = delete_hosts["chassis-1"]
         self.assertIn(
             "systemctl disable --now ovn-kernel-kernel-0.service",
@@ -1251,7 +1590,7 @@ class KernelRouterCreateTest(unittest.TestCase):
                 for n in NODES
             ]
 
-        _, create_hosts = mod.build_scripts(with_zerotier(), "create")
+        _, create_hosts = build_scripts(with_zerotier(), "create")
         router = _router_script(create_hosts["chassis-1"])
         up, _ = _router_branches(router)
         wire = "/usr/local/sbin/ovn-kernel-kernel-0-zerotier-wire.sh"
@@ -1273,7 +1612,7 @@ class KernelRouterDeleteTest(unittest.TestCase):
         # `down`: stop apps, then `ip netns delete`, then remove the root
         # veth leg). The devices INSIDE the netns are never individually
         # addressed — the netns teardown destroys them.
-        _, hosts = mod.build_scripts(NODES, "delete")
+        _, hosts = build_scripts(NODES, "delete")
         script = hosts["chassis-1"]
         self.assertIn(
             "systemctl disable --now ovn-kernel-kernel-0.service",
@@ -1283,7 +1622,7 @@ class KernelRouterDeleteTest(unittest.TestCase):
         self.assertNotIn("dummy-", script)
         self.assertNotIn("ip addr", script)
         self.assertNotIn("ip route", script)
-        _, create_hosts = mod.build_scripts(NODES, "create")
+        _, create_hosts = build_scripts(NODES, "create")
         _, down = _router_branches(_router_script(create_hosts["chassis-1"]))
         self.assertIn("ip netns delete ns-kernel-0", down)
 
@@ -1294,7 +1633,7 @@ class KernelRouterDeleteTest(unittest.TestCase):
         # still living inside the netns (2026-08-18). The netns teardown
         # now happens inside the router service's `down` (run by
         # `systemctl disable --now`), so that must precede the bindings.
-        _, hosts = mod.build_scripts(NODES, "delete")
+        _, hosts = build_scripts(NODES, "delete")
         script = hosts["chassis-1"]
         self.assertGreater(
             script.index("ip link delete eth0.129"),
@@ -1330,7 +1669,7 @@ class KernelRouterDeleteTest(unittest.TestCase):
             )
             for n in NODES
         ]
-        _, create_hosts = mod.build_scripts(nodes, "create")
+        _, create_hosts = build_scripts(nodes, "create")
         _, down = _router_branches(_router_script(create_hosts["chassis-1"]))
         self.assertIn("ip link delete veth-ovn-0", down)
         self.assertGreater(
@@ -1344,7 +1683,7 @@ class KernelRouterDeleteTest(unittest.TestCase):
         # stale 8021q registration on the parent, so recreating the same
         # vlan afterwards fails with "VLAN device already exists" (hit
         # live 2026-08-19 on an LXC).
-        _, create_hosts = mod.build_scripts(NODES, "create")
+        _, create_hosts = build_scripts(NODES, "create")
         _, down = _router_branches(_router_script(create_hosts["chassis-1"]))
         self.assertIn("ip netns exec ns-kernel-0 ip link delete eth0.2280", down)
         self.assertLess(
@@ -1363,7 +1702,7 @@ class UnsupportedIfaceKindTest(unittest.TestCase):
                 ],
             ),
         )
-        cluster, hosts = mod.build_scripts(nodes, "create")
+        cluster, hosts = build_scripts(nodes, "create")
         self.assertIn("unsupported interface kind", hosts["chassis-1"])
         self.assertNotIn("add-br", hosts["chassis-1"])
         self.assertNotIn("lsp-home-localnet", cluster)
@@ -1377,13 +1716,7 @@ class NoCentralChassisTest(unittest.TestCase):
             if not (n.kind == "infra.host" and n.data.ovnRole == pt.OvnRole.central)
         ]
         with self.assertRaises(ValueError):
-            mod.build_scripts(nodes, "create")
-
-
-class InvalidActionTest(unittest.TestCase):
-    def test_rejects_an_unknown_action(self) -> None:
-        with self.assertRaises(ValueError):
-            mod.build_scripts(NODES, "destroy")
+            build_scripts(nodes, "create")
 
 
 class GeneratePythonDeployerTest(unittest.TestCase):
@@ -1426,23 +1759,25 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         ]
         compile(mod.generate_python_deployer(nodes), "<generated>", "exec")
 
-    def test_generated_host_function_issues_the_same_commands_as_the_shell(self) -> None:
-        # The Emitter refactor's core guarantee (2026-08-23): the Python
-        # front-end and the shell front-end render the SAME emitter
-        # operations, so running a generated host function must issue
-        # exactly the argv the shell generator prints as commands.
+    def test_generated_host_function_issues_the_commands_the_trace_shows(self) -> None:
+        # What ties every trace-based test in this file to the real
+        # deployer: the generated Python renders the SAME emitter
+        # operations build_scripts() traces, so running a generated host
+        # function must issue exactly the argv the trace lists as commands.
         ns = self._exec_runtime()
-        _, create_hosts = mod.build_scripts(NODES, "create")
-        # File writes (heredocs for the router script + unit) are
-        # write_file() in Python, not commands — skip them from the shell
-        # side so only command argv are compared (2026-08-30).
+        _, create_hosts = build_scripts(NODES, "create")
+        # File writes (the router script + unit) are write_file() in the
+        # generated Python, not commands — skip them from the trace so
+        # only command argv are compared (2026-08-30).
         shell_commands = _shell_command_lines(create_hosts["chassis-1"])
         argv_seen: list[list[str]] = []
         with mock.patch("subprocess.run") as run:
             run.return_value.returncode = 0
             # File writes (the router script + unit) are write_file(), not
-            # commands — no-op them so the run_cmd argv stays comparable.
+            # commands, and so are the install queue's jobs (queue_file()) —
+            # no-op them so the run_cmd argv stays comparable.
             ns["write_file"] = mock.Mock()
+            ns["queue_file"] = mock.Mock()
             ns["_host_chassis_1_create"](False, True, False)
             argv_seen = [call.args[0] for call in run.call_args_list]
         self.assertEqual(shell_commands, argv_seen)
@@ -1455,18 +1790,20 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             "--host",
             "--verbose",
             "--skip-deps",
+            "--ovn-purge",
             "def run_cmd",
             "def write_file",
+            "def queue_file",
             "argparse.ArgumentParser",
             'choices=["create", "delete"]',
         ):
             self.assertIn(marker, src)
 
-    def test_skip_deps_omits_only_the_os_dependency_install(self) -> None:
+    def test_skip_deps_omits_only_the_install_queue(self) -> None:
         # --skip-deps (2026-10-10): the generated deployer runs against a
-        # host whose packages are already present, so the per-host OS
-        # dependency block is wrapped in `if not skip_deps:` — dropping
-        # just the apt installs, not the rest of the create pass.
+        # host whose packages are already present, so everything about
+        # the install queue is wrapped in `if not skip_deps:` — dropping
+        # just that, not the rest of the create pass.
         nodes = [
             (
                 dataclasses.replace(
@@ -1489,18 +1826,42 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             with mock.patch("subprocess.run") as run:
                 run.return_value.returncode = 0
                 ns["write_file"] = mock.Mock()
+                ns["queue_file"] = mock.Mock()
                 ns["_host_chassis_1_create"](False, True, skip_deps)
                 seen = [call.args[0] for call in run.call_args_list]
             return [" ".join(argv) for argv in seen]
 
         with_deps = _argv(False)
-        self.assertTrue(any("apt-get install" in line for line in with_deps))
+        self.assertIn("/usr/local/sbin/ovn-fabric-install --once", with_deps)
+        # Each job is queued by the runtime (which names the file after
+        # the time it runs at), in order: packages, then — once they
+        # exist, after the last command — the units.
+        queued = ns["queue_file"].call_args_list
+        self.assertEqual({call.args[1] for call in queued}, {"/var/spool/ovn-fabric/install"})
+        self.assertEqual(
+            [call.args[2] for call in queued],
+            [
+                "package-ovn.json",
+                "package-ovs.json",
+                "package-ip.json",
+                "package-iptables.json",
+                "unit-ovn-kernel-kernel-0.service.json",
+            ],
+        )
+        self.assertEqual(json.loads(queued[1].args[3])["packages"], ["openvswitch-switch"])
         # The rest of the create pass still runs (OVS/OVN setup).
         self.assertTrue(any("ovs-vsctl" in line for line in with_deps))
 
+        # --skip-deps leaves the host's dependencies alone ALTOGETHER:
+        # nothing is queued, no consumer is installed, asked or started.
         skipped = _argv(True)
-        self.assertFalse(any("apt-get" in line for line in skipped))
+        self.assertFalse(any("ovn-fabric-install" in line for line in skipped))
         self.assertTrue(any("ovs-vsctl" in line for line in skipped))
+        ns["queue_file"].assert_not_called()
+        ns["write_file"].assert_called()
+        self.assertFalse(
+            any("ovn-fabric-install" in call.args[1] for call in ns["write_file"].call_args_list)
+        )
 
     def test_default_create_runs_hosts_before_cluster(self) -> None:
         # The dependencies-vs-commands ordering bug (2026-09-19): in the
@@ -1544,6 +1905,161 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             ns["main"]()
         self.assertEqual(order, ["cluster:create"])
 
+    # ── --ovn-purge ──────────────────────────────────────────────────
+    def _purge(self, *cli: str, system_id: str = '"sys-1"') -> tuple[list[str], mock.Mock, int]:
+        """Run the generated deployer with `--ovn-purge` + `cli` against a
+        faked subprocess; returns (commands in order, write_file mock,
+        exit code). The system-id lookup answers `system_id`."""
+        ns = self._exec_runtime()
+        ns["write_file"] = mock.Mock()
+        # A purge must never fall through into a deploy pass.
+        ns["cluster_create"] = ns["cluster_delete"] = mock.Mock(side_effect=AssertionError)
+        for fns in ns["HOSTS"].values():
+            fns["create"] = fns["delete"] = mock.Mock(side_effect=AssertionError)
+
+        def fake_run(argv: list[str], **_kwargs: Any) -> mock.Mock:
+            is_lookup = argv[:2] == ["ovs-vsctl", "--if-exists"]
+            return mock.Mock(returncode=0, stdout=f"{system_id}\n" if is_lookup else "")
+
+        with mock.patch("subprocess.run", side_effect=fake_run) as run:
+            with mock.patch.object(sys, "argv", ["deployer", "--ovn-purge", *cli]):
+                code = ns["main"]()
+            commands = [" ".join(call.args[0]) for call in run.call_args_list]
+        return commands, ns["write_file"], code
+
+    def test_ovn_purge_on_the_central_wipes_ovs_and_the_nb_sb_databases(self) -> None:
+        commands, write_file, code = self._purge("--host", "central-1")
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            commands,
+            [
+                "ovs-vsctl --if-exists get open_vswitch . external_ids:system-id",
+                "systemctl stop ovn-controller",
+                "systemctl stop ovn-northd ovn-ovsdb-server-nb ovn-ovsdb-server-sb",
+                "systemctl stop ovs-vswitchd ovsdb-server",
+                "rm -f /var/lib/openvswitch/conf.db",
+                "rm -f /var/lib/ovn/ovnnb_db.db /var/lib/ovn/ovnsb_db.db"
+                " /var/lib/ovn/.ovnnb_db.db.~lock~ /var/lib/ovn/.ovnsb_db.db.~lock~",
+                "systemctl start ovsdb-server ovs-vswitchd",
+                # The chassis keeps its identity: system-id IS Chassis.name
+                # in the SB database.
+                "ovs-vsctl set open_vswitch . external_ids:system-id=sys-1",
+                "systemctl start ovn-ovsdb-server-nb ovn-ovsdb-server-sb ovn-northd",
+                "systemctl start ovn-controller",
+            ],
+        )
+        write_file.assert_called_once_with(
+            "host:central-1 (purge)", "/etc/openvswitch/system-id.conf", "sys-1", False, True
+        )
+
+    def test_ovn_purge_on_a_chassis_leaves_the_nb_sb_databases_alone(self) -> None:
+        commands, _, _ = self._purge("--host", "chassis-1")
+        self.assertIn("rm -f /var/lib/openvswitch/conf.db", commands)
+        self.assertFalse(any("/var/lib/ovn/" in c or "ovn-northd" in c for c in commands))
+
+    def test_ovn_purge_with_cluster_wipes_only_the_nb_sb_databases(self) -> None:
+        commands, write_file, _ = self._purge("--cluster")
+        self.assertEqual(
+            commands,
+            [
+                "systemctl stop ovn-northd ovn-ovsdb-server-nb ovn-ovsdb-server-sb",
+                "rm -f /var/lib/ovn/ovnnb_db.db /var/lib/ovn/ovnsb_db.db"
+                " /var/lib/ovn/.ovnnb_db.db.~lock~ /var/lib/ovn/.ovnsb_db.db.~lock~",
+                "systemctl start ovn-ovsdb-server-nb ovn-ovsdb-server-sb ovn-northd",
+            ],
+        )
+        write_file.assert_not_called()
+
+    def test_ovn_purge_without_a_selector_covers_every_host(self) -> None:
+        commands, _, _ = self._purge()
+        self.assertEqual(commands.count("rm -f /var/lib/openvswitch/conf.db"), 2)
+        # ...and NB/SB once, for the one host the IR makes the central.
+        self.assertEqual(sum(1 for c in commands if c.startswith("rm -f /var/lib/ovn/")), 1)
+
+    def test_ovn_purge_without_a_system_id_restores_none(self) -> None:
+        commands, write_file, _ = self._purge("--host", "chassis-1", system_id="")
+        self.assertFalse(any("external_ids:system-id=" in c for c in commands))
+        write_file.assert_not_called()
+        self.assertEqual(commands[-1], "systemctl start ovn-controller")
+
+    def test_ovn_purge_skips_a_host_outside_the_ovn_cluster(self) -> None:
+        nodes = [
+            (
+                dataclasses.replace(n, data=dataclasses.replace(n.data, ovnRole=None))
+                if n.kind == "infra.host" and n.key.host == "chassis-1"
+                else n
+            )
+            for n in NODES
+        ]
+        ns: dict[str, Any] = {}
+        exec(mod.generate_python_deployer(nodes), ns)
+        stdout = io.StringIO()
+        with mock.patch("subprocess.run") as run:
+            with mock.patch.object(sys, "argv", ["deployer", "--ovn-purge", "--host", "chassis-1"]):
+                with contextlib.redirect_stdout(stdout):
+                    self.assertEqual(ns["main"](), 0)
+        run.assert_not_called()
+        self.assertIn("nothing to purge", stdout.getvalue())
+
+    def test_ovn_purge_refuses_to_be_combined_with_an_action(self) -> None:
+        # It replaces the action — an --action next to it is an error, not
+        # something silently ignored or silently run as well.
+        ns = self._exec_runtime()
+        stderr = io.StringIO()
+        with mock.patch("subprocess.run") as run:
+            with mock.patch.object(sys, "argv", ["deployer", "--ovn-purge", "--action", "create"]):
+                with self.assertRaises(SystemExit) as ctx, contextlib.redirect_stderr(stderr):
+                    ns["main"]()
+        self.assertEqual(ctx.exception.code, 2)
+        self.assertIn("--ovn-purge replaces the action", stderr.getvalue())
+        run.assert_not_called()
+
+    def test_ovn_purge_unknown_host_is_an_error(self) -> None:
+        ns = self._exec_runtime()
+        stderr = io.StringIO()
+        with mock.patch("subprocess.run") as run:
+            with mock.patch.object(sys, "argv", ["deployer", "--ovn-purge", "--host", "nope"]):
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(ns["main"](), 2)
+        run.assert_not_called()
+
+    def test_ovn_purge_tolerates_a_daemon_that_is_not_running(self) -> None:
+        # Stops only warn (a half-installed host must still be purgeable);
+        # a database that cannot be removed aborts.
+        ns = self._exec_runtime()
+        ns["write_file"] = mock.Mock()
+
+        def fake_run(argv: list[str], **_kwargs: Any) -> mock.Mock:
+            failing = argv[:2] == ["systemctl", "stop"]
+            return mock.Mock(returncode=5 if failing else 0, stdout="")
+
+        stderr = io.StringIO()
+        with mock.patch("subprocess.run", side_effect=fake_run) as run:
+            with contextlib.redirect_stderr(stderr):
+                ns["ovn_purge"]("host:x (purge)", False, ovs=True, central=False)
+            commands = [" ".join(call.args[0]) for call in run.call_args_list]
+        self.assertIn("warning: failed in host:x (purge): systemctl stop", stderr.getvalue())
+        self.assertEqual(commands[-1], "systemctl start ovn-controller")
+
+        def rm_fails(argv: list[str], **_kwargs: Any) -> mock.Mock:
+            return mock.Mock(returncode=1 if argv[0] == "rm" else 0, stdout="")
+
+        with mock.patch("subprocess.run", side_effect=rm_fails):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(stderr):
+                ns["ovn_purge"]("host:x (purge)", False, ovs=True, central=False)
+
+    def test_default_action_is_still_create(self) -> None:
+        # --action lost its argparse default so --ovn-purge can tell
+        # whether one was given; with neither flag the run is a create.
+        ns = self._exec_runtime()
+        order: list[str] = []
+        ns["cluster_create"] = lambda v, a: order.append(f"cluster:create:abort={a}")
+        for fns in ns["HOSTS"].values():
+            fns["create"] = lambda v, a, s: order.append("host:create")
+        with mock.patch.object(sys, "argv", ["deployer"]):
+            self.assertEqual(ns["main"](), 0)
+        self.assertEqual(order[-1], "cluster:create:abort=True")
+
     def test_run_cmd_warns_for_delete_and_aborts_for_create(self) -> None:
         ns = self._exec_runtime()
         stderr = io.StringIO()
@@ -1577,15 +2093,57 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         self.assertIn("warning: cannot run in host", stderr.getvalue())
 
     def test_write_file_writes_content_with_a_trailing_newline(self) -> None:
-        # The append() emitter operation at runtime must produce the same
-        # file the shell front-end's heredoc would — content plus a
-        # single trailing newline (2026-08-23).
+        # The append() emitter operation at runtime: the file holds the
+        # content plus a single trailing newline (2026-08-23).
         ns = self._exec_runtime()
         with tempfile.TemporaryDirectory() as tmp:
             path = os.path.join(tmp, "unit.service")
             ns["write_file"]("host", path, "[Unit]\nDescription=x", False, False)
             with open(path, encoding="utf-8") as out:
                 self.assertEqual(out.read(), "[Unit]\nDescription=x\n")
+
+    def test_queue_file_names_a_file_after_the_time_it_is_queued(self) -> None:
+        # The enqueue() emitter operation at runtime: the file's name
+        # starts with a UTC timestamp, so a queue's files sort by name
+        # into the order they were queued in — here against the alphabet.
+        ns = self._exec_runtime()
+        with tempfile.TemporaryDirectory() as tmp:
+            for name in ("unit-z.json", "package-m.json", "image-a.json"):
+                ns["queue_file"]("host", tmp, name, f'{{"name": "{name}"}}', False, True)
+            names = sorted(os.listdir(tmp))
+            self.assertEqual(
+                [name.split("-", 1)[1] for name in names],
+                ["unit-z.json", "package-m.json", "image-a.json"],
+            )
+            for name in names:
+                self.assertRegex(name, r"^\d{8}T\d{6}\.\d{6}Z-[a-z]+-[a-z]\.json$")
+            # Whole files under their final name only — nothing half-written
+            # is left for the consumer to trip over.
+            with open(os.path.join(tmp, names[0]), encoding="utf-8") as out:
+                self.assertEqual(out.read(), '{"name": "unit-z.json"}\n')
+
+    def test_queue_stamps_never_repeat_or_go_back(self) -> None:
+        # Two files queued within the same microsecond — or across a clock
+        # that steps back — must still sort in the order they were queued.
+        ns = self._exec_runtime()
+        at = 1_791_748_501_000_123_000  # ns
+        with mock.patch.object(ns["time"], "time_ns", side_effect=[at, at, at - 5_000_000, at]):
+            stamps = [ns["queue_stamp"]() for _ in range(4)]
+        self.assertEqual(stamps, sorted(stamps))
+        self.assertEqual(len(set(stamps)), 4)
+        self.assertEqual(stamps[0], "20261011T195501.000123Z")
+        self.assertEqual(stamps[3], "20261011T195501.000126Z")
+
+    def test_queue_file_follows_the_runtimes_error_policy(self) -> None:
+        ns = self._exec_runtime()
+        missing = os.path.join(tempfile.gettempdir(), "ovn-fabric-no-such-queue")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            ns["queue_file"]("host", missing, "unit-x.json", "{}", False, False)
+        self.assertIn("warning: cannot queue in host", stderr.getvalue())
+        with self.assertRaises(SystemExit) as ctx, contextlib.redirect_stderr(stderr):
+            ns["queue_file"]("host", missing, "unit-x.json", "{}", False, True)
+        self.assertEqual(ctx.exception.code, 127)
 
 
 if __name__ == "__main__":
@@ -1667,7 +2225,7 @@ class KernelServiceDeployTest(unittest.TestCase):
             ),
         )
         nodes = list(NODES) + [seg, cp, svc, lrp_seg, lrp_cp]
-        _, create_hosts = mod.build_scripts(nodes, "create")
+        _, create_hosts = build_scripts(nodes, "create")
         create = create_hosts["chassis-1"]
         self.assertIn("cat > /usr/local/sbin/ovn-kernel-service-dns.sh << 'OVN'", create)
         self.assertIn('image="ovn-fabric-dns"', create)
@@ -1712,7 +2270,7 @@ class KernelServiceDeployTest(unittest.TestCase):
         self.assertIn('/usr/bin/docker rm -f "ovn-fabric-dns"', create)
         self.assertIn('del-port "br-cont" "sc-', create)
         self.assertIn('del-port "br-cp" "sc-', create)
-        _, delete_hosts = mod.build_scripts(nodes, "delete")
+        _, delete_hosts = build_scripts(nodes, "delete")
         delete = delete_hosts["chassis-1"]
         self.assertIn("systemctl disable --now ovn-kernel-service-dns.service", delete)
 
@@ -1752,7 +2310,7 @@ class KernelServiceDeployTest(unittest.TestCase):
             ),
         )
         nodes = list(NODES) + [seg, cp, svc, lrp_seg, lrp_cp]
-        _, create_hosts = mod.build_scripts(nodes, "create")
+        _, create_hosts = build_scripts(nodes, "create")
         create = create_hosts["chassis-1"]
         links = [line for line in create.splitlines() if line.startswith('ip link add "sc-')]
         self.assertEqual(len(links), 2)
@@ -1789,7 +2347,7 @@ class KernelServiceDeployTest(unittest.TestCase):
             ),
         )
         nodes = list(NODES) + [seg, svc, lrp]
-        _, create_hosts = mod.build_scripts(nodes, "create")
+        _, create_hosts = build_scripts(nodes, "create")
         create = create_hosts["chassis-1"]
         self.assertIn("--dns 10.43.0.10 --dns 1.1.1.1", create)
 
@@ -1824,7 +2382,7 @@ class KernelServiceDeployTest(unittest.TestCase):
             ),
         )
         nodes = list(NODES) + [cp, svc, lrp]
-        _, create_hosts = mod.build_scripts(nodes, "create")
+        _, create_hosts = build_scripts(nodes, "create")
         create = create_hosts["chassis-1"]
         # IPv6 route/rule MUST carry `-6`: `ip route`/`ip rule` default to
         # IPv4 and reject a v6 prefix/source with "Invalid source address"
@@ -1918,7 +2476,7 @@ class MultiServiceDeployTest(unittest.TestCase):
             lrp("router-a", "seg-a", "dns-128"),
             lrp("router-b", "seg-b", "dns-129"),
         ]
-        _, create_hosts = mod.build_scripts(nodes, "create")
+        _, create_hosts = build_scripts(nodes, "create")
         create = create_hosts["chassis-1"]
         self.assertIn("ovn-kernel-service-dns-128.sh", create)
         self.assertIn("ovn-kernel-service-dns-129.sh", create)
@@ -2033,7 +2591,7 @@ class DnsServiceEndToEndTest(unittest.TestCase):
         from protocol.hydrate import hydrate_nodes
 
         nodes = hydrate_nodes(raw)
-        _, create_hosts = mod.build_scripts(nodes, "create")
+        _, create_hosts = build_scripts(nodes, "create")
         s = create_hosts["chassis-1"]
         self.assertIn("ovn-kernel-service-dns-129.sh", s)
         # Serving NIC on the real segment, admin NIC on the control plane.
@@ -2102,7 +2660,7 @@ def _with_ipfix(
 
 class IpfixExportTest(unittest.TestCase):
     def test_ipfix_attaches_to_the_segment_bridge_on_create(self) -> None:
-        _, hosts = mod.build_scripts(_with_ipfix(NODES), "create")
+        _, hosts = build_scripts(_with_ipfix(NODES), "create")
         script = hosts["chassis-1"]
         self.assertIn("# --- flow export (IPFIX) ---", script)
         # Idempotent: reuse the bridge's existing IPFIX row, else create.
@@ -2115,15 +2673,15 @@ class IpfixExportTest(unittest.TestCase):
         self.assertIn("set Bridge br-home ipfix=@ipfix", script)
 
     def test_a_leg_that_opts_out_clears_its_bridge(self) -> None:
-        _, hosts = mod.build_scripts(_with_ipfix(NODES, {"home"}), "create")
+        _, hosts = build_scripts(_with_ipfix(NODES, {"home"}), "create")
         script = hosts["chassis-1"]
         self.assertNotIn("create IPFIX", script)
         self.assertIn("--if-exists clear Bridge br-home ipfix", script)
 
     def test_delete_clears_the_sampler(self) -> None:
-        _, hosts = mod.build_scripts(_with_ipfix(NODES), "delete")
+        _, hosts = build_scripts(_with_ipfix(NODES), "delete")
         self.assertIn("--if-exists clear Bridge br-home ipfix", hosts["chassis-1"])
 
     def test_no_ipfix_config_emits_nothing(self) -> None:
-        _, hosts = mod.build_scripts(NODES, "create")
+        _, hosts = build_scripts(NODES, "create")
         self.assertNotIn("IPFIX", hosts["chassis-1"])

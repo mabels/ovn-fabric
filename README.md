@@ -4,11 +4,12 @@ A declarative OVN/OVS network topology generator. You describe a network —
 hosts, routers, collision domains, VPN tunnels — as plain TypeScript, and
 ovn-fabric emits a desired-state **IR** (JSON): one `{id, kind, key, data}`
 node per host / collision domain / router port / workload. Feed that IR to
-the Python deployer (`deployer/`), which turns it into **one self-installing
-shell script per host**. Copy that script to the host and run it: it creates
-the OVS bridges/interfaces, builds the full OVN logical topology (routers,
-switches, NAT), and installs itself as a boot-time systemd unit —
-idempotently, so re-running it (or rebooting) is always safe.
+the Python deployer (`deployer/`), which turns it into **one self-contained
+Python script** carrying every host's pass. Copy that script to a host and
+run it: it creates the OVS bridges/interfaces, builds the full OVN logical
+topology (routers, switches, NAT), and installs the kernel routers and
+workloads as boot-time systemd units — idempotently, so re-running it is
+always safe.
 
 No netplan, no hand-written `ovn-nbctl`/`ovs-vsctl` invocations, no
 configuration drift between "what I meant to set up" and "what's actually
@@ -121,18 +122,55 @@ const site = rt.env["SITE"] ?? "hh"; // SITE=... in the environment
 npx -p @adviser/ovn-fabric ovn-fabric generate-ir --runtime debug=1 topology.ts
 ```
 
-Then hand the IR to the Python deployer, which emits the per-host script(s):
+Then hand the IR to the Python deployer, which emits the deployer script:
 
 ```sh
 npx -p @adviser/ovn-fabric ovn-fabric generate-ir topology.ts \
-  | python3 -m deployer.cli - --emit python > install.py
+  | python3 -m deployer.cli - > install.py
 ```
 
-The deployer prints one script per distinct `Host` your config declares. For
-a multi-host config, scripts are separated by a `# ===== host: X =====`
-marker line — never printed before the first script, since each script is
-meant to be saved and run (or `systemctl`-exec'd) as-is, and a leading
-non-shebang line would break that.
+`install.py` needs only `python3` on the target. It holds the cluster-wide
+OVN pass and every host's own pass, for both directions; pick what runs:
+
+```sh
+python3 install.py                      # create: every host, then the cluster pass
+python3 install.py --action delete      # the reverse
+python3 install.py --host NAME          # only that host's pass (run it on that host)
+python3 install.py --cluster            # only the cluster-wide ovn-nbctl pass
+python3 install.py --ovn-purge          # wipe the OVS database and, on the central, OVN's NB/SB
+```
+
+`--verbose` echoes every command.
+
+Deploying a router can cut the host's own internet access while the deploy
+runs, so nothing is installed inline. Each host's create **queues** what the
+host needs instead — one JSON job file per package, docker image and systemd
+unit in `/var/spool/ovn-fabric/install`, each named after the moment it was
+queued:
+
+```text
+20261011T195501.000101Z-package-ovs.json
+20261011T195501.000417Z-image-coredns_coredns_latest.json
+20261011T195533.120008Z-unit-ovn-kernel-router-x.service.json
+```
+
+and installs the queue's consumer, `ovn-fabric-install.service`. It looks at
+the directory every 10 seconds and works on the files in name order — the
+order they were queued in: a job for something the host already has is
+dropped without a connection, a missing package or image is installed
+whenever the host is online (a public DNS resolver — `1.1.1.1`, `8.8.8.8`
+or `9.9.9.9`, asked by address — resolves a query), and a router or workload unit
+that did not come up is restarted once the packages and images queued
+before it are there. A job's file is removed when the job is done, so what
+is left in the directory is what the host still lacks
+(`journalctl -u ovn-fabric-install` says why). A host that is online when
+the deploy starts gets everything right away: the pass runs the consumer
+once in the foreground before it goes on. `--skip-deps` leaves the queue
+and its consumer out altogether.
+
+`--ovn-purge` runs INSTEAD of an action and resets OVS/OVN to
+a freshly-installed state — the logical topology of the whole cluster goes
+with the NB/SB databases, so deploy again afterwards.
 
 ## Model
 
@@ -181,10 +219,10 @@ an explanation of what it's for and why it's shaped the way it is.
 
 ## Design notes worth knowing before you rely on this
 
-- Boot safety: package checks (`dpkg -s`) on the systemd/boot path are
-  `timeout`-capped and warn-only — a missing tool never blocks router
-  startup. Real `apt-get install` only ever runs in the manual/first-run
-  branch, never from `systemctl`.
+- Boot safety: the router and workload units install no packages — a
+  missing tool never blocks router startup. Packages only ever come through
+  the install queue (above), whose consumer waits for the internet instead
+  of failing and puts a time limit on every command it runs.
 - Idempotency throughout: `--may-exist`/`--if-exists` on every
   `ovs-vsctl`/`ovn-nbctl` call, `ip link show ... || ...` guards, `cmp -s`
   before overwriting any file (including WireGuard confs — the tunnel only

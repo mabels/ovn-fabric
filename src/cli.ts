@@ -169,7 +169,7 @@ const generateIr = command({
     "{id, kind, key, data} node per host/collision-domain/router-port, " +
     "the same envelope shape the reconciler produces from live state. " +
     "Feed this into the Python deployer (deployer/cli.py) to convert " +
-    "it into shell scripts.",
+    "it into the generated deployer script.",
   args: {
     configPath: positional({
       type: string,
@@ -188,7 +188,7 @@ const generateIr = command({
 // ── generate-pytypes: the protocol, TS -> Python ────────────────────
 // src/protocol.ts's ArkType schema is the one contract both languages
 // agree on for the desired-state IR crossing the boundary (toIR()'s
-// JSON -> deployer/ir_to_shell.py) — the stabilizing factor against
+// JSON -> deployer/ir_common.py) — the stabilizing factor against
 // version skew between the two sides, built and deployed independently.
 // This command regenerates BOTH artifacts from that one schema:
 // protocol/ir-nodes.schema.json (JSON Schema, draft 2020-12) and

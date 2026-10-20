@@ -9,7 +9,7 @@
 #
 # external_id write primitives exist for chassis registration
 # (ovn-remote/ovn-encap-ip/ovn-encap-type/ovn-cms-options — the real
-# consumer is deployer/ir_to_shell.py's per-host script, converting
+# consumer is deployer/ir_common.py's per-host script, converting
 # infra.host IR nodes) — the concrete need this module's own header
 # comment used to say wasn't identified yet.
 #
@@ -66,7 +66,7 @@ def remove_external_id(key: str) -> None:
 
 
 # ── bridges + ports (real-world binding for ovn.ls collision domains —
-# deployer/ir_to_shell.py's per-host script) ─────────────────────────
+# deployer/ir_common.py's per-host script) ─────────────────────────
 # Both adds take --may-exist: the create pass is re-run as a blunt
 # "make it so" (README's idempotency guarantee), and an existing bridge/
 # port is the expected state on every run after the first — without the

@@ -146,7 +146,7 @@ def delete_route(prefix: str, dev: str, netns: str | None) -> None:
 
 
 # ── VLAN sub-interfaces (real-world binding for ovn.ls collision ────
-# domains — deployer/ir_to_shell.py's per-host script) ───────────────
+# domains — deployer/ir_common.py's per-host script) ───────────────
 # Argv builders exposed separately from their run_in_netns wrappers,
 # same reasoning as ladops/ovn.py: the generator needs the exact argv
 # to print, not to execute.
@@ -162,8 +162,7 @@ def ensure_vlan_argv(parent: str, name: str, vlan_id: int) -> list[str]:
     previous run would abort the whole create pass (confirmed live
     2026-09-19). The guard rides inside one `sh -c` (the same idiom as
     the zerotier installer and set_sysctl_file_argv) so it stays a single
-    argv operation for BOTH front-ends: the shell backend prints it as a
-    normal line, the Python backend shlex-splits it back to `sh -c
+    argv operation: the Python deployer shlex-splits it back to `sh -c
     '<script>'` and the shell runs the `||`."""
     script = (
         f"ip link show {shlex.quote(name)} >/dev/null 2>&1 || "
@@ -184,7 +183,7 @@ def add_dummy_argv(name: str) -> list[str]:
 # A KernelRouter's own transit veth pair (types.ts's InterfaceKind "veth"
 # variant) — `name` is the ROOT-side leg (later attached to the transit
 # domain's OVS bridge), `peer` the leg moved into the kernel router's
-# netns by deployer/ir_to_shell.py's _emit_kernel_router_create. Run from
+# netns by deployer/ir_common.py's _emit_kernel_router_create. Run from
 # the root namespace (2026-08-18).
 #
 # `peer_mac` pins the PEER leg's MAC (`address` after `peer name` applies
@@ -207,7 +206,7 @@ def set_link_up_argv(name: str) -> list[str]:
 
 
 # Set a sysctl knob in place — used to enable IPv4/IPv6 forwarding inside
-# a KernelRouter's netns (deployer/ir_to_shell.py's _emit_kernel_router_
+# a KernelRouter's netns (deployer/ir_common.py's _emit_kernel_router_
 # create): a kernel router IS a router, and Linux won't forward between
 # its two sides until `net.ipv4.ip_forward`/`net.ipv6.conf.all.forwarding`
 # say so (2026-08-19).

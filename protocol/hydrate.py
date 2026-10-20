@@ -27,7 +27,7 @@
 # (see ADR 0002, "Type stability across the TypeScript/Python
 # boundary").
 #
-# Every OTHER Python component (deployer/ir_to_shell.py, deployer/
+# Every OTHER Python component (deployer/ir_common.py, deployer/
 # cli.py) works with these typed nodes exclusively — this module is the
 # ONE place a raw dict is still indexed by string key.
 

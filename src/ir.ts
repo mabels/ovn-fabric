@@ -299,7 +299,7 @@ function kernelRouterBackRoutes(
 // — no real iface binding yet (deliberately deferred, see
 // KernelRouterSide's own doc comment, types.ts), so a dummy device
 // stands in as the thing addresses/routes actually bind to (deployer/
-// ir_to_shell.py's own _emit_kernel_router_create) — assigning these to
+// ir_common.py's own _emit_kernel_router_create) — assigning these to
 // a REAL device is its own next step. `routes`: declared entries with a
 // `via` (a route with none means "handled elsewhere," e.g. IPv6 RA/DHCP
 // on the real segment, not yet modeled — same semantic computeRoutes
@@ -324,7 +324,7 @@ function kernelRouterBackRoutes(
 // the side node so the deployer creates/moves the real interface into
 // the netns and binds addresses/routes to IT instead of a dummy stand-
 // in; a side with no `ifaces` still gets the dummy (deployer/
-// ir_to_shell.py's own _emit_kernel_router_create). `iface` stays
+// ir_common.py's own _emit_kernel_router_create). `iface` stays
 // structurally unmodeled in the cross-language protocol, same as
 // ovn.ls's own entries (see protocol.ts's OvnLsInterface).
 function kernelRouterSideToIR(
@@ -353,7 +353,7 @@ function kernelRouterSideToIR(
   // device name, so the readable-when-it-fits/else-deterministic-hash
   // suffix is resolved HERE and the deployer builds the real pair
   // (`veth-krn-<shortName>`/`veth-ovn-<shortName>`) from it
-  // (deployer/ir_to_shell.py's _emit_kernel_router_create) — same
+  // (deployer/ir_common.py's _emit_kernel_router_create) — same
   // "generator computes the final name" boundary as shortIfaceName.
   // It also carries the netns-side leg's `mac`, resolved HERE for the
   // same reason an LRP's is (resolveMac): deterministic from this
@@ -468,12 +468,12 @@ function vethShortId(ifaceName: string): string {
 
 // Readable (`${prefix}${name}`) whenever it fits; only falls back to a
 // short deterministic hash (fnv1a32, addressing.ts) when it doesn't.
-// Resolved HERE, not in deployer/ir_to_shell.py (the translator) — same
+// Resolved HERE, not in deployer/ir_common.py (the translator) — same
 // boundary reasoning as mac/gatewayChassis/routes throughout this file:
 // the generator computes the FINAL name a real kernel object needs, the
 // translator only ever applies an already-resolved fact. Moved here
 // 2026-08-12 — this used to live translator-side as deployer/
-// ir_to_shell.py's own `_bridge_name`/`_fnv1a_32`.
+// ir_common.py's own `_bridge_name`/`_fnv1a_32`.
 function shortIfaceName(prefix: string, name: string): string {
   const candidate = `${prefix}${name}`;
   if (candidate.length <= IFNAMSIZ_MAX) return candidate;
@@ -496,7 +496,7 @@ function shortIfaceName(prefix: string, name: string): string {
 // it rather than pretending it's already reconciled).
 //
 // `shortName`: the real OVS bridge name this domain binds to on any
-// chassis with a bindable interface (see deployer/ir_to_shell.py's
+// chassis with a bindable interface (see deployer/ir_common.py's
 // _emit_iface_bindings_create/_delete) — see shortIfaceName() above.
 // Carried on EACH interface entry, not as its own data field: `iface`
 // is already the one place a real-world-binding fact lives per (host,
@@ -609,7 +609,7 @@ function routerToIR(router: Router): OvnLrNode {
 // so reordering endpoints cannot re-key a port.
 // Resolved HERE, not left for the shell-conversion step to guess: the
 // IR is the desired-state boundary between this project's TypeScript
-// half and its Python half (deployer/ir_to_shell.py) — it should carry
+// half and its Python half (deployer/ir_common.py) — it should carry
 // the FINAL mac, not push "how do I fold one" across that boundary
 // (macFromV4 only exists on this side). Same reasoning as
 // resolveEncapIp above. Matches RouterEndpoint.mac's own doc comment
@@ -631,7 +631,7 @@ function resolveMac(lrp: string, endpoint: OvnRouterEndpoint): string {
 // Folds RouterEndpoint.services into the single ipv6_ra_configs smap
 // OVN actually has (see RouterEndpointService, types.ts, for why these
 // are two independently-toggleable services rather than one boolean).
-// Resolved HERE, not in deployer/ir_to_shell.py, same boundary reasoning
+// Resolved HERE, not in deployer/ir_common.py, same boundary reasoning
 // as resolveMac/resolveEncapIp above: the IR carries the FINAL key/value
 // pairs to set, not "here's a services list, go figure out the ovn-nbctl
 // options syntax." Undefined (not an empty object) when no service is
@@ -1011,7 +1011,7 @@ function anchorAddressSharedWith(
 // `domain` names WHICH RoutingDomain produced this route (net.
 // routingDomain()'s own name) — every route, from either mechanism
 // below, always belongs to exactly one. Confirmed live, 2026-08-12:
-// without this, deployer/ir_to_shell.py had no way to group a
+// without this, deployer/ir_common.py had no way to group a
 // router's routes into labeled blocks in the generated script — every
 // route landed in one flat, unlabeled dump instead of being grouped
 // with its router and its source, unlike every other section of the

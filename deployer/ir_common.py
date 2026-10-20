@@ -1,14 +1,15 @@
-# deployer/ir_common.py — the shared emitters behind BOTH generator
-# front-ends (deployer/ir_to_shell.py's `build_scripts` and deployer/
-# ir_to_python.py's `generate_python_deployer`, split 2026-08-19): the
+# deployer/ir_common.py — the emitters behind the generated deployer
+# (deployer/ir_to_python.py's `generate_python_deployer`): the
 # desired-state IR (ovn-fabric's src/ir.ts toIR(), emitted as JSON by
 # `deno run src/cli.ts generate-ir`, then hydrated into protocol/
 # generated.py's typed dataclasses by protocol/hydrate.py) in,
 # RENDERER-AGNOSTIC OPERATIONS out (2026-08-23). Every _emit_* function
-# builds through an `Emitter` sink (see below) — the shell front-end
-# renders literal shell script from it, the Python front-end renders
-# Python source that performs the same operations at runtime with its
-# own logging/error handling. Every node this module touches is one of
+# builds through an `Emitter` sink (see below) — the Python front-end
+# renders Python source from it that performs the operations at runtime
+# with its own logging/error handling. (A second front-end that rendered
+# the same operations as plain shell scripts was removed 2026-10-11; the
+# tests still read the operations through a text trace of that shape.)
+# Every node this module touches is one of
 # protocol.generated.InfraHostNode/OvnLsNode/OvnLrpNode — never a raw
 # dict. That's deliberate: the protocol (src/protocol.ts's ArkType
 # schema) is the stabilizing factor for the TypeScript/Python boundary,
@@ -81,6 +82,8 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import ipaddress
+import json
+import pathlib
 import shlex
 from collections.abc import Sequence
 
@@ -91,6 +94,8 @@ from ladops import ovs as ovs_ops
 from protocol import KernelApp
 from protocol import generated as pt
 
+from .install_queue import QUEUE_DIR, Job
+
 Action = str  # "create" | "delete"
 
 _BINDABLE_IFACE_KINDS = {"vlan", "physical", "veth"}
@@ -100,9 +105,9 @@ class Ref:
     """A runtime VARIABLE reference inside an emitted command's argv —
     e.g. a chassis id resolved at runtime via `ovs-vsctl`/`ovn-sbctl`
     (see lrp_set_gateway_chassis below). Rendering is backend-specific:
-    the shell front-end emits `$NAME`, the Python front-end emits the
-    Python variable `NAME` — never a quoted literal. Everything else in
-    an argv is a plain string."""
+    the Python front-end emits the Python variable `NAME`, a shell
+    rendering (_ShellBody, the tests' trace) emits `$NAME` — never a
+    quoted literal. Everything else in an argv is a plain string."""
 
     __slots__ = ("name",)
 
@@ -129,32 +134,26 @@ def _sh(argv: list[str]) -> str:
 
 # ── the emitter interface ─────────────────────────────────────────────
 # Every _emit_* function below builds its output through an `Emitter`
-# sink, NOT by returning shell lines. The two front-ends each provide
-# their own Emitter implementation (deployer/ir_to_shell.py renders
-# literal shell script, deployer/ir_to_python.py renders Python source
-# that performs the same operations at runtime with logging/error
-# handling) — so the shared emitters never render, they only APPEND
-# operations. That's what gives the Python deployer real control over
+# sink, NOT by returning shell lines. A front-end provides the Emitter
+# implementation (deployer/ir_to_python.py renders Python source that
+# performs the operations at runtime with logging/error handling; the
+# tests provide a text trace) — so the emitters never render, they only
+# APPEND operations. That's what gives the Python deployer real control over
 # its own execution (2026-08-23): a `sh()` command becomes a
 # run_cmd(...) call, an `append()` file-write becomes a write_file(...)
-# call, each with the Python runtime's error/verbose policy — instead of
+# call, an `enqueue()` a queue_file(...) call, each with the Python
+# runtime's error/verbose policy — instead of
 # the old design where the whole shell block was embedded verbatim and
 # the runtime had to re-parse shell syntax (heredocs included) itself.
 #
 # `append(path, content)` semantics: the file ends up holding `content`
-# plus a single trailing newline (the shell backend renders this as a
-# `cat > path << 'EOF'` heredoc, whose body always ends in a newline;
-# the Python backend's write_file() writes content + "\n" to match).
+# plus a single trailing newline (the Python backend's write_file()
+# writes content + "\n"; the nested _ShellBody renders a
+# `cat > path << 'EOF'` heredoc, whose body always ends in a newline).
 class Emitter:
     def __init__(self, action: Action) -> None:
         self.action = action
         self.lines: list[str] = []
-
-    def raw(self, text: str) -> None:
-        """Append a backend-specific raw line verbatim — used by the
-        shell backend for the `#!/bin/sh`/`set -eu` envelope; the Python
-        backend has no envelope and never calls this."""
-        self.lines.append(text)
 
     def sh(
         self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
@@ -176,6 +175,15 @@ class Emitter:
     def append(self, path: str, content: str) -> None:
         raise NotImplementedError
 
+    def enqueue(self, directory: str, name: str, content: str) -> None:
+        """Queue a file: write `content` to
+        `<directory>/<timestamp>-<name>`, the timestamp being the moment
+        the deployer RUNS this operation (UTC, to the microsecond, never
+        the same twice in one run) — so the files of a queue sort by name
+        into the order they were queued in, whatever their names say.
+        The file appears under that name complete or not at all."""
+        raise NotImplementedError
+
     def comment(self, text: str) -> None:
         self.lines.append(text)
 
@@ -187,8 +195,8 @@ class Emitter:
         (Python: `if not skip_deps:`) — every operation emitted until the
         matching end_block() nests one level deeper. Only the Python
         front-end implements this (its generated file needs a real
-        conditional for `--skip-deps`); the shell front-end never calls
-        it, so its eager text stays flat."""
+        conditional for `--skip-deps`); it is only called when the caller
+        asked for that guard."""
         raise NotImplementedError
 
     def end_block(self) -> None:
@@ -197,12 +205,12 @@ class Emitter:
 
 class _ShellBody(Emitter):
     """A nested SHELL-ONLY emitter used to build a kernel router's
-    up/down script body. The router script is a literal shell file no
-    matter which outer front-end (shell or Python) installed it, so this
-    renders shlex-joined command lines (with an optional trailing ` &` to
-    background a long-running/daemon app inside the netns) and heredoc
-    appends, never Python. `background=True` is only meaningful here —
-    the outer front-ends ignore it."""
+    up/down script body. The router script is a literal shell file on
+    the host (systemd runs it) even though the Python deployer installs
+    it, so this renders shlex-joined command lines (with an optional
+    trailing ` &` to background a long-running/daemon app inside the
+    netns) and heredoc appends, never Python. `background=True` is only
+    meaningful here — the outer front-end ignores it."""
 
     def sh(
         self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
@@ -671,7 +679,7 @@ def _emit_security_group_rules(
         if rule.kind != "masq":
             emit.comment(
                 f'# unsupported security group rule kind "{rule.kind}" for '
-                f"{group.key.name} on {dev} — skipped, see deployer/ir_to_shell.py"
+                f"{group.key.name} on {dev} — skipped, see deployer/ir_common.py"
             )
             continue
         iptables = "iptables" if rule.family == pt.Family.ipv4 else "ip6tables"
@@ -1025,7 +1033,7 @@ def _emit_kernel_app_rules(
             else:
                 emit.comment(
                     f'# unsupported dhcp-client style "{app.style}" on {dev} in {netns} — '
-                    "skipped, see deployer/ir_to_shell.py"
+                    "skipped, see deployer/ir_common.py"
                 )
                 continue
         elif app.kind == "docker":
@@ -1180,7 +1188,7 @@ def _emit_kernel_app_rules(
         else:
             emit.comment(
                 f'# unsupported kernel app kind "{app.kind}" on {dev} in {netns} — '
-                "skipped, see deployer/ir_to_shell.py"
+                "skipped, see deployer/ir_common.py"
             )
             continue
 
@@ -1322,7 +1330,7 @@ def _emit_kernel_router_owner(
             emit.comment(
                 f'# unsupported kernel router side interface kind "{iface.kind}" '
                 f"for {owner.key.name} ({_side(side_node).value}) — skipped, "
-                "see deployer/ir_to_shell.py"
+                "see deployer/ir_common.py"
             )
             continue
         if iface is not None and iface.kind == "veth":
@@ -1433,7 +1441,7 @@ def _kernel_router_script(router: str, up_lines: list[str], down_lines: list[str
         "# veths/vlans, security-group rules and apps; 'down' stops the apps",
         "# then tears the netns and the transit veth's root leg down. One",
         "# service per router; systemd runs ExecStart=<script> up and",
-        "# ExecStop=<script> down. Generated by deployer/ir_to_shell.py.",
+        "# ExecStop=<script> down. Generated by deployer/ir_common.py.",
         "set -u",
         'action="${1:-up}"',
         'case "$action" in',
@@ -1485,7 +1493,7 @@ def _emit_kernel_router(host_id: str, nodes: list[pt.Model], emit: Emitter) -> N
         netns = _netns_name(owner.key.name)
         router = owner.key.name
         script_path = f"/usr/local/sbin/ovn-kernel-{router}.sh"
-        unit = f"ovn-kernel-{router}.service"
+        unit = _kernel_router_unit_name(router)
         unit_path = f"/etc/systemd/system/{unit}"
         emit.comment(f"# --- kernel netns service: {netns} ({router}) ---")
         if action == "delete":
@@ -1531,7 +1539,7 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
             if iface.kind not in _BINDABLE_IFACE_KINDS:
                 emit.comment(
                     f'# unsupported interface kind "{iface.kind}" for domain '
-                    f"{domain} on {host_name} — skipped, see deployer/ir_to_shell.py"
+                    f"{domain} on {host_name} — skipped, see deployer/ir_common.py"
                 )
                 continue
             real_name = _iface_real_name(iface)
@@ -1673,28 +1681,76 @@ _PACKAGE_BY_DEP = {
 }
 
 
-def _emit_os_dependencies(host_node: pt.InfraHostNode, emit: Emitter) -> None:
-    """Install the host's ABSTRACT dependencies (the IR's `dependencies`
-    list, computed by src/ir.ts's hostDependencies — base tooling plus
-    `ovn`/`ovs`/`ip`/`iptables`/`dhclient`/`dhcpcd`/`wireguard`/
-    `zerotier`/`docker`, deliberately not distro packages) at the very
-    START of the create pass, mapped to the host OS's install form.
-    Always resolved to a concrete OS (assume Ubuntu when the config
-    leaves it unset, 2026-08-23); no deinstall ever happens."""
-    deps = host_node.data.dependencies or []
-    if not deps:
-        return
-    os_name = host_node.data.os.name
-    emit.comment(f"# --- OS dependencies ({os_name} {host_node.data.os.version}) ---")
-    if os_name in ("ubuntu", "debian"):
-        emit.sh(["apt-get", "update"])
-        for dep in deps:
-            if dep == "zerotier":
-                # the zerotier install script — run via `sh -c` so the
-                # pipe survives both front-ends (argv-safe).
-                emit.sh(["sh", "-c", "curl -s https://install.zerotier.com | bash"])
-                continue
-            if dep == "ovn":
+# ── the install queue ────────────────────────────────────────────────
+# Deploying a router can cut the host's own internet access while the
+# pass runs, so nothing that needs the network is done inline. The create
+# pass QUEUES what the host needs instead — one JSON job file per package,
+# docker image and unit under _QUEUE_DIR, each prefixed with the time the
+# deployer queued it (Emitter.enqueue) — and installs the consumer of
+# that queue (deployer/install_queue.py, copied to the host unchanged)
+# with its systemd service. The service polls the directory, works on the
+# files in name order — the order they were queued in — and removes a
+# job's file once the job is done; see install_queue.py's own header for
+# the file format and the retry rules.
+_QUEUE_DIR = QUEUE_DIR
+_INSTALLER = "/usr/local/sbin/ovn-fabric-install"
+_INSTALLER_UNIT = "ovn-fabric-install.service"
+_INSTALLER_UNIT_PATH = f"/etc/systemd/system/{_INSTALLER_UNIT}"
+# The host OSes whose packages are known (both install with apt).
+_APT_OS = ("ubuntu", "debian")
+
+# One queue file: its name WITHOUT the timestamp the deployer puts in
+# front of it at runtime (see _queue_name) and the job it holds. A list of
+# them is queued in list order.
+QueueFile = tuple[str, Job]
+
+
+def _kernel_router_unit_name(router: str) -> str:
+    return f"ovn-kernel-{router}.service"
+
+
+def _kernel_service_unit_name(name: str) -> str:
+    return f"ovn-kernel-service-{name}.service"
+
+
+def _queue_name(kind: str, name: str) -> str:
+    """`<kind>-<name>.json` — what a queue file is called after its
+    timestamp. Only there for whoever lists the directory: the consumer
+    takes the order from the timestamp and everything else from the
+    content."""
+    safe = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
+    return f"{kind}-{safe}.json"
+
+
+def _package_jobs(host_node: pt.InfraHostNode) -> tuple[list[QueueFile], list[str]]:
+    """One job per ABSTRACT dependency of this host (the IR's
+    `dependencies` list, computed by src/ir.ts's hostDependencies — base
+    tooling plus `ovn`/`ovs`/`ip`/`iptables`/`dhclient`/`dhcpcd`/
+    `wireguard`/`zerotier`/`docker`, deliberately not distro packages),
+    mapped to the host OS's packages and install command — plus a note per
+    dependency that could NOT be mapped. Always resolved to a concrete OS
+    (assume Ubuntu when the config leaves it unset, 2026-08-23); no
+    deinstall ever happens."""
+    names = host_node.data.dependencies or []
+    if names and host_node.data.os.name not in _APT_OS:
+        os_name = host_node.data.os.name
+        return [], [f"unknown OS {os_name!r} — cannot install dependencies, skipping"]
+    jobs: list[QueueFile] = []
+    notes: list[str] = []
+    for name in names:
+        job: Job
+        if name == "zerotier":
+            # Not in the distro's own repositories: ZeroTier's installer
+            # adds its repository and installs the `zerotier-one` package.
+            job = {
+                "kind": "package",
+                "name": name,
+                "packages": ["zerotier-one"],
+                "install": ["sh", "-c", "curl -s https://install.zerotier.com | bash"],
+                "apt": False,
+            }
+        else:
+            if name == "ovn":
                 # EVERY OVN host runs ovn-controller (ovn-host) — a
                 # central chassis included: it owns OVS bridges and
                 # registers as a gateway chassis too. The central one
@@ -1703,21 +1759,185 @@ def _emit_os_dependencies(host_node: pt.InfraHostNode, emit: Emitter) -> None:
                 # central with no ovn-controller, so no chassis ever
                 # joined the SB DB and the whole fabric carried no
                 # traffic (confirmed live 2026-09-19).
-                pkgs = (
+                packages = (
                     ["ovn-central", "ovn-host"]
                     if host_node.data.ovnRole == pt.OvnRole.central
                     else ["ovn-host"]
                 )
             else:
-                pkg = _PACKAGE_BY_DEP.get(dep)
-                if pkg is None:
-                    emit.comment(f'# unknown dependency "{dep}" — skipped')
+                package = _PACKAGE_BY_DEP.get(name)
+                if package is None:
+                    notes.append(f'unknown dependency "{name}" — skipped')
                     continue
-                pkgs = [pkg]
-            for pkg in pkgs:
-                emit.sh(["env", "DEBIAN_FRONTEND=noninteractive", "apt-get", "install", "-y", pkg])
-    else:
-        emit.comment(f"# unknown OS {os_name!r} — cannot install dependencies, skipping")
+                packages = [package]
+            job = {
+                "kind": "package",
+                "name": name,
+                "packages": packages,
+                "install": [
+                    "env",
+                    "DEBIAN_FRONTEND=noninteractive",
+                    "apt-get",
+                    "install",
+                    "-y",
+                    *packages,
+                ],
+                "apt": True,
+            }
+        jobs.append((_queue_name("package", name), job))
+    return jobs, notes
+
+
+def _image_jobs(host_id: str, nodes: list[pt.Model]) -> list[QueueFile]:
+    """One job per docker image a unit on this host runs — a kernel
+    router's docker apps and the host's workload containers — with the
+    Dockerfile to build it from when the IR declares a `build` (else it is
+    pulled). The units' own `up` scripts still build/pull on first use;
+    queueing the images lets the consumer provide them BEFORE it restarts
+    a unit."""
+    by_name: dict[str, Job] = {}
+
+    def add(image: str, build: pt.DockerBuild | None) -> None:
+        by_name.setdefault(
+            image,
+            {
+                "kind": "image",
+                "image": image,
+                "dockerfile": _docker_dockerfile(build) if build else None,
+            },
+        )
+
+    for owner in _kernel_router_owners(host_id, nodes):
+        for side_node in _kernel_router_sides(owner.key.name, nodes):
+            for app in side_node.data.apps or []:
+                if app.kind == "docker":
+                    container = app.name or f"{owner.key.name}-docker"
+                    add(app.image or f"ovn-fabric-{container}", app.build)
+    for node in nodes:
+        if node.kind == "kernel.app.container" and node.data.host == host_id:
+            add(node.data.image, node.data.build)
+    return [(_queue_name("image", name), by_name[name]) for name in sorted(by_name)]
+
+
+def _unit_jobs(host_id: str, nodes: list[pt.Model]) -> list[QueueFile]:
+    """One job per systemd unit of the fabric on this host, in the order
+    the create pass starts them: a unit that could not come up (no image,
+    no tool, no internet) is the consumer's to restart once what it lacked
+    is there."""
+    units = [_kernel_router_unit_name(o.key.name) for o in _kernel_router_owners(host_id, nodes)]
+    units += [
+        _kernel_service_unit_name(n.key.name)
+        for n in nodes
+        if n.kind in ("kernel.app.container", "kernel.app.service") and n.data.host == host_id
+    ]
+    return [(_queue_name("unit", unit), {"kind": "unit", "unit": unit}) for unit in units]
+
+
+def _install_queue_consumer() -> str:
+    """deployer/install_queue.py's own source — the installed consumer IS
+    that tested, type-checked file, not a second implementation in a
+    string."""
+    source = pathlib.Path(__file__).with_name("install_queue.py").read_text(encoding="utf-8")
+    return source.rstrip("\n")
+
+
+def _install_queue_unit() -> str:
+    return "\n".join(
+        [
+            "[Unit]",
+            "Description=ovn-fabric install queue (packages, docker images, units to restart)",
+            # It waits for the internet itself (install_queue.online) —
+            # so no network-online.target.
+            "After=network-pre.target",
+            "Wants=network-pre.target",
+            "",
+            "[Service]",
+            "Type=simple",
+            f"ExecStart={_INSTALLER}",
+            "Restart=on-failure",
+            "RestartSec=10",
+            # Stopping the service stops the polling loop only: an
+            # apt-get/docker command it already started is left to finish
+            # (a killed dpkg leaves the package database half-configured).
+            "KillMode=process",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+        ]
+    )
+
+
+def _emit_queue_files(files: list[QueueFile], emit: Emitter) -> None:
+    for name, job in files:
+        emit.enqueue(_QUEUE_DIR, name, json.dumps(job, indent=2))
+
+
+def _has_install_queue(host_node: pt.InfraHostNode, nodes: list[pt.Model]) -> bool:
+    """A host with no package, no image and no unit of its own has nothing
+    to queue."""
+    return bool(
+        _package_jobs(host_node)[0]
+        or _image_jobs(host_node.id, nodes)
+        or _unit_jobs(host_node.id, nodes)
+    )
+
+
+def _emit_install_queue(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter) -> None:
+    """CREATE, at the START of the host pass: install the consumer and its
+    unit, queue this host's packages, then its images, run the consumer once in
+    the foreground (`--once`: what is missing is installed IF the host is
+    online; offline it returns at once and the pass goes on with what the
+    host has), then (re)start the service, which polls the queue from then
+    on. The consumer steps are optional — a host that cannot install
+    right now must not stop the deploy; a tool the pass itself needs and
+    does not find fails at the command that needs it.
+    DELETE: stop and remove it FIRST, queue included, so it cannot restart
+    a unit the delete pass is tearing down."""
+    if emit.action == "delete":
+        emit.comment("# --- install queue: remove ---")
+        emit.sh(["systemctl", "disable", "--now", _INSTALLER_UNIT])
+        emit.sh(["rm", "-f", _INSTALLER])
+        emit.sh(["rm", "-f", _INSTALLER_UNIT_PATH])
+        emit.sh(["rm", "-rf", _QUEUE_DIR])
+        emit.sh(["systemctl", "daemon-reload"])
+        emit.blank()
+        return
+    packages, notes = _package_jobs(host_node)
+    os_data = host_node.data.os
+    emit.comment(f"# --- install queue ({os_data.name} {os_data.version}) ---")
+    for note in notes:
+        emit.comment(f"# {note}")
+    emit.append(_INSTALLER, _install_queue_consumer())
+    emit.sh(["chmod", "+x", _INSTALLER])
+    emit.append(_INSTALLER_UNIT_PATH, _install_queue_unit())
+    emit.sh(["systemctl", "daemon-reload"])
+    # The queue is THIS deploy's: whatever an earlier one left is dropped.
+    emit.sh(["rm", "-rf", _QUEUE_DIR])
+    emit.sh(["mkdir", "-p", _QUEUE_DIR])
+    _emit_queue_files(packages + _image_jobs(host_node.id, nodes), emit)
+    # A consumer an earlier deploy left running is NOT stopped first (a
+    # create stops nothing; delete does). Until the restart below it may
+    # work on the queue side by side with `--once` — accepted: deploys
+    # are rare, and a job tried twice at once is just a failed try.
+    emit.sh([_INSTALLER, "--once"], optional=True)
+    # `restart`, not `enable --now`: a consumer that is already running
+    # must be replaced by the one just written; one that is not is started.
+    emit.sh(["systemctl", "enable", _INSTALLER_UNIT], optional=True)
+    emit.sh(["systemctl", "restart", _INSTALLER_UNIT], optional=True)
+    emit.blank()
+
+
+def _emit_unit_queue(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter) -> None:
+    """The END of a host's create pass: the fabric's units exist now, so
+    queue them — behind the packages and images, which were queued when
+    the pass began. The running consumer finds the files on its next poll
+    — nothing has to be started — drops the job of every unit that is up
+    and restarts one that is not, once its packages and images are in."""
+    units = _unit_jobs(host_node.id, nodes)
+    if not units:
+        return
+    emit.comment("# --- install queue: the units just started ---")
+    _emit_queue_files(units, emit)
     emit.blank()
 
 
@@ -1991,7 +2211,7 @@ def _emit_kernel_services(host_id: str, nodes: list[pt.Model], emit: Emitter) ->
         name = node.key.name
         faces = _service_faces(name, host_name, nodes)
         script_path = f"/usr/local/sbin/ovn-kernel-service-{name}.sh"
-        unit = f"ovn-kernel-service-{name}.service"
+        unit = _kernel_service_unit_name(name)
         unit_path = f"/etc/systemd/system/{unit}"
         emit.comment(f"# --- kernel.service: {name} ({len(faces)} NIC(s)) ---")
         if emit.action == "delete":
@@ -2066,7 +2286,13 @@ def _emit_host(
     host_name = host_node.key.host
     data = host_node.data
 
+    has_queue = _has_install_queue(host_node, nodes)
+
     if emit.action == "delete":
+        # The install queue goes FIRST: its consumer must not restart a
+        # unit this pass is about to tear down.
+        if has_queue:
+            _emit_install_queue(host_node, nodes, emit)
         if data.ovnRole == pt.OvnRole.central:
             emit.comment("# central: stop exposing the shared NB/SB DBs")
             emit.sh(ovn_ops.nb_del_connection_argv())
@@ -2098,17 +2324,20 @@ def _emit_host(
         return
 
     # Dependencies FIRST — nothing below (OVS/OVN, netns, services)
-    # works without them; no deinstall ever (2026-08-23). The Python
-    # front-end wraps this in `if not skip_deps:` so the generated
-    # deployer can run against a host whose packages are already present
-    # (`--skip-deps`); the shell front-end has no runtime flag, so its
-    # text stays flat.
-    if guard_deps and data.dependencies:
-        emit.begin_block("if not skip_deps:")
-        _emit_os_dependencies(host_node, emit)
-        emit.end_block()
-    else:
-        _emit_os_dependencies(host_node, emit)
+    # works without them; no deinstall ever (2026-08-23). They are no
+    # longer installed inline: they are QUEUED, the queue's consumer is
+    # asked once to install what is missing if the host is online, and
+    # its service does the rest in the background (see
+    # _emit_install_queue). The Python front-end wraps this in
+    # `if not skip_deps:` so the generated deployer can leave a host's
+    # dependencies alone altogether (`--skip-deps`); a caller that passes
+    # no `guard_deps` gets the commands flat.
+    if has_queue:
+        if guard_deps:
+            emit.begin_block("if not skip_deps:")
+        _emit_install_queue(host_node, nodes, emit)
+        if guard_deps:
+            emit.end_block()
     # Chassis registration RIGHT AFTER the packages, so ovn-controller
     # registers while the heavier steps run (the cluster pass resolves
     # this chassis by the hostname set here).
@@ -2120,13 +2349,20 @@ def _emit_host(
     # Flow export attaches to those now-existing segment bridges.
     _emit_ipfix(host_node, nodes, emit)
     _emit_kernel_services(host_node.id, nodes, emit)
+    # LAST: the units exist now — a router or workload that could not get
+    # its image or tool is the queue consumer's to restart once the
+    # internet is back (possibly through the very router this pass just
+    # deployed).
+    if has_queue and _unit_jobs(host_node.id, nodes):
+        if guard_deps:
+            emit.begin_block("if not skip_deps:")
+        _emit_unit_queue(host_node, nodes, emit)
+        if guard_deps:
+            emit.end_block()
 
 
-# The shared per-host body emitter — the one entry point both front-ends
-# call (the shell generator hands it a ShellEmitter, the Python generator
-# a PythonEmitter). The `#!/bin/sh`/`set -eu` envelope is NOT part of
-# this: that's shell-script structure, owned by the shell front-end (see
-# deployer/ir_to_shell.py); the Python front-end has no envelope.
+# The per-host body emitter — the one entry point a front-end calls (the
+# Python generator hands it a PythonEmitter, the tests a trace emitter).
 def _emit_host_script(
     host_node: pt.InfraHostNode,
     nodes: list[pt.Model],

@@ -68,7 +68,7 @@ def scope_id(scope: JsonObject) -> str:
 def netns_exec_argv(argv: list[str], netns: str | None) -> list[str]:
     """Wrap argv to run inside `netns` if given (via `ip netns exec`),
     unwrapped otherwise — the SAME wrapping run() applies below, exposed
-    separately so a generator (deployer/ir_to_shell.py) can print the
+    separately so a generator (deployer/ir_common.py) can print the
     exact argv without executing it, same reasoning as add_netns_argv/
     delete_netns_argv above."""
     return argv if netns is None else ["ip", "netns", "exec", netns, *argv]
@@ -86,7 +86,7 @@ def add_netns_argv(name: str) -> list[str]:
     """`ip netns add` — the mount-based naming convention every
     list_netns()/net.netns fact already relies on. Argv exposed
     separately from add_netns() below, same reasoning as ladops/ovn.py:
-    deployer/ir_to_shell.py (the generator) needs the exact argv to
+    deployer/ir_common.py (the generator) needs the exact argv to
     print, not to execute. Not netns-relative — `ip netns add/delete`
     manage /var/run/netns, reachable the same way regardless of which
     namespace you happen to be running from — so this always runs in

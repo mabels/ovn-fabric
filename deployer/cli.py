@@ -1,10 +1,10 @@
 # deployer/cli.py — reads an IR JSON file (ovn-fabric's `generate-ir`
-# output, or the reconciler's own live-state output), hydrates it into
-# protocol/generated.py's typed dataclasses (protocol/hydrate.py — a
-# malformed or newer-shaped node fails HERE, loudly, before any script
-# text is built), and prints shell script text via ir_to_shell.
-# build_scripts(). Pure text output — see ir_to_shell.py's header
-# comment for why this never executes anything.
+# output), hydrates it into protocol/generated.py's typed dataclasses
+# (protocol/hydrate.py — a malformed or newer-shaped node fails HERE,
+# loudly, before any text is built), and prints the all-in-one generated
+# Python deployer (deployer/ir_to_python.py). Pure text output — nothing
+# here executes anything; WHAT runs (create/delete, which host, a purge)
+# is picked when the generated file itself is run.
 
 from __future__ import annotations
 
@@ -15,13 +15,12 @@ import sys
 from protocol.hydrate import hydrate_nodes
 
 from .ir_to_python import generate_python_deployer
-from .ir_to_shell import build_scripts
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="deployer",
-        description="Convert a desired-state IR JSON file into shell scripts.",
+        description="Convert a desired-state IR JSON file into the generated Python deployer.",
     )
     parser.add_argument(
         "ir_path",
@@ -30,18 +29,12 @@ def main(argv: list[str] | None = None) -> int:
         "or - to read from stdin (e.g. piped straight from generate-ir)",
     )
     parser.add_argument(
-        "--action",
-        choices=["create", "delete"],
-        default="create",
-        help="create (default, plain adds) or delete (--if-exists, cascading — see ladops/ovn.py).",
-    )
-    parser.add_argument(
         "--emit",
-        choices=["scripts", "python"],
-        default="scripts",
-        help="scripts (default): the current cluster + per-host shell-script text; "
-        "python: the all-in-one generated Python deployer (runs every pass, "
-        "pick with --action/--cluster/--host at runtime)",
+        choices=["python"],
+        default="python",
+        help="the output format — only `python` remains (the all-in-one generated deployer; "
+        "pick what it does with --action/--cluster/--host/--ovn-purge when you run it). "
+        "Kept so existing `--emit python` invocations keep working",
     )
     args = parser.parse_args(argv)
 
@@ -52,18 +45,7 @@ def main(argv: list[str] | None = None) -> int:
             raw_nodes = json.load(f)
     nodes = hydrate_nodes(raw_nodes)
 
-    if args.emit == "python":
-        print(generate_python_deployer(nodes))
-        return 0
-
-    cluster_script, host_scripts = build_scripts(nodes, args.action)
-
-    print("# ===== cluster (run once, on the central chassis) =====")
-    print(cluster_script)
-    for host_name, script in host_scripts.items():
-        print(f"# ===== host: {host_name} =====")
-        print(script)
-
+    print(generate_python_deployer(nodes))
     return 0
 
 

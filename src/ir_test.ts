@@ -1,5 +1,5 @@
 // src/ir_test.ts — covers toIR()'s shortIfaceName derivation, moved
-// here from deployer/ir_to_shell.py's own _bridge_name/_fnv1a_32
+// here from deployer/ir_common.py's own _bridge_name/_fnv1a_32
 // (2026-08-12 — see ir.ts's own shortIfaceName() doc comment for why:
 // the generator computes the FINAL name a real kernel object needs,
 // the translator only ever applies an already-resolved fact).

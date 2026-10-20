@@ -636,7 +636,7 @@ export interface TunnelRouterEndpoint extends EndpointDefinition {
  * addresses/routes actually bind to (same shape as RouterEndpointBase.
  * ifaces — see its own doc comment above) — the deployer creates/moves
  * the interface into the netns instead of a dummy stand-in
- * (deployer/ir_to_shell.py's own _emit_kernel_router_create). Only
+ * (deployer/ir_common.py's own _emit_kernel_router_create). Only
  * populated for `right` today (via NetworkBuilder.kernelRouterEndpoint(),
  * which copies the kernelRouterEndpoint() input's `ifaces` onto this
  * side in ADDITION to the OVN-side endpoint's own copy, 2026-08-18 —

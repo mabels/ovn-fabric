@@ -215,7 +215,7 @@ class HydrateOvnLrpTest(unittest.TestCase):
     def test_missing_mac_raises_instead_of_reaching_the_deployer(self) -> None:
         # The whole point of hydrating at the boundary: a stale IR JSON
         # (predating src/ir.ts resolving mac itself) fails loudly HERE,
-        # not deep inside ir_to_shell.py's script emission.
+        # not deep inside ir_common.py's script emission.
         raw = {**RAW_OVN_LRP, "data": {k: v for k, v in RAW_OVN_LRP["data"].items() if k != "mac"}}
         with self.assertRaises(mod.IRShapeError) as caught:
             mod.hydrate_node(raw)
