@@ -7,9 +7,9 @@ node per host / collision domain / router port / workload. Feed that IR to
 the Python deployer (`deployer/`), which turns it into **one self-contained
 Python script** carrying every host's pass. Copy that script to a host and
 run it: it creates the OVS bridges/interfaces, builds the full OVN logical
-topology (routers, switches, NAT), and installs the kernel routers and
-workloads as boot-time systemd units — idempotently, so re-running it is
-always safe.
+topology (routers, switches, NAT), and installs the interface bindings,
+kernel routers and workloads as boot-time systemd units — idempotently, so
+re-running it is always safe.
 
 No netplan, no hand-written `ovn-nbctl`/`ovs-vsctl` invocations, no
 configuration drift between "what I meant to set up" and "what's actually
@@ -140,7 +140,19 @@ python3 install.py --cluster            # only the cluster-wide ovn-nbctl pass
 python3 install.py --ovn-purge          # wipe the OVS database and, on the central, OVN's NB/SB
 ```
 
-`--verbose` echoes every command.
+`--verbose` echoes every command; `--skip-deps` leaves the install queue
+out altogether; `--no-start` writes and enables the fabric's units without
+starting them (the boot restore pass uses it).
+
+A create pass also installs its own generated program as
+`/usr/local/sbin/ovn-fabric-deployer.py` and enables
+`ovn-fabric-restore.service`, which re-runs that host's pass at boot —
+`--host NAME --skip-deps --no-start`, after OVS and the interface bindings.
+The fabric's units are ordered after it, so the create pass stays the
+source of truth on the host: anything it set up that a kernel netdevice or
+OVS row does not survive a reboot with is put back. (A run from stdin has
+no file to install, so it only warns and the unit's `ExecCondition` skips
+itself.)
 
 Deploying a router can cut the host's own internet access while the deploy
 runs, so nothing is installed inline. Each host's create **queues** what the
@@ -223,6 +235,12 @@ an explanation of what it's for and why it's shaped the way it is.
   missing tool never blocks router startup. Packages only ever come through
   the install queue (above), whose consumer waits for the internet instead
   of failing and puts a time limit on every command it runs.
+- Boot order: `ovn-fabric-bindings.service` (real VLANs and OVS
+  bridges/ports) runs first, then `ovn-fabric-restore.service` (the host
+  pass with `--no-start`), then the router/workload units. The restore pass
+  enables the fabric units but does not start them — it is ordered before
+  them, so starting one from inside it would deadlock; systemd starts them
+  once it finishes.
 - Idempotency throughout: `--may-exist`/`--if-exists` on every
   `ovs-vsctl`/`ovn-nbctl` call, `ip link show ... || ...` guards, `cmp -s`
   before overwriting any file (including WireGuard confs — the tunnel only

@@ -111,7 +111,12 @@ function resolveEncapIp(host: Host): string | undefined {
 // everyday debugging commands, and curl is also what the zerotier
 // installer needs), an OVN-cluster host needs `ovn`+`ovs`, any kernel
 // router's netns needs `ip`+`iptables`, and the apps need their own
-// (dhclient/dhcpcd, wireguard, zerotier, docker). The deployer maps each
+// (dhclient/dhcpcd, wireguard, zerotier+jq, docker). `jq` is not
+// optional for zerotier: the generated wire script parses
+// `zerotier-cli -j listnetworks` with it to learn the mesh device name
+// (deployer/ir_common.py's _zerotier_wire_script), and without it that
+// script dies with "jq: not found" and the mesh device is never
+// configured (confirmed live, 2026-10-20). The deployer maps each
 // abstract dependency to the host OS's concrete package/install form;
 // there is deliberately NO deinstall.
 function hostDependencies(host: Host, network: NetworkDefinition): string[] {
@@ -135,6 +140,7 @@ function hostDependencies(host: Host, network: NetworkDefinition): string[] {
             deps.add("wireguard");
           } else if (app.kind === "zerotier") {
             deps.add("zerotier");
+            deps.add("jq");
           } else if (app.kind === "docker") {
             deps.add("docker");
           }

@@ -82,6 +82,17 @@ class _TraceEmitter(Emitter):
     def enqueue(self, directory: str, name: str, content: str) -> None:
         self.append(f"{directory}/<queued-at>-{name}", content)
 
+    def install_self(self, path: str) -> None:
+        # No shell equivalent — a comment keeps it out of
+        # _shell_command_lines (the generated Python's install_self() call
+        # likewise is not a run_cmd).
+        self.lines.append(f"# install-self {path}")
+
+    def enable_unit(self, unit: str, optional: bool = True) -> None:
+        # The trace is the deploy pass (`no_start` false), so render the
+        # branch the generated Python takes there.
+        self.sh(["systemctl", "enable", "--now", unit], optional=optional)
+
 
 def build_scripts(nodes: list[pt.Model], action: Action) -> tuple[str, dict[str, str]]:
     """(the cluster pass, {host name: that host's pass}) for `action`, each
@@ -534,10 +545,13 @@ class IfaceBindingCreateTest(unittest.TestCase):
         _, hosts = build_scripts(nodes, "create")
         script = hosts["chassis-1"]
         self.assertIn("ip link set veth-ovn-9adb1d up", script)
-        self.assertLess(
-            script.index("ip link set veth-ovn-9adb1d up"),
-            script.index("ovs-vsctl --may-exist add-port br-1f5b95ad veth-ovn-9adb1d"),
-        )
+        # The LIVE create block must up the root leg before adding it as
+        # a port. (The boot bindings block above it also adds the port,
+        # before any veth exists — the router unit creates and ups it —
+        # so start the search at the live block's `up`.)
+        up = script.index("ip link set veth-ovn-9adb1d up")
+        port = script.index("ovs-vsctl --may-exist add-port br-1f5b95ad veth-ovn-9adb1d", up)
+        self.assertLess(up, port)
 
     def test_bridge_mapping_set_on_the_owning_host(self) -> None:
         self.assertIn("external-ids:ovn-bridge-mappings=net-home:br-home", self.hosts["chassis-1"])
@@ -607,6 +621,106 @@ class IfaceBindingDeleteTest(unittest.TestCase):
         self.assertIn(
             "ovs-vsctl remove open_vswitch . external-ids ovn-bridge-mappings",
             self.hosts["chassis-1"],
+        )
+
+
+class BootBindingsTest(unittest.TestCase):
+    """The per-host ovn-fabric-bindings.service: OVS keeps its bridge/port
+    rows across a reboot, the netdevices they reference do not (confirmed
+    live, 2026-10-20 — every segment bridge read "could not open network
+    device eth0.<vlan>"). This unit re-runs the idempotent create bindings
+    at boot, after OVS and before the fabric's own units."""
+
+    SCRIPT = "/usr/local/sbin/ovn-fabric-bindings.sh"
+    UNIT = "/etc/systemd/system/ovn-fabric-bindings.service"
+
+    def setUp(self) -> None:
+        _, self.hosts = build_scripts(NODES, "create")
+
+    def test_recreates_the_vlan_and_its_bridge_at_boot(self) -> None:
+        body = _written_file(self.hosts["chassis-1"], self.SCRIPT)
+        self.assertIn("ip link add link eth0 name eth0.129 type vlan id 129", body)
+        self.assertIn("ip link set eth0.129 up", body)
+        self.assertIn("ovs-vsctl --may-exist add-br br-home", body)
+        self.assertIn("ovs-vsctl --may-exist add-port br-home eth0.129", body)
+
+    def test_ordered_after_ovs_and_enabled(self) -> None:
+        host = self.hosts["chassis-1"]
+        unit = _written_file(host, self.UNIT)
+        self.assertIn("After=network-pre.target ovsdb-server.service ovs-vswitchd.service", unit)
+        self.assertIn("systemctl enable ovn-fabric-bindings.service", host)
+
+    def test_fabric_units_are_ordered_after_the_bindings(self) -> None:
+        router = _written_file(
+            self.hosts["chassis-1"], "/etc/systemd/system/ovn-kernel-kernel-0.service"
+        )
+        self.assertIn("After=network-pre.target ovn-fabric-bindings.service", router)
+
+    def test_a_host_without_bindings_gets_no_unit(self) -> None:
+        # The restore unit mentions it in After=, but no bindings files
+        # are written on a host that has nothing to bind.
+        self.assertNotIn("/usr/local/sbin/ovn-fabric-bindings.sh", self.hosts["central-1"])
+        self.assertNotIn("/etc/systemd/system/ovn-fabric-bindings.service", self.hosts["central-1"])
+
+    def test_delete_removes_the_unit_before_the_bridges(self) -> None:
+        _, hosts = build_scripts(NODES, "delete")
+        script = hosts["chassis-1"]
+        self.assertIn("systemctl disable --now ovn-fabric-bindings.service", script)
+        self.assertLess(
+            script.index("systemctl disable --now ovn-fabric-bindings.service"),
+            script.index("ovs-vsctl --if-exists del-br br-home"),
+        )
+
+
+class BootRestoreTest(unittest.TestCase):
+    """ovn-fabric-restore.service: the generated program is installed on
+    the host and its host pass re-runs at boot (--skip-deps --no-start).
+    The fabric units are ordered After= it, and `--no-start` is what
+    keeps that from deadlocking: the restore pass enables them, systemd
+    starts them once it has finished."""
+
+    SCRIPT = "/usr/local/sbin/ovn-fabric-deployer.py"
+    UNIT = "/etc/systemd/system/ovn-fabric-restore.service"
+
+    def setUp(self) -> None:
+        _, self.hosts = build_scripts(NODES, "create")
+
+    def test_installs_the_running_program_and_enables_the_unit(self) -> None:
+        host = self.hosts["chassis-1"]
+        self.assertIn(f"# install-self {self.SCRIPT}", host)
+        unit = _written_file(host, self.UNIT)
+        self.assertIn(
+            f"ExecStart=/usr/bin/python3 {self.SCRIPT} --host chassis-1 --skip-deps --no-start",
+            unit,
+        )
+        self.assertIn(f"ExecCondition=/usr/bin/test -x {self.SCRIPT}", unit)
+        self.assertIn("systemctl enable ovn-fabric-restore.service", host)
+
+    def test_runs_after_ovs_and_the_bindings(self) -> None:
+        unit = _written_file(self.hosts["chassis-1"], self.UNIT)
+        self.assertIn(
+            "After=network-pre.target ovsdb-server.service ovs-vswitchd.service"
+            " ovn-fabric-bindings.service",
+            unit,
+        )
+
+    def test_router_units_wait_for_the_restore(self) -> None:
+        router = _written_file(
+            self.hosts["chassis-1"],
+            "/etc/systemd/system/ovn-kernel-kernel-0.service",
+        )
+        self.assertIn(
+            "After=network-pre.target ovn-fabric-bindings.service" " ovn-fabric-restore.service",
+            router,
+        )
+
+    def test_delete_removes_the_restore_unit_before_the_fabric(self) -> None:
+        _, hosts = build_scripts(NODES, "delete")
+        script = hosts["chassis-1"]
+        self.assertIn("systemctl disable --now ovn-fabric-restore.service", script)
+        self.assertLess(
+            script.index("systemctl disable --now ovn-fabric-restore.service"),
+            script.index("systemctl disable --now ovn-kernel-kernel-0.service"),
         )
 
 
@@ -751,6 +865,14 @@ class KernelRouterCreateTest(unittest.TestCase):
         self.assertIn("ip link set veth-krn-0 netns ns-kernel-0", script)
         self.assertIn("ip netns exec ns-kernel-0 ip addr add 10.99.0.2/28 dev veth-krn-0", script)
         self.assertNotIn("ip link add dummy-left type dummy", script)
+        # The ROOT leg is born DOWN; the boot unit must up it itself, or
+        # the netns leg stays LOWERLAYERDOWN and its routes linkdown
+        # after a reboot (confirmed live, 2026-10-20).
+        self.assertIn("ip link set veth-ovn-0 up", script)
+        self.assertLess(
+            script.index("ip link add veth-ovn-0 type veth peer name veth-krn-0"),
+            script.index("ip link set veth-ovn-0 up"),
+        )
 
     def test_veth_netns_leg_gets_the_generator_resolved_mac(self) -> None:
         # The generator resolves the netns-side leg's MAC from the side's
@@ -1009,6 +1131,7 @@ class KernelRouterCreateTest(unittest.TestCase):
                             "iptables",
                             "dhclient",
                             "zerotier",
+                            "jq",
                         ],
                     ),
                 )
@@ -1039,6 +1162,8 @@ class KernelRouterCreateTest(unittest.TestCase):
                 # zerotier's curl installer runs via sh -c so the pipe is
                 # argv-safe.
                 "zerotier": "sh -c curl -s https://install.zerotier.com | bash",
+                # zerotier's wire script parses `zerotier-cli -j` with jq.
+                "jq": apt + "jq",
             },
         )
         # One file per dependency, queued in the IR's order (curl before
@@ -1778,9 +1903,25 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             # no-op them so the run_cmd argv stays comparable.
             ns["write_file"] = mock.Mock()
             ns["queue_file"] = mock.Mock()
-            ns["_host_chassis_1_create"](False, True, False)
+            ns["install_self"] = mock.Mock()
+            ns["_host_chassis_1_create"](False, True, False, False)
             argv_seen = [call.args[0] for call in run.call_args_list]
         self.assertEqual(shell_commands, argv_seen)
+
+    def test_no_start_enables_without_starting_the_fabric_units(self) -> None:
+        # ovn-fabric-restore.service runs the host pass with --no-start:
+        # the units are ordered After= the restore, so starting one from
+        # inside the pass would wait forever on the pass itself.
+        ns = self._exec_runtime()
+        ns["write_file"] = mock.Mock()
+        ns["queue_file"] = mock.Mock()
+        ns["install_self"] = mock.Mock()
+        with mock.patch("subprocess.run") as run:
+            run.return_value.returncode = 0
+            ns["_host_chassis_1_create"](False, True, True, True)
+            argv = [call.args[0] for call in run.call_args_list]
+        self.assertIn(["systemctl", "enable", "ovn-kernel-kernel-0.service"], argv)
+        self.assertNotIn(["systemctl", "enable", "--now", "ovn-kernel-kernel-0.service"], argv)
 
     def test_runtime_exposes_the_cli_selectors(self) -> None:
         src = mod.generate_python_deployer(NODES)
@@ -1790,6 +1931,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             "--host",
             "--verbose",
             "--skip-deps",
+            "--no-start",
             "--ovn-purge",
             "def run_cmd",
             "def write_file",
@@ -1827,7 +1969,8 @@ class GeneratePythonDeployerTest(unittest.TestCase):
                 run.return_value.returncode = 0
                 ns["write_file"] = mock.Mock()
                 ns["queue_file"] = mock.Mock()
-                ns["_host_chassis_1_create"](False, True, skip_deps)
+                ns["install_self"] = mock.Mock()
+                ns["_host_chassis_1_create"](False, True, skip_deps, False)
                 seen = [call.args[0] for call in run.call_args_list]
             return [" ".join(argv) for argv in seen]
 
@@ -1875,8 +2018,8 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         ns["cluster_create"] = lambda v, a: order.append("cluster:create")
         ns["cluster_delete"] = lambda v, a: order.append("cluster:delete")
         for name, fns in ns["HOSTS"].items():
-            fns["create"] = (lambda n: lambda v, a, s: order.append(f"host:{n}:create"))(name)
-            fns["delete"] = (lambda n: lambda v, a, s: order.append(f"host:{n}:delete"))(name)
+            fns["create"] = (lambda n: lambda v, a, s, t: order.append(f"host:{n}:create"))(name)
+            fns["delete"] = (lambda n: lambda v, a, s, t: order.append(f"host:{n}:delete"))(name)
 
         with mock.patch.object(sys, "argv", ["deployer", "--action", "create"]):
             ns["main"]()
@@ -1900,7 +2043,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         order: list[str] = []
         ns["cluster_create"] = lambda v, a: order.append("cluster:create")
         for name, fns in ns["HOSTS"].items():
-            fns["create"] = (lambda n: lambda v, a, s: order.append(f"host:{n}:create"))(name)
+            fns["create"] = (lambda n: lambda v, a, s, t: order.append(f"host:{n}:create"))(name)
         with mock.patch.object(sys, "argv", ["deployer", "--cluster"]):
             ns["main"]()
         self.assertEqual(order, ["cluster:create"])
@@ -2055,7 +2198,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         order: list[str] = []
         ns["cluster_create"] = lambda v, a: order.append(f"cluster:create:abort={a}")
         for fns in ns["HOSTS"].values():
-            fns["create"] = lambda v, a, s: order.append("host:create")
+            fns["create"] = lambda v, a, s, t: order.append("host:create")
         with mock.patch.object(sys, "argv", ["deployer"]):
             self.assertEqual(ns["main"](), 0)
         self.assertEqual(order[-1], "cluster:create:abort=True")

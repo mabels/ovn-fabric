@@ -184,6 +184,20 @@ class Emitter:
         The file appears under that name complete or not at all."""
         raise NotImplementedError
 
+    def install_self(self, path: str) -> None:
+        """Copy the running generated program to `path` — what the boot
+        restore unit execs (Python: install_self(); the tests' trace
+        renders a comment; there is no shell rendering)."""
+        raise NotImplementedError
+
+    def enable_unit(self, unit: str, optional: bool = True) -> None:
+        """Enable a unit and start it now — EXCEPT during the boot restore
+        pass (`--no-start`), which must only enable: the fabric units are
+        ordered After= the restore unit, so starting them from inside it
+        would deadlock (`systemctl` waits for a unit that waits for the
+        restore to finish)."""
+        raise NotImplementedError
+
     def comment(self, text: str) -> None:
         self.lines.append(text)
 
@@ -1352,7 +1366,14 @@ def _emit_kernel_router_owner(
                 # `mac` (src/ir.ts's kernelRouterSideToIR) pins the
                 # netns-side leg's MAC so the OVN router's MAC_Binding
                 # for this side stays valid across a down/up.
-                emit.sh(linux_net_ops.add_veth_argv(f"veth-ovn-{iface.shortName}", dev, iface.mac))
+                root_leg = f"veth-ovn-{iface.shortName}"
+                emit.sh(linux_net_ops.add_veth_argv(root_leg, dev, iface.mac))
+                # The ROOT leg is born DOWN and nothing else touches it
+                # at boot: _emit_iface_bindings also upped it, but that
+                # only runs in the deploy pass. Without this the netns
+                # leg stays LOWERLAYERDOWN and every route through it
+                # linkdown after a reboot (confirmed live, 2026-10-20).
+                emit.sh(linux_net_ops.set_link_up_argv(root_leg))
             # "physical": the device must already exist in the root
             # namespace — nothing to create, only the move below.
         else:
@@ -1460,7 +1481,10 @@ def _kernel_router_unit(router: str, script_path: str) -> str:
         [
             "[Unit]",
             f"Description=ovn-fabric kernel router {router}",
-            "After=network-pre.target",
+            # Bindings first, then the restore pass (which re-applies
+            # everything else), then this unit — which creates (and ups)
+            # the transit veths.
+            "After=network-pre.target ovn-fabric-bindings.service" " ovn-fabric-restore.service",
             "Wants=network-pre.target",
             "",
             "[Service]",
@@ -1514,8 +1538,9 @@ def _emit_kernel_router(host_id: str, nodes: list[pt.Model], emit: Emitter) -> N
         emit.append(unit_path, _kernel_router_unit(router, script_path))
         emit.sh(["systemctl", "daemon-reload"])
         # Optional: one broken router unit must not stop the rest of the
-        # deploy (it is reported and the pass continues).
-        emit.sh(["systemctl", "enable", "--now", unit], optional=True)
+        # deploy (it is reported and the pass continues). The boot
+        # restore pass only enables — systemd starts it after the restore.
+        emit.enable_unit(unit, optional=True)
     if len(emit.lines) > before:
         emit.blank()
 
@@ -1530,7 +1555,16 @@ def _emit_kernel_router(host_id: str, nodes: list[pt.Model], emit: Emitter) -> N
 # del-port call — same reasoning as ladops.ovn.ls_del_argv), plus an
 # explicit vlan link delete, and removes the ovn-bridge-mappings entry.
 # Create/delete branches adjacent, 2026-08-19 (flag schema).
-def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -> None:
+def _emit_iface_bindings(
+    host_name: str, nodes: list[pt.Model], emit: Emitter, boot: bool = False
+) -> None:
+    """`boot=True` renders the body of the per-host bindings unit
+    (ovn-fabric-bindings.service), which runs BEFORE the kernel
+    router/service units. The transit veths do not exist yet at that
+    point — their own units create them (and up the root leg themselves,
+    see _emit_kernel_router_owner), so the `veth` case here only ensures
+    the OVS port row and skips `ip link set` on a device that is not
+    there yet."""
     before = len(emit.lines)
     bindings = _host_bindings(nodes).get(host_name, [])
     if emit.action == "create":
@@ -1548,13 +1582,15 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
             if iface.kind == "vlan":
                 emit.sh(linux_net_ops.ensure_vlan_argv(iface.vlanParent, real_name, iface.vlanId))
                 emit.sh(linux_net_ops.set_link_up_argv(real_name))
-            elif iface.kind == "veth":
+            elif iface.kind == "veth" and not boot:
                 # The ROOT-side leg of the kernel router's transit veth —
                 # the kernel router block brings the netns-side leg up,
                 # but the peer stays DOWN in root until told otherwise
                 # (confirmed live, 2026-08-19: `ip l | grep 9adb1d`
                 # showed state DOWN until `ip l set dev veth-ovn-... up`),
                 # so bring it up before it becomes the bridge's port.
+                # At boot the router unit owns it (and creates it), so
+                # there is nothing to up here yet.
                 emit.sh(linux_net_ops.set_link_up_argv(real_name))
             emit.sh(ovs_ops.add_br_argv(bridge))
             emit.sh(ovs_ops.set_bridge_fail_mode_argv(bridge))
@@ -1578,6 +1614,156 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
             emit.sh(ovs_ops.remove_external_id_argv("ovn-bridge-mappings"))
     if len(emit.lines) > before:
         emit.blank()
+
+
+# ── boot-time interface bindings ──────────────────────────────────────
+# _emit_iface_bindings above creates the real segment interfaces (VLAN
+# sub-interfaces, the transit veths' root legs) and their OVS
+# bridges/ports — but only in the deploy pass. OVS's own rows survive a
+# reboot (conf.db); the NETDEVICES do not, so after a reboot every VLAN
+# port in every segment bridge read "could not open network device
+# eth0.<vlan> (No such device)" and the segments had no uplink
+# (confirmed live, 2026-10-20). This unit re-runs the same (idempotent)
+# create body at boot, ordered after OVS and before the kernel
+# router/service units (which declare After= this unit).
+_BINDINGS_SCRIPT = "/usr/local/sbin/ovn-fabric-bindings.sh"
+_BINDINGS_UNIT = "ovn-fabric-bindings.service"
+_BINDINGS_UNIT_PATH = f"/etc/systemd/system/{_BINDINGS_UNIT}"
+
+
+def _bindings_script(host_name: str, nodes: list[pt.Model]) -> str:
+    body = _ShellBody("create")
+    _emit_iface_bindings(host_name, nodes, body, boot=True)
+    return "\n".join(
+        [
+            "#!/bin/sh",
+            f"# ovn-fabric host bindings ({host_name}): recreate the real",
+            "# segment interfaces (VLAN sub-interfaces) and their OVS",
+            "# bridges/ports at boot. OVS keeps its rows across a reboot, the",
+            "# netdevices they reference do not. The kernel routers' transit",
+            "# veths are created by their own units, which run AFTER this one.",
+            "# Idempotent — re-running is always safe.",
+            "set -eu",
+            *body.lines,
+        ]
+    ).rstrip("\n")
+
+
+def _bindings_unit(host_name: str) -> str:
+    return "\n".join(
+        [
+            "[Unit]",
+            f"Description=ovn-fabric host bindings ({host_name})",
+            # The OVS daemons own the datapath these devices attach to;
+            # network-pre.target alone would race them (2026-10-20).
+            "After=network-pre.target ovsdb-server.service ovs-vswitchd.service",
+            "Wants=network-pre.target ovsdb-server.service ovs-vswitchd.service",
+            "",
+            "[Service]",
+            "Type=oneshot",
+            f"ExecStart={_BINDINGS_SCRIPT}",
+            "RemainAfterExit=yes",
+            "TimeoutStartSec=60",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+        ]
+    )
+
+
+def _emit_bindings_unit(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitter) -> None:
+    """The per-host bindings unit. CREATE installs it (enabled, not
+    started — the deploy pass applies the bindings inline right after);
+    DELETE removes it BEFORE the bridges are torn down."""
+    host_name = host_node.key.host
+    bindable = any(
+        iface.kind in _BINDABLE_IFACE_KINDS
+        for _domain, iface in _host_bindings(nodes).get(host_name, [])
+    )
+    if not bindable:
+        return
+    emit.comment(f"# --- host bindings service: {_BINDINGS_UNIT} ---")
+    if emit.action == "delete":
+        emit.sh(["systemctl", "disable", "--now", _BINDINGS_UNIT], optional=True)
+        emit.sh(["rm", "-f", _BINDINGS_SCRIPT])
+        emit.sh(["rm", "-f", _BINDINGS_UNIT_PATH])
+        emit.sh(["systemctl", "daemon-reload"])
+        emit.blank()
+        return
+    emit.append(_BINDINGS_SCRIPT, _bindings_script(host_name, nodes))
+    emit.sh(["chmod", "+x", _BINDINGS_SCRIPT])
+    emit.append(_BINDINGS_UNIT_PATH, _bindings_unit(host_name))
+    emit.sh(["systemctl", "daemon-reload"])
+    emit.sh(["systemctl", "enable", _BINDINGS_UNIT], optional=True)
+    emit.blank()
+
+
+# ── boot-time full restore ────────────────────────────────────────────
+# The bindings unit restores today's known gap, but the create pass is
+# still the source of truth for everything else (chassis external-ids,
+# OVS/OVN settings, kernel routers/workloads). Installing the generated
+# program on the host and re-running the host pass at boot makes that
+# true on the host too, so a future create-pass step is restored for
+# free instead of needing its own unit (2026-10-20).
+_RESTORE_SCRIPT = "/usr/local/sbin/ovn-fabric-deployer.py"
+_RESTORE_UNIT = "ovn-fabric-restore.service"
+_RESTORE_UNIT_PATH = f"/etc/systemd/system/{_RESTORE_UNIT}"
+
+
+def _restore_unit(host_name: str) -> str:
+    return "\n".join(
+        [
+            "[Unit]",
+            f"Description=ovn-fabric boot restore ({host_name})",
+            # Bindings first: it recreates the netdevices the host pass
+            # would otherwise have to race. The fabric's own units are
+            # NOT ordered after this one — the pass itself starts them,
+            # and After= here would deadlock (`enable --now` waits for a
+            # unit that waits for this one).
+            "After=network-pre.target ovsdb-server.service ovs-vswitchd.service"
+            " ovn-fabric-bindings.service",
+            "Wants=network-pre.target ovsdb-server.service ovs-vswitchd.service",
+            "",
+            "[Service]",
+            "Type=oneshot",
+            # A run from stdin has no file to install — skip cleanly
+            # instead of failing the boot.
+            f"ExecCondition=/usr/bin/test -x {_RESTORE_SCRIPT}",
+            # --skip-deps: packages/images/units are the queue's job (its
+            # service is already enabled and keeps its own state).
+            # --no-start: the fabric units are ordered After= this unit;
+            # starting them from inside it would deadlock, so this pass
+            # only writes and enables them and systemd starts them next.
+            f"ExecStart=/usr/bin/python3 {_RESTORE_SCRIPT} --host {host_name} "
+            "--skip-deps --no-start",
+            "TimeoutStartSec=300",
+            "RemainAfterExit=yes",
+            "",
+            "[Install]",
+            "WantedBy=multi-user.target",
+        ]
+    )
+
+
+def _emit_restore_unit(host_node: pt.InfraHostNode, emit: Emitter) -> None:
+    """CREATE installs the running generated program as _RESTORE_SCRIPT
+    and enables the unit that re-runs its host pass at boot. DELETE
+    disables it FIRST (it must not re-create what the delete pass tears
+    down) and removes both files."""
+    host_name = host_node.key.host
+    emit.comment(f"# --- boot restore service: {_RESTORE_UNIT} ---")
+    if emit.action == "delete":
+        emit.sh(["systemctl", "disable", "--now", _RESTORE_UNIT], optional=True)
+        emit.sh(["rm", "-f", _RESTORE_UNIT_PATH])
+        emit.sh(["rm", "-f", _RESTORE_SCRIPT])
+        emit.sh(["systemctl", "daemon-reload"])
+        emit.blank()
+        return
+    emit.install_self(_RESTORE_SCRIPT)
+    emit.append(_RESTORE_UNIT_PATH, _restore_unit(host_name))
+    emit.sh(["systemctl", "daemon-reload"])
+    emit.sh(["systemctl", "enable", _RESTORE_UNIT], optional=True)
+    emit.blank()
 
 
 # ── flow export (IPFIX) ───────────────────────────────────────────────
@@ -1672,6 +1858,9 @@ _PACKAGE_BY_DEP = {
     "dhcpcd": "dhcpcd",
     "wireguard": "wireguard-tools",
     "docker": "docker.io",
+    # zerotier's generated wire script parses `zerotier-cli -j` with jq
+    # (src/ir.ts's hostDependencies adds it for the same reason).
+    "jq": "jq",
     # base tooling — abstract names the generator adds to every host
     # (src/ir.ts's hostDependencies), mapped here like every other dep.
     "arp": "net-tools",
@@ -1847,8 +2036,9 @@ def _install_queue_unit() -> str:
             "[Unit]",
             "Description=ovn-fabric install queue (packages, docker images, units to restart)",
             # It waits for the internet itself (install_queue.online) —
-            # so no network-online.target.
-            "After=network-pre.target",
+            # so no network-online.target. After the restore pass, so it
+            # never restarts a unit while the pass is rewriting it.
+            "After=network-pre.target ovn-fabric-restore.service",
             "Wants=network-pre.target",
             "",
             "[Service]",
@@ -2178,7 +2368,9 @@ def _service_unit(name: str, script_path: str) -> str:
         [
             "[Unit]",
             f"Description=ovn-fabric kernel service {name}",
-            "After=network-pre.target",
+            # A container's veth attaches to a segment bridge, which the
+            # bindings unit and the restore pass (re)create first.
+            "After=network-pre.target ovn-fabric-bindings.service" " ovn-fabric-restore.service",
             "Wants=network-pre.target",
             "",
             "[Service]",
@@ -2230,8 +2422,9 @@ def _emit_kernel_services(host_id: str, nodes: list[pt.Model], emit: Emitter) ->
         emit.sh(["systemctl", "daemon-reload"])
         # Optional: a non-working workload must not block every other
         # operation — the failure is reported and the deploy continues to
-        # the next service (2026-09-16).
-        emit.sh(["systemctl", "enable", "--now", unit], optional=True)
+        # the next service (2026-09-16). The boot restore pass only
+        # enables; systemd starts it after the restore.
+        emit.enable_unit(unit, optional=True)
 
 
 def _emit_chassis_registration(
@@ -2293,6 +2486,8 @@ def _emit_host(
         # unit this pass is about to tear down.
         if has_queue:
             _emit_install_queue(host_node, nodes, emit)
+        # Likewise the boot restore unit: it re-runs the create pass.
+        _emit_restore_unit(host_node, emit)
         if data.ovnRole == pt.OvnRole.central:
             emit.comment("# central: stop exposing the shared NB/SB DBs")
             emit.sh(ovn_ops.nb_del_connection_argv())
@@ -2320,6 +2515,8 @@ def _emit_host(
         # (`_emit_iface_bindings` del-br's them) — a clear after would
         # target a bridge that no longer exists.
         _emit_ipfix(host_node, nodes, emit)
+        # The boot unit goes before the bridges/interfaces it re-creates.
+        _emit_bindings_unit(host_node, nodes, emit)
         _emit_iface_bindings(host_name, nodes, emit)
         return
 
@@ -2342,6 +2539,13 @@ def _emit_host(
     # registers while the heavier steps run (the cluster pass resolves
     # this chassis by the hostname set here).
     _emit_chassis_registration(host_node, nodes, emit)
+    # The boot-time bindings unit is written first so the router/service
+    # units below can be ordered After= it; the live create pass still
+    # applies the same bindings inline (below).
+    _emit_bindings_unit(host_node, nodes, emit)
+    # Installs the generated program on the host and enables the boot
+    # restore unit (which re-runs this host pass, --skip-deps).
+    _emit_restore_unit(host_node, emit)
     _emit_kernel_router(host_node.id, nodes, emit)
     # The segment bridges must exist (bound by _emit_iface_bindings) before
     # a container's veth can attach — containers come AFTER.
