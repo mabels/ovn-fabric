@@ -8,7 +8,7 @@
 #                             failed command, delete warns and continues)
 #   --cluster                only the cluster-wide ovn-nbctl pass
 #   --host NAME              only that host's pass
-#   --verbose                echo every command before running it
+#   --verbose                log every command (DEBUG)
 #   --ovn-purge              instead of an action: reset OVS and OVN to a
 #                            freshly-installed state (see ovn_purge in the
 #                            runtime below)
@@ -22,10 +22,10 @@
 # The generated file is NOT a big shell block embedded verbatim: each
 # emitted operation becomes a direct
 # Python call — a command becomes run_cmd(argv), a file append (e.g. a
-# systemd unit) becomes write_file(path, content), a queued file (a job
-# of the install queue) queue_file(directory, name, content) — each with
-# the runtime's own error/verbose policy. That is what makes the Python
-# deployment genuinely controllable: no shell syntax (heredocs,
+# systemd unit) becomes write_file(path, content), and the host's
+# packages/images become one INSTALL object run by run_install() — each
+# with the runtime's own logging/error policy. That is what makes the
+# Python deployment genuinely controllable: no shell syntax (heredocs,
 # redirection) survives into the generated file for the runtime to
 # re-parse.
 # python3 is required on every target host (2026-08-19, confirmed).
@@ -33,12 +33,32 @@
 from __future__ import annotations
 
 import functools
+import pathlib
 import re
 from collections.abc import Callable, Sequence
+from typing import Any
 
 from protocol import generated as pt
 
-from .ir_common import Action, Emitter, Ref, _emit_cluster_body, _emit_host_script, _python_token
+from .ir_common import (
+    Action,
+    Emitter,
+    Ref,
+    _abstract,
+    _configure_dependencies,
+    _emit_cluster_body,
+    _emit_host_configure,
+    _emit_host_script,
+    _emit_kernel_router_owner,
+    _emit_service_down,
+    _emit_service_up,
+    _install_plan,
+    _job_dependencies,
+    _kernel_router_owners,
+    _netns_name,
+    _python_token,
+    _service_faces,
+)
 
 
 def _py_str(s: str) -> str:
@@ -59,7 +79,7 @@ class PythonEmitter(Emitter):
     ir_common's own `_sh` (shlex.join) — the SAME function the shell
     front-end uses to render the line — and a file append becomes a
     write_file(...) call; both wrapped in the runtime's own
-    error/verbose handling. `action` (create/delete) is carried on the
+    logging/error handling. `action` (create/delete) is carried on the
     emitter — the SAME parameter every ir_common emitter branches on —
     so a create and its reverse (delete) live in one emitter function."""
 
@@ -70,8 +90,8 @@ class PythonEmitter(Emitter):
 
     def _push(self, line: str) -> None:
         # Indent by the emitter's current block depth — begin_block()/
-        # end_block() bracket the `if not skip_deps:` guard around the OS
-        # dependency commands. _python_fn adds the function body's own
+        # end_block() bracket a conditional block (e.g. the docker build).
+        # _python_fn adds the function body's own
         # single level on top of this.
         self.lines.append(("    " * self._indent + line) if line else "")
 
@@ -99,29 +119,27 @@ class PythonEmitter(Emitter):
         # the runtime passes the variable's VALUE as one argv element.
         abort = "False" if optional else "abort_on_error"
         tokens = ", ".join(_python_token(token) for token in argv)
-        self._push(f"run_cmd({self.label!r}, _sh([{tokens}]), verbose, {abort})")
+        self._push(f"await job.run_cmd({self.label!r}, [{tokens}], {abort})")
 
-    def capture(self, var: str, argv: list[str]) -> None:
-        self._push(f"{var} = capture_cmd({self.label!r}, _sh({argv!r}), verbose, abort_on_error)")
+    def capture(self, var: str, argv: Sequence[str | Ref]) -> None:
+        tokens = ", ".join(_python_token(token) for token in argv)
+        self._push(f"{var} = await job.capture_cmd({self.label!r}, [{tokens}], abort_on_error)")
 
     def append(self, path: str, content: str) -> None:
         self._push(
-            f"write_file({self.label!r}, {path!r}, {_py_str(content)}, verbose, abort_on_error)"
-        )
-
-    def enqueue(self, directory: str, name: str, content: str) -> None:
-        # The timestamp in front of `name` is the RUNTIME's (queue_file):
-        # it says when the deployer queued the file, not when this source
-        # was generated.
-        self._push(
-            f"queue_file({self.label!r}, {directory!r}, {name!r}, {_py_str(content)}, "
-            "verbose, abort_on_error)"
+            f"await write_file(job, {self.label!r}, {path!r}, {_py_str(content)}, "
+            "abort_on_error)"
         )
 
     def install_self(self, path: str) -> None:
         # Copy the running generated program to `path` (install_self in
         # the runtime) — the boot restore unit execs that copy.
-        self._push(f"install_self({self.label!r}, {path!r}, verbose, abort_on_error)")
+        self._push(f"await install_self(job, {self.label!r}, {path!r}, abort_on_error)")
+
+    def install(self, host: str) -> None:
+        # Execute the host's merged install object (packages, then
+        # images) with the runtime's logging/error policy.
+        self._push(f"await run_install(job, INSTALL[{host!r}], abort_on_error)")
 
     def enable_unit(self, unit: str, optional: bool = True) -> None:
         # `no_start` is a parameter of the generated host function: the
@@ -129,16 +147,85 @@ class PythonEmitter(Emitter):
         # them to systemd, which orders them After= the restore unit.
         abort = "False" if optional else "abort_on_error"
         self.begin_block("if no_start:")
-        self._push(
-            f"run_cmd({self.label!r}, _sh(['systemctl', 'enable', {unit!r}]), verbose, {abort})"
-        )
+        self._push(f"await job.run_cmd({self.label!r}, ['systemctl', 'enable', {unit!r}], {abort})")
         self.end_block()
         self.begin_block("else:")
         self._push(
-            f"run_cmd({self.label!r}, _sh(['systemctl', 'enable', '--now', {unit!r}]), "
-            f"verbose, {abort})"
+            f"await job.run_cmd({self.label!r}, ['systemctl', 'enable', '--now', {unit!r}], "
+            f"{abort})"
         )
         self.end_block()
+
+
+class PythonBodyEmitter(Emitter):
+    """One generated job body (a kernel router's or service's up/down),
+    as direct Python calls: `sh` becomes job.run_cmd(),
+    `append` becomes write_file(), `capture` becomes capture_cmd(). The
+    body runs in the generated file itself — no shell script is written
+    or exec'd."""
+
+    def __init__(self, label: str, action: Action) -> None:
+        self.label = label
+        self._indent = 0
+        super().__init__(action)
+
+    def _push(self, line: str) -> None:
+        self.lines.append(("    " * self._indent + line) if line else "")
+
+    def sh(
+        self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
+    ) -> None:
+        tokens = ", ".join(_python_token(token) for token in argv)
+        # Every job is blocking: `background` (a shell `&`) has no
+        # meaning here; the command runs and is awaited.
+        abort = "False" if optional else "abort_on_error"
+        self._push(f"await job.run_cmd({self.label!r}, [{tokens}], {abort})")
+
+    def capture(self, var: str, argv: Sequence[str | Ref]) -> None:
+        tokens = ", ".join(_python_token(token) for token in argv)
+        self._push(f"{var} = await job.capture_cmd({self.label!r}, [{tokens}], abort_on_error)")
+
+    def install(self, host: str) -> None:
+        self._push(f"await run_install(job, INSTALL[{host!r}], abort_on_error)")
+
+    def append(self, path: str, content: str) -> None:
+        self._push(
+            f"await write_file(job, {self.label!r}, {path!r}, {_py_str(content)}, "
+            "abort_on_error)"
+        )
+
+    def py(self, line: str) -> None:
+        self._push(line)
+
+    def begin_block(self, header: str) -> None:
+        self._push(header)
+        self._indent += 1
+
+    def end_block(self) -> None:
+        self._indent -= 1
+
+    def comment(self, text: str) -> None:
+        self._push(text)
+
+    def blank(self) -> None:
+        self.lines.append("")
+
+
+def _body_fn_name(host_name: str, name: str, action: str) -> str:
+    clean = re.sub(r"[^A-Za-z0-9]", "_", f"{host_name}_{name}_{action}")
+    return f"_job_{clean}"
+
+
+def _python_body_fn(name: str, label: str, action: Action, body: Callable[[Emitter], None]) -> str:
+    emit = PythonBodyEmitter(label, action)
+    body(emit)
+    # create aborts on the first failure; delete warns and keeps going —
+    # the same policy as the host pass (the old shell scripts' `set -e`
+    # only in `up`).
+    abort = "False" if action == "delete" else "True"
+    lines = [f"    abort_on_error = {abort}"]
+    lines += [f"    {line}" if line else "" for line in emit.lines]
+    return f"async def {name}(job: Job) -> None:\n" + "\n".join(lines) + "\n"
 
 
 _GENERATED_RUNTIME = r"""#!/usr/bin/env python3
@@ -155,130 +242,361 @@ _GENERATED_RUNTIME = r"""#!/usr/bin/env python3
 # running it first on a fresh host fails (2026-09-19). Delete reverses
 # that: the cluster topology goes first, then the hosts.
 #
-# Dependencies are never installed inline (deploying a router can cut the
-# host's own internet while the pass runs). Each host's create QUEUES
-# them instead — one job file per package, docker image and unit in
-# /var/spool/ovn-fabric/install, named after the moment it was queued
-# (queue_file below) — and installs the queue's consumer,
-# ovn-fabric-install.service: it looks at the directory every 10 seconds,
-# works on the files in name order whenever the host is online, restarts
-# the fabric's units that failed for lack of a package or image, and
-# removes each file once its job is done. --skip-deps leaves all of that
-# out, for hosts whose dependencies are looked after elsewhere.
+# The IR's dependency/image data is merged into ONE install object per
+# host (`BIDIRECTIONAL_DEPS[host]`) and executed directly before OVS/OVN.
 #
 # --ovn-purge replaces the action: it wipes OVS's database and, on the
 # central, OVN's NB/SB databases, and restarts the daemons — back to the
 # state right after the packages were installed (see ovn_purge below).
 #
 # Every command/file-write is a direct Python call into run_cmd()/
-# write_file()/queue_file() below, each with the same error policy:
+# write_file()/run_install() below, each with the same error policy:
 # create aborts on the first failure, delete warns and keeps going.
 
+from __future__ import annotations
+
 import argparse
+import asyncio
+import json
+import logging
 import os
 import shlex
 import shutil
-import subprocess
+import signal
 import sys
-import time
+import tempfile
 
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
 RED = "\033[31m"
 RESET = "\033[0m"
 
+_deploy_log = logging.getLogger("ovn-fabric.deployer")
 
-# The command stringifier from deployer/ir_common.py (_sh) — embedded
-# verbatim here so the generated file stays self-contained on the target
-# host, which only needs python3, not the ovn-fabric package.
-def _sh(argv: list[str]) -> str:
-    return shlex.join(argv)
+# __RUNTIME_LIB__
 
 
-def run_cmd(label: str, cmd: str, verbose: bool, abort_on_error: bool) -> None:
-    if verbose:
-        print(f"{GREEN}{label}$ {cmd}{RESET}")
+async def _docker_image_exists(image: str) -> bool:
     try:
-        proc = subprocess.run(shlex.split(cmd))
-    except OSError as exc:
-        # e.g. the binary isn't installed on this host — same
-        # "command failed" policy, not a crash (2026-08-19).
-        detail = f" ({exc.strerror})" if exc.strerror else ""
-        if abort_on_error:
-            print(
-                f"{RED}error: cannot run in {label}{detail}: {cmd}{RESET}",
-                file=sys.stderr,
-            )
-            sys.exit(127)
-        print(
-            f"{YELLOW}warning: cannot run in {label}{detail}: {cmd}{RESET}",
-            file=sys.stderr,
+        proc = await asyncio.create_subprocess_exec(
+            "/usr/bin/docker",
+            "image",
+            "inspect",
+            image,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
         )
+        return await proc.wait() == 0
+    except OSError:
+        return False
+
+
+def _write_text(path: str, content: str) -> None:
+    with open(path, "w", encoding="utf-8") as out:
+        out.write(content + ("" if content.endswith("\n") else "\n"))
+
+
+async def _ensure_image(
+    job: Job, label: str, image: str, dockerfile: str | None
+) -> None:
+    # Build the image when the IR declares a Dockerfile; otherwise let
+    # `docker run` pull it.
+    if dockerfile is None or await _docker_image_exists(image):
         return
-    if proc.returncode == 0:
-        return
-    if abort_on_error:
-        print(
-            f"{RED}error: failed in {label}: {cmd}{RESET}",
-            file=sys.stderr,
+    build_dir = tempfile.mkdtemp()
+    try:
+        await write_file(
+            job, label, os.path.join(build_dir, "Dockerfile"), dockerfile, True
         )
-        sys.exit(proc.returncode)
-    print(
-        f"{YELLOW}warning: failed in {label}: {cmd}{RESET}",
-        file=sys.stderr,
+        await job.run_cmd(
+            label, ["/usr/bin/docker", "build", "-t", image, build_dir], True
+        )
+    finally:
+        shutil.rmtree(build_dir, ignore_errors=True)
+
+
+def _netns_link(container: str) -> str:
+    return f"/var/run/netns/{container}"
+
+
+async def _symlink_netns(job: Job, label: str, container: str, pid: str) -> None:
+    await job.run_cmd(label, ["mkdir", "-p", "/var/run/netns"], True)
+    link = _netns_link(container)
+    if os.path.lexists(link):
+        os.unlink(link)
+    os.symlink(f"/proc/{pid}/ns/net", link)
+
+
+async def _docker_veth_up(
+    job: Job,
+    label: str,
+    container: str,
+    image: str,
+    dockerfile: str | None,
+    cmd: list[str],
+    netns: str,
+    veth: str,
+    router_ip: str,
+    container_ip: str,
+    gateway: str,
+) -> None:
+    # One veth injected into the router netns, the peer into the
+    # container's netns as eth0 (CNI/Multus-style).
+    peer = f"{veth}-c"
+    await _ensure_image(job, label, image, dockerfile)
+    await job.run_cmd(label, ["/usr/bin/docker", "rm", "-f", container], False)
+    await job.run_cmd(
+        label,
+        ["/usr/bin/docker", "run", "-d", "--network", "none", "--name", container, image, *cmd],
+        True,
+    )
+    pid = await job.capture_cmd(
+        label, ["/usr/bin/docker", "inspect", "-f", "{{.State.Pid}}", container], True
+    )
+    await _symlink_netns(job, label, container, pid)
+    await job.run_cmd(
+        label, ["ip", "link", "add", veth, "type", "veth", "peer", "name", peer], True
+    )
+    await job.run_cmd(label, ["ip", "link", "set", peer, "netns", container], True)
+    await job.run_cmd(label, ["ip", "link", "set", veth, "netns", netns], True)
+    await job.run_cmd(
+        label, ["ip", "netns", "exec", netns, "ip", "link", "set", veth, "up"], True
+    )
+    await job.run_cmd(
+        label, ["ip", "netns", "exec", netns, "ip", "addr", "add", router_ip, "dev", veth], True
+    )
+    await job.run_cmd(
+        label, ["ip", "netns", "exec", container, "ip", "link", "set", peer, "name", "eth0"], True
+    )
+    await job.run_cmd(
+        label, ["ip", "netns", "exec", container, "ip", "link", "set", "eth0", "up"], True
+    )
+    await job.run_cmd(
+        label,
+        ["ip", "netns", "exec", container, "ip", "addr", "add", container_ip, "dev", "eth0"],
+        True,
+    )
+    await job.run_cmd(
+        label,
+        [
+            "ip",
+            "netns",
+            "exec",
+            container,
+            "ip",
+            "route",
+            "add",
+            "default",
+            "via",
+            gateway,
+            "dev",
+            "eth0",
+        ],
+        True,
+    )
+    await job.run_cmd(label, ["/usr/bin/docker", "wait", container], True)
+
+
+async def _docker_owns_start(
+    job: Job,
+    label: str,
+    container: str,
+    image: str,
+    dockerfile: str | None,
+    netns: str,
+    dev: str,
+    transit_leg: str | None,
+) -> None:
+    # The container owns the router's interfaces ("container IS the
+    # router"): move them in, then the body applies the static network.
+    await _ensure_image(job, label, image, dockerfile)
+    await job.run_cmd(label, ["/usr/bin/docker", "rm", "-f", container], False)
+    await job.run_cmd(
+        label,
+        [
+            "/usr/bin/docker",
+            "run",
+            "-d",
+            "--privileged",
+            "--network",
+            "none",
+            "--name",
+            container,
+            image,
+            "sleep",
+            "infinity",
+        ],
+        True,
+    )
+    pid = await job.capture_cmd(
+        label, ["/usr/bin/docker", "inspect", "-f", "{{.State.Pid}}", container], True
+    )
+    await _symlink_netns(job, label, container, pid)
+    if transit_leg:
+        await job.run_cmd(
+            label,
+            [
+                "ip",
+                "netns",
+                "exec",
+                netns,
+                "ip",
+                "link",
+                "set",
+                transit_leg,
+                "netns",
+                container,
+            ],
+            True,
+        )
+        await job.run_cmd(
+            label, ["ip", "netns", "exec", container, "ip", "link", "set", transit_leg, "up"], True
+        )
+    await job.run_cmd(
+        label, ["ip", "netns", "exec", netns, "ip", "link", "set", dev, "netns", container], True
+    )
+    await job.run_cmd(
+        label, ["ip", "netns", "exec", container, "ip", "link", "set", dev, "up"], True
+    )
+    await job.run_cmd(
+        label, ["ip", "netns", "exec", container, "sysctl", "-w", "net.ipv4.ip_forward=1"], True
+    )
+    await job.run_cmd(
+        label,
+        ["ip", "netns", "exec", container, "sysctl", "-w", "net.ipv6.conf.all.forwarding=1"],
+        True,
     )
 
 
-def capture_cmd(label: str, cmd: str, verbose: bool, abort_on_error: bool) -> str:
-    # The Emitter.capture() operation at runtime: run `cmd` and return its
-    # trimmed stdout for a later command to use as a value (e.g. a
-    # chassis's OVS system-id). Same error policy as run_cmd(); on any
-    # failure the empty string is returned (the generated `test -n` guard
-    # right after a capture turns that into a loud, explicit failure).
-    if verbose:
-        print(f"{GREEN}{label}$ {cmd}{RESET}")
+async def _docker_exec_wait(
+    job: Job, label: str, container: str, cmd: list[str], dev: str
+) -> None:
+    await job.run_cmd(label, ["/usr/bin/docker", "exec", container, *cmd, dev], True)
+    await job.run_cmd(label, ["/usr/bin/docker", "wait", container], True)
+
+
+async def _zerotier_up(
+    job: Job,
+    label: str,
+    netns: str,
+    home: str,
+    network: str,
+    masq: list[str],
+    routes: list[str],
+) -> None:
+    # `/usr/sbin/zerotier-one <home>` WITHOUT `-d` is the foreground
+    # daemon: run it as this job's tracked child, do the wiring while it
+    # runs, then await it. The job blocks for the daemon's whole life;
+    # Job.stop() kills the process group, so `down` needs no pkill and no
+    # PID bookkeeping.
+    await job.run_cmd(label, ["mkdir", "-p", home], True)
+    daemon = asyncio.create_task(
+        job.run_cmd(label, ["/usr/sbin/zerotier-one", home], True)
+    )
     try:
-        proc = subprocess.run(shlex.split(cmd), capture_output=True, text=True)
-    except OSError as exc:
-        detail = f" ({exc.strerror})" if exc.strerror else ""
-        if abort_on_error:
-            print(
-                f"{RED}error: cannot run in {label}{detail}: {cmd}{RESET}",
-                file=sys.stderr,
-            )
-            sys.exit(127)
-        print(
-            f"{YELLOW}warning: cannot run in {label}{detail}: {cmd}{RESET}",
-            file=sys.stderr,
+        for _ in range(10):
+            if await job.capture_cmd(
+                label,
+                ["ip", "netns", "exec", netns, "zerotier-cli", f"-D{home}", "info"],
+                False,
+            ):
+                break
+            await asyncio.sleep(1)
+        await job.run_cmd(
+            label,
+            ["ip", "netns", "exec", netns, "zerotier-cli", f"-D{home}", "join", network],
+            True,
         )
-        return ""
-    if proc.returncode != 0:
-        if abort_on_error:
-            print(f"{RED}error: failed in {label}: {cmd}{RESET}", file=sys.stderr)
-            sys.exit(proc.returncode)
-        print(f"{YELLOW}warning: failed in {label}: {cmd}{RESET}", file=sys.stderr)
-        return ""
-    return proc.stdout.strip()
+        var = ""
+        for _ in range(30):
+            raw = await job.capture_cmd(
+                label,
+                [
+                    "ip",
+                    "netns",
+                    "exec",
+                    netns,
+                    "zerotier-cli",
+                    f"-D{home}",
+                    "-j",
+                    "listnetworks",
+                ],
+                False,
+            )
+            if raw:
+                try:
+                    for entry in json.loads(raw):
+                        if entry.get("nwid") == network:
+                            var = entry.get("portDeviceName") or ""
+                            break
+                except ValueError:
+                    var = ""
+            if var and var != "null":
+                break
+            await asyncio.sleep(1)
+        if not var or var == "null":
+            raise RuntimeError(f"zerotier network {network}: no portDeviceName in {netns}")
+        await job.run_cmd(
+            label, ["ip", "netns", "exec", netns, "ip", "link", "set", var, "up"], True
+        )
+        for family in masq:
+            binary = "iptables" if family == "ipv4" else "ip6tables"
+            await job.run_cmd(
+                label,
+                [
+                    "ip",
+                    "netns",
+                    "exec",
+                    netns,
+                    binary,
+                    "-t",
+                    "nat",
+                    "-A",
+                    "POSTROUTING",
+                    "-o",
+                    var,
+                    "-j",
+                    "MASQUERADE",
+                ],
+                True,
+            )
+        for dst in routes:
+            await job.run_cmd(
+                label,
+                ["ip", "netns", "exec", netns, "ip", "route", "add", dst, "dev", var],
+                True,
+            )
+    except BaseException:
+        daemon.cancel()
+        raise
+    # Block for the daemon; stop kills it and this returns.
+    await daemon
 
 
-def write_file(label: str, path: str, content: str, verbose: bool, abort_on_error: bool) -> None:
+async def write_file(
+    job: Job, label: str, path: str, content: str, abort_on_error: bool
+) -> None:
     # The append() emitter operation at runtime: write `content` (plus a
     # single trailing newline, so the file always ends in one) to
-    # `path`, with the same error policy as run_cmd().
-    if verbose:
-        print(f"{GREEN}{label}$ write {path} ({len(content.splitlines())} lines){RESET}")
+    # `path`, with the same error policy as run_cmd(). The file I/O runs
+    # off the event loop.
+    job.debug(f"{label}$ write {path} ({len(content.splitlines())} lines)")
     try:
-        with open(path, "w", encoding="utf-8") as out:
-            out.write(content + ("" if content.endswith("\n") else "\n"))
+        await asyncio.to_thread(_write_text, path, content)
     except OSError as exc:
         detail = f" ({exc.strerror})" if exc.strerror else ""
         if abort_on_error:
-            print(f"{RED}error: cannot write in {label}{detail}: {path}{RESET}", file=sys.stderr)
+            job.error(f"cannot write in {label}{detail}: {path}")
             sys.exit(127)
-        print(f"{YELLOW}warning: cannot write in {label}{detail}: {path}{RESET}", file=sys.stderr)
+        job.warn(f"cannot write in {label}{detail}: {path}")
 
 
-def install_self(label: str, path: str, verbose: bool, abort_on_error: bool) -> None:
+def _install_copy(src: str, path: str) -> None:
+    shutil.copyfile(src, path)
+    os.chmod(path, 0o755)
+
+
+async def install_self(job: Job, label: str, path: str, abort_on_error: bool) -> None:
     # The install_self() emitter operation: copy THIS generated program to
     # `path`, so ovn-fabric-restore.service can re-run the host pass at
     # boot. `__file__` is the script that was invoked; a run from stdin
@@ -286,62 +604,295 @@ def install_self(label: str, path: str, verbose: bool, abort_on_error: bool) -> 
     # ExecCondition then skips itself.
     src = globals().get("__file__")
     if not src or not os.path.isfile(src):
-        print(
-            f"{YELLOW}warning: cannot install the boot restore copy in {label}: "
-            f"run the deployer from a file, not stdin{RESET}",
-            file=sys.stderr,
+        job.warn(
+            f"cannot install the boot restore copy in {label}: "
+            "run the deployer from a file, not stdin"
         )
         return
     if os.path.abspath(src) == os.path.abspath(path):
         return
-    if verbose:
-        print(f"{GREEN}{label}$ install {src} -> {path}{RESET}")
+    job.debug(f"{label}$ install {src} -> {path}")
     try:
-        shutil.copyfile(src, path)
-        os.chmod(path, 0o755)
+        await asyncio.to_thread(_install_copy, src, path)
     except OSError as exc:
         detail = f" ({exc.strerror})" if exc.strerror else ""
         if abort_on_error:
-            print(f"{RED}error: cannot install in {label}{detail}: {path}{RESET}", file=sys.stderr)
+            job.error(f"cannot install in {label}{detail}: {path}")
             sys.exit(127)
-        print(f"{YELLOW}warning: cannot install in {label}{detail}: {path}{RESET}", file=sys.stderr)
+        job.warn(f"cannot install in {label}{detail}: {path}")
 
 
-# The timestamp queue_file() puts in front of a file's name: UTC to the
-# microsecond, and never the same (or an earlier) one twice in a run — so
-# sorting a queue's files by name gives the order they were queued in.
-_last_stamp = 0
+INSTALL_INTERVAL = 24 * 60 * 60
 
 
-def queue_stamp() -> str:
-    global _last_stamp
-    _last_stamp = max(time.time_ns() // 1000, _last_stamp + 1)
-    seconds, micros = divmod(_last_stamp, 1_000_000)
-    return time.strftime("%Y%m%dT%H%M%S", time.gmtime(seconds)) + f".{micros:06d}Z"
+class DepWaiter:
+    # Deployer-side dependency waiter, installed as a job's ctx. The
+    # runtime only knows ctx and on_emit; the job's on_emit filter feeds
+    # every event to waitfor(), which fires the action once all deps are
+    # seen.
+
+    def __init__(self, dependencies: list[dict]) -> None:
+        self._dependencies = {self._key(dep) for dep in dependencies}
+        self._seen: set[tuple] = set()
+        self._fired = False
+
+    @staticmethod
+    def _key(dep: object) -> tuple:
+        if isinstance(dep, dict):
+            kind = dep.get("kind")
+            if kind == "abstract":
+                return ("abstract", dep.get("name"))
+            if kind == "docker-image":
+                return ("docker-image", dep.get("image"))
+            if kind == "apt-pkg":
+                return ("apt-pkg", dep.get("name"))
+            if kind == "sys-cmd":
+                return ("sys-cmd", tuple(dep.get("cmd") or ()))
+        return ("unknown", repr(dep))
+
+    async def waitfor(self, event: object, action: Any) -> None:
+        if self._fired:
+            return
+        if self._dependencies <= self._seen:
+            self._fired = True
+            await action()
+            return
+        if isinstance(event, dict):
+            kind = event.get("kind")
+            key: tuple | None = None
+            if kind == "dependency" and isinstance(event.get("dep"), dict):
+                key = self._key(event["dep"])
+            elif kind == "apt-dep":
+                key = ("apt-dep", event.get("package"))
+            elif kind == "sys-cmd-dep":
+                key = ("sys-cmd-dep", event.get("name"))
+            elif kind == "abstract-dep":
+                key = ("abstract", event.get("name"))
+            if key is not None and key in self._dependencies:
+                self._seen.add(key)
+        if not self._dependencies or self._dependencies <= self._seen:
+            self._fired = True
+            await action()
 
 
-def queue_file(
-    label: str, directory: str, name: str, content: str, verbose: bool, abort_on_error: bool
-) -> None:
-    # The enqueue() emitter operation at runtime: write `content` to
-    # `<directory>/<timestamp>-<name>`, with the same error policy as
-    # run_cmd(). It is written under a name the queue's consumer does not
-    # read and renamed, so the consumer — which may look at the directory
-    # at any moment — sees the whole file or none.
-    path = f"{directory}/{queue_stamp()}-{name}"
-    pending = f"{directory}/.{name}.tmp"
-    if verbose:
-        print(f"{GREEN}{label}$ queue {path} ({len(content.splitlines())} lines){RESET}")
+def register(job: Job, dependencies: list[dict], action: Any) -> None:
+    # The job has no on_start work: it registers a DepWaiter with its
+    # abstract deps and, once they are fulfilled, runs the job content.
+    waiter = DepWaiter(dependencies)
+    job.ctx = waiter
+    job.hold()
+
+    async def on_event(job: Job, event: object, ctx: object = None) -> None:
+        async def run() -> None:
+            try:
+                await action(job)
+            finally:
+                job.release()
+
+        await waiter.waitfor(event, run)
+
+    job.on_emit(on_event)
+
+    async def dependency_timeout() -> None:
+        await asyncio.sleep(DEPENDENCY_TIMEOUT)
+        if not waiter._fired and not job._stopped:
+            job.error(
+                f"{job.name}: dependencies were not fulfilled within "
+                f"{DEPENDENCY_TIMEOUT}s; the install cannot complete "
+                f"(missing packages or no network)"
+            )
+
     try:
-        with open(pending, "w", encoding="utf-8") as out:
-            out.write(content + ("" if content.endswith("\n") else "\n"))
-        os.replace(pending, path)
-    except OSError as exc:
-        detail = f" ({exc.strerror})" if exc.strerror else ""
-        if abort_on_error:
-            print(f"{RED}error: cannot queue in {label}{detail}: {path}{RESET}", file=sys.stderr)
-            sys.exit(127)
-        print(f"{YELLOW}warning: cannot queue in {label}{detail}: {path}{RESET}", file=sys.stderr)
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    asyncio.create_task(dependency_timeout())
+
+
+def package_waiters(host: str) -> dict[str, DepWaiter]:
+    # One SEPARATE DepWaiter instance per abstract dependency in
+    # BIDIRECTIONAL_DEPS, keyed by the abstract name and initialized with
+    # that entry's concrete deps.
+    waiters: dict[str, DepWaiter] = {}
+    for name, entry in BIDIRECTIONAL_DEPS.get(host, {}).items():
+        if entry["abstract"].get("kind") != "abstract":
+            continue
+        waiters[name] = DepWaiter(entry["concrete"])
+    return waiters
+
+
+async def _apt_retry(
+    job: Job, label: str, cmd: list[str], attempts: int = 6
+) -> bool:
+    # apt-get may hit the network; bound each attempt and retry with an
+    # exponential backoff. Each attempt is a fresh run_cmd (the old one is
+    # killed on timeout).
+    delay = 5.0
+    for attempt in range(1, attempts + 1):
+        if await job.run_cmd(label, cmd, False, timeout=600):
+            return True
+        if attempt < attempts:
+            job.warn(
+                f"{label}: attempt {attempt}/{attempts} failed; retrying in {delay:g}s"
+            )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 300.0)
+    job.error(f"{label}: gave up after {attempts} attempts")
+    return False
+
+
+async def _dpkg_version(job: Job, name: str) -> str | None:
+    status = await job.capture_cmd(
+        "dpkg", ["dpkg-query", "-W", "-f=${Status} ${Version}", name], False
+    )
+    if "installed" not in status:
+        return None
+    return status.rsplit(" ", 1)[-1]
+
+
+async def _install_packages(job: Job, deps: dict) -> None:
+    label = "install-packages"
+    apt_packages: list[str] = []
+    sys_cmds: list[dict] = []
+    for entry in deps.values():
+        for dep in entry["concrete"]:
+            if dep["kind"] == "apt-dep" and dep["package"] not in apt_packages:
+                apt_packages.append(dep["package"])
+            elif dep["kind"] == "sys-cmd-dep":
+                sys_cmds.append(dep)
+
+    installed = [
+        name for name in apt_packages if await _dpkg_version(job, name) is not None
+    ]
+    missing = [name for name in apt_packages if name not in installed]
+
+    update_ok = True
+    if apt_packages:
+        update_ok = await _apt_retry(job, label, ["apt-get", "update"])
+        if not update_ok:
+            job.error(f"{label}: apt-get update failed; skipping install")
+
+    if update_ok and installed:
+        await _apt_retry(
+            job,
+            label,
+            [
+                "env",
+                "DEBIAN_FRONTEND=noninteractive",
+                "apt-get",
+                "install",
+                "--only-upgrade",
+                "-y",
+                *sorted(installed),
+            ],
+        )
+
+    apt_ok = update_ok
+    if apt_ok and missing:
+        apt_ok = await _apt_retry(
+            job,
+            label,
+            [
+                "env",
+                "DEBIAN_FRONTEND=noninteractive",
+                "apt-get",
+                "install",
+                "-y",
+                *sorted(missing),
+            ],
+        )
+
+    installed_sys: set[str] = set()
+    for dep in sorted(sys_cmds, key=lambda entry: entry.get("order", 0)):
+        if not apt_ok:
+            job.warn(
+                f"cannot install {dep['name']}: apt dependencies failed"
+            )
+            continue
+        if await _apt_retry(job, label, dep["cmd"]):
+            installed_sys.add(dep["name"])
+
+    # Concrete events only; the packages job ctx translates them.
+    for name in apt_packages:
+        if await _dpkg_version(job, name) is not None:
+            job.emit({"kind": "apt-dep", "package": name, "state": "installed"})
+    for name in installed_sys:
+        job.emit({"kind": "sys-cmd-dep", "name": name, "state": "installed"})
+
+
+async def _install_image(job: Job, entry: dict) -> None:
+    label = f"image:{entry['image']}"
+    if entry.get("dockerfile") is None:
+        await job.run_cmd(
+            label, ["/usr/bin/docker", "pull", entry["image"]], False, timeout=600
+        )
+        job.info(f"pulled {entry['image']}")
+        return
+    build_dir = tempfile.mkdtemp()
+    try:
+        await write_file(
+            job,
+            label,
+            os.path.join(build_dir, "Dockerfile"),
+            entry["dockerfile"],
+            True,
+        )
+        await job.run_cmd(
+            label,
+            ["/usr/bin/docker", "build", "-t", entry["image"], build_dir],
+            False,
+            timeout=600,
+        )
+        job.info(f"built {entry['image']}")
+    finally:
+        shutil.rmtree(build_dir, ignore_errors=True)
+        job.emit(
+            {
+                "kind": "dependency",
+                "dep": {"kind": "docker-image", "image": entry["image"]},
+                "state": "installed",
+            }
+        )
+
+
+async def _install_images(job: Job, deps: dict) -> None:
+    # One dynamic job per docker-image concrete dependency.
+    images = [
+        entry["concrete"][0]
+        for entry in deps.values()
+        if entry["abstract"].get("kind") == "docker-image"
+    ]
+    if not images:
+        return
+    if not await _docker_ready(job):
+        job.warn("docker is not available; images were not installed")
+        return
+    remaining = len(images)
+    complete = asyncio.Event()
+
+    def configure(index: int, entry: dict) -> Any:
+        async def start(image_job: Job) -> None:
+            await _install_image(image_job, entry)
+
+        async def stop(image_job: Job) -> None:
+            nonlocal remaining
+            remaining -= 1
+            if remaining == 0:
+                complete.set()
+
+        def configure_job(image_job: Job) -> None:
+            image_job.on_start(start)
+            image_job.on_stop(stop)
+
+        return configure_job
+
+    for index, entry in enumerate(images):
+        job.job(
+            f"image-{index}",
+            initiate=True,
+            configure=configure(index, entry),
+        )
+    await complete.wait()
 
 
 # ── --ovn-purge ───────────────────────────────────────────────────
@@ -377,48 +928,59 @@ OVN_DBS = [
 OVN_CENTRAL_DB_SERVICES = ["ovn-ovsdb-server-nb", "ovn-ovsdb-server-sb"]
 
 
-def ovn_purge(label: str, verbose: bool, ovs: bool, central: bool) -> None:
+async def ovn_purge(job: Job, label: str, ovs: bool, central: bool) -> None:
     system_id = ""
     if ovs:
-        system_id = capture_cmd(
-            label,
-            _sh(["ovs-vsctl", "--if-exists", "get", "open_vswitch", ".", "external_ids:system-id"]),
-            verbose,
-            False,
+        system_id = (
+            await job.capture_cmd(
+                label,
+                [
+                    "ovs-vsctl",
+                    "--if-exists",
+                    "get",
+                    "open_vswitch",
+                    ".",
+                    "external_ids:system-id",
+                ],
+                False,
+            )
         ).strip('"')
-        run_cmd(label, _sh(["systemctl", "stop", "ovn-controller"]), verbose, False)
+        await job.run_cmd(label, ["systemctl", "stop", "ovn-controller"], False)
     if central:
-        run_cmd(
+        await job.run_cmd(
             label,
-            _sh(["systemctl", "stop", "ovn-northd", *OVN_CENTRAL_DB_SERVICES]),
-            verbose,
+            ["systemctl", "stop", "ovn-northd", *OVN_CENTRAL_DB_SERVICES],
             False,
         )
     if ovs:
-        run_cmd(label, _sh(["systemctl", "stop", "ovs-vswitchd", "ovsdb-server"]), verbose, False)
-        run_cmd(label, _sh(["rm", "-f", OVS_DB]), verbose, True)
+        await job.run_cmd(
+            label, ["systemctl", "stop", "ovs-vswitchd", "ovsdb-server"], False
+        )
+        await job.run_cmd(label, ["rm", "-f", OVS_DB], True)
     if central:
-        run_cmd(label, _sh(["rm", "-f", *OVN_DBS]), verbose, True)
+        await job.run_cmd(label, ["rm", "-f", *OVN_DBS], True)
     if ovs:
-        run_cmd(label, _sh(["systemctl", "start", "ovsdb-server", "ovs-vswitchd"]), verbose, True)
+        await job.run_cmd(
+            label, ["systemctl", "start", "ovsdb-server", "ovs-vswitchd"], True
+        )
         if system_id:
             setting = f"external_ids:system-id={system_id}"
-            run_cmd(
+            await job.run_cmd(
                 label,
-                _sh(["ovs-vsctl", "set", "open_vswitch", ".", setting]),
-                verbose,
+                ["ovs-vsctl", "set", "open_vswitch", ".", setting],
                 True,
             )
-            write_file(label, "/etc/openvswitch/system-id.conf", system_id, verbose, True)
+            await write_file(
+                job, label, "/etc/openvswitch/system-id.conf", system_id, True
+            )
     if central:
-        run_cmd(
+        await job.run_cmd(
             label,
-            _sh(["systemctl", "start", *OVN_CENTRAL_DB_SERVICES, "ovn-northd"]),
-            verbose,
+            ["systemctl", "start", *OVN_CENTRAL_DB_SERVICES, "ovn-northd"],
             True,
         )
     if ovs:
-        run_cmd(label, _sh(["systemctl", "start", "ovn-controller"]), verbose, True)
+        await job.run_cmd(label, ["systemctl", "start", "ovn-controller"], True)
 
 
 __CLUSTER_FUNCS__
@@ -430,14 +992,270 @@ HOSTS = {
 __HOSTS__
 }
 
+SERVICES = __SERVICES__
 
-def purge(host, cluster_only: bool, verbose: bool) -> int:
-    # Which part of ovn_purge runs where: --cluster is the NB/SB databases
-    # alone; a host is its OVS database plus, when the IR makes it the
-    # central, NB/SB. A host the IR keeps out of the OVN cluster (no role)
-    # runs neither OVS nor OVN for this fabric and is left alone.
+BIDIRECTIONAL_DEPS = {
+__BIDIRECTIONAL_DEPS__
+}
+
+
+def concrete_deps(kind: str, host: str | None = None) -> list[dict]:
+    # Unique concrete dependencies of one kind from BIDIRECTIONAL_DEPS.
+    # kind: "apt-dep" | "sys-cmd-dep" | "docker-image".
+    hosts = [host] if host is not None else list(BIDIRECTIONAL_DEPS)
+    seen: set[tuple] = set()
+    out: list[dict] = []
+    for host_name in hosts:
+        for entry in BIDIRECTIONAL_DEPS.get(host_name, {}).values():
+            for dep in entry["concrete"]:
+                if dep["kind"] != kind:
+                    continue
+                key = (
+                    dep["kind"],
+                    dep.get("package"),
+                    dep.get("name"),
+                    dep.get("image"),
+                )
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(dep)
+    return out
+
+
+def apt_deps(host: str | None = None) -> list[dict]:
+    return concrete_deps("apt-dep", host)
+
+
+def sys_cmd_deps(host: str | None = None) -> list[dict]:
+    return concrete_deps("sys-cmd-dep", host)
+
+
+def docker_image_deps(host: str | None = None) -> list[dict]:
+    return concrete_deps("docker-image", host)
+
+
+_LOG_LEVELS = {
+    "debug": logging.DEBUG,
+    "info": logging.INFO,
+    "warn": logging.WARNING,
+    "error": logging.ERROR,
+}
+_deploy_log = logging.getLogger("ovn-fabric.deployer")
+
+
+async def _handle_log(job: Job, event: object) -> None:
+    # The ONE central log sink: every job's `log()`/`warn()`/... bubbles
+    # up here with the job name already attached.
+    if not isinstance(event, dict) or event.get("kind") != "log":
+        return
+    level = _LOG_LEVELS.get(event.get("level"), logging.INFO)
+    _deploy_log.log(level, "%s: %s", event.get("name", "?"), event.get("message", ""))
+
+
+def _resolve_dependency_job(
+    root: Job,
+    host: str,
+    image_deps: list[dict],
+    repeat: bool,
+    with_images: bool = True,
+) -> None:
+    waiters = package_waiters(host)
+    packages = root.job("install-packages", initiate=True, ctx=waiters)
+
+    async def packages_start(job: Job) -> None:
+        async def translate(job: Job, event: object, ctx: object = None) -> None:
+            waiters_ctx = ctx if isinstance(ctx, dict) else {}
+            for abstract, waiter in waiters_ctx.items():
+                async def emit(name: str = abstract) -> None:
+                    job.emit(
+                        {"kind": "abstract-dep", "name": name, "state": "installed"}
+                    )
+
+                await waiter.waitfor(event, emit)
+
+        job.on_emit(translate)
+        while True:
+            await _install_packages(job, BIDIRECTIONAL_DEPS[host])
+            if not repeat:
+                break
+            await asyncio.sleep(INSTALL_INTERVAL)
+
+    packages.on_start(packages_start)
+
+    if not with_images:
+        return
+
+    async def install_images(job: Job) -> None:
+        await _install_images(job, BIDIRECTIONAL_DEPS[host])
+
+    images_job = root.job("install-images", initiate=True)
+    register(images_job, image_deps, install_images)
+
+
+def _run_common(
+    root: Job,
+    host: str,
+    image_deps: list[dict],
+    configure_deps: list[dict],
+) -> Job:
+    root.on_emit(_handle_log)
+    _resolve_dependency_job(root, host, image_deps, repeat=True)
+
+    async def configure(job: Job) -> None:
+        await CONFIGURE[host](job)
+        job.emit(
+            {"kind": "abstract-dep", "name": "configure", "state": "ready"}
+        )
+
+    configure_job = root.job("configure", initiate=True)
+    register(configure_job, configure_deps, configure)
+    return configure_job
+
+
+def _action_jobs(
+    root: Job,
+    host: str,
+    image_deps: list[dict],
+    dependencies: list[dict],
+    name: str,
+    action: Any,
+) -> Job:
+    root.on_emit(_handle_log)
+    _resolve_dependency_job(root, host, image_deps, repeat=False)
+    job = root.job(name, initiate=True)
+    register(job, dependencies, action)
+    return job
+
+
+def _python_job(
+    parent: Job, name: str, dependencies: list[str], up: object, down: object
+) -> Job:
+    # One kernel router/service job, gated on its IR-derived deps (which
+    # always include configure). DepWait is the generated deployer's.
+    job = parent.job(name, initiate=True)
+    register(job, dependencies, up)
+    job.on_stop(down)
+    return job
+
+
+
+__JOB_FUNCS__
+
+JOB_BODIES = {
+__JOB_BODIES__
+}
+
+CONFIGURE = {
+__CONFIGURE__
+}
+
+__TREE_FUNCS__
+
+__CREATE_FUNCS__
+
+__DELETE_FUNCS__
+
+RUN_JOBS = {
+__TREES__
+}
+
+CREATE_JOBS = {
+__CREATE_JOBS__
+}
+
+DELETE_JOBS = {
+__DELETE_JOBS__
+}
+
+
+async def _run_host(host: str) -> int:
+    root = RUN_JOBS[host]()
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass
+    running = asyncio.create_task(root.run())
+    stopped = asyncio.create_task(stop.wait())
+    done, _ = await asyncio.wait({running, stopped}, return_when=asyncio.FIRST_COMPLETED)
+    if stopped in done:
+        await root.stop()
+    else:
+        stopped.cancel()
+    await running
+    return 0
+
+
+DEPENDENCY_TIMEOUT = 60
+
+
+async def _run_job_set(factory: Any, label: str) -> None:
+    root = factory()
+    try:
+        await asyncio.wait_for(root.run(), timeout=DEPENDENCY_TIMEOUT)
+    except asyncio.TimeoutError:
+        await root.stop()
+        print(
+            f"{RED}error: {label} did not complete within "
+            f"{DEPENDENCY_TIMEOUT}s; dependencies could not be installed "
+            f"(missing packages or no network){RESET}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+async def purge(host, cluster_only: bool) -> int:
+    async def run_one(name: str) -> None:
+        root = Job(f"ovn-fabric(purge:{name})")
+        _resolve_dependency_job(root, name, [], repeat=False, with_images=False)
+        job = root.job("ovn-fabric(purge)", initiate=True)
+
+        async def action(j: Job) -> None:
+            await _purge(j, name, cluster_only)
+
+        register(job, [{"kind": "abstract", "name": "ovn"}], action)
+        await _run_job_set(lambda: root, f"purge on {name}")
+
     if cluster_only:
-        ovn_purge("cluster (purge)", verbose, ovs=False, central=True)
+        central = next(
+            (name for name, data in HOSTS.items() if data["role"] == "central"),
+            None,
+        )
+        if central is None:
+            print(f"{RED}error: no central host for --cluster{RESET}", file=sys.stderr)
+            return 2
+        await run_one(central)
+        return 0
+    if host is not None:
+        if host not in HOSTS:
+            print(
+                f"{RED}error: unknown host {host!r}; known hosts: {', '.join(HOSTS)}{RESET}",
+                file=sys.stderr,
+            )
+            return 2
+        if HOSTS[host]["role"] is None:
+            print(
+                f"{YELLOW}host:{host} is not part of the OVN cluster — nothing to purge{RESET}"
+            )
+            return 0
+        await run_one(host)
+        return 0
+    for name in HOSTS:
+        if HOSTS[name]["role"] is None:
+            print(
+                f"{YELLOW}host:{name} is not part of the OVN cluster — nothing to purge{RESET}"
+            )
+            continue
+        await run_one(name)
+    return 0
+
+
+async def _purge(job: Job, host, cluster_only: bool) -> int:
+    if cluster_only:
+        await ovn_purge(job, "cluster (purge)", ovs=False, central=True)
         return 0
     if host is not None and host not in HOSTS:
         print(
@@ -448,9 +1266,11 @@ def purge(host, cluster_only: bool, verbose: bool) -> int:
     for name in HOSTS if host is None else [host]:
         role = HOSTS[name]["role"]
         if role is None:
-            print(f"{YELLOW}host:{name} is not part of the OVN cluster — nothing to purge{RESET}")
+            print(
+                f"{YELLOW}host:{name} is not part of the OVN cluster — nothing to purge{RESET}"
+            )
             continue
-        ovn_purge(f"host:{name} (purge)", verbose, ovs=True, central=role == "central")
+        await ovn_purge(job, f"host:{name} (purge)", ovs=True, central=role == "central")
     return 0
 
 
@@ -458,7 +1278,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="ovn-fabric generated deployer")
     parser.add_argument(
         "--action",
-        choices=["create", "delete"],
+        choices=["create", "delete", "run"],
         help="create (default) aborts on the first failed command; delete warns and continues",
     )
     parser.add_argument(
@@ -468,15 +1288,24 @@ def main() -> int:
     )
     parser.add_argument("--host", metavar="NAME", help="run only this host's pass")
     parser.add_argument(
+        "--run",
+        action="store_true",
+        help="alias for --action run (the generated service uses --action run)",
+    )
+    parser.add_argument(
+        "--job",
+        metavar="NAME",
+        help="run one generated kernel router/service body (the systemd units call this)",
+    )
+    parser.add_argument(
+        "--job-action",
+        choices=["up", "down"],
+        help="which body of --job to run",
+    )
+    parser.add_argument(
         "--verbose",
         action="store_true",
         help="echo every command before running it",
-    )
-    parser.add_argument(
-        "--skip-deps",
-        action="store_true",
-        help="do not queue a host's packages, docker images and units, and do not install "
-        "the queue's consumer (ovn-fabric-install.service)",
     )
     parser.add_argument(
         "--no-start",
@@ -492,12 +1321,60 @@ def main() -> int:
         "that host's part; with --cluster only the NB/SB databases (run it on the central)",
     )
     args = parser.parse_args()
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+    if args.job is not None:
+        if args.job_action is None:
+            parser.error("--job needs --job-action")
+        if args.job not in JOB_BODIES:
+            print(
+                f"{RED}error: unknown job {args.job!r}; known jobs: {', '.join(JOB_BODIES)}{RESET}",
+                file=sys.stderr,
+            )
+            return 2
+        up, down = JOB_BODIES[args.job]
+
+        async def run_job() -> None:
+            job = Job(args.job)
+
+            async def start(h: Job) -> None:
+                await up(h)
+
+            async def stop(h: Job) -> None:
+                await down(h)
+
+            job.on_start(start)
+            job.on_stop(stop)
+            # start() only schedules; run() observes the started set and
+            # emits on_stop when the job completes (or stop() kills it).
+            await job.run()
+
+        asyncio.run(run_job())
+        return 0
+    if args.job_action is not None:
+        parser.error("--job-action needs --job")
+    if args.action == "run" or args.run:
+        if args.host is None:
+            parser.error("--action run needs --host")
+        if args.cluster or args.ovn_purge:
+            parser.error("--action run replaces the other actions")
+        if args.host not in RUN_JOBS:
+            print(
+                f"{RED}error: unknown host {args.host!r}; "
+                f"known hosts: {', '.join(RUN_JOBS)}{RESET}",
+                file=sys.stderr,
+            )
+            return 2
+        return asyncio.run(_run_host(args.host))
     if args.ovn_purge:
         # A purge is its own run, never a silent prelude or epilogue to
         # create/delete: say so instead of ignoring an --action.
         if args.action is not None:
             parser.error("--ovn-purge replaces the action; run --action as a separate step")
-        return purge(args.host, args.cluster, args.verbose)
+        return asyncio.run(purge(args.host, args.cluster))
     args.action = args.action or "create"
     abort_on_error = args.action == "create"
 
@@ -508,25 +1385,37 @@ def main() -> int:
                 file=sys.stderr,
             )
             return 2
-        HOSTS[args.host][args.action](args.verbose, abort_on_error, args.skip_deps, args.no_start)
+        jobs = CREATE_JOBS if args.action == "create" else DELETE_JOBS
+        asyncio.run(
+            _run_job_set(jobs[args.host], f"{args.action} on {args.host}")
+        )
     elif args.cluster:
         cluster = cluster_create if args.action == "create" else cluster_delete
-        cluster(args.verbose, abort_on_error)
+
+        async def run_cluster() -> None:
+            job = Job("ovn-fabric")
+            await job.start()
+            try:
+                await cluster(job, abort_on_error)
+            finally:
+                await job.stop()
+
+        asyncio.run(run_cluster())
     elif args.action == "create":
-        # Chassis first: each host's pass installs its OS dependencies and
-        # (on the central) exposes the shared NB/SB DBs. The cluster-wide
-        # ovn-nbctl pass below needs both — running it first on a fresh
-        # host fails with ovn-nbctl missing (2026-09-19). --skip-deps
-        # drops only the package installation, keep the rest.
-        for name in HOSTS:
-            HOSTS[name]["create"](args.verbose, abort_on_error, args.skip_deps, args.no_start)
-        cluster_create(args.verbose, abort_on_error)
+        async def run_create() -> None:
+            for name in CREATE_JOBS:
+                await _run_job_set(CREATE_JOBS[name], f"create on {name}")
+
+        asyncio.run(run_create())
     else:
-        # Delete reverses create: drop the logical topology first, then
-        # tear every host down.
-        cluster_delete(args.verbose, abort_on_error)
-        for name in HOSTS:
-            HOSTS[name]["delete"](args.verbose, abort_on_error, args.skip_deps, args.no_start)
+        async def run_delete() -> None:
+            order = sorted(
+                DELETE_JOBS, key=lambda name: HOSTS[name]["role"] != "central"
+            )
+            for name in order:
+                await _run_job_set(DELETE_JOBS[name], f"delete on {name}")
+
+        asyncio.run(run_delete())
     return 0
 
 
@@ -545,25 +1434,137 @@ def _python_fn(
     """One generated function: run `body(emit)` through a PythonEmitter
     carrying `action` (the ONE create/delete parameter) and render its
     lines as an indented function body. `extra_params` appends parameters
-    after `verbose, abort_on_error` — the per-host functions take
-    `skip_deps` (see --skip-deps); the cluster pass has no dependencies,
-    so it takes none."""
+    after `abort_on_error` — the per-host functions take `no_start` (see
+    --no-start); the cluster pass takes none."""
     emit = PythonEmitter(label, action)
     body(emit)
     body_lines = [f"    {line}" if line else "" for line in emit.lines]
-    return f"def {name}(verbose, abort_on_error{extra_params}):\n" + "\n".join(body_lines) + "\n"
+    return f"async def {name}(job, abort_on_error{extra_params}):\n" + "\n".join(body_lines) + "\n"
 
 
 def _host_fn_name(host_name: str, action: str) -> str:
     return f"_host_{re.sub(r'[^A-Za-z0-9]', '_', host_name)}_{action}"
 
 
+def _run_fn_name(host_name: str) -> str:
+    return f"_run_{re.sub(r'[^A-Za-z0-9]', '_', host_name)}"
+
+
+def _runtime_code() -> str:
+    """The runtime library, inlined into the generated single file.
+
+    The deployer is copied to hosts that do not have the ovn-fabric
+    package, so `runtime/service.py` is embedded — not imported. Its
+    module docstring and `from __future__` are dropped (the latter must
+    be the first statement of a module).
+    """
+    path = pathlib.Path(__file__).resolve().parents[1] / "runtime" / "service.py"
+    source = path.read_text(encoding="utf-8")
+    if source.startswith('"""'):
+        end = source.index('"""', 3) + 3
+        source = source[end:]
+    source = source.replace("from __future__ import annotations\n", "", 1)
+    return source.strip("\n")
+
+
+def _service_manifest(nodes: list[pt.Model]) -> dict[str, list[dict[str, str]]]:
+    """The kernel routers/workloads each host owns, as the generated
+    tree's `SERVICES` manifest (logical name, kind)."""
+    out: dict[str, list[dict[str, str]]] = {}
+    for node in nodes:
+        if node.kind != "infra.host":
+            continue
+        entries: list[dict[str, str]] = []
+        for owner in _kernel_router_owners(node.id, nodes):
+            name = owner.key.name
+            entries.append(
+                {
+                    "name": name,
+                    "kind": "router",
+                }
+            )
+        for n in nodes:
+            if n.kind in ("kernel.app.container", "kernel.app.service") and n.data.host == node.id:
+                name = n.key.name
+                entries.append(
+                    {
+                        "name": name,
+                        "kind": "service",
+                    }
+                )
+        out[node.key.host] = entries
+    return out
+
+
 def generate_python_deployer(nodes: list[pt.Model]) -> str:
     """The all-in-one Python deployer: every action of every pass, as
     native Python functions over the shared emitters (2026-08-19,
-    refactored 2026-08-23)."""
+    refactored 2026-08-23). Kernel routers and services are generated BODY
+    functions (run_cmd/write_file calls), not shell scripts: their systemd
+    units exec this file's `--job NAME --job-action up|down`."""
+    service_manifest = _service_manifest(nodes)
+    install_plans = {
+        node.key.host: _install_plan(node, nodes) for node in nodes if node.kind == "infra.host"
+    }
+    bidirectional: dict[str, dict[str, dict[str, Any]]] = {}
+    for host, plan in install_plans.items():
+        per_host: dict[str, dict[str, Any]] = {}
+        for name, resolved in plan.get("resolved", {}).items():
+            if resolved["kind"] == "apt":
+                concrete = [
+                    {"kind": "apt-dep", "package": package} for package in resolved["packages"]
+                ]
+            else:
+                concrete = []
+                for required in resolved.get("requires", []):
+                    required_resolved = plan.get("resolved", {}).get(required)
+                    if required_resolved and required_resolved["kind"] == "apt":
+                        concrete.extend(
+                            {
+                                "kind": "apt-dep",
+                                "package": package,
+                                "order": 0,
+                            }
+                            for package in required_resolved["packages"]
+                        )
+                concrete.append(
+                    {
+                        "kind": "sys-cmd-dep",
+                        "name": name,
+                        "cmd": resolved["cmd"],
+                        "order": 10,
+                    }
+                )
+            per_host[name] = {
+                "abstract": {"kind": "abstract", "name": name},
+                "concrete": concrete,
+            }
+        for entry in plan["jobs"]:
+            if entry["kind"] != "image":
+                continue
+            descriptor = {
+                "kind": "docker-image",
+                "image": entry["image"],
+                "dockerfile": entry["dockerfile"],
+                "order": 20,
+            }
+            per_host[f"docker-image:{entry['image']}"] = {
+                "abstract": {"kind": "docker-image", "image": entry["image"]},
+                "concrete": [descriptor],
+            }
+        bidirectional[host] = per_host
+
     host_defs: list[str] = []
     host_entries: list[str] = []
+    job_funcs: list[str] = []
+    job_entries: list[str] = []
+    configure_entries: list[str] = []
+    tree_defs: list[str] = []
+    tree_entries: list[str] = []
+    create_defs: list[str] = []
+    create_entries: list[str] = []
+    delete_defs: list[str] = []
+    delete_entries: list[str] = []
     for node in nodes:
         if node.kind != "infra.host":
             continue
@@ -575,13 +1576,10 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
                     fn,
                     f"host:{host_name} ({action})",
                     action,
-                    functools.partial(_emit_host_script, node, nodes, guard_deps=True),
-                    extra_params=", skip_deps, no_start",
+                    functools.partial(_emit_host_script, node, nodes),
+                    extra_params=", no_start",
                 )
             )
-        # The host's role in the OVN cluster ("central"/"chassis", or None
-        # for a host outside it) — what --ovn-purge needs to know which
-        # databases live on it.
         role = node.data.ovnRole.value if node.data.ovnRole is not None else None
         host_entries.append(
             f"    {host_name!r}: {{\n"
@@ -590,6 +1588,151 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
             f'        "role": {role!r},\n'
             "    },"
         )
+
+        configure_fn = _body_fn_name(host_name, "configure", "up")
+        job_funcs.append(
+            _python_body_fn(
+                configure_fn,
+                f"{host_name}:configure",
+                "create",
+                functools.partial(_emit_host_configure, node, nodes),
+            )
+        )
+        configure_entries.append(f"    {host_name!r}: {configure_fn},")
+        # The service's ExecStart/ExecStop run this job: `up` drives the
+        # tree (and blocks until SIGTERM), `down` is a no-op because
+        # systemd's SIGTERM has already made the tree run its down bodies.
+        tree_job = f"ovn-fabric-{host_name}"
+        up_fn = _body_fn_name(host_name, "run", "up")
+        down_fn = _body_fn_name(host_name, "run", "down")
+        job_funcs.append(f"async def {up_fn}() -> None:\n" f"    await _run_host({host_name!r})\n")
+        job_funcs.append(f"async def {down_fn}() -> None:\n    return\n")
+        job_entries.append(f"    {tree_job!r}: ({up_fn}, {down_fn}),")
+
+        bodies: dict[str, tuple[str, str]] = {}
+        for owner in _kernel_router_owners(node.id, nodes):
+            router = owner.key.name
+            netns = _netns_name(router)
+            functions: list[str] = []
+            for body_action, label in (("create", "up"), ("delete", "down")):
+                fn = _body_fn_name(host_name, router, label)
+                job_funcs.append(
+                    _python_body_fn(
+                        fn,
+                        f"{host_name}:{router} ({label})",
+                        body_action,
+                        functools.partial(
+                            _emit_kernel_router_owner, owner, netns, nodes, body_action
+                        ),
+                    )
+                )
+                functions.append(fn)
+            bodies[router] = (functions[0], functions[1])
+        for n in nodes:
+            if n.kind not in ("kernel.app.container", "kernel.app.service"):
+                continue
+            if n.data.host != node.id:
+                continue
+            name = n.key.name
+            faces = _service_faces(name, host_name, nodes)
+            functions = []
+            for body_action, label in (("create", "up"), ("delete", "down")):
+                fn = _body_fn_name(host_name, name, label)
+                emit_fn = _emit_service_up if label == "up" else _emit_service_down
+                job_funcs.append(
+                    _python_body_fn(
+                        fn,
+                        f"{host_name}:{name} ({label})",
+                        body_action,
+                        functools.partial(emit_fn, n, faces),
+                    )
+                )
+                functions.append(fn)
+            bodies[name] = (functions[0], functions[1])
+
+        plan = install_plans[host_name]
+        image_deps = (
+            [{"kind": "abstract", "name": "docker"}]
+            if any(entry["kind"] == "image" for entry in plan["jobs"])
+            else []
+        )
+        configure_deps = _configure_dependencies(node, nodes)
+        job_deps = _job_dependencies(node, nodes)
+        services = service_manifest[host_name]
+        tree_fn = _run_fn_name(host_name)
+        tree_lines = [
+            f"def {tree_fn}() -> Job:",
+            "    root = Job('ovn-fabric')",
+            f"    configure = _run_common(root, {host_name!r}, "
+            f"{image_deps!r}, {configure_deps!r})",
+        ]
+        for svc in services:
+            up, down = bodies[svc["name"]]
+            deps = job_deps.get(svc["name"], ["configure"])
+            tree_lines.append(
+                f"    _python_job(configure, {svc['name']!r}, {deps!r}, {up}, {down})"
+            )
+        tree_lines.append("    return root")
+        tree_defs.append("\n".join(tree_lines))
+        tree_entries.append(f"    {host_name!r}: {tree_fn},")
+
+        all_deps = [
+            entry["abstract"]
+            for entry in bidirectional[host_name].values()
+            if entry["abstract"].get("kind") == "abstract"
+        ]
+        cluster = node.data.ovnRole == pt.OvnRole.central
+        create_fn = _run_fn_name(host_name).replace("_run_", "_create_")
+        create_lines = [
+            f"def {create_fn}() -> Job:",
+            "    root = Job('ovn-fabric')",
+            f"    _resolve_dependency_job(root, {host_name!r}, [], "
+            "repeat=False, with_images=False)",
+            "    async def create_action(job: Job) -> None:",
+            f"        await HOSTS[{host_name!r}]['create'](job, True, False)",
+            "    create_job = root.job('ovn-fabric(create)', initiate=True)",
+            f"    register(create_job, {all_deps!r}, create_action)",
+        ]
+        if cluster:
+            create_lines += [
+                "    async def cluster_action(job: Job) -> None:",
+                "        await cluster_create(job, True)",
+                "    cluster_job = root.job('cluster-create', initiate=True)",
+                f"    register(cluster_job, [{_abstract('ovn')!r}], cluster_action)",
+            ]
+        create_lines.append("    return root")
+        create_defs.append("\n".join(create_lines))
+        create_entries.append(f"    {host_name!r}: {create_fn},")
+
+        delete_fn = _run_fn_name(host_name).replace("_run_", "_delete_")
+        delete_lines = [
+            f"def {delete_fn}() -> Job:",
+            "    root = Job('ovn-fabric')",
+            f"    _resolve_dependency_job(root, {host_name!r}, [], "
+            "repeat=False, with_images=False)",
+        ]
+        delete_deps = list(all_deps)
+        if cluster:
+            delete_lines += [
+                "    async def cluster_action(job: Job) -> None:",
+                "        await cluster_delete(job, True)",
+                "        job.emit({'kind': 'abstract-dep', "
+                "'name': 'cluster-deleted', 'state': 'ready'})",
+                "    cluster_job = root.job('cluster-delete', initiate=True)",
+                f"    register(cluster_job, [{_abstract('ovn')!r}], cluster_action)",
+            ]
+            delete_deps.append({"kind": "abstract", "name": "cluster-deleted"})
+        delete_lines += [
+            "    async def delete_action(job: Job) -> None:",
+            f"        await HOSTS[{host_name!r}]['delete'](job, True, False)",
+            "    delete_job = root.job('ovn-fabric(delete)', initiate=True)",
+            f"    register(delete_job, {delete_deps!r}, delete_action)",
+            "    return root",
+        ]
+        delete_defs.append("\n".join(delete_lines))
+        delete_entries.append(f"    {host_name!r}: {delete_fn},")
+        for name, (up, down) in bodies.items():
+            job_entries.append(f"    {name!r}: ({up}, {down}),")
 
     cluster_defs = "\n\n".join(
         _python_fn(
@@ -605,4 +1748,23 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
         _GENERATED_RUNTIME.replace("__CLUSTER_FUNCS__", cluster_defs)
         .replace("__HOST_FUNCS__", "\n\n".join(host_defs))
         .replace("__HOSTS__", "\n".join(host_entries))
+        .replace("__SERVICES__", repr(service_manifest))
+        .replace(
+            "__INSTALL__",
+            "\n".join(f"    {host!r}: {plan!r}," for host, plan in install_plans.items()),
+        )
+        .replace(
+            "__BIDIRECTIONAL_DEPS__",
+            "\n".join(f"    {host!r}: {per_host!r}," for host, per_host in bidirectional.items()),
+        )
+        .replace("__JOB_FUNCS__", "\n\n".join(job_funcs))
+        .replace("__JOB_BODIES__", "\n".join(job_entries))
+        .replace("__CONFIGURE__", "\n".join(configure_entries))
+        .replace("__TREE_FUNCS__", "\n\n".join(tree_defs))
+        .replace("__TREES__", "\n".join(tree_entries))
+        .replace("__CREATE_FUNCS__", "\n\n".join(create_defs))
+        .replace("__DELETE_FUNCS__", "\n\n".join(delete_defs))
+        .replace("__CREATE_JOBS__", "\n".join(create_entries))
+        .replace("__DELETE_JOBS__", "\n".join(delete_entries))
+        .replace("# __RUNTIME_LIB__", _runtime_code())
     )

@@ -1300,6 +1300,12 @@ Deno.test("net.service + ep.attachTo -> kernel.service node + endpoint serviceRe
     image: "ovn-fabric-dns",
     cmd: ["/usr/sbin/dnsmasq", "--no-daemon"],
   });
+  // The host runs a container, so it needs docker — even without a
+  // kernel router.
+  assertEquals(
+    node(nodes, "host:chassis-1").data["dependencies"]?.includes("docker"),
+    true,
+  );
   // …and the ENDPOINT references it (its NIC on that segment).
   assertEquals(
     node(

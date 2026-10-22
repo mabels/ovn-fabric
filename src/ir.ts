@@ -152,6 +152,14 @@ function hostDependencies(host: Host, network: NetworkDefinition): string[] {
       }
     }
   }
+  // Host-level docker workloads (`net.service` -> kernel.app.container)
+  // are containers too: the host needs the docker engine even when it
+  // has no kernel router apps.
+  for (const service of serviceNodes(network)) {
+    if (service.data.host === `host:${host.name}`) {
+      deps.add("docker");
+    }
+  }
   return [...deps];
 }
 
