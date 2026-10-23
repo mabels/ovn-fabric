@@ -213,25 +213,131 @@ export function localHost(
 // (not a plain readonly interface), matching how ManualUplink already
 // holds mutable state (`switchTo`) elsewhere in this file — a bare
 // data literal can't expose a method.
+export interface CollisionDomainOptions {
+  /** Absent = cluster-wide OVN logical switch (an ovn.ls IR node).
+   * Present = host-local OVS bridge only (a bridge IR node): no OVN
+   * logical switch, no localnet port, no bridge mapping. */
+  readonly host?: Host;
+}
+
+/** A logical OVN router port attached to this domain. `host`/`iface`
+ * are its optional physical binding; a purely logical port has neither. */
+export interface CollisionDomainOvnPort {
+  readonly kind: "ovn";
+  readonly router: string;
+  readonly endpoint: string;
+  readonly host?: Host;
+  readonly iface?: InterfaceKind;
+  /** Per-leg flow switch (types.ts RouterEndpointInputBase.flow): true
+   * when this port's segment traffic must not be exported. Resolved by
+   * buildOvnRouterEndpoint, like the iface itself. */
+  readonly flowOff?: boolean;
+}
+
+/** A physical port the bridge owns directly (VLAN leg, ...). */
+export interface CollisionDomainHostPort {
+  readonly kind: "host";
+  readonly host: Host;
+  readonly iface: InterfaceKind;
+}
+
+export type CollisionDomainPort =
+  | CollisionDomainOvnPort
+  | CollisionDomainHostPort;
+
+function collisionDomainPortKey(port: CollisionDomainPort): string {
+  if (port.kind === "host") {
+    return `host:${port.host.name}:${JSON.stringify(port.iface)}`;
+  }
+  return `ovn:${port.router}:${port.endpoint}:${port.host?.name ?? ""}:${
+    port.iface ? JSON.stringify(port.iface) : ""
+  }`;
+}
+
+// A collision domain is the L2 primitive: a cluster-wide OVN logical
+// switch by default, or a host-local bridge when constructed with a
+// `host`. Its PORTS are the single source of truth for what is plugged
+// into it — buildOvnRouterEndpoint() adds one port per attached logical
+// router endpoint, and addInterface() adds physical ports the bridge
+// itself owns. collisionDomainToIR() serializes this, it does not scan
+// routers again.
 export class CollisionDomain {
   readonly name: string;
-  private readonly interfaces: InterfaceKind[] = [];
+  readonly host?: Host;
+  private readonly ports = new Map<string, CollisionDomainPort>();
 
-  constructor(name: string) {
+  constructor(name: string, options: CollisionDomainOptions = {}) {
     this.name = name;
+    this.host = options.host;
   }
 
-  /** Returns the same `iface` it was given — so a caller can register
-   * it and get a handle back in one expression, e.g.
-   * `ifaces: [{ host, iface: domain.addInterface({...}) }]`, rather
-   * than needing a separate statement before the call that uses it. */
-  addInterface(iface: InterfaceKind): InterfaceKind {
-    this.interfaces.push(iface);
+  get hostOnly(): boolean {
+    return this.host !== undefined;
+  }
+
+  get allPorts(): readonly CollisionDomainPort[] {
+    return [...this.ports.values()];
+  }
+
+  get ovnPorts(): readonly CollisionDomainOvnPort[] {
+    return this.allPorts.filter(
+      (port): port is CollisionDomainOvnPort => port.kind === "ovn",
+    );
+  }
+
+  get hostPorts(): readonly CollisionDomainHostPort[] {
+    return this.allPorts.filter(
+      (port): port is CollisionDomainHostPort => port.kind === "host",
+    );
+  }
+
+  /** The one mutation point. A host-only bridge can carry only host
+   * ports on its own host; a cluster domain can carry OVN ports on any
+   * host. */
+  addPort(port: CollisionDomainPort): CollisionDomainPort {
+    if (this.hostOnly && port.kind === "ovn") {
+      throw new Error(
+        `collision domain "${this.name}" is host-only and cannot carry ` +
+          `OVN router port ${port.router}:${port.endpoint}`,
+      );
+    }
+    if (this.host !== undefined && port.host?.name !== this.host.name) {
+      throw new Error(
+        `collision domain "${this.name}" is on host "${this.host.name}", ` +
+          `but port ${
+            port.kind === "ovn" ? port.endpoint : "host"
+          } is on "${port.host?.name}"`,
+      );
+    }
+    const key = collisionDomainPortKey(port);
+    if (this.ports.has(key)) {
+      throw new Error(
+        `collision domain "${this.name}" already has port ${key}`,
+      );
+    }
+    this.ports.set(key, port);
+    return port;
+  }
+
+  /** Explicit physical port. Host defaults to the domain's own host for
+   * a host-only bridge; a cluster domain requires it. Returns the same
+   * iface, so it can be used inline. */
+  addInterface(
+    iface: InterfaceKind,
+    host: Host = this.requiredHost(),
+  ): InterfaceKind {
+    this.addPort({ kind: "host", host, iface });
     return iface;
   }
 
-  get allInterfaces(): readonly InterfaceKind[] {
-    return this.interfaces;
+  private requiredHost(): Host {
+    if (this.host === undefined) {
+      throw new Error(
+        `collision domain "${this.name}" is cluster-wide; pass the host ` +
+          `for an explicit physical port`,
+      );
+    }
+    return this.host;
   }
 }
 
@@ -1441,6 +1547,8 @@ export type InterfaceKind =
      * one; Linux delivers matching-tagged frames to every registered
      * vlan netdevice for a given (parent, vlanId) pair, not just one). */
     ifaceName?: string;
+    /** Deterministic MAC for this subinterface. */
+    mac?: string;
   }
   | PhysicalIface // a real, untagged NIC/port
   | XdpIface // a real NIC driven by OVS's userspace datapath (AF_XDP)
@@ -1538,4 +1646,6 @@ export type InterfaceKind =
     kind: "veth";
     ifaceName: string;
     peerName: string;
+    /** Netns-side leg's MAC, whenever the generator pins one. */
+    mac?: string;
   };

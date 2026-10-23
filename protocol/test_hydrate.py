@@ -43,7 +43,7 @@ RAW_OVN_LS: dict[str, Any] = {
                     "kind": "vlan",
                     "vlanParent": {"kind": "physical", "name": "eth0"},
                     "vlanId": 129,
-                    "shortName": "br-home",
+                    "bridge": "br-home",
                 },
             },
         ],
@@ -112,11 +112,11 @@ class HydrateOvnLsTest(unittest.TestCase):
         iface = node.data.interfaces[0].iface
         self.assertIsInstance(iface, pt.OvnLsIfaceVlan)
         self.assertEqual(iface.vlanId, 129)
-        self.assertEqual(iface.shortName, "br-home")
+        self.assertEqual(iface.bridge, "br-home")
         self.assertIsNone(iface.flow)
 
     def test_an_iface_missing_its_bridge_name_raises(self) -> None:
-        # ovn.ls bindings REQUIRE `shortName` (the OVS bridge) — the
+        # ovn.ls bindings REQUIRE `bridge` (the OVS bridge) — the
         # deployer would otherwise name a bridge "None".
         raw_iface = {
             "kind": "vlan",
@@ -129,14 +129,14 @@ class HydrateOvnLsTest(unittest.TestCase):
         }
         with self.assertRaises(mod.IRShapeError) as caught:
             mod.hydrate_node(raw)
-        self.assertIn("shortName", str(caught.exception))
+        self.assertIn("bridge", str(caught.exception))
 
     def test_an_unknown_iface_kind_raises(self) -> None:
         raw = {
             **RAW_OVN_LS,
             "data": {
                 "interfaces": [
-                    {"host": "chassis-1", "iface": {"kind": "bond", "shortName": "br-home"}}
+                    {"host": "chassis-1", "iface": {"kind": "bond", "bridge": "br-home"}}
                 ]
             },
         }

@@ -315,6 +315,21 @@ def _host_bindings(nodes: list[pt.Model]) -> dict[str, list[tuple[str, pt.OvnLsI
     return by_host
 
 
+def _host_bridge_bindings(
+    nodes: list[pt.Model],
+) -> dict[str, list[tuple[str, pt.OvnLsIface]]]:
+    """Host-local `bridge` nodes' ports, keyed by host. Same shape as
+    _host_bindings so the bindings pass can treat a bridge exactly like a
+    segment bridge; these never contribute an ovn-bridge-mappings entry."""
+    by_host: dict[str, list[tuple[str, pt.OvnLsIface]]] = {}
+    for node in nodes:
+        if node.kind != "bridge":
+            continue
+        for entry in node.data.ports:
+            by_host.setdefault(entry.host, []).append((node.key.name, entry.iface))
+    return by_host
+
+
 def _domains_with_bindable_interfaces(nodes: list[pt.Model]) -> set[str]:
     domains: set[str] = set()
     for bindings in _host_bindings(nodes).values():
@@ -1042,14 +1057,18 @@ def _veth_root_bridge(root_leg: str, nodes: list[pt.Model]) -> str | None:
     """The OVS bridge a kernel-router veth's ROOT leg belongs to, from the
     same ovn.ls interface entry _emit_iface_bindings uses."""
     for node in nodes:
-        if node.kind != "ovn.ls":
+        if node.kind == "ovn.ls":
+            entries = node.data.interfaces or []
+        elif node.kind == "bridge":
+            entries = node.data.ports or []
+        else:
             continue
-        for entry in node.data.interfaces or []:
+        for entry in entries:
             iface = entry.iface
             if iface.kind != "veth":
                 continue
             if root_leg in (iface.ifaceName, iface.peerName):
-                return iface.shortName
+                return iface.bridge
     return None
 
 
@@ -1403,10 +1422,13 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
     their kernel-router units, which may not have run yet here."""
     before = len(emit.lines)
     bindings = _host_bindings(nodes).get(host_name, [])
+    bridge_bindings = _host_bridge_bindings(nodes).get(host_name, [])
+    ovn_domains = {domain for domain, _iface in bindings}
+    all_bindings = bindings + bridge_bindings
     if emit.action == "create":
         mappings: list[str] = []
-        xdp_ports = _xdp_ports(bindings)
-        xdp_trunks = _xdp_trunks(bindings)
+        xdp_ports = _xdp_ports(all_bindings)
+        xdp_trunks = _xdp_trunks(all_bindings)
         if xdp_ports:
             emit.comment("# --- XDP trunk: userspace datapath, one port for all segments ---")
             emit.sh(ovs_ops.add_br_argv(_XDP_TRUNK_BRIDGE))
@@ -1420,14 +1442,14 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
                 if trunk_vlans:
                     emit.sh(ovs_ops.set_port_trunks_argv(name, trunk_vlans))
             emit.blank()
-        for domain, iface in bindings:
+        for domain, iface in all_bindings:
             if iface.kind not in _BINDABLE_IFACE_KINDS:
                 emit.comment(
                     f'# unsupported interface kind "{iface.kind}" for domain '
                     f"{domain} on {host_name} — skipped, see deployer/ir_common.py"
                 )
                 continue
-            bridge = iface.shortName
+            bridge = iface.bridge
             is_xdp = iface.kind == "xdp" or (
                 iface.kind == "vlan" and iface.vlanParent.kind == "xdp"
             )
@@ -1463,17 +1485,19 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
                 pass
             else:
                 emit.sh(ovs_ops.add_port_argv(bridge, _iface_real_name(iface)))
-            mappings.append(f"{_network_name(domain)}:{bridge}")
+            if domain in ovn_domains:
+                mappings.append(f"{_network_name(domain)}:{bridge}")
         if mappings:
             emit.sh(ovs_ops.set_external_id_argv("ovn-bridge-mappings", ",".join(mappings)))
     else:
         any_bound = False
-        xdp_ports = _xdp_ports(bindings)
-        for domain, iface in bindings:
+        xdp_ports = _xdp_ports(all_bindings)
+        for domain, iface in all_bindings:
             if iface.kind not in _BINDABLE_IFACE_KINDS:
                 continue
-            any_bound = True
-            bridge = iface.shortName
+            if domain in ovn_domains:
+                any_bound = True
+            bridge = iface.bridge
             is_xdp = iface.kind == "xdp" or (
                 iface.kind == "vlan" and iface.vlanParent.kind == "xdp"
             )
@@ -1586,7 +1610,7 @@ def _ipfix_bridge_flags(host_name: str, nodes: list[pt.Model]) -> dict[str, bool
     for _domain, iface in _host_bindings(nodes).get(host_name, []):
         if iface.kind not in _BINDABLE_IFACE_KINDS:
             continue
-        bridge = iface.shortName
+        bridge = iface.bridge
         flags[bridge] = flags.get(bridge, True) and iface.flow is not False
     return flags
 
@@ -1902,8 +1926,8 @@ def _segment_bridge(host_name: str, l2_segment: str, nodes: list[pt.Model]) -> s
         if ls.kind != "ovn.ls" or ls.id != l2_segment:
             continue
         for binding in ls.data.interfaces:
-            if binding.host == host_name and binding.iface.shortName:
-                return binding.iface.shortName
+            if binding.host == host_name and binding.iface.bridge:
+                return binding.iface.bridge
     raise ValueError(
         f"no ovn.ls interface on {host_name} for {l2_segment} to bind a " f"container veth to"
     )

@@ -102,6 +102,31 @@ export function buildOvnRouterEndpoint(
     context.role,
     spec.l2Segment.name,
   );
+  // Register the port(s) on the domain itself: the collision domain is
+  // the single source of truth for what is plugged into its bridge/LS.
+  // A logical port with no physical binding is still a port.
+  const bindings = spec.ifaces ?? [];
+  if (bindings.length === 0) {
+    spec.l2Segment.addPort({
+      kind: "ovn",
+      router: context.routerName,
+      endpoint: name,
+      ...(spec.flow === false ? { flowOff: true } : {}),
+    });
+  } else {
+    for (const entry of bindings) {
+      spec.l2Segment.addPort({
+        kind: "ovn",
+        router: context.routerName,
+        endpoint: name,
+        host: entry.host,
+        iface: entry.iface,
+        ...(spec.flow === false || entry.iface.kind === "veth"
+          ? { flowOff: true }
+          : {}),
+      });
+    }
+  }
   // `name` LAST: an input spec may carry an explicit (optional) `name`,
   // but the resolved endpoint's name is always the derived/pinned value —
   // a spread of `spec` after it would otherwise write `name: undefined`

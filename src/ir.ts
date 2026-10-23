@@ -33,24 +33,25 @@
 
 import { fnv1a32, macFromAddrsOrName, macFromV4 } from "./addressing.ts";
 import type { IPv4, IPv6 } from "./ip.ts";
-import type {
+import {
   CollisionDomain,
-  Host,
-  InterfaceKind,
-  InterfaceParent,
-  KernelRouter,
-  OvnRouterEndpoint,
-  Resolver,
-  Router,
-  RouterEndpointService,
-  RoutingDomain,
-  SecurityGroup,
-  Service,
-  XdpIface,
-  XdpMode,
+  type Host,
+  type InterfaceKind,
+  type InterfaceParent,
+  type KernelRouter,
+  type OvnRouterEndpoint,
+  type Resolver,
+  type Router,
+  type RouterEndpointService,
+  type RoutingDomain,
+  type SecurityGroup,
+  type Service,
+  type XdpIface,
+  type XdpMode,
 } from "./types.ts";
 import type { NetworkDefinition } from "./define.ts";
 import type {
+  BridgeNode,
   InfraHostNode,
   Ipv6RaConfigs,
   IRNode,
@@ -518,6 +519,12 @@ function shortIfaceName(prefix: string, name: string): string {
   return `${prefix}${fnv1a32(name).toString(16).padStart(8, "0")}`;
 }
 
+// A host-local bridge for a VLAN shared by several kernel routers: Linux
+// allows only one 8021q device per (parent, VLAN id), even across netns.
+function transitBridgeName(parent: string, vlanId: number): string {
+  return shortIfaceName("br-upl-", `${parent}:${vlanId}`);
+}
+
 // ── ovn.ls (NEW — not in ADR 0002's original node-kind table) ────────
 // A bare OVN Logical_Switch — CollisionDomain's direct IR counterpart.
 // Not host-scoped (see CollisionDomain's own doc comment, types.ts —
@@ -547,14 +554,6 @@ function shortIfaceName(prefix: string, name: string): string {
 // tunnel backdoor) is an internal mesh veth, not segment traffic worth
 // sampling, so its bridge stays out of IPFIX unless the author opts in
 // with `flow: true`. Segment legs (vlan/physical) default ON.
-function ifaceFlowOff(
-  endpoint: OvnRouterEndpoint,
-  iface: { readonly kind: string },
-): boolean {
-  if (endpoint.flow !== undefined) return endpoint.flow === false;
-  return iface.kind === "veth";
-}
-
 // ── interface resolution ─────────────────────────────────────────────
 // The DSL leaves AF_XDP's `mode`/`nRxq` optional and accepts a bare
 // string as a VLAN parent (every pre-XDP topology). The IR carries the
@@ -604,57 +603,61 @@ function resolveIface(iface: InterfaceKind): ResolvedIface {
 
 function collisionDomainToIR(
   domain: CollisionDomain,
-  routers: readonly Router[],
-): OvnLsNode {
-  const id = `ls:${domain.name}`;
+): OvnLsNode | BridgeNode {
+  if (domain.hostOnly) {
+    // Host-local L2 segment: a bridge and its own physical ports. No
+    // OVN logical switch/localnet/mapping is emitted for it. A domain
+    // may already be named as its bridge (`br-...`); otherwise apply the
+    // usual `br-` prefix.
+    const shortName = domain.name.startsWith("br-")
+      ? domain.name
+      : shortIfaceName("br-", domain.name);
+    return {
+      id: `bridge:${shortName}`,
+      kind: "bridge",
+      key: { name: shortName },
+      data: {
+        host: `host:${domain.host!.name}`,
+        ports: domain.hostPorts.map((port) => ({
+          host: port.host.name,
+          iface: { ...resolveIface(port.iface), bridge: shortName },
+        })),
+      },
+    };
+  }
   const shortName = shortIfaceName("br-", domain.name);
   const interfaces: OvnLsInterface[] = [];
-  for (const router of routers) {
-    for (const endpoint of router.endpoints) {
-      if (endpoint.kind !== "ovn" || endpoint.l2Segment.name !== domain.name) {
-        continue;
-      }
-      for (const hi of endpoint.ifaces ?? []) {
-        if (hi.iface.kind !== "veth") {
-          interfaces.push({
-            host: hi.host.name,
-            iface: {
-              ...resolveIface(hi.iface),
-              shortName,
-              // Per-leg flow switch (types.ts RouterEndpointInputBase.
-              // flow): only reported when OFF — absent means "inherit".
-              // Rides the iface blob next to shortName for the same
-              // reason: it's a real-world-binding fact the deployer reads
-              // per (host, bridge), not a separate node. OFF WINS: the
-              // deployer disables a bridge if ANY entry on it carries
-              // flow:false.
-              ...(ifaceFlowOff(endpoint, hi.iface) ? { flow: false } : {}),
-            },
-          });
-          continue;
-        }
-        // A veth on a transit domain: buildKernelRouterEndpoint stamps
-        // LONG leg names on the endpoint; the deployer's binding
-        // emitter attaches `peerName` to the bridge, so the legs are
-        // shortened HERE to the same id kernelRouterSideToIR resolves
-        // for the netns-side pair (vethShortId above) — otherwise the
-        // bridge would be given a >IFNAMSIZ device name (2026-08-18).
-        const id = vethShortId(hi.iface.ifaceName);
-        interfaces.push({
-          host: hi.host.name,
-          iface: {
-            ...hi.iface,
-            ifaceName: `veth-krn-${id}`,
-            peerName: `veth-ovn-${id}`,
-            shortName,
-            ...(ifaceFlowOff(endpoint, hi.iface) ? { flow: false } : {}),
-          },
-        });
-      }
+  for (const port of domain.ovnPorts) {
+    if (port.host === undefined || port.iface === undefined) continue;
+    if (port.iface.kind !== "veth") {
+      interfaces.push({
+        host: port.host.name,
+        iface: {
+          ...resolveIface(port.iface),
+          bridge: shortName,
+          ...(port.flowOff ? { flow: false } : {}),
+        },
+      });
+      continue;
     }
+    // A veth on a transit domain: buildKernelRouterEndpoint stamps LONG
+    // leg names; the deployer's binding emitter attaches `peerName` to
+    // the bridge, so shorten both legs HERE to the same id
+    // kernelRouterSideToIR resolves for the netns-side pair.
+    const id = vethShortId(port.iface.ifaceName);
+    interfaces.push({
+      host: port.host.name,
+      iface: {
+        ...port.iface,
+        ifaceName: `veth-krn-${id}`,
+        peerName: `veth-ovn-${id}`,
+        bridge: shortName,
+        ...(port.flowOff ? { flow: false } : {}),
+      },
+    });
   }
   return {
-    id,
+    id: `ls:${domain.name}`,
     kind: "ovn.ls",
     key: { name: domain.name },
     data: { interfaces },
@@ -1546,7 +1549,7 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
   }
 
   for (const domain of network.allCollisionDomains) {
-    const node = collisionDomainToIR(domain, network.allRouters);
+    const node = collisionDomainToIR(domain);
     nodes[node.id] = node;
   }
 
@@ -1612,6 +1615,101 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
       );
       nodes[node.id] = node;
     }
+  }
+
+  // A WAN VLAN shared by several kernel routers cannot be moved into
+  // each router's netns (one 8021q device per parent+tag, cluster-wide).
+  // Emit a host-local `bridge` node carrying the shared VLAN leg plus one
+  // veth per router, and turn each router side into the veth that plugs
+  // into it. A topology can also declare this bridge explicitly with
+  // net.collisionDomain(name, { host }) + addInterface().
+  const vlanDomainKey = (host: string, parent: string, vlanId: number) =>
+    `${host}\u0000${parent}\u0000${vlanId}`;
+  const vlanUsers = new Map<string, Set<string>>();
+  for (const node of Object.values(nodes)) {
+    if (node.kind !== "kernel.router" || node.key.side === undefined) continue;
+    for (const entry of node.data.ifaces ?? []) {
+      if (entry.iface.kind !== "vlan") continue;
+      const key = vlanDomainKey(
+        entry.host,
+        entry.iface.vlanParent.name,
+        entry.iface.vlanId,
+      );
+      const users = vlanUsers.get(key) ?? new Set<string>();
+      users.add(node.key.name);
+      vlanUsers.set(key, users);
+    }
+  }
+  const hostsByName = new Map(
+    network.allHosts.map((host) => [host.name, host]),
+  );
+  const sharedDomains = new Map<string, CollisionDomain>();
+  for (const [id, node] of Object.entries(nodes)) {
+    if (
+      node.kind !== "kernel.router" || node.key.side === undefined ||
+      node.data.ifaces === undefined
+    ) {
+      continue;
+    }
+    let changed = false;
+    const ifaces = node.data.ifaces.map((entry) => {
+      if (entry.iface.kind !== "vlan") return entry;
+      const key = vlanDomainKey(
+        entry.host,
+        entry.iface.vlanParent.name,
+        entry.iface.vlanId,
+      );
+      if ((vlanUsers.get(key)?.size ?? 0) < 2) return entry;
+      changed = true;
+      const bridge = transitBridgeName(
+        entry.iface.vlanParent.name,
+        entry.iface.vlanId,
+      );
+      const host = hostsByName.get(entry.host);
+      if (host === undefined) {
+        throw new Error(`unknown host "${entry.host}" for shared WAN bridge`);
+      }
+      let domain = sharedDomains.get(bridge);
+      if (domain === undefined) {
+        domain = new CollisionDomain(bridge, { host });
+        domain.addInterface({
+          kind: "vlan",
+          vlanParent: {
+            kind: "physical",
+            name: entry.iface.vlanParent.name,
+          },
+          vlanId: entry.iface.vlanId,
+          ifaceName: `${entry.iface.vlanParent.name}.${entry.iface.vlanId}`,
+        });
+        sharedDomains.set(bridge, domain);
+      }
+      // The WAN leg and the transit leg are two different veth pairs on
+      // the same router, so they need different short ids.
+      const shortId = vethShortId(`veth-krn-${node.key.name}-wan`);
+      const mac = entry.iface.mac ??
+        macFromAddrsOrName([], `${node.key.name}-${node.key.side}`);
+      domain.addInterface({
+        kind: "veth",
+        ifaceName: `veth-krn-${shortId}`,
+        peerName: `veth-ovn-${shortId}`,
+        mac,
+      }, host);
+      return {
+        host: entry.host,
+        iface: {
+          kind: "veth" as const,
+          ifaceName: `veth-krn-${shortId}`,
+          peerName: `veth-ovn-${shortId}`,
+          shortName: shortId,
+          mac,
+        },
+      };
+    });
+    if (changed) nodes[id] = { ...node, data: { ...node.data, ifaces } };
+  }
+  for (const domain of sharedDomains.values()) {
+    const node = collisionDomainToIR(domain);
+    nodes[node.id] = node;
   }
 
   // Every security group built via net.securityGroup() (define.ts) —

@@ -93,7 +93,7 @@ export const InfraHostNode = type({
 // (types.ts), discriminated on `kind`. The base shapes are shared; each
 // of the two places an interface appears adds its own IR-resolved facts:
 //
-//   ovn.ls `interfaces[].iface` (OvnLsIface*) — `shortName`: the real,
+//   ovn.ls `interfaces[].iface` (OvnLsIface*) — `bridge`: the real,
 //   IFNAMSIZ-safe OVS bridge this domain binds to (src/ir.ts's
 //   shortIfaceName, always resolved by the time toIR() emits it), and
 //   `flow: false` when the leg opted out of flow export (absent = on).
@@ -161,7 +161,7 @@ const ifaceVeth = {
   peerName: "string",
 } as const;
 
-const lsBinding = { shortName: "string", "flow?": "false" } as const;
+const lsBinding = { bridge: "string", "flow?": "false" } as const;
 export const OvnLsIfaceVlan = type({ ...ifaceVlan, ...lsBinding });
 export const OvnLsIfacePhysical = type({ ...ifacePhysical, ...lsBinding });
 export const OvnLsIfaceXdp = type({ ...ifaceXdp, ...lsBinding });
@@ -169,7 +169,13 @@ export const OvnLsIfaceBridgePort = type({ ...ifaceBridgePort, ...lsBinding });
 export const OvnLsIfaceWireguard = type({ ...ifaceWireguard, ...lsBinding });
 export const OvnLsIfaceZerotier = type({ ...ifaceZerotier, ...lsBinding });
 export const OvnLsIfaceDummy = type({ ...ifaceDummy, ...lsBinding });
-export const OvnLsIfaceVeth = type({ ...ifaceVeth, ...lsBinding });
+export const OvnLsIfaceVeth = type({
+  ...ifaceVeth,
+  ...lsBinding,
+  // The netns-side leg's MAC, pinned by the generator when this port is
+  // a kernel router's WAN leg.
+  "mac?": "string",
+});
 export const OvnLsIface = OvnLsIfaceVlan.or(OvnLsIfacePhysical).or(
   OvnLsIfaceXdp,
 ).or(OvnLsIfaceBridgePort).or(OvnLsIfaceWireguard).or(OvnLsIfaceZerotier)
@@ -182,6 +188,7 @@ export const OvnLsInterface = type({ host: "string", iface: OvnLsIface });
 export const KernelIfaceVlan = type({
   ...ifaceVlan,
   vlanParent: ifaceParentPhysical,
+  "mac?": "string",
 });
 export const KernelIfacePhysical = type(ifacePhysical);
 export const KernelIfaceBridgePort = type(ifaceBridgePort);
@@ -471,6 +478,23 @@ export const KernelRouterNode = type({
   data: KernelRouterData,
 });
 
+// A host-local L2 segment: an OVS bridge and the ports plugged into it.
+// A cluster-wide collision domain is an ovn.ls; this one has no OVN
+// logical switch, no localnet port and no bridge mapping. `ports` is the
+// authoritative list (same host+iface shape as OvnLsInterface), so a WAN
+// fan-out bridge carries its shared VLAN leg and one veth per router.
+export const BridgeKey = type({ name: "string" });
+export const BridgeData = type({
+  host: "string",
+  ports: OvnLsInterface.array(),
+});
+export const BridgeNode = type({
+  id: "string",
+  kind: "'bridge'",
+  key: BridgeKey,
+  data: BridgeData,
+});
+
 // security.group: an IMPLEMENTATION-ABSTRACT named set of rules
 // (src/ir.ts's securityGroupToIR, from KernelRouterSide.services/
 // securityGroup, types.ts). The name is just a label (derived from the
@@ -571,6 +595,8 @@ export const IRNode = InfraHostNode.or(OvnLsNode).or(OvnLrNode).or(OvnLrpNode)
   ).or(
     KernelRouterNode,
   ).or(
+    BridgeNode,
+  ).or(
     SecurityGroupNode,
   ).or(
     KernelAppContainerNode,
@@ -601,6 +627,7 @@ export type Ipv4RouteNode = DeepReadonly<typeof Ipv4RouteNode.infer>;
 export type Ipv6RouteNode = DeepReadonly<typeof Ipv6RouteNode.infer>;
 export type RouteNode = Ipv4RouteNode | Ipv6RouteNode;
 export type KernelRouterNode = DeepReadonly<typeof KernelRouterNode.infer>;
+export type BridgeNode = DeepReadonly<typeof BridgeNode.infer>;
 export type KernelIface = DeepReadonly<typeof KernelIface.infer>;
 export type KernelRouterInterface = DeepReadonly<
   typeof KernelRouterInterface.infer
@@ -620,6 +647,7 @@ export type IRNode =
   | OvnLrpNode
   | RouteNode
   | KernelRouterNode
+  | BridgeNode
   | SecurityGroupNode
   | KernelAppContainerNode
   | KernelAppServiceNode;
@@ -779,6 +807,8 @@ export function buildJsonSchema(): Record<string, unknown> {
     DockerApp: shape(DockerApp),
     KernelApp: shape(KernelApp),
     KernelRouterData: shape(KernelRouterData),
+    BridgeKey: shape(BridgeKey),
+    BridgeData: shape(BridgeData),
     SecurityGroupKey: shape(SecurityGroupKey),
     SecurityGroupRule: shape(SecurityGroupRule),
     SecurityGroupData: shape(SecurityGroupData),
@@ -801,6 +831,7 @@ export function buildJsonSchema(): Record<string, unknown> {
       "KernelRouterKey",
       "KernelRouterData",
     ),
+    BridgeNode: nodeSchema("bridge", "BridgeKey", "BridgeData"),
     SecurityGroupNode: nodeSchema(
       "security.group",
       "SecurityGroupKey",
@@ -828,6 +859,7 @@ export function buildJsonSchema(): Record<string, unknown> {
       "Ipv4RouteNode",
       "Ipv6RouteNode",
       "KernelRouterNode",
+      "BridgeNode",
       "SecurityGroupNode",
       "KernelAppContainerNode",
       "KernelAppServiceNode",

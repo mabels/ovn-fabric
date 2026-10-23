@@ -258,7 +258,7 @@ NODES: list[pt.Model] = [
                         "kind": "vlan",
                         "vlanParent": {"kind": "physical", "name": "eth0"},
                         "vlanId": 129,
-                        "shortName": "br-home",
+                        "bridge": "br-home",
                     },
                 ),
             ],
@@ -655,7 +655,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
                                 "kind": "veth",
                                 "ifaceName": "veth-krn-9adb1d",
                                 "peerName": "veth-ovn-9adb1d",
-                                "shortName": "br-1f5b95ad",
+                                "bridge": "br-1f5b95ad",
                             },
                         ),
                     ],
@@ -688,7 +688,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
                             "kind": "vlan",
                             "vlanParent": {"kind": "physical", "name": "eth0"},
                             "vlanId": 129,
-                            "shortName": "br-8d8c0a55",
+                            "bridge": "br-8d8c0a55",
                         },
                     ),
                 ],
@@ -773,7 +773,7 @@ class XdpBindingTest(unittest.TestCase):
                         "nRxq": 1,
                     },
                     "vlanId": 1128,
-                    "shortName": "br-home",
+                    "bridge": "br-home",
                 }
             ),
         ]
@@ -815,7 +815,7 @@ class XdpBindingTest(unittest.TestCase):
                         "nRxq": 1,
                     },
                     "vlanId": 1128,
-                    "shortName": "br-home",
+                    "bridge": "br-home",
                 }
             ),
             _xdp_ls(
@@ -828,7 +828,7 @@ class XdpBindingTest(unittest.TestCase):
                         "nRxq": 1,
                     },
                     "vlanId": 2143,
-                    "shortName": "br-cp",
+                    "bridge": "br-cp",
                 },
                 domain="control-plane",
             ),
@@ -845,7 +845,7 @@ class XdpBindingTest(unittest.TestCase):
                     "name": "ovnxdp",
                     "mode": "best-effort",
                     "nRxq": 1,
-                    "shortName": "br-home",
+                    "bridge": "br-home",
                 }
             ),
         ]
@@ -874,7 +874,7 @@ class XdpBindingTest(unittest.TestCase):
                         "nRxq": 1,
                     },
                     "vlanId": 1128,
-                    "shortName": "br-home",
+                    "bridge": "br-home",
                 }
             ),
         ]
@@ -1901,13 +1901,51 @@ class KernelRouterDeleteTest(unittest.TestCase):
         )
 
 
+class BridgeNodeBindingsTest(unittest.TestCase):
+    def test_bridge_ports_create_the_bridge_and_shared_vlan_leg(self) -> None:
+        bridge = pt.BridgeNode(
+            id="bridge:br-test",
+            kind="bridge",
+            key=pt.BridgeKey(name="br-test"),
+            data=pt.BridgeData(
+                host="host:chassis-1",
+                ports=[
+                    pt.OvnLsInterface(
+                        host="chassis-1",
+                        iface=hydrate_as(
+                            pt.OvnLsIfaceVlan,
+                            {
+                                "kind": "vlan",
+                                "vlanParent": {"kind": "physical", "name": "eth0"},
+                                "vlanId": 2280,
+                                "ifaceName": "eth0.2280",
+                                "bridge": "br-test",
+                            },
+                        ),
+                    )
+                ],
+            ),
+        )
+        _, hosts = build_ops([*NODES, bridge], "create")
+        script = hosts["chassis-1"].bindings
+        self.assertIn("ensure_vlan(job, 'test', 'eth0', 'eth0.2280', 2280", script)
+        self.assertIn("--may-exist add-br br-test", script)
+        self.assertIn("--may-exist add-port br-test eth0.2280", script)
+        # A host-local bridge is not an OVN localnet domain.
+        self.assertNotIn("net-br-test:br-test", script)
+
+        down_emit = _OpEmitter("delete")
+        _emit_iface_bindings("chassis-1", [*NODES, bridge], down_emit)
+        self.assertIn("--if-exists del-br br-test", "\n".join(down_emit.lines))
+
+
 class UnsupportedIfaceKindTest(unittest.TestCase):
     def test_unsupported_kind_is_skipped_with_a_comment_not_crashed_on(self) -> None:
         nodes = _replace_home_ls(
             NODES,
             data=pt.OvnLsData(
                 interfaces=[
-                    _ls_interface(host="chassis-1", iface={"kind": "dummy", "shortName": "br-home"})
+                    _ls_interface(host="chassis-1", iface={"kind": "dummy", "bridge": "br-home"})
                 ],
             ),
         )
@@ -2514,7 +2552,7 @@ class KernelServiceDeployTest(unittest.TestCase):
                             "kind": "vlan",
                             "vlanParent": {"kind": "physical", "name": "eth0"},
                             "vlanId": vlan,
-                            "shortName": short,
+                            "bridge": short,
                         },
                     )
                 ]
@@ -2763,7 +2801,7 @@ class MultiServiceDeployTest(unittest.TestCase):
                             "kind": "vlan",
                             "vlanParent": {"kind": "physical", "name": "eth0"},
                             "vlanId": 1128,
-                            "shortName": "br-a",
+                            "bridge": "br-a",
                         },
                     )
                 ]
@@ -2781,7 +2819,7 @@ class MultiServiceDeployTest(unittest.TestCase):
                             "kind": "vlan",
                             "vlanParent": {"kind": "physical", "name": "eth0"},
                             "vlanId": 1129,
-                            "shortName": "br-b",
+                            "bridge": "br-b",
                         },
                     )
                 ]
@@ -2860,7 +2898,7 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                                 "kind": "vlan",
                                 "vlanParent": {"kind": "physical", "name": "eth0"},
                                 "vlanId": 1129,
-                                "shortName": "br-management-v2",
+                                "bridge": "br-management-v2",
                             },
                         }
                     ]
@@ -2878,7 +2916,7 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                                 "kind": "vlan",
                                 "vlanParent": {"kind": "physical", "name": "eth0"},
                                 "vlanId": 1143,
-                                "shortName": "br-control-plane",
+                                "bridge": "br-control-plane",
                             },
                         }
                     ]

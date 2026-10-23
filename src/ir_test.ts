@@ -15,6 +15,7 @@ import { defineNetwork } from "./define.ts";
 import { toIR } from "./ir.ts";
 import type { IRNode } from "./ir.ts";
 import type {
+  BridgeNode,
   InfraHostNode,
   KernelAppContainerNode,
   KernelRouterNode,
@@ -108,7 +109,7 @@ function lsShortIfaceName(
 ): string {
   const first = node(nodes, `ls:${domain}`).data.interfaces[0];
   if (!first) throw new Error(`no interfaces on ls:${domain}`);
-  return first.iface.shortName;
+  return first.iface.bridge;
 }
 
 function networkWithBoundDomain(domainName: string) {
@@ -262,7 +263,7 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
         kind: "veth",
         ifaceName: `veth-krn-${shortId}`,
         peerName: `veth-ovn-${shortId}`,
-        shortName: `br-${
+        bridge: `br-${
           fnv1a32("transit-router-wan").toString(16).padStart(8, "0")
         }`,
         // A kernel/tunnel router transit is internal mesh plumbing, not
@@ -271,6 +272,132 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
       },
     },
   ]);
+});
+
+Deno.test("collisionDomain: host-only domain emits a bridge with its ports", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const wan = net.collisionDomain("wan", { host });
+    wan.addInterface({
+      kind: "vlan",
+      vlanParent: "eth0",
+      vlanId: 2280,
+    });
+    return { routers: [] };
+  });
+
+  const nodes = toIR(network);
+  // No OVN logical switch for a host-only domain.
+  assertThrows(() => node(nodes, "ls:wan"));
+  const bridge = node(nodes, "bridge:br-wan") as BridgeNode;
+  assertEquals(bridge.kind, "bridge");
+  assertEquals(bridge.key, { name: "br-wan" });
+  assertEquals(bridge.data, {
+    host: "host:chassis-1",
+    ports: [{
+      host: "chassis-1",
+      iface: {
+        kind: "vlan",
+        vlanParent: { kind: "physical", name: "eth0" },
+        vlanId: 2280,
+        bridge: "br-wan",
+      },
+    }],
+  });
+});
+
+Deno.test("collisionDomain: auto-registers every ovnRouterEndpoint port", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const segment = net.collisionDomain("segment");
+    net.defineOvnRouter("router-a", (router) => ({
+      routingDomains: [],
+      endpoints: [
+        router.ovnRouterEndpoint({
+          l2Segment: segment,
+          ipaddrs: [IPv4.parse("192.168.10.1/24")],
+          ifaces: [{
+            host,
+            iface: { kind: "vlan", vlanParent: "eth0", vlanId: 100 },
+          }],
+        }),
+        router.ovnRouterEndpoint({
+          l2Segment: net.collisionDomain("backbone-segment"),
+          ipaddrs: [IPv4.parse("172.22.0.1/16")],
+        }),
+      ],
+    }));
+    return { routers: [] };
+  });
+
+  const nodes = toIR(network);
+  const ls = node(nodes, "ls:segment");
+  assertEquals((ls.data["interfaces"] as readonly unknown[]).length, 1);
+});
+
+Deno.test("kernelRouterSideToIR: shared WAN VLAN becomes a bridge with veth ports", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const define = (name: string, wan: string, transit: string) =>
+      net.defineOvnRouter(name, (router) => ({
+        routingDomains: [],
+        endpoints: [
+          router.kernelRouterEndpoint({
+            host,
+            transit: transitNetwork(
+              IPv4.parse(transit),
+              IPv6.parse("fd00::10:12:80:1/124"),
+            ),
+            ipaddrs: [IPv4.parse(wan)],
+            ifaces: [{
+              host,
+              iface: {
+                kind: "vlan",
+                vlanParent: "eth0",
+                vlanId: 2280,
+                mac: name === "router-home"
+                  ? "00:00:c0:a8:84:5d"
+                  : "00:00:c0:a8:84:5e",
+              },
+            }],
+          }),
+          router.ovnRouterEndpoint({
+            l2Segment: net.collisionDomain(`backbone-${name}`),
+            ipaddrs: [IPv4.parse("172.22.12.80/16")],
+          }),
+        ],
+      }));
+    return {
+      routers: [
+        define("router-home", "192.168.132.93/24", "10.12.80.1/28"),
+        define("router-neighbor", "192.168.132.94/24", "10.12.81.1/28"),
+      ],
+    };
+  });
+
+  const nodes = toIR(network);
+  const bridgeName = `br-upl-${
+    fnv1a32("eth0:2280").toString(16).padStart(8, "0")
+  }`;
+  const bridge = node(nodes, `bridge:${bridgeName}`) as BridgeNode;
+  assertEquals(bridge.kind, "bridge");
+  const ports = bridge.data.ports as readonly {
+    host: string;
+    iface: { kind: string; mac?: string };
+  }[];
+  assertEquals(ports.length, 3);
+  assertEquals(ports[0]!.iface.kind, "vlan");
+  assertEquals(
+    ports.slice(1).map((p) => p.iface.mac),
+    ["00:00:c0:a8:84:5d", "00:00:c0:a8:84:5e"],
+  );
+  for (const router of ["router-home", "router-neighbor"]) {
+    const right = node(nodes, `kernelrouter:${router}|side:right`);
+    const iface = (right.data["ifaces"] as readonly {
+      iface: { kind: string; mac?: string };
+    }[])[0]!.iface;
+    assertEquals(iface.kind, "veth");
+  }
 });
 
 Deno.test("iface resolution: a VLAN on an xdp parent carries the resolved AF_XDP settings", () => {
@@ -315,7 +442,7 @@ Deno.test("iface resolution: a VLAN on an xdp parent carries the resolved AF_XDP
           nRxq: 1,
         },
         vlanId: 1128,
-        shortName: "br-home",
+        bridge: "br-home",
       },
     },
   ]);
@@ -371,13 +498,13 @@ Deno.test("iface resolution: a bare xdp iface defaults to best-effort/1; an expl
     name: "ovnxdp",
     mode: "best-effort",
     nRxq: 1,
-    shortName: "br-home",
+    bridge: "br-home",
   });
   assertEquals(node(nodes, "ls:dmz").data.interfaces[0]!.iface, {
     kind: "vlan",
     vlanParent: { kind: "physical", name: "eth2" },
     vlanId: 129,
-    shortName: "br-dmz",
+    bridge: "br-dmz",
   });
 });
 

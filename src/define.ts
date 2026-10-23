@@ -38,6 +38,7 @@ import {
   type CertIssuer,
   type CertIssuerSpec,
   CollisionDomain,
+  type CollisionDomainOptions,
   type DnsProvider,
   type DnsProviderSpec,
   type Host,
@@ -356,13 +357,18 @@ export class NetworkBuilder implements RouterEndpointContext {
     this.ovnGlobalOptions = options;
   }
 
-  /** Declare a bare collision domain — an OVN logical switch, L2 only.
-   * See CollisionDomain (types.ts). */
-  collisionDomain(name: string): CollisionDomain {
+  /** Declare a bare collision domain — L2 only. No `host`: an OVN
+   * logical switch (cluster-wide). With `host`: a host-local OVS
+   * bridge, never an OVN logical switch. See CollisionDomain
+   * (types.ts). */
+  collisionDomain(
+    name: string,
+    options: CollisionDomainOptions = {},
+  ): CollisionDomain {
     if (this.collisionDomainsByName.has(name)) {
       throw new Error(`collision domain "${name}" declared more than once`);
     }
-    const domain = new CollisionDomain(name);
+    const domain = new CollisionDomain(name, options);
     this.collisionDomainsByName.set(name, domain);
     return domain;
   }
@@ -399,6 +405,13 @@ export class NetworkBuilder implements RouterEndpointContext {
         `router "${routerName}" references collision domain ` +
           `"${endpoint.l2Segment.name}", which was not declared via ` +
           `net.collisionDomain()/net.backbone() in this defineNetwork call`,
+      );
+    }
+    if (endpoint.l2Segment.hostOnly) {
+      throw new Error(
+        `router "${routerName}" attaches an OVN endpoint to host-only ` +
+          `collision domain "${endpoint.l2Segment.name}" — an OVN logical ` +
+          `switch cannot be host-scoped`,
       );
     }
     if (
