@@ -367,6 +367,22 @@ export type KernelApp =
      * — the router-netns end is `veth-<vethName>`-free, the pair is
      * `ve-<hash>` / `ve-<hash>-c`, both ≤ IFNAMSIZ. */
     readonly vethName?: string;
+    /** Host bind mounts, e.g. the ZeroTier identity directory. Each is
+     * created on the host before `docker run` and passed as
+     * `-v <host>:<container>`. */
+    readonly volumes?: readonly {
+      readonly host: string;
+      readonly container: string;
+    }[];
+    /** Extra `docker run` flags inserted before the image, e.g.
+     * ["--dns", "10.43.0.10"]. */
+    readonly run?: readonly string[];
+    /** ZeroTier identity files seeded into its state directory before
+     * the container starts. */
+    readonly identity?: {
+      readonly public: string;
+      readonly secret: string;
+    };
   };
 
 // ── Router: connects exactly two collision domains ──────────────────
@@ -888,9 +904,14 @@ export type RouterEndpointService =
   | {
     readonly kind: "zerotier";
     readonly networkId: string;
-    readonly instanceDir?: string;
     readonly masq?: readonly ("ipv4" | "ipv6")[];
     readonly routes?: readonly RouterEndpointRoute[];
+    /** Reuse an existing ZeroTier node identity: the exact
+     * identity.public / identity.secret files. */
+    readonly identity?: {
+      readonly public: string;
+      readonly secret: string;
+    };
   };
 
 // ── Service: a reusable WORKLOAD, and its network attachments ──────────

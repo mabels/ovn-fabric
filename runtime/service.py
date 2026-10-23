@@ -47,7 +47,6 @@ import logging
 import os
 import shlex
 import signal
-import sys
 from collections.abc import Callable, Coroutine, Iterator
 from typing import Any, Literal, TypedDict
 
@@ -91,6 +90,7 @@ StopHook = Callable[["Job"], Coroutine[Any, Any, None]]
 EmitHook = Callable[..., Coroutine[Any, Any, None]]
 Action = Callable[["Job"], Coroutine[Any, Any, None]]
 Configure = Callable[["Job"], None]
+LoggerFactory = Callable[[str], logging.Logger]
 
 log = logging.getLogger("ovn-fabric.runtime")
 
@@ -125,12 +125,22 @@ class Job:
         initiate: bool = False,
         parent: Job | None = None,
         ctx: Any = None,
+        logger_factory: LoggerFactory | None = None,
     ) -> None:
         self.name = name
         self.initiate = initiate
         self.parent = parent
         # Optional per-job context, handed to on_emit hooks that accept it.
         self.ctx: Any = ctx if ctx is not None or parent is None else parent.ctx
+        # Each job gets its own named logger; a factory can replace the
+        # default logging.getLogger(name).
+        if logger_factory is not None:
+            self._logger_factory: LoggerFactory = logger_factory
+        elif parent is not None:
+            self._logger_factory = parent._logger_factory
+        else:
+            self._logger_factory = logging.getLogger
+        self.logger: logging.Logger = self._logger_factory(name)
         self.children: list[Job] = []
 
         self._start_hooks: list[StartHook] = []
@@ -164,9 +174,16 @@ class Job:
         initiate: bool = False,
         configure: Configure | None = None,
         ctx: Any = None,
+        logger_factory: LoggerFactory | None = None,
     ) -> Job:
         """Add a child job. On a running tree it starts right away."""
-        child = Job(name, initiate=initiate, parent=self, ctx=ctx)
+        child = Job(
+            name,
+            initiate=initiate,
+            parent=self,
+            ctx=ctx,
+            logger_factory=logger_factory,
+        )
         self.children.append(child)
         if configure is not None:
             configure(child)
@@ -254,72 +271,6 @@ class Job:
         Returns whether the command exited 0."""
         ok, _ = await self._exec(label, cmd, abort_on_error, capture=False, timeout=timeout)
         return ok
-
-    async def run_streaming(
-        self,
-        label: str,
-        cmd: list[str],
-        abort_on_error: bool = True,
-        timeout: float | None = None,
-    ) -> bool:
-        """Run a command, capture its stdout+stderr, and print every line
-        prefixed with the job label when DEBUG logging is enabled."""
-        verbose = log.isEnabledFor(logging.DEBUG)
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-        except OSError as exc:
-            detail = f" ({exc.strerror})" if exc.strerror else ""
-            self.log(
-                "error" if abort_on_error else "warn",
-                f"cannot run in {label}{detail}: {shlex.join(cmd)}",
-            )
-            if abort_on_error:
-                raise JobError(f"cannot run in {label}{detail}: {shlex.join(cmd)}", 127)
-            return False
-        self.register_process(proc)
-
-        async def pump() -> int:
-            assert proc.stdout is not None
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    break
-                if verbose:
-                    print(
-                        f"{label}: {line.decode(errors='replace').rstrip()}",
-                        flush=True,
-                    )
-            return await proc.wait()
-
-        try:
-            returncode = await (asyncio.wait_for(pump(), timeout=timeout) if timeout else pump())
-        except asyncio.TimeoutError:
-            await _kill(proc)
-            self.unregister_process(proc)
-            self.log(
-                "error" if abort_on_error else "warn",
-                f"timed out after {timeout:g}s in {label}: {shlex.join(cmd)}",
-            )
-            if abort_on_error:
-                raise JobError(
-                    f"timed out after {timeout:g}s in {label}: {shlex.join(cmd)}",
-                    124,
-                )
-            return False
-        finally:
-            if proc.returncode is not None:
-                self.unregister_process(proc)
-        if returncode == 0:
-            return True
-        _fail_line = f"failed in {label}: {shlex.join(cmd)}"
-        self.log("error" if abort_on_error else "warn", _fail_line)
-        if abort_on_error:
-            raise JobError(f"failed in {label}: {shlex.join(cmd)}", returncode)
-        return False
 
     async def capture_cmd(
         self,
@@ -560,7 +511,10 @@ class Job:
                 # only shown on failure; verbose echoes it with the job
                 # label prefix.
                 stdout=asyncio.subprocess.PIPE,
-                stderr=None if capture else asyncio.subprocess.STDOUT,
+                # Capture stderr too: capture_cmd() only returns stdout,
+                # but a probing command's errors (dpkg-query "no packages
+                # found") must not leak to the terminal.
+                stderr=asyncio.subprocess.PIPE if capture else asyncio.subprocess.STDOUT,
                 # Its own process group, so _kill() takes everything it spawned.
                 start_new_session=True,
             )
@@ -571,22 +525,52 @@ class Job:
             return False, b""
         self.register_process(proc, cmd)
         self._trace("run_cmd %s started: pid %d: %s", label, proc.pid, line)
+        buffered: list[str] = []
+        verbose = self.logger.isEnabledFor(logging.DEBUG)
+
+        async def pump() -> int:
+            assert proc.stdout is not None
+            while True:
+                chunk = await proc.stdout.readline()
+                if not chunk:
+                    break
+                # apt/dpkg use '\r' for progress updates; split on both
+                # so a carriage-return line never overwrites the logger
+                # prefix or merges two lines.
+                for text in chunk.decode(errors="replace").replace("\r", "\n").splitlines():
+                    if not text:
+                        continue
+                    if verbose:
+                        self.logger.debug("%s: %s", label, text)
+                    else:
+                        buffered.append(text)
+            return await proc.wait()
+
         try:
-            if timeout is None:
-                stdout, _ = await proc.communicate()
+            if capture:
+                stdout, _stderr = await proc.communicate()
             else:
-                try:
-                    stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    self._trace("run_cmd %s timed out after %ss: pid %d", label, timeout, proc.pid)
-                    await _kill(proc)
-                    self.unregister_process(proc)
-                    self._fail(
-                        abort_on_error,
-                        124,
-                        f"timed out after {timeout:g}s in {label}: {line}",
-                    )
-                    return False, b""
+                stdout = b""
+                if timeout is None:
+                    await pump()
+                else:
+                    try:
+                        await asyncio.wait_for(pump(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        self._trace(
+                            "run_cmd %s timed out after %ss: pid %d",
+                            label,
+                            timeout,
+                            proc.pid,
+                        )
+                        await _kill(proc)
+                        self.unregister_process(proc)
+                        self._fail(
+                            abort_on_error,
+                            124,
+                            f"timed out after {timeout:g}s in {label}: {line}",
+                        )
+                        return False, b""
         except asyncio.CancelledError:
             self._trace("run_cmd %s cancelled: pid %d left for stop() to kill", label, proc.pid)
             raise
@@ -595,14 +579,9 @@ class Job:
             if proc.returncode is not None:
                 self.unregister_process(proc)
         self._trace("run_cmd %s completed: pid %d exit %d", label, proc.pid, proc.returncode)
-        if not capture and stdout:
-            text = stdout.decode(errors="replace")
-            if log.isEnabledFor(logging.DEBUG):
-                for output_line in text.splitlines():
-                    print(f"{label}: {output_line}", flush=True)
-            elif proc.returncode:
-                for output_line in text.splitlines():
-                    print(f"{label}: {output_line}", file=sys.stderr)
+        if not capture and buffered and proc.returncode:
+            for output_line in buffered:
+                self.logger.error("%s: %s", label, output_line)
         if proc.returncode:
             self._fail(abort_on_error, proc.returncode, f"failed in {label}: {line}")
             return False, stdout or b""

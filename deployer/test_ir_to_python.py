@@ -138,6 +138,7 @@ class _OpEmitter(Emitter):
 
     def enable_unit(self, unit: str, optional: bool = True) -> None:
         self.sh(["systemctl", "enable", "--now", unit], optional=optional)
+        self.sh(["systemctl", "restart", unit], optional=optional)
 
     def start_script(self, script: str, optional: bool = True) -> None:
         self.sh([script, "up"], optional=optional)
@@ -412,6 +413,8 @@ def _proc(returncode: int = 0, stdout: bytes = b"") -> mock.Mock:
     proc.returncode = returncode
     proc.wait = mock.AsyncMock(return_value=returncode)
     proc.communicate = mock.AsyncMock(return_value=(stdout, None))
+    proc.stdout = mock.Mock()
+    proc.stdout.readline = mock.AsyncMock(return_value=b"")
     return proc
 
 
@@ -1407,7 +1410,7 @@ class KernelRouterCreateTest(unittest.TestCase):
         tree = ns["_run_chassis_1"]()
         self.assertEqual(
             [job.name for job in tree.children],
-            ["install-packages", "install-images", "configure"],
+            ["install-packages", "configure"],
         )
 
     def test_units_are_not_part_of_the_install_plan(self) -> None:
@@ -2016,7 +2019,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             "def run_cmd",
             "def write_file",
             "def _install_packages",
-            "def _install_images",
+            "def _install_image",
             "argparse.ArgumentParser",
             'choices=["create", "delete", "run"]',
         ):
@@ -2052,7 +2055,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         tree = ns["_run_chassis_1"]()
         self.assertEqual(
             [job.name for job in tree.children],
-            ["install-packages", "install-images", "configure"],
+            ["install-packages", "configure"],
         )
 
     def _fake_action_jobs(self, ns: dict[str, Any], action: str) -> None:
@@ -2366,25 +2369,44 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             create.side_effect = lambda *argv, **kwargs: _proc(0, b"")
             _with_job(ns, ns["_install_packages"], deps)
             argv = [list(call.args) for call in create.call_args_list]
-        self.assertIn(["apt-get", "update"], argv)
         self.assertIn(
-            [
-                "env",
-                "DEBIAN_FRONTEND=noninteractive",
-                "apt-get",
-                "install",
-                "-y",
-                "iproute2",
-                "openvswitch-switch",
-            ],
+            ["apt-get", "-o", "Dpkg::Use-Pty=0", "-o", "Dpkg::Progress-Fancy=0", "update"],
             argv,
         )
+        self.assertTrue(
+            any(
+                command[:2] == ["env", "DEBIAN_FRONTEND=noninteractive"]
+                and command[-3:] == ["-y", "iproute2", "openvswitch-switch"]
+                for command in argv
+            )
+        )
 
-    def test_install_images_with_no_images_does_nothing(self) -> None:
+    def test_install_image_builds_when_a_dockerfile_is_given(self) -> None:
         ns = self._exec_runtime()
         with mock.patch("asyncio.create_subprocess_exec", new_callable=mock.AsyncMock) as create:
-            _with_job(ns, ns["_install_images"], {})
-        create.assert_not_called()
+            create.return_value = _proc()
+            ns["write_file"] = mock.AsyncMock()
+            ns["_docker_image_exists"] = mock.AsyncMock(return_value=False)
+            ns["tempfile"] = mock.Mock()
+            ns["tempfile"].mkdtemp.return_value = "/tmp/ctx"
+            ns["shutil"] = mock.Mock()
+            _with_job(
+                ns,
+                ns["_install_image"],
+                {
+                    "image": "ovn-fabric-router-zerotier",
+                    "dockerfile": "FROM ubuntu:24.04\nRUN true",
+                },
+            )
+            argv = [list(call.args) for call in create.call_args_list]
+        self.assertIn(
+            ["/usr/bin/docker", "build", "-t", "ovn-fabric-router-zerotier", "/tmp/ctx"],
+            argv,
+        )
+        self.assertNotIn(
+            ["/usr/bin/docker", "pull", "ovn-fabric-router-zerotier"],
+            argv,
+        )
 
     def test_generated_central_log_handler(self) -> None:
         ns: dict[str, Any] = {}
@@ -2462,13 +2484,12 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         self.assertEqual(tree.name, "ovn-fabric")
         self.assertEqual(
             [job.name for job in tree.children],
-            ["install-packages", "install-images", "configure"],
+            ["install-packages", "configure"],
         )
         self.assertTrue(tree.children[0].initiate)
         self.assertTrue(tree.children[1].initiate)
-        self.assertTrue(tree.children[2].initiate)
-        self.assertEqual([job.name for job in tree.children[2].children], ["kernel-0"])
-        kernel = tree.children[2].children[0]
+        self.assertEqual([job.name for job in tree.children[1].children], ["kernel-0"])
+        kernel = tree.children[1].children[0]
         self.assertIn(("abstract", "configure"), kernel.ctx._dependencies)
         self.assertIn(("abstract", "ip"), kernel.ctx._dependencies)
 

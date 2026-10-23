@@ -997,7 +997,7 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
 // ride on the zerotier app so the deployer's wire script can push them
 // out the RUNTIME-named interface — NOT on the kernel router's own
 // routes, which target the upstream veth (2026-08-30).
-Deno.test("tunnelRouterEndpoint: zerotier carries via-less tunnel routes onto its app", () => {
+Deno.test("tunnelRouterEndpoint: zerotier is a docker app with its state volume", () => {
   const network = defineNetwork("test-net", (net) => {
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
@@ -1022,7 +1022,7 @@ Deno.test("tunnelRouterEndpoint: zerotier carries via-less tunnel routes onto it
               {
                 kind: "zerotier",
                 networkId: "02cfbec15c2319ff",
-                instanceDir: "/var/lib/zerotier-one-uplink-zerotier",
+                identity: { public: "pub", secret: "sec" },
               },
             ],
             upstreamBackbone: {
@@ -1042,10 +1042,29 @@ Deno.test("tunnelRouterEndpoint: zerotier carries via-less tunnel routes onto it
   const nodes = toIR(network);
   // The netns wire script gets the via-less supernet to egress the tunnel.
   const right = node(nodes, "kernelrouter:router-zerotier|side:right").data as {
-    apps?: Array<{ kind: string; routes?: Array<{ dst: string }> }>;
+    apps?: Array<{
+      kind: string;
+      cmd?: string[];
+      build?: { dockerfile?: string };
+      volumes?: Array<{ host: string; container: string }>;
+    }>;
   };
-  const app = right.apps?.find((a) => a.kind === "zerotier");
-  assertEquals(app?.routes, [{ dst: "192.168.0.0/16" }]);
+  const app = right.apps?.find((a) => a.kind === "docker");
+  assertEquals(
+    app?.build?.dockerfile?.includes("ZT_NETWORK_ID=02cfbec15c2319ff"),
+    true,
+  );
+  assertEquals(app?.cmd?.join("\n").includes("192.168.0.0/16"), true);
+  assertEquals(app?.volumes, [
+    {
+      host: "/var/lib/ovn-fabric/router-zerotier/zerotier",
+      container: "/var/lib/zerotier-one",
+    },
+  ]);
+  assertEquals(
+    (app as { identity?: { public: string; secret: string } }).identity,
+    { public: "pub", secret: "sec" },
+  );
   // R2 (the OVN logical router) ALSO gets a route to forward the supernet
   // INTO its netns via the kernel-side transit address (10.12.85.14) —
   // otherwise it has no way to send ztnet traffic to the tunnel
@@ -1062,10 +1081,9 @@ Deno.test("tunnelRouterEndpoint: zerotier carries via-less tunnel routes onto it
   );
 });
 
-// instanceDir on a zerotier tunnel is OPTIONAL — when omitted it's
-// derived from the router name (/var/lib/zerotier-one-<router>) so a
-// config author only sets it when the default is wrong (2026-08-30).
-Deno.test("tunnelRouterEndpoint: zerotier instanceDir is derived from the router name when omitted", () => {
+// The ZeroTier docker app keeps its identity under the router's state
+// directory.
+Deno.test("tunnelRouterEndpoint: zerotier state directory is derived from the router name", () => {
   const network = defineNetwork("test-net", (net) => {
     const host = net.localHost("chassis-1");
     const backbone = net.collisionDomain("backbone");
@@ -1094,10 +1112,16 @@ Deno.test("tunnelRouterEndpoint: zerotier instanceDir is derived from the router
   });
   const nodes = toIR(network);
   const right = node(nodes, "kernelrouter:router-zt|side:right").data as {
-    apps?: Array<{ kind: string; instanceDir?: string }>;
+    apps?: Array<{
+      kind: string;
+      volumes?: Array<{ host: string; container: string }>;
+    }>;
   };
-  const app = right.apps?.find((a) => a.kind === "zerotier");
-  assertEquals(app?.instanceDir, "/var/lib/zerotier-one-router-zt");
+  const app = right.apps?.find((a) => a.kind === "docker");
+  assertEquals(
+    app?.volumes?.[0]?.host,
+    "/var/lib/ovn-fabric/router-zt/zerotier",
+  );
 });
 
 // hostToIR carries the host's ABSTRACT OS dependencies (ovn/ovs for an

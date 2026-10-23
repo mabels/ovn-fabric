@@ -413,6 +413,15 @@ export const DockerApp = type({
   "ip?": "string",
   "routerIp?": "string",
   "vethName?": "string",
+  "volumes?": type({
+    host: "string",
+    container: "string",
+  }).array(),
+  "run?": "string[]",
+  "identity?": type({
+    public: "string",
+    secret: "string",
+  }),
 });
 // The CONFIG-side `kernel.app.docker` service kind (types.ts's
 // RouterEndpointService): a docker container the kernel host runs. `image`

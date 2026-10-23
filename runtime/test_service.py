@@ -156,6 +156,23 @@ class ServiceBuilderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sorted(got), [("child", event), ("deps", event), ("root", event)])
         await root.stop()
 
+    async def test_each_job_gets_its_own_named_logger(self) -> None:
+        import logging
+
+        names: list[str] = []
+
+        def factory(name: str) -> logging.Logger:
+            names.append(name)
+            return logging.getLogger(f"test.ovn-fabric.jobs.{name}")
+
+        root = Job("root", logger_factory=factory)
+        child = root.job("child")
+        self.assertEqual(names, ["root", "child"])
+        self.assertIsNot(root.logger, child.logger)
+        self.assertEqual(child.logger.name, "test.ovn-fabric.jobs.child")
+        await root.start()
+        await root.stop()
+
     async def test_ctx_is_passed_to_on_emit_hooks(self) -> None:
         got: list[tuple[object, object]] = []
         root = Job("root", ctx={"host": "chassis-1"})

@@ -502,25 +502,63 @@ export function buildTunnelRouterEndpoint(
         config: workload.config,
         masq,
       }
-      : {
-        kind: "zerotier",
-        networkId: workload.networkId,
-        // `instanceDir` is optional on the tunnel — derived from the
-        // router name when omitted (types.ts), so a config author only
-        // sets it when the default location is wrong.
-        instanceDir: workload.instanceDir ??
-          `/var/lib/zerotier-one-${routerName}`,
-        masq,
-        // The tunnel's via-less declared routes (e.g. the ztnet mesh
-        // supernet 192.168.0.0/16) are the routes the zerotier netns
-        // must push OUT the tunnel once ZeroTier names the interface —
-        // carried here (not on the kernel router's own routes, which
-        // would target the upstream veth) so the wire script applies
-        // them over the runtime interface (2026-08-30).
-        routes: (routes ?? [])
-          .filter((r) => !r.via)
-          .map((r) => ({ dst: r.dst.to_string() })),
-      },
+      : (() => {
+        const ztNetworkId = workload.networkId;
+        const ztRoutes = (routes ?? [])
+          .filter((route) => !route.via)
+          .map((route) => route.dst.to_string());
+        const ztMasq = masq.map((family) =>
+          family === "ipv4"
+            ? 'iptables -t nat -A POSTROUTING -o "$var" -j MASQUERADE'
+            : 'ip6tables -t nat -A POSTROUTING -o "$var" -j MASQUERADE'
+        );
+        const ztRouteCmds = ztRoutes.map((dst) =>
+          `ip route add ${dst} dev "$var"`
+        );
+        const entrypoint = `
+/usr/sbin/zerotier-one -d /var/lib/zerotier-one
+for i in $(seq 1 30); do
+  zerotier-cli -D/var/lib/zerotier-one info >/dev/null 2>&1 && break
+  sleep 1
+done
+zerotier-cli -D/var/lib/zerotier-one join "${ztNetworkId}" || true
+var=""
+for i in $(seq 1 60); do
+  var=$(zerotier-cli -D/var/lib/zerotier-one -j listnetworks \
+    | jq -r '.[] | select(.nwid=="${ztNetworkId}") | .portDeviceName')
+  [ -n "$var" ] && [ "$var" != "null" ] && break
+  sleep 1
+done
+ip link set "$var" up
+${ztMasq.join("\n")}
+${ztRouteCmds.join("\n")}
+exec sleep infinity
+`;
+        const dockerfile = `
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl jq iproute2 iptables iputils-ping traceroute \
+ && curl -fsSL https://install.zerotier.com | bash \
+ && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /var/lib/zerotier-one
+ENV ZT_NETWORK_ID=${ztNetworkId}
+`;
+        return {
+          kind: "docker",
+          image: `ovn-fabric-${routerName}-zerotier`,
+          name: `${routerName}-zerotier`,
+          cmd: ["/bin/sh", "-c", entrypoint],
+          build: { from: "ubuntu:24.04", dockerfile },
+          volumes: [
+            {
+              host: `/var/lib/ovn-fabric/${routerName}/zerotier`,
+              container: "/var/lib/zerotier-one",
+            },
+          ],
+          run: ["--dns", "1.1.1.1"],
+          identity: workload.identity,
+        };
+      })(),
   ];
 
   // The OVN side: rewrite each via-less route (the tunnel's egress

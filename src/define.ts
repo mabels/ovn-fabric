@@ -119,7 +119,7 @@ class PlatformImpl implements Platform {
     // a placeholder until the platform's ingress template exists.
     this.#ingressService = {
       name: `${name}-ingress`,
-      image: "PLACEHOLDER",
+      image: "busybox",
       endpointRefs: [],
     };
   }

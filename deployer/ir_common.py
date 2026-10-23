@@ -855,10 +855,21 @@ def _emit_kernel_app_rules(
                     emit.sh(["rm", "-f", f"/var/run/netns/{container}"])
                     continue
                 image = app.image or f"ovn-fabric-{container}"
+                volumes = [
+                    {"host": volume.host, "container": volume.container}
+                    for volume in (app.volumes or [])
+                ]
+                identity = (
+                    {"public": app.identity.public, "secret": app.identity.secret}
+                    if app.identity
+                    else None
+                )
                 emit.py(
                     f"await _docker_owns_start(job, {emit.label!r}, {container!r}, "
                     f"{image!r}, {(_docker_dockerfile(app.build) if app.build else None)!r}, "
-                    f"{netns!r}, {dev!r}, {ctx.transit_leg!r})"
+                    f"{netns!r}, {dev!r}, {ctx.transit_leg!r}, "
+                    f"{volumes!r}, {list(app.run or [])!r}, "
+                    f"{identity!r})"
                 )
                 if ctx.transit_leg:
                     _apply_side_network(

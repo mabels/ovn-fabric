@@ -163,6 +163,12 @@ class PythonEmitter(Emitter):
             f"await job.run_cmd({self.label!r}, ['systemctl', 'enable', '--now', {unit!r}], "
             f"{abort})"
         )
+        # The unit may already be running the PREVIOUS installed copy of
+        # this file (install_self has just replaced it). `enable --now`
+        # does not restart an active unit, so force the new code in.
+        self._push(
+            f"await job.run_cmd({self.label!r}, ['systemctl', 'restart', {unit!r}], " f"{abort})"
+        )
         self.end_block()
 
 
@@ -286,6 +292,10 @@ RED = "\033[31m"
 RESET = "\033[0m"
 
 _deploy_log = logging.getLogger("ovn-fabric.deployer")
+
+
+def _job_logger(name: str) -> logging.Logger:
+    return logging.getLogger(f"ovn-fabric.deployer.{name}")
 
 # __RUNTIME_LIB__
 
@@ -479,6 +489,7 @@ async def _docker_veth_up(
     router_ip: str,
     container_ip: str,
     gateway: str,
+    run_flags: list[str] | None = None,
 ) -> None:
     # One veth injected into the router netns, the peer into the
     # container's netns as eth0 (CNI/Multus-style).
@@ -487,7 +498,18 @@ async def _docker_veth_up(
     await job.run_cmd(label, ["/usr/bin/docker", "rm", "-f", container], False)
     await job.run_cmd(
         label,
-        ["/usr/bin/docker", "run", "-d", "--network", "none", "--name", container, image, *cmd],
+        [
+            "/usr/bin/docker",
+            "run",
+            "-d",
+            "--network",
+            "none",
+            "--name",
+            container,
+            *(run_flags or []),
+            image,
+            *cmd,
+        ],
         True,
     )
     pid = await job.capture_cmd(
@@ -546,28 +568,40 @@ async def _docker_owns_start(
     netns: str,
     dev: str,
     transit_leg: str | None,
+    mounts: list[dict] | None = None,
+    run_flags: list[str] | None = None,
+    identity: dict | None = None,
 ) -> None:
     # The container owns the router's interfaces ("container IS the
     # router"): move them in, then the body applies the static network.
     await _ensure_image(job, label, image, dockerfile)
     await job.run_cmd(label, ["/usr/bin/docker", "rm", "-f", container], False)
-    await job.run_cmd(
-        label,
-        [
-            "/usr/bin/docker",
-            "run",
-            "-d",
-            "--privileged",
-            "--network",
-            "none",
-            "--name",
-            container,
-            image,
-            "sleep",
-            "infinity",
-        ],
-        True,
-    )
+    argv = [
+        "/usr/bin/docker",
+        "run",
+        "-d",
+        "--privileged",
+        "--network",
+        "none",
+        "--name",
+        container,
+    ]
+    state_dir = None
+    for mount in mounts or []:
+        host_path = mount["host"]
+        await job.run_cmd(label, ["mkdir", "-p", host_path], True)
+        argv += ["-v", f"{host_path}:{mount['container']}"]
+        if mount["container"] == "/var/lib/zerotier-one":
+            state_dir = host_path
+    if identity and state_dir:
+        public = os.path.join(state_dir, "identity.public")
+        secret = os.path.join(state_dir, "identity.secret")
+        await write_file(job, label, public, identity["public"], True)
+        await write_file(job, label, secret, identity["secret"], True)
+        await job.run_cmd(label, ["chmod", "644", public], True)
+        await job.run_cmd(label, ["chmod", "600", secret], True)
+    argv += [*(run_flags or []), image, "sleep", "infinity"]
+    await job.run_cmd(label, argv, True)
     pid = await job.capture_cmd(
         label, ["/usr/bin/docker", "inspect", "-f", "{{.State.Pid}}", container], True
     )
@@ -862,6 +896,8 @@ def register(
     job.on_emit(on_event)
 
     async def dependency_timeout() -> None:
+        if DEPENDENCY_TIMEOUT <= 0:
+            return
         await asyncio.sleep(DEPENDENCY_TIMEOUT)
         if not waiter._fired and not job._stopped:
             job.error(
@@ -945,7 +981,18 @@ async def _install_packages(job: Job, deps: dict) -> None:
                 f"apt update is fresh ({(now - last) / 3600:.1f}h old); skipping"
             )
         else:
-            update_ok = await _apt_retry(job, label, ["apt-get", "update"])
+            update_ok = await _apt_retry(
+            job,
+            label,
+            [
+                "apt-get",
+                "-o",
+                "Dpkg::Use-Pty=0",
+                "-o",
+                "Dpkg::Progress-Fancy=0",
+                "update",
+            ],
+        )
             if update_ok:
                 try:
                     await asyncio.to_thread(_write_stamp, APT_UPDATE_STAMP)
@@ -961,7 +1008,14 @@ async def _install_packages(job: Job, deps: dict) -> None:
             [
                 "env",
                 "DEBIAN_FRONTEND=noninteractive",
+                "APT_LISTCHANGES_FRONTEND=none",
+                "LC_ALL=C",
+                "TERM=dumb",
                 "apt-get",
+                "-o",
+                "Dpkg::Use-Pty=0",
+                "-o",
+                "Dpkg::Progress-Fancy=0",
                 "install",
                 "--only-upgrade",
                 "-y",
@@ -977,7 +1031,14 @@ async def _install_packages(job: Job, deps: dict) -> None:
             [
                 "env",
                 "DEBIAN_FRONTEND=noninteractive",
+                "APT_LISTCHANGES_FRONTEND=none",
+                "LC_ALL=C",
+                "TERM=dumb",
                 "apt-get",
+                "-o",
+                "Dpkg::Use-Pty=0",
+                "-o",
+                "Dpkg::Progress-Fancy=0",
                 "install",
                 "-y",
                 *sorted(missing),
@@ -1010,6 +1071,17 @@ async def _install_packages(job: Job, deps: dict) -> None:
 
 async def _install_image(job: Job, entry: dict) -> None:
     label = f"image:{entry['image']}"
+    if await _docker_image_exists(entry["image"]):
+        job.debug(f"{entry['image']} already exists")
+        job.emit(
+            {
+                "kind": "dependency",
+                "dep": {"kind": "docker-image", "image": entry["image"]},
+                "state": "installed",
+            },
+            queue=True,
+        )
+        return
     if entry.get("dockerfile") is None:
         ok = await job.run_cmd(
             label, ["/usr/bin/docker", "pull", entry["image"]], False, timeout=600
@@ -1064,46 +1136,6 @@ async def _docker_ready(job: Job) -> bool:
         await asyncio.sleep(delay)
         delay = min(delay * 2, 30.0)
     return False
-
-
-async def _install_images(job: Job, deps: dict) -> None:
-    # One dynamic job per docker-image concrete dependency.
-    images = [
-        entry["concrete"][0]
-        for entry in deps.values()
-        if entry["abstract"].get("kind") == "docker-image"
-    ]
-    if not images:
-        return
-    if not await _docker_ready(job):
-        job.warn("docker is not available; images were not installed")
-        return
-    remaining = len(images)
-    complete = asyncio.Event()
-
-    def configure(index: int, entry: dict) -> Any:
-        async def start(image_job: Job) -> None:
-            await _install_image(image_job, entry)
-
-        async def stop(image_job: Job) -> None:
-            nonlocal remaining
-            remaining -= 1
-            if remaining == 0:
-                complete.set()
-
-        def configure_job(image_job: Job) -> None:
-            image_job.on_start(start)
-            image_job.on_stop(stop)
-
-        return configure_job
-
-    for index, entry in enumerate(images):
-        job.job(
-            f"image-{index}",
-            initiate=True,
-            configure=configure(index, entry),
-        )
-    await complete.wait()
 
 
 # ── --ovn-purge ───────────────────────────────────────────────────
@@ -1269,7 +1301,7 @@ async def install_zerotier(job: Job) -> None:
     # The job is gated on the concrete curl dependency; only when that is
     # ready does it run the vendor installer and announce the abstract
     # zerotier dependency.
-    await job.run_streaming(
+    await job.run_cmd(
         "install-zerotier",
         ["sh", "-c", "curl -s https://install.zerotier.com | bash"],
         True,
@@ -1321,11 +1353,22 @@ def _resolve_dependency_job(
     if not with_images:
         return
 
-    async def install_images(job: Job) -> None:
-        await _install_images(job, BIDIRECTIONAL_DEPS[host])
+    # One STATIC job per docker-image, each gated on the docker abstract
+    # dependency. Each emits its own queued docker-image ready event.
+    images = [
+        entry["concrete"][0]
+        for entry in BIDIRECTIONAL_DEPS.get(host, {}).values()
+        if entry["abstract"].get("kind") == "docker-image"
+    ]
+    for entry in images:
+        # Name the job after the image itself; the BIDIRECTIONAL filter
+        # already gives the complete, unique list.
+        image_job = root.job(f"image:{entry['image']}", initiate=True)
 
-    images_job = root.job("install-images", initiate=True)
-    register(images_job, image_deps, install_images)
+        async def install_image(job: Job, image: dict = entry) -> None:
+            await _install_image(job, image)
+
+        register(image_job, image_deps, install_image)
 
 
 def _run_common(
@@ -1428,11 +1471,14 @@ async def _run_host(host: str) -> int:
     return 0
 
 
-DEPENDENCY_TIMEOUT = 60
+DEPENDENCY_TIMEOUT = 180
 
 
 async def _run_job_set(factory: Any, label: str) -> None:
     root = factory()
+    if DEPENDENCY_TIMEOUT <= 0:
+        await root.run()
+        return
     try:
         await asyncio.wait_for(root.run(), timeout=DEPENDENCY_TIMEOUT)
     except asyncio.TimeoutError:
@@ -1527,6 +1573,13 @@ def main() -> int:
     )
     parser.add_argument("--host", metavar="NAME", help="run only this host's pass")
     parser.add_argument(
+        "--timeout",
+        type=int,
+        default=180,
+        metavar="SECONDS",
+        help="dependency/action timeout in seconds (0 disables it; default 180)",
+    )
+    parser.add_argument(
         "--run",
         action="store_true",
         help="alias for --action run (the generated service uses --action run)",
@@ -1560,9 +1613,18 @@ def main() -> int:
         "that host's part; with --cluster only the NB/SB databases (run it on the central)",
     )
     args = parser.parse_args()
+    global DEPENDENCY_TIMEOUT
+    DEPENDENCY_TIMEOUT = args.timeout
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
-        format="%(levelname)s %(message)s",
+        # Verbose: timestamp every record, at every level. Normal: keep
+        # the compact level/message form.
+        format=(
+            "%(asctime)s.%(msecs)03d %(levelname)s %(message)s"
+            if args.verbose
+            else "%(levelname)s %(message)s"
+        ),
+        datefmt="%Y-%m-%d %H:%M:%S",
         stream=sys.stderr,
     )
     if args.job is not None:
@@ -1577,7 +1639,7 @@ def main() -> int:
         up, down = JOB_BODIES[args.job]
 
         async def run_job() -> None:
-            job = Job(args.job)
+            job = Job(args.job, logger_factory=_job_logger)
             action = up if args.job_action == "up" else down
 
             async def start(h: Job) -> None:
@@ -1628,7 +1690,7 @@ def main() -> int:
         cluster = cluster_create if args.action == "create" else cluster_delete
 
         async def run_cluster() -> None:
-            job = Job("ovn-fabric")
+            job = Job("ovn-fabric", logger_factory=_job_logger)
             await job.start()
             try:
                 await cluster(job, abort_on_error)
@@ -1910,7 +1972,7 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
         tree_fn = _run_fn_name(host_name)
         tree_lines = [
             f"def {tree_fn}() -> Job:",
-            "    root = Job('ovn-fabric')",
+            "    root = Job('ovn-fabric', logger_factory=_job_logger)",
             f"    configure = _run_common(root, {host_name!r}, "
             f"{image_deps!r}, {configure_deps!r}, {custom_installers!r})",
         ]
@@ -1929,11 +1991,12 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
             for entry in bidirectional[host_name].values()
             if entry["abstract"].get("kind") == "abstract"
         ]
+        create_deps = configure_deps
         cluster = node.data.ovnRole == pt.OvnRole.central
         create_fn = _run_fn_name(host_name).replace("_run_", "_create_")
         create_lines = [
             f"def {create_fn}() -> Job:",
-            "    root = Job('ovn-fabric')",
+            "    root = Job('ovn-fabric', logger_factory=_job_logger)",
             f"    _resolve_dependency_job(root, {host_name!r}, [], "
             f"repeat=False, with_images=False, "
             f"custom_installers={custom_installers!r})",
@@ -1943,7 +2006,7 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
             "        job.emit({'kind': 'abstract-dep', 'name': 'create-ready', "
             "'state': 'ready'}, queue=True)",
             "    create_job = root.job('ovn-fabric(create)', initiate=True)",
-            f"    register(create_job, {all_deps!r}, create_action)",
+            f"    register(create_job, {create_deps!r}, create_action)",
         ]
         if cluster:
             create_lines += [
@@ -1960,7 +2023,7 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
         delete_fn = _run_fn_name(host_name).replace("_run_", "_delete_")
         delete_lines = [
             f"def {delete_fn}() -> Job:",
-            "    root = Job('ovn-fabric')",
+            "    root = Job('ovn-fabric', logger_factory=_job_logger)",
             f"    _resolve_dependency_job(root, {host_name!r}, [], "
             f"repeat=False, with_images=False, "
             f"custom_installers={custom_installers!r})",
