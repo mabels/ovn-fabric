@@ -455,11 +455,12 @@ Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes 
   // Both default routes point at the kernel router's transit side, even
   // though the v4 one was declared with a literal ISP `via`.
   assertEquals(
-    node(nodes, "ovnrouter:router-wan|route:0.0.0.0/0").data["nexthop"],
+    node(nodes, "ovnrouter:router-wan|route:test-domain|0.0.0.0/0")
+      .data["nexthop"],
     "10.12.80.14",
   );
   assertEquals(
-    node(nodes, "ovnrouter:router-wan|route:::/0").data["nexthop"],
+    node(nodes, "ovnrouter:router-wan|route:test-domain|::/0").data["nexthop"],
     "fd00::10:12:80:f",
   );
 
@@ -946,8 +947,16 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
   const nodes = toIR(network);
   // neighbor defaults out the tunnel (rewritten to its backbone addr).
   assertEquals(
-    node(nodes, "ovnrouter:router-neighbor|route:0.0.0.0/0").data,
-    { nexthop: "172.22.0.140", masq: false, domain: "Neighbor-defaultRoute" },
+    node(
+      nodes,
+      "ovnrouter:router-neighbor|route:Neighbor-defaultRoute|0.0.0.0/0",
+    ).data,
+    {
+      nexthop: "172.22.0.140",
+      masq: false,
+      domain: "Neighbor-defaultRoute",
+      metric: 400,
+    },
   );
   // No leakage: the tunnel default stays inside Neighbor-defaultRoute,
   // so voda (only in Voda-defaultRoute) keeps its OWN literal default.
@@ -955,12 +964,25 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
   // side, keeps its OWN tunnel egress (0.0.0.0/0 -> its netns) instead
   // of overwriting it with voda's learned default (2026-08-30).
   assertEquals(
-    node(nodes, "ovnrouter:router-voda|route:0.0.0.0/0").data,
-    { nexthop: "192.168.132.1", masq: false, domain: "Voda-defaultRoute" },
+    node(nodes, "ovnrouter:router-voda|route:Voda-defaultRoute|0.0.0.0/0").data,
+    {
+      nexthop: "192.168.132.1",
+      masq: false,
+      domain: "Voda-defaultRoute",
+      metric: 401,
+    },
   );
   assertEquals(
-    node(nodes, "ovnrouter:router-mullvad-de|route:0.0.0.0/0").data,
-    { nexthop: "10.12.81.14", masq: false, domain: "Neighbor-defaultRoute" },
+    node(
+      nodes,
+      "ovnrouter:router-mullvad-de|route:Neighbor-defaultRoute|0.0.0.0/0",
+    ).data,
+    {
+      nexthop: "10.12.81.14",
+      masq: false,
+      domain: "Neighbor-defaultRoute",
+      metric: 400,
+    },
   );
   // The netns backroutes are scoped to the tunnel router's OWN domain:
   // only the neighbor subnet comes back into the netns (no home/voda
@@ -1029,8 +1051,14 @@ Deno.test("tunnelRouterEndpoint: zerotier carries via-less tunnel routes onto it
   // otherwise it has no way to send ztnet traffic to the tunnel
   // (2026-08-30).
   assertEquals(
-    node(nodes, "ovnrouter:router-zerotier|route:192.168.0.0/16").data,
-    { nexthop: "10.12.85.14", masq: false, domain: "Zerotier-route" },
+    node(nodes, "ovnrouter:router-zerotier|route:Zerotier-route|192.168.0.0/16")
+      .data,
+    {
+      nexthop: "10.12.85.14",
+      masq: false,
+      domain: "Zerotier-route",
+      metric: 400,
+    },
   );
 });
 
@@ -1122,6 +1150,7 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
     "ping",
     "traceroute",
     "curl",
+    "python",
     "ovn",
     "ovs",
     "ip",
@@ -1463,8 +1492,10 @@ Deno.test("route metrics fall back to execution order (first NIC lowest)", () =>
     const refs = lrp.data.serviceRefs ?? [];
     return (refs[0]!.routes ?? [])[0]!.metric;
   };
-  assertEquals(metricOn("seg-a"), 100);
-  assertEquals(metricOn("seg-b"), 200);
+  // The routing domain now always carries an auto metric (400+), so
+  // both NICs inherit it; the execution-order fallback is no longer used.
+  assertEquals(metricOn("seg-a"), 400);
+  assertEquals(metricOn("seg-b"), 400);
 });
 
 // A control-plane attachment with no resolver of its own is fed the
@@ -2196,7 +2227,7 @@ Deno.test("routingDomain: explicit routes replace the calculated set", () => {
     .serviceRefs ?? [];
   // Exactly the declared prefix — no default alongside it.
   assertEquals(refs[0]?.routes, [
-    { dst: "192.168.129.0/24", via: "10.0.0.1", metric: 100 },
+    { dst: "192.168.129.0/24", via: "10.0.0.1", metric: 400 },
   ]);
 });
 
@@ -2722,7 +2753,7 @@ Deno.test("routingDomain: explicit routes replace the calculated set", () => {
     .serviceRefs ?? [];
   // Exactly the declared prefix — no default alongside it.
   assertEquals(refs[0]?.routes, [
-    { dst: "192.168.129.0/24", via: "10.0.0.1", metric: 100 },
+    { dst: "192.168.129.0/24", via: "10.0.0.1", metric: 400 },
   ]);
 });
 

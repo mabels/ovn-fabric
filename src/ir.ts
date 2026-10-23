@@ -111,7 +111,8 @@ function resolveEncapIp(host: Host): string | undefined {
 // The ABSTRACT dependencies this Host needs (2026-08-23), derived from
 // what the topology puts on it — ABSTRACT names, deliberately not
 // distro package names, so the IR stays OS-agnostic: every host gets the
-// base tooling (`arp`/net-tools, `ping`, `traceroute`, `curl` — the
+// base tooling (`arp`/net-tools, `ping`, `traceroute`, `curl`,
+// `python`/python-is-python3 — the
 // everyday debugging commands, and curl is also what the zerotier
 // installer needs), an OVN-cluster host needs `ovn`+`ovs`, any kernel
 // router's netns needs `ip`+`iptables`, and the apps need their own
@@ -124,7 +125,7 @@ function resolveEncapIp(host: Host): string | undefined {
 // abstract dependency to the host OS's concrete package/install form;
 // there is deliberately NO deinstall.
 function hostDependencies(host: Host, network: NetworkDefinition): string[] {
-  const deps = new Set<string>(["arp", "ping", "traceroute", "curl"]);
+  const deps = new Set<string>(["arp", "ping", "traceroute", "curl", "python"]);
   if (host.ovn) {
     deps.add("ovn");
     deps.add("ovs");
@@ -1106,6 +1107,7 @@ function routeToIR(
   nexthop: IPv4 | IPv6,
   masq: boolean,
   domain: string,
+  metric: number,
 ): RouteNode {
   // Every route this module builds funnels through here — the ONE
   // place that guarantees dst and nexthop never mismatch family. A
@@ -1124,12 +1126,12 @@ function routeToIR(
     );
   }
   const prefix = dst.to_string();
-  const id = `ovnrouter:${router.name}|route:${prefix}`;
+  const id = `ovnrouter:${router.name}|route:${domain}|${prefix}`;
   return {
     id,
     kind: dst.is_ipv4() ? "ipv4.route" : "ipv6.route",
     key: { ovnrouter: router.name, prefix },
-    data: { nexthop: nexthop.to_s(), masq, domain },
+    data: { nexthop: nexthop.to_s(), masq, domain, metric },
   };
 }
 
@@ -1195,7 +1197,14 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
               // anchor's own branch, not the whole route entry.
               if (!route.via) continue;
               nodes.push(
-                routeToIR(router, route.dst, route.via, masq, domain.name),
+                routeToIR(
+                  router,
+                  route.dst,
+                  route.via,
+                  masq,
+                  domain.name,
+                  domain.metric ?? 400,
+                ),
               );
               continue;
             }
@@ -1209,7 +1218,14 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
               continue;
             }
             nodes.push(
-              routeToIR(router, route.dst, nexthop, masq, domain.name),
+              routeToIR(
+                router,
+                route.dst,
+                nexthop,
+                masq,
+                domain.name,
+                domain.metric ?? 400,
+              ),
             );
           }
         }
@@ -1259,7 +1275,16 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
           route.dst,
         );
         if (!nexthop) continue;
-        nodes.push(routeToIR(router, route.dst, nexthop, false, domain.name));
+        nodes.push(
+          routeToIR(
+            router,
+            route.dst,
+            nexthop,
+            false,
+            domain.name,
+            route.metric ?? domain.metric ?? 400,
+          ),
+        );
       }
     }
   }
@@ -1323,6 +1348,7 @@ function computeInterconnectRoutes(
                       nexthop,
                       false,
                       domain.name,
+                      domain.metric ?? 400,
                     ),
                   );
                 }

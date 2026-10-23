@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import unittest
 
-from .service import Job, run_cmd
+from .service import Job, JobError, run_cmd
 
 
 class ServiceBuilderTest(unittest.IsolatedAsyncioTestCase):
@@ -93,6 +93,36 @@ class ServiceBuilderTest(unittest.IsolatedAsyncioTestCase):
         release.set()
         await root.stop()
 
+    async def test_queued_event_reaches_a_late_hook(self) -> None:
+        got: list[object] = []
+        root = Job("root")
+        await root.start()
+        root.emit({"kind": "dependency", "name": "x"}, queue=True)
+        child = root.job("late", initiate=True)
+
+        async def hook(job: Job, event: object) -> None:
+            got.append(event)
+
+        child.on_emit(hook)
+        await asyncio.sleep(0)
+        self.assertEqual(got, [{"kind": "dependency", "name": "x"}])
+        await root.stop()
+
+    async def test_non_queued_event_does_not_reach_a_late_hook(self) -> None:
+        got: list[object] = []
+        root = Job("root")
+        await root.start()
+        root.emit({"kind": "dependency", "name": "x"})
+        child = root.job("late", initiate=True)
+
+        async def hook(job: Job, event: object) -> None:
+            got.append(event)
+
+        child.on_emit(hook)
+        await asyncio.sleep(0)
+        self.assertEqual(got, [])
+        await root.stop()
+
     async def test_emit_reaches_every_registered_job(self) -> None:
         got: list[tuple[str, object]] = []
         root = Job("root")
@@ -144,7 +174,7 @@ class ServiceBuilderTest(unittest.IsolatedAsyncioTestCase):
     async def test_run_cmd_timeout_kills_the_process(self) -> None:
         root = Job("root")
         await root.start()
-        with self.assertRaises(SystemExit):
+        with self.assertRaises(JobError):
             await root.run_cmd("test", ["sleep", "30"], True, timeout=0.05)
         self.assertEqual(root._processes, {})
         await root.stop()

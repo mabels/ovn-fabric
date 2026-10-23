@@ -73,6 +73,16 @@ def _py_str(s: str) -> str:
     return '"""' + escaped + '"""'
 
 
+def _python_argv_expr(argv: Sequence[str | Ref]) -> str:
+    # Render `ip netns exec <ns> ...` as in_netns('<ns>', [...]) so the
+    # generated code stays readable.
+    if len(argv) >= 4 and argv[0] == "ip" and argv[1] == "netns" and argv[2] == "exec":
+        netns = _python_token(argv[3])
+        rest = ", ".join(_python_token(token) for token in argv[4:])
+        return f"in_netns({netns}, [{rest}])"
+    return "[" + ", ".join(_python_token(token) for token in argv) + "]"
+
+
 class PythonEmitter(Emitter):
     """The Python rendering of the shared emitter interface: a command
     becomes a run_cmd(...) call whose command is the string produced by
@@ -118,12 +128,16 @@ class PythonEmitter(Emitter):
         # A `Ref` token becomes the bare Python variable of that name, so
         # the runtime passes the variable's VALUE as one argv element.
         abort = "False" if optional else "abort_on_error"
-        tokens = ", ".join(_python_token(token) for token in argv)
-        self._push(f"await job.run_cmd({self.label!r}, [{tokens}], {abort})")
+        expr = _python_argv_expr(argv)
+        self._push(f"await job.run_cmd({self.label!r}, {expr}, {abort})")
 
     def capture(self, var: str, argv: Sequence[str | Ref]) -> None:
-        tokens = ", ".join(_python_token(token) for token in argv)
-        self._push(f"{var} = await job.capture_cmd({self.label!r}, [{tokens}], abort_on_error)")
+        expr = _python_argv_expr(argv)
+        self._push(f"{var} = await job.capture_cmd({self.label!r}, {expr}, abort_on_error)")
+
+    def wait_capture(self, var: str, argv: Sequence[str | Ref]) -> None:
+        expr = _python_argv_expr(argv)
+        self._push(f"{var} = await wait_for_chassis(job, {self.label!r}, {expr}, 30)")
 
     def append(self, path: str, content: str) -> None:
         self._push(
@@ -135,11 +149,6 @@ class PythonEmitter(Emitter):
         # Copy the running generated program to `path` (install_self in
         # the runtime) — the boot restore unit execs that copy.
         self._push(f"await install_self(job, {self.label!r}, {path!r}, abort_on_error)")
-
-    def install(self, host: str) -> None:
-        # Execute the host's merged install object (packages, then
-        # images) with the runtime's logging/error policy.
-        self._push(f"await run_install(job, INSTALL[{host!r}], abort_on_error)")
 
     def enable_unit(self, unit: str, optional: bool = True) -> None:
         # `no_start` is a parameter of the generated host function: the
@@ -175,15 +184,19 @@ class PythonBodyEmitter(Emitter):
     def sh(
         self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
     ) -> None:
-        tokens = ", ".join(_python_token(token) for token in argv)
         # Every job is blocking: `background` (a shell `&`) has no
         # meaning here; the command runs and is awaited.
         abort = "False" if optional else "abort_on_error"
-        self._push(f"await job.run_cmd({self.label!r}, [{tokens}], {abort})")
+        expr = _python_argv_expr(argv)
+        self._push(f"await job.run_cmd({self.label!r}, {expr}, {abort})")
 
     def capture(self, var: str, argv: Sequence[str | Ref]) -> None:
-        tokens = ", ".join(_python_token(token) for token in argv)
-        self._push(f"{var} = await job.capture_cmd({self.label!r}, [{tokens}], abort_on_error)")
+        expr = _python_argv_expr(argv)
+        self._push(f"{var} = await job.capture_cmd({self.label!r}, {expr}, abort_on_error)")
+
+    def wait_capture(self, var: str, argv: Sequence[str | Ref]) -> None:
+        expr = _python_argv_expr(argv)
+        self._push(f"{var} = await wait_for_chassis(job, {self.label!r}, {expr}, 30)")
 
     def install(self, host: str) -> None:
         self._push(f"await run_install(job, INSTALL[{host!r}], abort_on_error)")
@@ -265,6 +278,7 @@ import shutil
 import signal
 import sys
 import tempfile
+import time
 
 GREEN = "\033[32m"
 YELLOW = "\033[33m"
@@ -289,6 +303,132 @@ async def _docker_image_exists(image: str) -> bool:
         return await proc.wait() == 0
     except OSError:
         return False
+
+
+def in_netns(netns: str, argv: list[str]) -> list[str]:
+    # `ip netns exec <netns> ...` without repeating it in every argv.
+    return ["ip", "netns", "exec", netns, *argv]
+
+
+async def _link_exists(name: str) -> bool:
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "ip",
+            "link",
+            "show",
+            name,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        return await proc.wait() == 0
+    except OSError:
+        return False
+
+
+async def ensure_netns(
+    job: Job, label: str, netns: str, abort_on_error: bool
+) -> None:
+    # A stale netns from a failed previous run makes `ip netns add` fail
+    # with "File exists"; recreate it so create is idempotent.
+    if os.path.lexists(f"/run/netns/{netns}"):
+        await job.run_cmd(label, ["ip", "netns", "delete", netns], False)
+    await job.run_cmd(label, ["ip", "netns", "add", netns], abort_on_error)
+
+
+async def ensure_vlan(
+    job: Job,
+    label: str,
+    parent: str,
+    name: str,
+    vlan_id: int,
+    abort_on_error: bool,
+) -> None:
+    if await _link_exists(name):
+        return
+    await job.run_cmd(
+        label,
+        ["ip", "link", "add", "link", parent, "name", name, "type", "vlan", "id", str(vlan_id)],
+        abort_on_error,
+    )
+
+
+async def wait_for_chassis(
+    job: Job, label: str, cmd: list[str], attempts: int = 30
+) -> str:
+    restarted = False
+    for attempt in range(attempts):
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        value = out.decode(errors="replace").strip()
+        if proc.returncode == 0 and value:
+            return value
+        if not restarted and attempt + 1 >= attempts // 2:
+            # The controller is installed but never registered a chassis.
+            # (Re)start it once, then keep waiting.
+            await job.run_cmd(
+                label,
+                ["systemctl", "enable", "--now", "ovn-controller"],
+                False,
+            )
+            restarted = True
+        await asyncio.sleep(1)
+    message = f"{label}: chassis did not register within {attempts}s"
+    _log_at(job, "error", message)
+    raise JobError(message, 1)
+
+
+async def write_sysctl_in_netns(
+    job: Job,
+    label: str,
+    netns: str,
+    path: str,
+    value: str,
+    abort_on_error: bool,
+) -> None:
+    # No shell redirection: run a tiny Python writer inside the netns.
+    # `sysctl` cannot address an iface name containing a dot (eth0.2280).
+    proc = await asyncio.create_subprocess_exec(
+        "ip",
+        "netns",
+        "exec",
+        netns,
+        sys.executable,
+        "-c",
+        "import sys; open(sys.argv[1], 'w').write(sys.argv[2])",
+        path,
+        value,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.DEVNULL,
+    )
+    job.register_process(proc)
+    try:
+        await proc.communicate()
+    finally:
+        if proc.returncode is not None:
+            job.unregister_process(proc)
+    if proc.returncode != 0:
+        _log_at(
+            job,
+            "error" if abort_on_error else "warn",
+            f"cannot write {path} in {netns}",
+        )
+        if abort_on_error:
+            raise JobError(f"cannot write {path} in {netns}", proc.returncode or 1)
+
+
+async def ensure_veth(
+    job: Job, label: str, name: str, peer: str, abort_on_error: bool
+) -> None:
+    if await _link_exists(name):
+        return
+    await job.run_cmd(
+        label, ["ip", "link", "add", name, "type", "veth", "peer", "name", peer],
+        abort_on_error,
+    )
 
 
 def _write_text(path: str, content: str) -> None:
@@ -491,7 +631,11 @@ async def _zerotier_up(
     # PID bookkeeping.
     await job.run_cmd(label, ["mkdir", "-p", home], True)
     daemon = asyncio.create_task(
-        job.run_cmd(label, ["/usr/sbin/zerotier-one", home], True)
+        job.run_cmd(
+            label,
+            ["ip", "netns", "exec", netns, "/usr/sbin/zerotier-one", home],
+            True,
+        )
     )
     try:
         for _ in range(10):
@@ -587,7 +731,7 @@ async def write_file(
         detail = f" ({exc.strerror})" if exc.strerror else ""
         if abort_on_error:
             job.error(f"cannot write in {label}{detail}: {path}")
-            sys.exit(127)
+            raise JobError(f"cannot write in {label}{detail}: {path}", 127)
         job.warn(f"cannot write in {label}{detail}: {path}")
 
 
@@ -618,11 +762,26 @@ async def install_self(job: Job, label: str, path: str, abort_on_error: bool) ->
         detail = f" ({exc.strerror})" if exc.strerror else ""
         if abort_on_error:
             job.error(f"cannot install in {label}{detail}: {path}")
-            sys.exit(127)
+            raise JobError(f"cannot install in {label}{detail}: {path}", 127)
         job.warn(f"cannot install in {label}{detail}: {path}")
 
 
 INSTALL_INTERVAL = 24 * 60 * 60
+APT_UPDATE_STAMP = "/var/lib/ovn-fabric/last-apt-update"
+
+
+def _read_stamp(path: str) -> float:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return float(handle.read().strip())
+    except (OSError, ValueError):
+        return 0.0
+
+
+def _write_stamp(path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(str(time.time()))
 
 
 class DepWaiter:
@@ -644,10 +803,10 @@ class DepWaiter:
                 return ("abstract", dep.get("name"))
             if kind == "docker-image":
                 return ("docker-image", dep.get("image"))
-            if kind == "apt-pkg":
-                return ("apt-pkg", dep.get("name"))
-            if kind == "sys-cmd":
-                return ("sys-cmd", tuple(dep.get("cmd") or ()))
+            if kind in ("apt-dep", "apt-pkg"):
+                return ("apt-dep", dep.get("package") or dep.get("name"))
+            if kind in ("sys-cmd-dep", "sys-cmd"):
+                return ("sys-cmd-dep", dep.get("name"))
         return ("unknown", repr(dep))
 
     async def waitfor(self, event: object, action: Any) -> None:
@@ -675,7 +834,9 @@ class DepWaiter:
             await action()
 
 
-def register(job: Job, dependencies: list[dict], action: Any) -> None:
+def register(
+    job: Job, dependencies: list[dict], action: Any, keep_alive: bool = False
+) -> None:
     # The job has no on_start work: it registers a DepWaiter with its
     # abstract deps and, once they are fulfilled, runs the job content.
     waiter = DepWaiter(dependencies)
@@ -686,7 +847,14 @@ def register(job: Job, dependencies: list[dict], action: Any) -> None:
         async def run() -> None:
             try:
                 await action(job)
-            finally:
+            except BaseException:
+                job.release()
+                raise
+            if keep_alive:
+                # A router/service job stays alive after its setup; its
+                # down body runs only when the tree/service is stopped.
+                job.hold()
+            else:
                 job.release()
 
         await waiter.waitfor(event, run)
@@ -745,7 +913,9 @@ async def _dpkg_version(job: Job, name: str) -> str | None:
     status = await job.capture_cmd(
         "dpkg", ["dpkg-query", "-W", "-f=${Status} ${Version}", name], False
     )
-    if "installed" not in status:
+    # `unknown ok not-installed` also contains the substring
+    # "installed" — only the exact installed state counts.
+    if not status.startswith("install ok installed"):
         return None
     return status.rsplit(" ", 1)[-1]
 
@@ -768,9 +938,21 @@ async def _install_packages(job: Job, deps: dict) -> None:
 
     update_ok = True
     if apt_packages:
-        update_ok = await _apt_retry(job, label, ["apt-get", "update"])
-        if not update_ok:
-            job.error(f"{label}: apt-get update failed; skipping install")
+        now = time.time()
+        last = await asyncio.to_thread(_read_stamp, APT_UPDATE_STAMP)
+        if now - last < INSTALL_INTERVAL:
+            job.debug(
+                f"apt update is fresh ({(now - last) / 3600:.1f}h old); skipping"
+            )
+        else:
+            update_ok = await _apt_retry(job, label, ["apt-get", "update"])
+            if update_ok:
+                try:
+                    await asyncio.to_thread(_write_stamp, APT_UPDATE_STAMP)
+                except OSError as exc:
+                    job.warn(f"cannot save apt update timestamp: {exc}")
+            else:
+                job.error(f"{label}: apt-get update failed; skipping install")
 
     if update_ok and installed:
         await _apt_retry(
@@ -815,44 +997,73 @@ async def _install_packages(job: Job, deps: dict) -> None:
     # Concrete events only; the packages job ctx translates them.
     for name in apt_packages:
         if await _dpkg_version(job, name) is not None:
-            job.emit({"kind": "apt-dep", "package": name, "state": "installed"})
+            job.emit(
+                {"kind": "apt-dep", "package": name, "state": "installed"},
+                queue=True,
+            )
     for name in installed_sys:
-        job.emit({"kind": "sys-cmd-dep", "name": name, "state": "installed"})
+        job.emit(
+                {"kind": "sys-cmd-dep", "name": name, "state": "installed"},
+                queue=True,
+            )
 
 
 async def _install_image(job: Job, entry: dict) -> None:
     label = f"image:{entry['image']}"
     if entry.get("dockerfile") is None:
-        await job.run_cmd(
+        ok = await job.run_cmd(
             label, ["/usr/bin/docker", "pull", entry["image"]], False, timeout=600
         )
+        if not ok:
+            job.warn(f"could not pull {entry['image']}")
+            return
         job.info(f"pulled {entry['image']}")
-        return
-    build_dir = tempfile.mkdtemp()
-    try:
-        await write_file(
-            job,
-            label,
-            os.path.join(build_dir, "Dockerfile"),
-            entry["dockerfile"],
-            True,
-        )
-        await job.run_cmd(
-            label,
-            ["/usr/bin/docker", "build", "-t", entry["image"], build_dir],
-            False,
-            timeout=600,
-        )
+    else:
+        build_dir = tempfile.mkdtemp()
+        try:
+            await write_file(
+                job,
+                label,
+                os.path.join(build_dir, "Dockerfile"),
+                entry["dockerfile"],
+                True,
+            )
+            ok = await job.run_cmd(
+                label,
+                ["/usr/bin/docker", "build", "-t", entry["image"], build_dir],
+                False,
+                timeout=600,
+            )
+        finally:
+            shutil.rmtree(build_dir, ignore_errors=True)
+        if not ok:
+            job.warn(f"could not build {entry['image']}")
+            return
         job.info(f"built {entry['image']}")
-    finally:
-        shutil.rmtree(build_dir, ignore_errors=True)
-        job.emit(
-            {
-                "kind": "dependency",
-                "dep": {"kind": "docker-image", "image": entry["image"]},
-                "state": "installed",
-            }
-        )
+    job.emit(
+        {
+            "kind": "dependency",
+            "dep": {"kind": "docker-image", "image": entry["image"]},
+            "state": "installed",
+        },
+        queue=True,
+    )
+
+
+async def _docker_ready(job: Job) -> bool:
+    delay = 1.0
+    for _ in range(8):
+        if await job.capture_cmd(
+            "docker", ["/usr/bin/docker", "version"], False
+        ):
+            job.emit(
+                {"kind": "abstract-dep", "name": "docker", "state": "ready"},
+                queue=True,
+            )
+            return True
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 30.0)
+    return False
 
 
 async def _install_images(job: Job, deps: dict) -> None:
@@ -1053,12 +1264,30 @@ async def _handle_log(job: Job, event: object) -> None:
     _deploy_log.log(level, "%s: %s", event.get("name", "?"), event.get("message", ""))
 
 
+async def install_zerotier(job: Job) -> None:
+    # Custom installer, separate from the apt/sys-cmd system-deps job.
+    # The job is gated on the concrete curl dependency; only when that is
+    # ready does it run the vendor installer and announce the abstract
+    # zerotier dependency.
+    await job.run_streaming(
+        "install-zerotier",
+        ["sh", "-c", "curl -s https://install.zerotier.com | bash"],
+        True,
+        600,
+    )
+    job.emit(
+        {"kind": "abstract-dep", "name": "zerotier", "state": "installed"},
+        queue=True,
+    )
+
+
 def _resolve_dependency_job(
     root: Job,
     host: str,
     image_deps: list[dict],
     repeat: bool,
     with_images: bool = True,
+    custom_installers: dict[str, list[dict[str, str]]] | None = None,
 ) -> None:
     waiters = package_waiters(host)
     packages = root.job("install-packages", initiate=True, ctx=waiters)
@@ -1069,7 +1298,8 @@ def _resolve_dependency_job(
             for abstract, waiter in waiters_ctx.items():
                 async def emit(name: str = abstract) -> None:
                     job.emit(
-                        {"kind": "abstract-dep", "name": name, "state": "installed"}
+                        {"kind": "abstract-dep", "name": name, "state": "installed"},
+                        queue=True,
                     )
 
                 await waiter.waitfor(event, emit)
@@ -1082,6 +1312,11 @@ def _resolve_dependency_job(
             await asyncio.sleep(INSTALL_INTERVAL)
 
     packages.on_start(packages_start)
+
+    for name, dependencies in (custom_installers or {}).items():
+        installer = root.job(f"install-{name}", initiate=True)
+        if name == "zerotier":
+            register(installer, dependencies, install_zerotier)
 
     if not with_images:
         return
@@ -1098,14 +1333,18 @@ def _run_common(
     host: str,
     image_deps: list[dict],
     configure_deps: list[dict],
+    custom_installers: dict[str, list[dict]],
 ) -> Job:
     root.on_emit(_handle_log)
-    _resolve_dependency_job(root, host, image_deps, repeat=True)
+    _resolve_dependency_job(
+        root, host, image_deps, repeat=True, custom_installers=custom_installers
+    )
 
     async def configure(job: Job) -> None:
         await CONFIGURE[host](job)
         job.emit(
-            {"kind": "abstract-dep", "name": "configure", "state": "ready"}
+            {"kind": "abstract-dep", "name": "configure", "state": "ready"},
+            queue=True,
         )
 
     configure_job = root.job("configure", initiate=True)
@@ -1134,7 +1373,7 @@ def _python_job(
     # One kernel router/service job, gated on its IR-derived deps (which
     # always include configure). DepWait is the generated deployer's.
     job = parent.job(name, initiate=True)
-    register(job, dependencies, up)
+    register(job, dependencies, up, keep_alive=True)
     job.on_stop(down)
     return job
 
@@ -1339,17 +1578,13 @@ def main() -> int:
 
         async def run_job() -> None:
             job = Job(args.job)
+            action = up if args.job_action == "up" else down
 
             async def start(h: Job) -> None:
-                await up(h)
-
-            async def stop(h: Job) -> None:
-                await down(h)
+                await action(h)
 
             job.on_start(start)
-            job.on_stop(stop)
-            # start() only schedules; run() observes the started set and
-            # emits on_stop when the job completes (or stop() kills it).
+            # start() only schedules; run() observes the started set.
             await job.run()
 
         asyncio.run(run_job())
@@ -1605,8 +1840,11 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
         tree_job = f"ovn-fabric-{host_name}"
         up_fn = _body_fn_name(host_name, "run", "up")
         down_fn = _body_fn_name(host_name, "run", "down")
-        job_funcs.append(f"async def {up_fn}() -> None:\n" f"    await _run_host({host_name!r})\n")
-        job_funcs.append(f"async def {down_fn}() -> None:\n    return\n")
+        job_funcs.append(
+            f"async def {up_fn}(job: Job) -> None:\n" f"    await _run_host({host_name!r})\n"
+        )
+        down_all = _body_fn_name(host_name, "all", "down")
+        job_funcs.append(f"async def {down_fn}(job: Job) -> None:\n" f"    await {down_all}(job)\n")
         job_entries.append(f"    {tree_job!r}: ({up_fn}, {down_fn}),")
 
         bodies: dict[str, tuple[str, str]] = {}
@@ -1650,12 +1888,22 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
                 functions.append(fn)
             bodies[name] = (functions[0], functions[1])
 
+        down_calls = [f"    await {down}(job)" for _up, down in reversed(list(bodies.values()))]
+        job_funcs.append(
+            f"async def {down_all}(job: Job) -> None:\n"
+            + ("\n".join(down_calls) if down_calls else "    return")
+            + "\n"
+        )
+
         plan = install_plans[host_name]
         image_deps = (
             [{"kind": "abstract", "name": "docker"}]
             if any(entry["kind"] == "image" for entry in plan["jobs"])
             else []
         )
+        custom_installers: dict[str, list[dict[str, str]]] = {}
+        if "zerotier" in (node.data.dependencies or []):
+            custom_installers["zerotier"] = [{"kind": "apt-dep", "package": "curl"}]
         configure_deps = _configure_dependencies(node, nodes)
         job_deps = _job_dependencies(node, nodes)
         services = service_manifest[host_name]
@@ -1664,7 +1912,7 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
             f"def {tree_fn}() -> Job:",
             "    root = Job('ovn-fabric')",
             f"    configure = _run_common(root, {host_name!r}, "
-            f"{image_deps!r}, {configure_deps!r})",
+            f"{image_deps!r}, {configure_deps!r}, {custom_installers!r})",
         ]
         for svc in services:
             up, down = bodies[svc["name"]]
@@ -1687,9 +1935,13 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
             f"def {create_fn}() -> Job:",
             "    root = Job('ovn-fabric')",
             f"    _resolve_dependency_job(root, {host_name!r}, [], "
-            "repeat=False, with_images=False)",
+            f"repeat=False, with_images=False, "
+            f"custom_installers={custom_installers!r})",
             "    async def create_action(job: Job) -> None:",
             f"        await HOSTS[{host_name!r}]['create'](job, True, False)",
+            f"        await CONFIGURE[{host_name!r}](job)",
+            "        job.emit({'kind': 'abstract-dep', 'name': 'create-ready', "
+            "'state': 'ready'}, queue=True)",
             "    create_job = root.job('ovn-fabric(create)', initiate=True)",
             f"    register(create_job, {all_deps!r}, create_action)",
         ]
@@ -1698,7 +1950,8 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
                 "    async def cluster_action(job: Job) -> None:",
                 "        await cluster_create(job, True)",
                 "    cluster_job = root.job('cluster-create', initiate=True)",
-                f"    register(cluster_job, [{_abstract('ovn')!r}], cluster_action)",
+                f"    register(cluster_job, "
+                f"[{_abstract('ovn')!r}, {_abstract('create-ready')!r}], cluster_action)",
             ]
         create_lines.append("    return root")
         create_defs.append("\n".join(create_lines))
@@ -1709,22 +1962,25 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
             f"def {delete_fn}() -> Job:",
             "    root = Job('ovn-fabric')",
             f"    _resolve_dependency_job(root, {host_name!r}, [], "
-            "repeat=False, with_images=False)",
+            f"repeat=False, with_images=False, "
+            f"custom_installers={custom_installers!r})",
         ]
         delete_deps = list(all_deps)
         if cluster:
             delete_lines += [
                 "    async def cluster_action(job: Job) -> None:",
-                "        await cluster_delete(job, True)",
+                "        await cluster_delete(job, False)",
                 "        job.emit({'kind': 'abstract-dep', "
-                "'name': 'cluster-deleted', 'state': 'ready'})",
+                "'name': 'cluster-deleted', 'state': 'ready'}, queue=True)",
                 "    cluster_job = root.job('cluster-delete', initiate=True)",
                 f"    register(cluster_job, [{_abstract('ovn')!r}], cluster_action)",
             ]
             delete_deps.append({"kind": "abstract", "name": "cluster-deleted"})
+        down_calls = [f"        await {down}(job)" for _up, down in reversed(list(bodies.values()))]
         delete_lines += [
             "    async def delete_action(job: Job) -> None:",
-            f"        await HOSTS[{host_name!r}]['delete'](job, True, False)",
+            f"        await HOSTS[{host_name!r}]['delete'](job, False, False)",
+            *down_calls,
             "    delete_job = root.job('ovn-fabric(delete)', initiate=True)",
             f"    register(delete_job, {delete_deps!r}, delete_action)",
             "    return root",

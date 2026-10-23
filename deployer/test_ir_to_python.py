@@ -501,7 +501,7 @@ class ClusterScriptCreateTest(unittest.TestCase):
             "hostname=chassis-1",
             self.cluster,
         )
-        self.assertIn('test -n "$OVN_CHASSIS_chassis_1"', self.cluster)
+        self.assertNotIn("test -n", self.cluster)
         self.assertIn(
             'ovn-nbctl lrp-set-gateway-chassis lrp-router-home-left "$OVN_CHASSIS_chassis_1" 100',
             self.cluster,
@@ -623,8 +623,10 @@ class IfaceBindingCreateTest(unittest.TestCase):
         script = self.hosts["chassis-1"]
         # The create is guarded so a re-run tolerates the VLAN already
         # existing (`ip link add` has no --may-exist).
-        self.assertIn("ip link show eth0.129", script)
-        self.assertIn("ip link add link eth0 name eth0.129 type vlan id 129", script)
+        self.assertIn(
+            "await ensure_vlan(job, 'test', 'eth0', 'eth0.129', 129, abort_on_error)",
+            script,
+        )
         self.assertIn("ip link set eth0.129 up", script)
 
     def test_bridge_created_and_port_attached_on_the_owning_host(self) -> None:
@@ -634,12 +636,9 @@ class IfaceBindingCreateTest(unittest.TestCase):
         self.assertIn("ovs-vsctl --may-exist add-port br-home eth0.129", script)
 
     def test_veth_root_leg_is_left_to_its_router_unit(self) -> None:
-        # The binding block attaches the root-side peer to the bridge,
-        # but the kernel-router unit creates AND ups the device (the
-        # reboot fix, 2026-10-20). It must not `ip link set` it here:
-        # the boot restore pass runs before those units, so the line
-        # failed with "Cannot find device" and took the restore down
-        # (confirmed live, 2026-10-20).
+        # The binding block only creates the bridge; the kernel-router
+        # job creates/uplinks the veth and attaches its root leg AFTER
+        # `ip link add` (the configure/bindings pass runs before that).
         nodes = NODES + [
             pt.OvnLsNode(
                 id="ls:transit-router-wan",
@@ -662,7 +661,8 @@ class IfaceBindingCreateTest(unittest.TestCase):
         ]
         _, hosts = build_ops(nodes, "create")
         script = hosts["chassis-1"]
-        self.assertIn("ovs-vsctl --may-exist add-port br-1f5b95ad veth-ovn-9adb1d", script)
+        self.assertIn("ovs-vsctl --may-exist add-br br-1f5b95ad", script)
+        self.assertNotIn("add-port br-1f5b95ad veth-ovn-9adb1d", script)
         self.assertNotIn("ip link set veth-ovn-9adb1d up", script)
 
     def test_bridge_mapping_set_on_the_owning_host(self) -> None:
@@ -710,7 +710,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
         script = self.hosts["chassis-1"]
         self.assertIn("ovs-vsctl --may-exist add-br", script)
         self.assertIn("ovs-vsctl --may-exist add-port", script)
-        self.assertIn("ip link show eth0.129", script)
+        self.assertIn("await ensure_vlan(job, 'test', 'eth0', 'eth0.129'", script)
 
 
 class IfaceBindingDeleteTest(unittest.TestCase):
@@ -895,7 +895,7 @@ class FabricServiceTest(unittest.TestCase):
 
     def test_bindings_are_a_generated_body(self) -> None:
         body = self.hosts["chassis-1"].bindings
-        self.assertIn("ip link add link eth0 name eth0.129 type vlan id 129", body)
+        self.assertIn("await ensure_vlan(job, 'test', 'eth0', 'eth0.129', 129", body)
         self.assertIn("ip link set eth0.129 up", body)
         self.assertIn("ovs-vsctl --may-exist add-br br-home", body)
         self.assertIn("ovs-vsctl --may-exist add-port br-home eth0.129", body)
@@ -934,7 +934,7 @@ class KernelRouterCreateTest(unittest.TestCase):
 
     def test_netns_created_once_on_the_owning_host(self) -> None:
         script = self.hosts["chassis-1"]
-        self.assertEqual(script.count("ip netns add ns-kernel-0"), 1)
+        self.assertEqual(script.count("ensure_netns"), 1)
 
     def test_router_is_a_tree_job_not_a_unit(self) -> None:
         script = self.hosts["chassis-1"]
@@ -979,7 +979,7 @@ class KernelRouterCreateTest(unittest.TestCase):
         self.assertIn("ip link set dummy-left netns ns-kernel-0", script)
         self.assertGreater(
             script.index("ip link add link eth0 name eth0.2280 type vlan id 2280"),
-            script.index("ip netns add ns-kernel-0"),
+            script.index("ensure_netns"),
         )
         self.assertGreater(
             script.index("ip link set eth0.2280 netns ns-kernel-0"),
@@ -1347,10 +1347,6 @@ class KernelRouterCreateTest(unittest.TestCase):
                 "ip": apt + "iproute2",
                 "iptables": apt + "iptables",
                 "dhclient": apt + "isc-dhcp-client",
-                # zerotier's curl installer runs via sh -c so the pipe is
-                # argv-safe.
-                "zerotier": "sh -c curl -s https://install.zerotier.com | bash",
-                # zerotier's wire script parses `zerotier-cli -j` with jq.
                 "jq": apt + "jq",
             },
         )
@@ -1371,8 +1367,6 @@ class KernelRouterCreateTest(unittest.TestCase):
                 "apt": True,
             },
         )
-        self.assertEqual(by_name["zerotier"]["packages"], ["zerotier-one"])
-        self.assertFalse(by_name["zerotier"]["apt"])
         # The install runs in its own job, not inline in the host pass.
         # delete never uninstalls and does not run an install object.
         _, delete_hosts = build_ops(nodes, "delete")
@@ -1395,7 +1389,7 @@ class KernelRouterCreateTest(unittest.TestCase):
         ]
         _, hosts = build_ops(nodes, "create")
         jobs = hosts["chassis-1"].install_plan["jobs"]
-        self.assertEqual([job["kind"] for job in jobs], ["package", "package", "package"])
+        self.assertEqual([job["kind"] for job in jobs], ["package", "package"])
         for job in jobs:
             self.assertIn(job["kind"], ("package", "image"))
 
@@ -2282,7 +2276,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
 
         with mock.patch("asyncio.create_subprocess_exec", side_effect=rm_fails):
             with (
-                self.assertRaises(SystemExit),
+                self.assertRaises(ns["JobError"]),
                 self.assertLogs("ovn-fabric.deployer", level="ERROR"),
             ):
                 _with_job(ns, ns["ovn_purge"], "host:x (purge)", ovs=True, central=False)
@@ -2314,11 +2308,11 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             self.assertTrue(any("failed in host" in line for line in logs.output))
             # create: the same command aborts the pass.
             with (
-                self.assertRaises(SystemExit) as ctx,
+                self.assertRaises(ns["JobError"]) as ctx,
                 self.assertLogs("ovn-fabric.deployer", level="ERROR"),
             ):
                 _with_job(ns, ns["run_cmd"], "host", ["false"], True)
-        self.assertEqual(ctx.exception.code, 1)
+        self.assertEqual(ctx.exception.exit_code, 1)
 
     def test_run_cmd_logs_every_command_at_debug(self) -> None:
         ns = self._exec_runtime()
@@ -2348,6 +2342,13 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             _with_job(ns, ns["write_file"], "host", path, "[Unit]\nDescription=x", False)
             with open(path, encoding="utf-8") as out:
                 self.assertEqual(out.read(), "[Unit]\nDescription=x\n")
+
+    def test_dpkg_not_installed_is_missing(self) -> None:
+        ns = self._exec_runtime()
+        with mock.patch("asyncio.create_subprocess_exec", new_callable=mock.AsyncMock) as create:
+            create.return_value = _proc(0, b"unknown ok not-installed")
+            version = _with_job(ns, ns["_dpkg_version"], "curl")
+        self.assertIsNone(version)
 
     def test_install_packages_runs_one_apt_command(self) -> None:
         ns = self._exec_runtime()
@@ -2422,18 +2423,37 @@ class GeneratePythonDeployerTest(unittest.TestCase):
                 {"kind": "apt-dep", "package": "ovn-host"},
             ],
         )
-        self.assertEqual(per_host["zerotier"]["concrete"][1]["kind"], "sys-cmd-dep")
-        self.assertEqual(per_host["zerotier"]["concrete"][1]["name"], "zerotier")
-        self.assertIn("cmd", per_host["zerotier"]["concrete"][1])
-        self.assertEqual(
-            per_host["zerotier"]["concrete"][0],
-            {"kind": "apt-dep", "package": "curl", "order": 0},
-        )
-        self.assertEqual(per_host["zerotier"]["concrete"][1]["order"], 10)
+        # zerotier is a custom installer now, not a system dependency.
+        self.assertNotIn("zerotier", per_host)
         apt = ns["concrete_deps"]("apt-dep", "chassis-1")
         self.assertIn({"kind": "apt-dep", "package": "ovn-host"}, apt)
         self.assertIn({"kind": "apt-dep", "package": "docker.io"}, apt)
         self.assertEqual(len(apt), len({tuple(sorted(dep.items())) for dep in apt}))
+
+    def test_zerotier_is_a_custom_installer_job(self) -> None:
+        nodes = [
+            (
+                dataclasses.replace(
+                    n,
+                    data=dataclasses.replace(
+                        n.data,
+                        dependencies=["ovn", "zerotier", "curl", "docker"],
+                    ),
+                )
+                if n.kind == "infra.host" and n.key.host == "chassis-1"
+                else n
+            )
+            for n in NODES
+        ]
+        ns: dict[str, Any] = {}
+        exec(mod.generate_python_deployer(nodes), ns)
+        tree = ns["_run_chassis_1"]()
+        installer = next(job for job in tree.children if job.name == "install-zerotier")
+        self.assertEqual(
+            installer.ctx._dependencies,
+            {("apt-dep", "curl")},
+        )
+        self.assertNotIn("zerotier", ns["BIDIRECTIONAL_DEPS"]["chassis-1"])
 
     def test_generated_tree_has_configure_and_kernel_jobs(self) -> None:
         ns: dict[str, Any] = {}

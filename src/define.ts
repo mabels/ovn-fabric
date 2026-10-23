@@ -277,6 +277,9 @@ export class NetworkBuilder implements RouterEndpointContext {
   private readonly routersByName = new Map<string, Router>();
   private readonly kernelRoutersByName = new Map<string, KernelRouter>();
   private readonly routingDomainsByName = new Map<string, RoutingDomain>();
+  // Auto-metric sequence for routing domains: starts at 400; an explicit
+  // metric advances the sequence to max(explicit, current) + 1.
+  private nextRoutingDomainMetric = 400;
   private readonly securityGroupsByName = new Map<string, SecurityGroup>();
   private readonly dnsProvidersByName = new Map<string, DnsProvider>();
   private readonly platforms: PlatformImpl[] = [];
@@ -479,10 +482,13 @@ export class NetworkBuilder implements RouterEndpointContext {
     if (this.routingDomainsByName.has(name)) {
       throw new Error(`routing domain "${name}" declared more than once`);
     }
+    const metric = spec?.metric ?? this.nextRoutingDomainMetric;
+    this.nextRoutingDomainMetric =
+      Math.max(this.nextRoutingDomainMetric, metric) + 1;
     const domain: RoutingDomain = {
       name,
       ...(spec?.routes ? { routes: spec.routes } : {}),
-      ...(spec?.metric !== undefined ? { metric: spec.metric } : {}),
+      metric,
     };
     this.routingDomainsByName.set(name, domain);
     return domain;

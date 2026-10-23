@@ -171,6 +171,11 @@ class Emitter:
         (e.g. a chassis's OVS `system-id`)."""
         raise NotImplementedError
 
+    def wait_capture(self, var: str, argv: Sequence[str | Ref]) -> None:
+        """Like capture(), but waits (bounded) for the value to appear —
+        used for a chassis that may still be registering."""
+        self.capture(var, argv)
+
     def py(self, line: str) -> None:
         """A raw Python statement, for the few body operations that move a
         runtime value into a path/expression (Python-bodied jobs only)."""
@@ -553,8 +558,7 @@ def _emit_gateway_chassis_refs(
         host_name = host_names[host_id]
         var = _chassis_var(host_name)
         emit.comment(f"# --- chassis id for {host_name} (resolved on this host) ---")
-        emit.capture(var, ovn_ops.sb_chassis_id_by_hostname_argv(host_name))
-        emit.sh(["test", "-n", Ref(var)])
+        emit.wait_capture(var, ovn_ops.sb_chassis_id_by_hostname_argv(host_name))
         refs[host_id] = Ref(var)
     if refs:
         emit.blank()
@@ -1023,6 +1027,21 @@ def _emit_kernel_app_rules(
 # addresses/routes to it — up before addr/route, not after (a route
 # through a device that isn't up yet fails; an address on one is
 # pointless until it is).
+def _veth_root_bridge(root_leg: str, nodes: list[pt.Model]) -> str | None:
+    """The OVS bridge a kernel-router veth's ROOT leg belongs to, from the
+    same ovn.ls interface entry _emit_iface_bindings uses."""
+    for node in nodes:
+        if node.kind != "ovn.ls":
+            continue
+        for entry in node.data.interfaces or []:
+            iface = entry.iface
+            if iface.kind != "veth":
+                continue
+            if root_leg in (iface.ifaceName, iface.peerName):
+                return iface.shortName
+    return None
+
+
 def _emit_kernel_router_owner(
     owner: pt.KernelRouterNode, netns: str, nodes: list[pt.Model], action: Action, emit: Emitter
 ) -> None:
@@ -1106,7 +1125,7 @@ def _emit_kernel_router_owner(
                 emit.sh(linux_net_ops.delete_link_argv(root_leg))
         return
 
-    emit.sh(netns_ops.add_netns_argv(netns))
+    emit.py(f"await ensure_netns(job, {emit.label!r}, {netns!r}, abort_on_error)")
     # A fresh netns starts with lo DOWN; bring it up so loopback works
     # inside (2026-08-30).
     emit.sh(netns_ops.netns_exec_argv(linux_net_ops.set_link_up_argv("lo"), netns))
@@ -1162,6 +1181,9 @@ def _emit_kernel_router_owner(
                 # leg stays LOWERLAYERDOWN and every route through it
                 # linkdown after a reboot (confirmed live, 2026-10-20).
                 emit.sh(linux_net_ops.set_link_up_argv(root_leg))
+                bridge = _veth_root_bridge(root_leg, nodes)
+                if bridge is not None:
+                    emit.sh(ovs_ops.add_port_argv(bridge, root_leg))
             # "physical": the device must already exist in the root
             # namespace — nothing to create, only the move below.
         else:
@@ -1179,13 +1201,10 @@ def _emit_kernel_router_owner(
         # iface name (`eth0.2280`) can't be a sysctl key component
         # ("cannot stat .../eth0/2280/accept_ra").
         if side_node.key.side == pt.Side.right:
-            emit.sh(
-                netns_ops.netns_exec_argv(
-                    linux_net_ops.set_sysctl_file_argv(
-                        f"/proc/sys/net/ipv6/conf/{dev}/accept_ra", "2"
-                    ),
-                    netns,
-                )
+            emit.py(
+                f"await write_sysctl_in_netns(job, {emit.label!r}, {netns!r}, "
+                f"{f'/proc/sys/net/ipv6/conf/{dev}/accept_ra'!r}, '2', "
+                "abort_on_error)"
             )
         # The side's static addressing + security-group (masq) rules,
         # applied inside the netns — SAME code as the dhcpcd-in-docker
@@ -1344,7 +1363,9 @@ def _emit_xdp_leg(segment_bridge: str, vlan_id: int | None, emit: Emitter) -> No
     suffix = _short_suffix(segment_bridge)
     trunk_leg = f"veth-xdp-{suffix}"
     seg_leg = f"veth-seg-{suffix}"
-    emit.sh(linux_net_ops.ensure_veth_argv(trunk_leg, seg_leg))
+    emit.py(
+        f"await ensure_veth(job, {emit.label!r}, {trunk_leg!r}, {seg_leg!r}, " "abort_on_error)"
+    )
     emit.sh(linux_net_ops.set_link_up_argv(trunk_leg))
     emit.sh(linux_net_ops.set_link_up_argv(seg_leg))
     emit.sh(ovs_ops.add_port_argv(_XDP_TRUNK_BRIDGE, trunk_leg))
@@ -1407,10 +1428,10 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
                 label = _iface_real_name(iface)
             emit.comment(f"# --- interface: {domain} on {host_name} ({label}) ---")
             if iface.kind == "vlan" and not is_xdp:
-                emit.sh(
-                    linux_net_ops.ensure_vlan_argv(
-                        iface.vlanParent.name, _iface_real_name(iface), iface.vlanId
-                    )
+                emit.py(
+                    f"await ensure_vlan(job, {emit.label!r}, "
+                    f"{iface.vlanParent.name!r}, {_iface_real_name(iface)!r}, "
+                    f"{iface.vlanId}, abort_on_error)"
                 )
                 emit.sh(linux_net_ops.set_link_up_argv(_iface_real_name(iface)))
             # A transit veth's ROOT leg is created AND upped by its own
@@ -1424,6 +1445,11 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
             if is_xdp:
                 vlan_id = iface.vlanId if iface.kind == "vlan" else None
                 _emit_xdp_leg(bridge, vlan_id, emit)
+            elif iface.kind == "veth":
+                # The root leg is created by the kernel-router job, which
+                # attaches it to this bridge AFTER `ip link add` (the
+                # bindings/configure pass can run before that job).
+                pass
             else:
                 emit.sh(ovs_ops.add_port_argv(bridge, _iface_real_name(iface)))
             mappings.append(f"{_network_name(domain)}:{bridge}")
@@ -1631,6 +1657,7 @@ _PACKAGE_BY_DEP = {
     "ping": "iputils-ping",
     "traceroute": "traceroute",
     "curl": "curl",
+    "python": "python-is-python3",
 }
 
 
@@ -1663,18 +1690,9 @@ def _package_jobs(host_node: pt.InfraHostNode) -> tuple[list[dict[str, Any]], li
     for name in names:
         job: dict[str, Any]
         if name == "zerotier":
-            # Not in the distro's own repositories: ZeroTier's installer
-            # adds its repository and installs the `zerotier-one` package.
-            job = {
-                "kind": "package",
-                "name": name,
-                "packages": ["zerotier-one"],
-                "install": ["sh", "-c", "curl -s https://install.zerotier.com | bash"],
-                "apt": False,
-                # The installer pipes the vendor script through curl, which
-                # is an abstract apt dependency of its own.
-                "requires": ["curl"],
-            }
+            # Not a system package: the deployer has a dedicated
+            # install-zerotier job gated on the concrete curl dependency.
+            continue
         else:
             if name == "ovn":
                 # EVERY OVN host runs ovn-controller (ovn-host) — a

@@ -335,6 +335,7 @@ export const RouteData = type({
   nexthop: "string",
   masq: "boolean",
   domain: "string",
+  metric: "number",
 });
 export const Ipv4RouteNode = type({
   id: "string",

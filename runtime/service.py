@@ -95,9 +95,24 @@ Configure = Callable[["Job"], None]
 log = logging.getLogger("ovn-fabric.runtime")
 
 
+class JobError(RuntimeError):
+    """A job (or one of its commands) failed; only that job fails."""
+
+    def __init__(self, message: str, exit_code: int = 1) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
 def _log_task_failure(task: asyncio.Task[None]) -> None:
-    if not task.cancelled() and task.exception() is not None:
-        log.error("job hook failed", exc_info=task.exception())
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is None:
+        return
+    if isinstance(exc, JobError):
+        log.error("job hook failed: %s", exc)
+    else:
+        log.error("job hook failed", exc_info=exc)
 
 
 class Job:
@@ -136,6 +151,8 @@ class Job:
         # A held job is waiting (e.g. on a dependency event): run() must
         # not treat it as a completed leaf.
         self._held = False
+        # Root-only queue of events explicitly marked for late subscribers.
+        self._queued_events: list[Event] = []
         # Set once _stop() has finished (it may run in another task).
         self._stop_done = asyncio.Event()
 
@@ -168,16 +185,27 @@ class Job:
 
     def on_emit(self, hook: EmitHook) -> EmitHook:
         self._emit_hooks.append(hook)
+        # A job created/registered after an event was emitted still sees
+        # events explicitly queued by the producer (dependency state).
+        if self._root._started:
+            for event in list(self._root._queued_events):
+                if self.ctx is None:
+                    self._spawn(hook(self, event))
+                else:
+                    self._spawn(hook(self, event, self.ctx))
         return hook
 
     # -- events and logging -------------------------------------------------
 
-    def emit(self, event: Event) -> None:
+    def emit(self, event: Event, queue: bool = False) -> None:
         """Deliver `event` without waiting: each hook runs in its own task.
 
-        Log events go to the ancestors; everything else to every job."""
+        Log events go to the ancestors; everything else to every job.
+        `queue=True` retains the event for jobs/hooks registered later."""
         if not self._root._started:
             raise RuntimeError(f"{self.name}: emit() before start()")
+        if queue:
+            self._root._queued_events.append(event)
         if isinstance(event, dict) and event.get("kind") == "log":
             self._trace("emit called (log -> root): %r", event)
             receivers: Iterator[Job] = self._ancestors()
@@ -226,6 +254,72 @@ class Job:
         Returns whether the command exited 0."""
         ok, _ = await self._exec(label, cmd, abort_on_error, capture=False, timeout=timeout)
         return ok
+
+    async def run_streaming(
+        self,
+        label: str,
+        cmd: list[str],
+        abort_on_error: bool = True,
+        timeout: float | None = None,
+    ) -> bool:
+        """Run a command, capture its stdout+stderr, and print every line
+        prefixed with the job label when DEBUG logging is enabled."""
+        verbose = log.isEnabledFor(logging.DEBUG)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except OSError as exc:
+            detail = f" ({exc.strerror})" if exc.strerror else ""
+            self.log(
+                "error" if abort_on_error else "warn",
+                f"cannot run in {label}{detail}: {shlex.join(cmd)}",
+            )
+            if abort_on_error:
+                raise JobError(f"cannot run in {label}{detail}: {shlex.join(cmd)}", 127)
+            return False
+        self.register_process(proc)
+
+        async def pump() -> int:
+            assert proc.stdout is not None
+            while True:
+                line = await proc.stdout.readline()
+                if not line:
+                    break
+                if verbose:
+                    print(
+                        f"{label}: {line.decode(errors='replace').rstrip()}",
+                        flush=True,
+                    )
+            return await proc.wait()
+
+        try:
+            returncode = await (asyncio.wait_for(pump(), timeout=timeout) if timeout else pump())
+        except asyncio.TimeoutError:
+            await _kill(proc)
+            self.unregister_process(proc)
+            self.log(
+                "error" if abort_on_error else "warn",
+                f"timed out after {timeout:g}s in {label}: {shlex.join(cmd)}",
+            )
+            if abort_on_error:
+                raise JobError(
+                    f"timed out after {timeout:g}s in {label}: {shlex.join(cmd)}",
+                    124,
+                )
+            return False
+        finally:
+            if proc.returncode is not None:
+                self.unregister_process(proc)
+        if returncode == 0:
+            return True
+        _fail_line = f"failed in {label}: {shlex.join(cmd)}"
+        self.log("error" if abort_on_error else "warn", _fail_line)
+        if abort_on_error:
+            raise JobError(f"failed in {label}: {shlex.join(cmd)}", returncode)
+        return False
 
     async def capture_cmd(
         self,
@@ -437,7 +531,9 @@ class Job:
             *(hook(self) for hook in self._stop_hooks), return_exceptions=True
         )
         for result in results:
-            if isinstance(result, Exception):
+            if isinstance(result, JobError):
+                log.error("%s: stop hook failed: %s", self.name, result)
+            elif isinstance(result, Exception):
                 log.error("%s: stop hook failed", self.name, exc_info=result)
 
     async def _kill_processes(self) -> None:
@@ -460,7 +556,11 @@ class Job:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
-                stdout=asyncio.subprocess.PIPE if capture else None,
+                # Always capture: non-verbose output stays quiet and is
+                # only shown on failure; verbose echoes it with the job
+                # label prefix.
+                stdout=asyncio.subprocess.PIPE,
+                stderr=None if capture else asyncio.subprocess.STDOUT,
                 # Its own process group, so _kill() takes everything it spawned.
                 start_new_session=True,
             )
@@ -495,6 +595,14 @@ class Job:
             if proc.returncode is not None:
                 self.unregister_process(proc)
         self._trace("run_cmd %s completed: pid %d exit %d", label, proc.pid, proc.returncode)
+        if not capture and stdout:
+            text = stdout.decode(errors="replace")
+            if log.isEnabledFor(logging.DEBUG):
+                for output_line in text.splitlines():
+                    print(f"{label}: {output_line}", flush=True)
+            elif proc.returncode:
+                for output_line in text.splitlines():
+                    print(f"{label}: {output_line}", file=sys.stderr)
         if proc.returncode:
             self._fail(abort_on_error, proc.returncode, f"failed in {label}: {line}")
             return False, stdout or b""
@@ -503,7 +611,7 @@ class Job:
     def _fail(self, abort: bool, exit_code: int, message: str) -> None:
         if abort:
             self.error(message)
-            sys.exit(exit_code)
+            raise JobError(message, exit_code)
         self.warn(message)
 
 
