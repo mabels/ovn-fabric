@@ -276,18 +276,18 @@ class HydrateKernelRouterTest(unittest.TestCase):
 
     def test_security_group_ref_defaults_to_none_when_absent(self) -> None:
         node = mod.hydrate_node(self.RAW_KERNEL_ROUTER_RIGHT)
-        self.assertIsNone(node.data.securityGroup)
+        self.assertIsNone(node.data.securityGroups)
 
     def test_security_group_ref_hydrates_when_present(self) -> None:
         raw = {
             **self.RAW_KERNEL_ROUTER_RIGHT,
             "data": {
                 **self.RAW_KERNEL_ROUTER_RIGHT["data"],
-                "securityGroup": "sg-kernel-0",
+                "securityGroups": [{"render": "kernel", "name": "sg-kernel-0"}],
             },
         }
         node = mod.hydrate_node(raw)
-        self.assertEqual(node.data.securityGroup, "sg-kernel-0")
+        self.assertEqual(node.data.securityGroups[0].name, "sg-kernel-0")
 
     def test_apps_default_to_none_when_absent(self) -> None:
         node = mod.hydrate_node(self.RAW_KERNEL_ROUTER_RIGHT)
@@ -355,7 +355,7 @@ class HydrateKernelRouterTest(unittest.TestCase):
                                 "endpoint": "146.70.117.130:51820",
                             },
                         },
-                        "masq": ["ipv4", "ipv6"],
+                        "securityGroups": [{"render": "kernel", "name": "masq-router"}],
                     }
                 ],
             },
@@ -366,7 +366,7 @@ class HydrateKernelRouterTest(unittest.TestCase):
         self.assertEqual(app.ifaceName, "mullvad-de")
         self.assertEqual(app.config.privateKey, "k")
         self.assertEqual(app.config.peer.allowedIps, "0.0.0.0/0")
-        self.assertEqual(app.masq, [pt.MasqEnum.ipv4, pt.MasqEnum.ipv6])
+        self.assertEqual(app.securityGroups[0].name, "masq-router")
 
 
 class HydrateSecurityGroupTest(unittest.TestCase):
@@ -480,13 +480,13 @@ class GenericWalkTest(unittest.TestCase):
                         "kind": "zerotier",
                         "networkId": "02cfbec15c2319ff",
                         "instanceDir": "/var/lib/zt",
-                        "masq": ["ipv4"],
+                        "securityGroups": [{"render": "kernel", "name": "masq-zt"}],
                         "routes": [{"dst": "192.168.0.0/16"}],
                     },
                     {
                         "kind": "wireguard",
                         "ifaceName": "wg0",
-                        "masq": [],
+                        "securityGroups": [],
                         "config": {
                             "privateKey": "k",
                             "address": "10.64.0.2/32",
@@ -506,7 +506,7 @@ class GenericWalkTest(unittest.TestCase):
         self.assertIsInstance(wireguard, AppWireguard)
         # A field the hand-written mapping used to drop.
         self.assertEqual(zerotier.routes, [pt.KernelRouterRoute(dst="192.168.0.0/16")])
-        self.assertEqual(zerotier.masq, [pt.MasqEnum.ipv4])
+        self.assertEqual(zerotier.securityGroups[0].name, "masq-zt")
 
     def test_an_unknown_union_member_raises(self) -> None:
         with self.assertRaises(mod.IRShapeError) as caught:

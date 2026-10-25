@@ -356,32 +356,58 @@ export interface SecurityGroupRef {
   readonly name: string;
 }
 
-/** One rule inside a security group — generic vocabulary, deliberately
- * implementation-abstract (see SecurityGroup's own doc comment): a rule
- * is expressed in terms any backend can translate to its own concrete
- * command, not in iptables/nft/OVN-ACL syntax. Today the only kind is
- * `masq` (masquerade egress from the attached interface, per address
- * family); future kernel services (docker containers, wireguard, ...)
- * extend this same union. */
-export type SecurityGroupRule = {
+export type SecurityGroupRender = "kernel" | "ovn";
+
+/** Kernel netns rule: MASQUERADE egress out the attached interface. */
+export interface KernelMasqRule {
   readonly family: "ipv4" | "ipv6";
   readonly kind: "masq";
-};
+}
 
-/** A fully-resolved security group — name plus its rules. Built via
- * net.securityGroup(name, build) (define.ts — see SecurityGroupBuilder,
- * same file), never assembled by hand: the builder is the one place a
- * rule's abstract shape gets turned into the concrete SecurityGroupRule
- * this type carries. Serialized straight into the implementation-
- * abstract `security.group` IR node (src/ir.ts's securityGroupToIR).
- * The `.masq` kernel services are a SHORTCUT that expands to one of
- * these: an explicit `securityGroup` on a kernelRouterEndpoint() wins
- * outright (and the masq services are ignored), otherwise the shortcut
- * builds `{ name: "masq-<router>", rules: [<one per masq family>] }`
- * through the very same builder. */
-export interface SecurityGroup {
+/** OVN logical-router rule: SNAT to an external address. Rendered by
+ * TypeScript; the IR receives only this concrete form, never a
+ * placeholder. */
+export interface OvnSnatRule {
+  readonly family: "ipv4" | "ipv6";
+  readonly kind: "snat";
+  readonly externalIp: IPv4 | IPv6;
+  readonly logicalIps: readonly (IPv4 | IPv6)[];
+}
+
+export type SecurityGroupRule<R extends SecurityGroupRender> = R extends
+  "kernel" ? KernelMasqRule : OvnSnatRule;
+
+/** A rendered group. Its `rules` are concrete and backend-specific;
+ * the IR only ever sees this. */
+export interface SecurityGroup<
+  R extends SecurityGroupRender = SecurityGroupRender,
+> {
   readonly name: string;
-  readonly rules: readonly SecurityGroupRule[];
+  readonly render: R;
+  readonly rules: readonly SecurityGroupRule<R>[];
+}
+
+/** What a consumer carries: backend + name + the rendered rules to emit
+ * into the `security.group` node. Only {render,name} reaches the IR. */
+export interface SecurityGroupRef<
+  R extends SecurityGroupRender = SecurityGroupRender,
+> {
+  readonly render: R;
+  readonly name: string;
+  readonly rules: readonly SecurityGroupRule<R>[];
+}
+
+/** A reusable, typed template. `P` is the reference's placeholder
+ * environment: `ref(values)` requires every field at compile time and
+ * the callback receives them as real IPv4/IPv6 instances. Nothing about
+ * placeholders survives into the IR. */
+export interface SecurityGroupTemplate<
+  P extends object,
+  R extends SecurityGroupRender,
+> {
+  readonly name: string;
+  readonly render: R;
+  ref(values: P): SecurityGroupRef<R>;
 }
 
 /** A fully-resolved kernel-netns APPLICATION — the `kernel.app.*`
@@ -402,12 +428,11 @@ export type KernelApp =
     readonly ifaceName: string;
     /** The full wg-quick conf content, written verbatim. */
     readonly config: WireguardInterfaceConfig;
-    /** The address families to MASQUERADE out the tunnel interface —
-     * resolved from the tunnelRouterEndpoint's `kernel.*.masq` services.
-     * Masq belongs to the TUNNEL iface here, NOT to the upstream leg
-     * (the security-group shortcut targets the side's real iface, which
-     * would be wrong for a tunnel router). */
-    readonly masq: readonly ("ipv4" | "ipv6")[];
+    /** Security groups whose `masq` rules apply out the TUNNEL interface.
+     * Masq belongs to the TUNNEL iface here, NOT to the upstream leg (the
+     * kernel-side shortcut targets the side's real iface, which would be
+     * wrong for a tunnel router). */
+    readonly securityGroups: readonly SecurityGroupRef<"kernel">[];
   }
   | {
     readonly kind: "zerotier";
@@ -416,11 +441,10 @@ export type KernelApp =
     readonly networkId: string;
     /** This tunnel's OWN dedicated ZeroTier home directory. */
     readonly instanceDir: string;
-    /** The address families to MASQUERADE out the tunnel interface —
-     * the real iface name is only known at RUNTIME (ZeroTier names it),
-     * so the wire script adds/removes these rules on the captured
-     * interface. */
-    readonly masq: readonly ("ipv4" | "ipv6")[];
+    /** Security groups whose `masq` rules apply out the tunnel interface.
+     * The real iface name is only known at RUNTIME (ZeroTier names it),
+     * so the wire script applies them to the captured interface. */
+    readonly securityGroups: readonly SecurityGroupRef<"kernel">[];
     /** Via-less routes the tunnel carries out the mesh — the tunnel
      * endpoint's declared `routes` (e.g. the ztnet supernet
      * 192.168.0.0/16). The interface name is only known at RUNTIME, so
@@ -674,15 +698,13 @@ export interface KernelRouterEndpoint extends RouterEndpointInputBase {
   readonly kind: "kernel";
   readonly host: Host;
   readonly transit: TransitNetwork;
-  /** An EXPLICIT, fully-built security group (net.securityGroup(),
+  /** EXPLICIT, fully-built security groups (net.securityGroup(),
    * define.ts) to attach to this endpoint's real-world-facing
-   * interface — overrides the base `SecurityGroupRef` shape, since a
-   * kernel endpoint carries the whole group, not a bare ref. When set,
-   * the `kernel.*.masq` services are IGNORED (the author owns the
-   * group's content); when absent, the masq shortcut builds
-   * `masq-<router>` implicitly. Must have been declared via
-   * net.securityGroup() in the same defineNetwork call. */
-  readonly securityGroup?: SecurityGroup;
+   * interface. When non-empty, the `kernel.*.masq` services are IGNORED
+   * (the author owns the groups' content); when absent, the masq
+   * shortcut builds `masq-<router>` implicitly. Every group must have
+   * been declared via net.securityGroup() in the same defineNetwork call. */
+  readonly securityGroups?: readonly SecurityGroupRef<"kernel">[];
 }
 
 /** The input shape for NetworkBuilder.tunnelRouterEndpoint() (define.ts)
@@ -788,13 +810,13 @@ export interface KernelRouterSide {
    * interface (right side only in practice) — an object reference, same
    * "no string that could drift" discipline as l2Segment/routingDomains.
    * Computed once, in buildKernelRouterEndpoint (define.ts): an explicit
-   * `securityGroup` on the kernelRouterEndpoint() input wins outright
+   * `securityGroups` on the kernelRouterEndpoint() input win outright
    * (the `kernel.*.masq` services are then IGNORED), otherwise the masq
    * shortcut builds `{ name: "masq-<router>", rules: [...] }` through
    * net.securityGroup() — see SecurityGroup, types.ts. Serialized into
    * the implementation-abstract `security.group` IR node (src/ir.ts's
    * securityGroupToIR); this side node is the ATTACHMENT point. */
-  readonly securityGroup?: SecurityGroup;
+  readonly securityGroups?: readonly SecurityGroupRef<"kernel">[];
 }
 
 /** A router whose two ports are real Linux interfaces inside ONE netns
@@ -1329,8 +1351,9 @@ export type OvnRouterEndpointSpec =
  * ambiguity instead of resolving it algorithmically). The anchor is now
  * simply "whichever (router, side) this array lives on" — see
  * computeRoutes, src/ir.ts, which no longer searches for it at all.
- * `with: "masq"` (source NAT) is only ever meaningful here, at the
+ * `securityGroup` (source NAT/masq) is only collected here, at the
  * anchor — never replicated onto routers that merely relay toward it.
+ * The group's rules are the source of intent; the IR carries its name.
  *
  * `via` is OPTIONAL on the ANCHOR side only — omitting it means "the
  * anchor needs no literal route of its own here, it's handled some
@@ -1348,7 +1371,10 @@ export type OvnRouterEndpointSpec =
 export interface RouterEndpointRoute {
   readonly dst: IPv4 | IPv6;
   readonly via?: IPv4 | IPv6;
-  readonly with?: "masq";
+  /** Security groups whose rules apply to traffic for this route. The
+   * groups are the single source of what "masq"/NAT means; the IR carries
+   * their references, not a boolean. */
+  readonly securityGroups?: readonly SecurityGroupRef[];
   /** Preference of THIS route among equal-prefix routes (lower wins, standard
    * Linux metric) — chiefly to rank two endpoints' default routes when a
    * workload has several NICs (e.g. management-v2 preferred over

@@ -2,7 +2,7 @@
 // net.securityGroup()'s build callback. Separate from define.ts because
 // it's pure accumulation with no NetworkBuilder state.
 
-import type { SecurityGroup, SecurityGroupRule } from "./types.ts";
+import type { KernelMasqRule, SecurityGroup } from "./types.ts";
 
 /** The per-declaration rule API handed to net.securityGroup()'s build
  * callback — the ONE place a rule's abstract shape gets turned into the
@@ -11,7 +11,7 @@ import type { SecurityGroup, SecurityGroupRule } from "./types.ts";
  * ...) add their own methods here, and the implementation-abstract
  * IR/deployer side consumes them unchanged. */
 export class SecurityGroupBuilder {
-  private readonly rules: SecurityGroupRule[] = [];
+  private readonly rules: KernelMasqRule[] = [];
 
   constructor(private readonly name: string) {}
 
@@ -25,14 +25,14 @@ export class SecurityGroupBuilder {
 
   /** Add an already-fully-shaped rule — for the day a service isn't a
    * simple masq. Chainable. */
-  rule(rule: SecurityGroupRule): this {
+  rule(rule: KernelMasqRule): this {
     this.rules.push(rule);
     return this;
   }
 
   /** The resolved, immutable group — name + a snapshot of the rules
    * accumulated so far. */
-  build(): SecurityGroup {
-    return { name: this.name, rules: [...this.rules] };
+  build(): SecurityGroup<"kernel"> {
+    return { name: this.name, render: "kernel", rules: [...this.rules] };
   }
 }

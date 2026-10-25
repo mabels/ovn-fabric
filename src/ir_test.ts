@@ -596,9 +596,11 @@ Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes 
   // the kernel router's RIGHT (WAN) side, emitted as an
   // implementation-abstract `security.group` node carrying the rules.
   const right = node(nodes, "kernelrouter:router-wan|side:right");
-  assertEquals(right.data["securityGroup"], "masq-router-wan");
+  assertEquals(right.data["securityGroups"], [
+    { render: "kernel", name: "masq-router-wan" },
+  ]);
   const left = node(nodes, "kernelrouter:router-wan|side:left");
-  assertEquals(left.data["securityGroup"], undefined);
+  assertEquals(left.data["securityGroups"], undefined);
   assertEquals(node(nodes, "securitygroup:masq-router-wan").data["rules"], [
     { family: "ipv4", kind: "masq" },
     { family: "ipv6", kind: "masq" },
@@ -628,7 +630,7 @@ Deno.test("kernelRouterEndpoint: explicit security group wins, masq services are
               { kind: "kernel.ipv4.masq" },
               { kind: "kernel.ipv6.masq" },
             ],
-            securityGroup: out,
+            securityGroups: [out],
             ifaces: [
               {
                 host,
@@ -650,8 +652,8 @@ Deno.test("kernelRouterEndpoint: explicit security group wins, masq services are
   // The explicit group is attached, exactly as built (ipv4-only masq);
   // the services' ipv6 masq never made it in.
   assertEquals(
-    node(nodes, "kernelrouter:router-wan|side:right").data["securityGroup"],
-    "wan-out",
+    node(nodes, "kernelrouter:router-wan|side:right").data["securityGroups"],
+    [{ render: "kernel", name: "wan-out" }],
   );
   assertEquals(node(nodes, "securitygroup:wan-out").data["rules"], [
     { family: "ipv4", kind: "masq" },
@@ -664,6 +666,7 @@ Deno.test("kernelRouterEndpoint: explicit security group wins, masq services are
 // resolve. Same register + fail-fast split every other builder uses.
 Deno.test("kernelRouterEndpoint: unregistered security group is rejected", () => {
   const foreign = {
+    render: "kernel" as const,
     name: "wan-out",
     rules: [{ family: "ipv4" as const, kind: "masq" as const }],
   };
@@ -683,7 +686,7 @@ Deno.test("kernelRouterEndpoint: unregistered security group is rejected", () =>
                 IPv6.parse("fd00::10:12:80:1/124"),
               ),
               ipaddrs: [IPv4.parse("192.168.132.93/24")],
-              securityGroup: foreign,
+              securityGroups: [foreign],
               ifaces: [
                 {
                   host,
@@ -1080,7 +1083,7 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
     ).data,
     {
       nexthop: "172.22.0.140",
-      masq: false,
+      securityGroups: [],
       domain: "Neighbor-defaultRoute",
       metric: 400,
     },
@@ -1094,7 +1097,7 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
     node(nodes, "ovnrouter:router-voda|route:Voda-defaultRoute|0.0.0.0/0").data,
     {
       nexthop: "192.168.132.1",
-      masq: false,
+      securityGroups: [],
       domain: "Voda-defaultRoute",
       metric: 401,
     },
@@ -1106,7 +1109,7 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
     ).data,
     {
       nexthop: "10.12.81.14",
-      masq: false,
+      securityGroups: [],
       domain: "Neighbor-defaultRoute",
       metric: 400,
     },
@@ -1201,7 +1204,7 @@ Deno.test("tunnelRouterEndpoint: zerotier is a docker app with its state volume"
       .data,
     {
       nexthop: "10.12.85.14",
-      masq: false,
+      securityGroups: [],
       domain: "Zerotier-route",
       metric: 400,
     },
@@ -2621,19 +2624,23 @@ Deno.test("ovn masq services resolve to SNAT rows on the logical router", () => 
     return { hosts: [host], routers: [] };
   });
 
-  const lr = node(toIR(network), "ovnrouter:router-x");
-  assertEquals(lr.data["nats"], [
+  const nodes = toIR(network);
+  const lr = node(nodes, "ovnrouter:router-x");
+  assertEquals(lr.data["securityGroups"], [
+    { render: "ovn", name: "masq-router-x-ovn" },
+  ]);
+  assertEquals(node(nodes, "securitygroup:masq-router-x-ovn").data["rules"], [
     {
-      type: "snat",
+      kind: "snat",
       family: "ipv4",
       externalIp: "172.22.0.2",
-      logicalIp: "10.43.0.0/24",
+      logicalIps: ["10.43.0.0/24"],
     },
     {
-      type: "snat",
+      kind: "snat",
       family: "ipv6",
       externalIp: "2600:db8:1::2",
-      logicalIp: "2600:db8::/112",
+      logicalIps: ["2600:db8::/112"],
     },
   ]);
 });

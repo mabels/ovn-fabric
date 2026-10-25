@@ -53,7 +53,7 @@ export interface KernelRouterEndpointBuilder {
   ipaddrs?: readonly (IPv4 | IPv6)[];
   ifaces?: readonly HostInterface[];
   services?: RouterEndpointService[];
-  securityGroup?: SecurityGroup;
+  securityGroups?: readonly SecurityGroup[];
   routes?: readonly RouterEndpointRoute[];
   routingDomains?: readonly RoutingDomain[];
   buildAppDocker(name: string, build: (app: DockerAppBuilder) => void): void;
@@ -118,8 +118,8 @@ export function normalizeKernelEndpoint(
     ipaddrs: endpoint.ipaddrs ?? [],
     ...(endpoint.ifaces ? { ifaces: endpoint.ifaces } : {}),
     ...(services.length > 0 ? { services } : {}),
-    ...(endpoint.securityGroup
-      ? { securityGroup: endpoint.securityGroup }
+    ...(endpoint.securityGroups && endpoint.securityGroups.length > 0
+      ? { securityGroups: endpoint.securityGroups }
       : {}),
     ...(endpoint.routes ? { routes: endpoint.routes } : {}),
     ...(endpoint.routingDomains

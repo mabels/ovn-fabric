@@ -32,7 +32,7 @@
 // allRouters/allHosts.
 
 import { fnv1a32, macFromAddrsOrName, macFromV4 } from "./addressing.ts";
-import type { IPv4, IPv6 } from "./ip.ts";
+import { IPv4, IPv6 } from "./ip.ts";
 import {
   CollisionDomain,
   type Host,
@@ -40,11 +40,13 @@ import {
   type InterfaceParent,
   type KernelRouter,
   type OvnRouterEndpoint,
+  type OvnSnatRule,
   type Resolver,
   type Router,
   type RouterEndpointService,
   type RoutingDomain,
   type SecurityGroup,
+  type SecurityGroupRef,
   type Service,
   type XdpIface,
   type XdpMode,
@@ -61,11 +63,11 @@ import type {
   OvnLrpNode,
   OvnLsInterface,
   OvnLsNode,
-  OvnNatRule,
   RouteNode,
   SecurityGroupNode,
   ServiceRef,
 } from "./protocol.ts";
+import { IpValue, NetworkValue } from "./protocol.ts";
 
 // The IR node types are the ones INFERRED from the protocol schema
 // (src/protocol.ts) — not a loose `{key, data: Record<string, unknown>}`
@@ -437,13 +439,29 @@ function kernelRouterSideToIR(
       // name (`masq-<router>` for the masq shortcut): the attachment
       // point lives on the side node, the rules live in the group node
       // itself.
-      securityGroup: router[side].securityGroup?.name,
+      ...(router[side].securityGroups && router[side].securityGroups.length > 0
+        ? {
+          securityGroups: router[side].securityGroups.map((g) => ({
+            render: g.render,
+            name: g.name,
+          })),
+        }
+        : {}),
       // Applications running inside the netns on this side's real
       // interface (right side only in practice — the `kernel.app.*`
       // services resolved in buildKernelRouterEndpoint, define.ts). The
       // deployer turns each into its `ip netns exec` service script,
       // and stops/releases it on delete.
       apps: router[side].apps?.map((app) => {
+        const withRefs = app.kind === "wireguard" || app.kind === "zerotier"
+          ? {
+            ...app,
+            securityGroups: (app.securityGroups ?? []).map((g) => ({
+              render: g.render,
+              name: g.name,
+            })),
+          }
+          : app;
         // A VETH-CLIENT docker app needs SHORT, collision-free veth device
         // names (IFNAMSIZ ≤ 15): `ve-<hash>` / `ve-<hash>-c` derived from
         // the container name — same rule shortIfaceName applies everywhere
@@ -452,9 +470,9 @@ function kernelRouterSideToIR(
         // interfaces" is exactly the ABSENCE of the veth machinery.
         if (app.kind === "docker" && app.ip) {
           const hash = fnv1a32(app.name).toString(16).padStart(8, "0");
-          return { ...app, vethName: `ve-${hash}` };
+          return { ...withRefs, vethName: `ve-${hash}` };
         }
-        return app;
+        return withRefs;
       }),
     },
   };
@@ -480,7 +498,27 @@ function securityGroupToIR(group: SecurityGroup): SecurityGroupNode {
     id: `securitygroup:${group.name}`,
     kind: "security.group",
     key: { name: group.name },
-    data: { rules: group.rules },
+    data: {
+      rules: group.rules.map((rule) =>
+        rule.kind === "masq" ? rule : (() => {
+          const externalIp = rule.externalIp.to_s();
+          const logicalIps = rule.logicalIps.map((a) => a.to_string());
+          if (IpValue(externalIp) instanceof Error) {
+            throw new Error(
+              `security group "${group.name}": bad externalIp ${externalIp}`,
+            );
+          }
+          for (const logicalIp of logicalIps) {
+            if (NetworkValue(logicalIp) instanceof Error) {
+              throw new Error(
+                `security group "${group.name}": bad logicalIp ${logicalIp}`,
+              );
+            }
+          }
+          return { ...rule, externalIp, logicalIps };
+        })()
+      ),
+    },
   };
 }
 
@@ -675,12 +713,15 @@ function collisionDomainToIR(
 // resolveIpv6RaConfigs below. The deployer only applies each pair.
 // OVN SNAT: `{kind:"ovn.ipv4.masq"}` / `ovn.ipv6.masq` on an endpoint means
 // "masquerade this router's OTHER endpoint subnets to THIS endpoint's own
-// address of that family". One `lr-nat-add ... snat external logical` row
-// per logical prefix; the deployer owns the imperative side.
-function computeOvnNats(network: NetworkDefinition): Map<string, OvnNatRule[]> {
-  const byRouter = new Map<string, OvnNatRule[]>();
+// address of that family". TypeScript renders the concrete `snat` rules
+// into a security.group; the IR stores the group + one LR reference.
+function computeOvnSecurityGroups(network: NetworkDefinition): {
+  byRouter: Map<string, SecurityGroup<"ovn">>;
+} {
+  const byRouter = new Map<string, SecurityGroup<"ovn">>();
   for (const router of network.allRouters) {
-    const rules: OvnNatRule[] = [];
+    const rules: OvnSnatRule[] = [];
+    const name = `masq-${router.name}-ovn`;
     for (const endpoint of router.endpoints) {
       for (const service of endpoint.services ?? []) {
         if (
@@ -696,39 +737,36 @@ function computeOvnNats(network: NetworkDefinition): Map<string, OvnNatRule[]> {
           );
         }
         const externalNet = external.network().to_string();
-        const seen = new Set<string>();
+        const logicalIps = new Set<string>();
         for (const other of router.endpoints) {
           if (other.name === endpoint.name) continue;
           for (const addr of other.ipaddrs) {
             if (addr.is_ipv4() !== isV4) continue;
             const logical = addr.network().to_string();
-            if (logical === externalNet || seen.has(logical)) continue;
-            seen.add(logical);
-            rules.push({
-              type: "snat",
-              family: isV4 ? "ipv4" : "ipv6",
-              externalIp: external.to_s(),
-              logicalIp: logical,
-            });
+            if (logical !== externalNet) logicalIps.add(logical);
           }
         }
+        if (logicalIps.size === 0) continue;
+        rules.push({
+          kind: "snat",
+          family: isV4 ? "ipv4" : "ipv6",
+          externalIp: external,
+          logicalIps: [...logicalIps].map((s) =>
+            isV4 ? IPv4.parse(s) : IPv6.parse(s)
+          ),
+        });
       }
     }
     if (rules.length > 0) {
-      rules.sort((a, b) =>
-        `${a.externalIp}|${a.logicalIp}`.localeCompare(
-          `${b.externalIp}|${b.logicalIp}`,
-        )
-      );
-      byRouter.set(router.name, rules);
+      byRouter.set(router.name, { name, render: "ovn", rules });
     }
   }
-  return byRouter;
+  return { byRouter };
 }
 
 function routerToIR(
   router: Router,
-  nats?: readonly OvnNatRule[],
+  securityGroups: readonly SecurityGroupRef[] = [],
 ): OvnLrNode {
   return {
     id: `ovnrouter:${router.name}`,
@@ -738,7 +776,14 @@ function routerToIR(
       options: {
         mac_binding_age_threshold: router.options.macBindingAgeThreshold,
       },
-      ...(nats && nats.length > 0 ? { nats: [...nats] } : {}),
+      ...(securityGroups.length > 0
+        ? {
+          securityGroups: securityGroups.map((g) => ({
+            render: g.render,
+            name: g.name,
+          })),
+        }
+        : {}),
     },
   };
 }
@@ -1171,7 +1216,10 @@ function routeToIR(
   router: Router,
   dst: IPv4 | IPv6,
   nexthop: IPv4 | IPv6,
-  masq: boolean,
+  securityGroups: readonly {
+    readonly render: "kernel" | "ovn";
+    readonly name: string;
+  }[],
   domain: string,
   metric: number,
 ): RouteNode {
@@ -1197,7 +1245,12 @@ function routeToIR(
     id,
     kind: dst.is_ipv4() ? "ipv4.route" : "ipv6.route",
     key: { ovnrouter: router.name, prefix },
-    data: { nexthop: nexthop.to_s(), masq, domain, metric },
+    data: {
+      nexthop: nexthop.to_s(),
+      securityGroups: [...securityGroups],
+      domain,
+      metric,
+    },
   };
 }
 
@@ -1249,7 +1302,10 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
           isDomainParticipant(r, domain)
         );
         for (const route of routes) {
-          const masq = route.with === "masq";
+          const securityGroups = (route.securityGroups ?? []).map((g) => ({
+            render: g.render,
+            name: g.name,
+          }));
           for (const router of participants) {
             if (router.name === anchorRouter.name) {
               // No `via` here means "the anchor needs no literal route
@@ -1267,7 +1323,7 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
                   router,
                   route.dst,
                   route.via,
-                  masq,
+                  securityGroups,
                   domain.name,
                   domain.metric ?? 400,
                 ),
@@ -1288,7 +1344,7 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
                 router,
                 route.dst,
                 nexthop,
-                masq,
+                securityGroups,
                 domain.name,
                 domain.metric ?? 400,
               ),
@@ -1346,7 +1402,7 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
             router,
             route.dst,
             nexthop,
-            false,
+            [],
             domain.name,
             route.metric ?? domain.metric ?? 400,
           ),
@@ -1412,7 +1468,7 @@ function computeInterconnectRoutes(
                       r1,
                       peerAddr.network(),
                       nexthop,
-                      false,
+                      [],
                       domain.name,
                       domain.metric ?? 400,
                     ),
@@ -1616,9 +1672,14 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
     nodes[node.id] = node;
   }
 
-  const natsByRouter = computeOvnNats(network);
+  const ovnGroups = computeOvnSecurityGroups(network).byRouter;
+  for (const group of ovnGroups.values()) {
+    const node = securityGroupToIR(group);
+    nodes[node.id] = node;
+  }
   for (const router of network.allRouters) {
-    const routerNode = routerToIR(router, natsByRouter.get(router.name));
+    const group = ovnGroups.get(router.name);
+    const routerNode = routerToIR(router, group ? [group] : []);
     nodes[routerNode.id] = routerNode;
     for (const endpoint of router.endpoints) {
       if (endpoint.kind !== "ovn") {

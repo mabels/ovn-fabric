@@ -68,6 +68,9 @@ import {
   type RoutingDomain,
   type RoutingDomainRoute,
   type SecurityGroup,
+  type SecurityGroupRef,
+  type SecurityGroupRender,
+  type SecurityGroupTemplate,
   type Service,
   sshHost,
 } from "./types.ts";
@@ -655,7 +658,7 @@ export class NetworkBuilder implements RouterEndpointContext {
   securityGroup(
     name: string,
     build: (group: SecurityGroupBuilder) => void,
-  ): SecurityGroup {
+  ): SecurityGroup<"kernel"> {
     if (this.securityGroupsByName.has(name)) {
       throw new Error(`security group "${name}" declared more than once`);
     }
@@ -666,11 +669,48 @@ export class NetworkBuilder implements RouterEndpointContext {
     return group;
   }
 
-  /** True iff `group` is the exact object net.securityGroup() returned for
-   * its name in this call — the fail-fast check a kernelRouterEndpoint's
-   * explicit securityGroup must pass (RouterEndpointContext). */
-  securityGroupDeclared(group: SecurityGroup): boolean {
-    return this.securityGroupsByName.get(group.name) === group;
+  /** A reusable, placeholder-typed template. The callback receives the
+   * reference's typed values (real IPv4/IPv6 instances) and returns the
+   * CONCRETE rules; `.ref(values)` registers that rendering and returns
+   * the consumer handle. Only {render,name} reaches the IR. */
+  securityGroupTemplate<P extends object, R extends SecurityGroupRender>(
+    name: string,
+    render: R,
+    build: (values: P) => readonly SecurityGroupRef<R>["rules"][number][],
+  ): SecurityGroupTemplate<P, R> {
+    return {
+      name,
+      render,
+      ref: (values: P) => {
+        const group: SecurityGroup<R> = {
+          name,
+          render,
+          rules: build(values),
+        };
+        this.#registerRenderedGroup(group);
+        return group;
+      },
+    };
+  }
+
+  #registerRenderedGroup(group: SecurityGroup): void {
+    const existing = this.securityGroupsByName.get(group.name);
+    if (existing !== undefined) {
+      if (JSON.stringify(existing.rules) !== JSON.stringify(group.rules)) {
+        throw new Error(
+          `security group "${group.name}" rendered with different rules`,
+        );
+      }
+      return;
+    }
+    this.securityGroupsByName.set(group.name, group);
+  }
+
+  /** True iff a group/reference with this name was declared or rendered in
+   * this call — the fail-fast check a kernelRouterEndpoint's explicit
+   * securityGroups must pass (RouterEndpointContext). */
+  securityGroupDeclared(group: SecurityGroupRef): boolean {
+    return this.securityGroupsByName.has(group.name);
   }
 
   /** Declare a router connecting exactly two collision domains — see

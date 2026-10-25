@@ -52,6 +52,7 @@
 // Apps1/ServiceRef1 and emit the same shape twice).
 
 import { type } from "arktype";
+import { IPAddress } from "jsr:@adviser/ipaddress@0.2.11";
 
 export const InfraHostKey = type({ host: "string" });
 export const HostOs = type({ name: "string", version: "string" });
@@ -236,18 +237,16 @@ export const OvnLrKey = type({ name: "string" });
 export const OvnLrOptions = type({
   mac_binding_age_threshold: "number.integer",
 });
-// OVN SNAT rules (src/ir.ts's computeOvnNats, from `ovn.ipv4.masq` /
-// `ovn.ipv6.masq` endpoint services). NAT is router state like the LR
-// itself; `lr-nat-add <router> snat <externalIp> <logicalIp>`.
-export const OvnNatRule = type({
-  type: "'snat'",
-  family: "'ipv4'|'ipv6'",
-  externalIp: "string",
-  logicalIp: "string",
+// A reference to a security.group. `render` selects the backend; the
+// group's rules are the concrete facts for that backend. Only these two
+// fields reach the IR — placeholder values were consumed in TypeScript.
+export const SecurityGroupRef = type({
+  render: "'kernel'|'ovn'",
+  name: "string",
 });
 export const OvnLrData = type({
   options: OvnLrOptions,
-  "nats?": OvnNatRule.array(),
+  "securityGroups?": SecurityGroupRef.array(),
 });
 export const OvnLrNode = type({
   id: "string",
@@ -350,7 +349,7 @@ export const RouteKey = type({ ovnrouter: "string", prefix: "string" });
 // flat, unlabeled dump.
 export const RouteData = type({
   nexthop: "string",
-  masq: "boolean",
+  securityGroups: SecurityGroupRef.array(),
   domain: "string",
   metric: "number",
 });
@@ -409,13 +408,13 @@ export const WireguardApp = type({
   kind: "'wireguard'",
   ifaceName: "string",
   config: WireguardAppConfig,
-  masq: "('ipv4'|'ipv6')[]",
+  securityGroups: SecurityGroupRef.array(),
 });
 export const ZerotierApp = type({
   kind: "'zerotier'",
   networkId: "string",
   instanceDir: "string",
-  masq: "('ipv4'|'ipv6')[]",
+  securityGroups: SecurityGroupRef.array(),
   // Via-less routes the tunnel carries out the mesh — applied over the
   // runtime-named interface by the wire script (types.ts). Carried as
   // plain {dst} objects; the deployer adds `ip route add <dst> dev <var>`.
@@ -464,11 +463,10 @@ export const KernelRouterData = type({
   // its own copy so the transit domain's bridge binding survives, see
   // buildKernelRouterEndpoint); absent = bind to a dummy device.
   "ifaces?": KernelRouterInterface.array(),
-  // The `security.group` node's name (`masq-<router>` for the masq
+  // The `security.group` node names (`masq-<router>` for the masq
   // shortcut) attached to THIS side's interface (right side only in
-  // practice) — the attachment point for the rules that group carries;
-  // see SecurityGroupKey below.
-  "securityGroup?": "string",
+  // practice) — the attachment point for the rules those groups carry.
+  "securityGroups?": SecurityGroupRef.array(),
   // The tunnel router's UPSTREAM peer address(es) — the OTHER end of the
   // upstream veth (right side only; tunnelRouterEndpoint, define.ts). The
   // deployer brings that root-side peer leg up and assigns it these
@@ -515,10 +513,31 @@ export const BridgeNode = type({
 // vocabulary (kind `masq` = masquerade, family = address family) that
 // each implementation maps to its own concrete command; future kernel
 // services (docker containers, wireguard) extend this same rules list.
+// `masq` is the kernel netfilter rule; `snat` is the OVN logical-router
+// rule. Only the IR's concrete forms live here — placeholders are gone.
+// Runtime validators (NOT part of the serialized schema: arktype cannot
+// turn a predicate into JSON Schema). Used when the generator renders a
+// concrete snat rule, so every IP that reaches the IR was parsed by the
+// same ip-address library the rest of the code uses.
+export const IpValue = type("string").narrow((s, ctx) =>
+  IPAddress.parse(s) !== undefined && !s.includes("/")
+    ? true
+    : ctx.mustBe("an IP address")
+);
+export const NetworkValue = type("string").narrow((s, ctx) =>
+  IPAddress.parse(s) !== undefined ? true : ctx.mustBe("an IP or CIDR")
+);
 export const SecurityGroupRule = type({
   family: "'ipv4'|'ipv6'",
   kind: "'masq'",
-});
+}).or(type({
+  kind: "'snat'",
+  family: "'ipv4'|'ipv6'",
+  // Kept plain strings for JSON-Schema portability; validated with
+  // IpValue/NetworkValue before the node is emitted.
+  externalIp: "string",
+  logicalIps: "string[]",
+}));
 export const SecurityGroupKey = type({ name: "string" });
 export const SecurityGroupData = type({
   rules: SecurityGroupRule.array(),
@@ -629,7 +648,6 @@ export type OvnLsNode = DeepReadonly<typeof OvnLsNode.infer>;
 export type OvnLsIface = DeepReadonly<typeof OvnLsIface.infer>;
 export type OvnLsInterface = DeepReadonly<typeof OvnLsInterface.infer>;
 export type OvnLrNode = DeepReadonly<typeof OvnLrNode.infer>;
-export type OvnNatRule = DeepReadonly<typeof OvnNatRule.infer>;
 export type OvnLrpNode = DeepReadonly<typeof OvnLrpNode.infer>;
 export type Ipv6RaConfigs = DeepReadonly<typeof Ipv6RaConfigs.infer>;
 export type ServiceRef = DeepReadonly<typeof ServiceRef.infer>;
@@ -792,7 +810,6 @@ export function buildJsonSchema(): Record<string, unknown> {
     OvnLsData: shape(OvnLsData),
     OvnLrKey: shape(OvnLrKey),
     OvnLrOptions: shape(OvnLrOptions),
-    OvnNatRule: shape(OvnNatRule),
     OvnLrData: shape(OvnLrData),
     OvnLrpKey: shape(OvnLrpKey),
     KernelRouterRoute: shape(KernelRouterRoute),
@@ -823,6 +840,7 @@ export function buildJsonSchema(): Record<string, unknown> {
     BridgeData: shape(BridgeData),
     SecurityGroupKey: shape(SecurityGroupKey),
     SecurityGroupRule: shape(SecurityGroupRule),
+    SecurityGroupRef: shape(SecurityGroupRef),
     SecurityGroupData: shape(SecurityGroupData),
     KernelServiceKey: shape(KernelServiceKey),
     KernelAppServiceFile: shape(KernelAppServiceFile),

@@ -429,7 +429,6 @@ def _emit_router_routes(router: str, routes: list[RouteNode], emit: Emitter) -> 
     by_domain: dict[str, list[RouteNode]] = {}
     for node in routes:
         by_domain.setdefault(node.data.domain, []).append(node)
-
     for domain in sorted(by_domain):
         emit.comment(f"# --- routes: {router} ({domain}) ---")
         for node in sorted(by_domain[domain], key=lambda n: n.key.prefix):
@@ -473,9 +472,36 @@ def _emit_router(
     chassis_refs: dict[str, Ref],
     domain_names: dict[str, str],
     lr: pt.OvnLrNode | None,
+    nodes: list[pt.Model],
     emit: Emitter,
 ) -> None:
     if emit.action == "delete":
+        # lr_del_argv cascades, but NAT is removed EXPLICITLY first: the
+        # SNAT rows are referenced from the LR, and an operator reading
+        # the teardown should see them go rather than relying on the
+        # cascade. De-duplicated per external IP.
+        if lr is not None and lr.data.securityGroups:
+            groups = _security_groups_from_refs(
+                list(lr.data.securityGroups),
+                nodes,
+                pt.Render.ovn,
+                f"router {router}",
+            )
+            externals = sorted(
+                {
+                    rule.externalIp
+                    for group in groups
+                    for rule in group.data.rules
+                    if rule.kind == "snat"
+                }
+            )
+            if externals:
+                emit.comment(f"# --- router NAT teardown: {router} ---")
+                for external in externals:
+                    emit.sh(
+                        ovn_ops.lr_nat_del_argv(router, "snat", external),
+                        optional=True,
+                    )
         # lr_del_argv cascades — deletes the router's own LRPs AND its
         # own static routes (both are strongly referenced from
         # Logical_Router, same as ports), and (once the matching
@@ -533,18 +559,31 @@ def _emit_router(
         if data.ipv6RaConfigs is not None:
             for key, value in _ovn_settings(data.ipv6RaConfigs):
                 emit.sh(ovn_ops.lrp_set_ipv6_ra_config_argv(lrp, key, value))
-    # OVN SNAT rows (`ovn.ipv4.masq` / `ovn.ipv6.masq`). lr-nat-add has no
-    # --may-exist, so replace the router's SNAT rules per external IP
-    # before re-adding them; lr-del removes them on teardown.
-    if lr is not None and lr.data.nats:
-        emit.comment(f"# --- router NAT: {router} ---")
-        by_external: dict[str, list[pt.OvnNatRule]] = {}
-        for nat in sorted(lr.data.nats, key=lambda n: (n.externalIp, n.logicalIp)):
-            by_external.setdefault(nat.externalIp, []).append(nat)
-        for external in sorted(by_external):
-            emit.sh(ovn_ops.lr_nat_del_argv(router, "snat", external), optional=True)
-            for nat in by_external[external]:
-                emit.sh(ovn_ops.lr_nat_add_argv(router, nat.type, nat.externalIp, nat.logicalIp))
+    # OVN SNAT lives in the security.group rules referenced by the LR.
+    # lr-nat-add has no --may-exist, so replace per external IP first;
+    # lr-del removes them on teardown.
+    if lr is not None and lr.data.securityGroups:
+        groups = _security_groups_from_refs(
+            list(lr.data.securityGroups), nodes, pt.Render.ovn, f"router {router}"
+        )
+        by_external: dict[str, list[pt.SecurityGroupRule1]] = {}
+        for group in groups:
+            for rule in group.data.rules:
+                if rule.kind != "snat":
+                    raise ValueError(
+                        f"{group.key.name}: rule kind {rule.kind!r} is not an "
+                        "OVN rule; an ovn reference may not carry it"
+                    )
+                by_external.setdefault(rule.externalIp, []).append(rule)
+        if by_external:
+            emit.comment(f"# --- router NAT: {router} ---")
+            for external in sorted(by_external):
+                # lr-nat-del is idempotent (exit 0 when nothing matched),
+                # so a MISSING delete is a real failure: let it abort.
+                emit.sh(ovn_ops.lr_nat_del_argv(router, "snat", external))
+                for rule in sorted(by_external[external], key=lambda r: r.logicalIps):
+                    for logical in rule.logicalIps:
+                        emit.sh(ovn_ops.lr_nat_add_argv(router, "snat", external, logical))
     _emit_router_routes(router, routes, emit)
     emit.blank()
 
@@ -624,6 +663,7 @@ def _emit_cluster_body(nodes: list[pt.Model], emit: Emitter) -> None:
                 chassis_refs,
                 domain_names,
                 router_nodes.get(router),
+                nodes,
                 emit,
             )
     else:
@@ -635,6 +675,7 @@ def _emit_cluster_body(nodes: list[pt.Model], emit: Emitter) -> None:
                 {},
                 domain_names,
                 router_nodes.get(router),
+                nodes,
                 emit,
             )
         for node in switches:
@@ -697,6 +738,29 @@ def _security_group_by_name(name: str, nodes: list[pt.Model]) -> pt.SecurityGrou
     )
 
 
+def _security_groups_from_refs(
+    refs: list[pt.SecurityGroupRef],
+    nodes: list[pt.Model],
+    render: pt.Render,
+    where: str,
+) -> list[pt.SecurityGroupNode]:
+    groups: list[pt.SecurityGroupNode] = []
+    for ref in refs:
+        if ref.render != render:
+            raise ValueError(
+                f"{where}: security group {ref.name!r} renders for "
+                f"{ref.render.value}, not {render.value}"
+            )
+        group = _security_group_by_name(ref.name, nodes)
+        if group is None:
+            raise ValueError(
+                f'{where} references security group "{ref.name}", but no such '
+                "security.group node"
+            )
+        groups.append(group)
+    return groups
+
+
 # A security group's rules, applied INSIDE a kernel router's netns on a
 # specific real interface (the `right` side's WAN iface, by
 # construction). This is the services emit function for `security.group`
@@ -724,18 +788,34 @@ def _emit_security_group_rules(
     emit.comment(f"# --- security group: {group.key.name} in {netns} on {dev} ---")
     for rule in group.data.rules:
         if rule.kind != "masq":
-            emit.comment(
-                f'# unsupported security group rule kind "{rule.kind}" for '
-                f"{group.key.name} on {dev} — skipped, see deployer/ir_common.py"
+            raise ValueError(
+                f"{group.key.name}: rule kind {rule.kind!r} is not a kernel "
+                "rule; a kernel reference may not carry it"
             )
-            continue
         iptables = "iptables" if rule.family == pt.Family.ipv4 else "ip6tables"
         argv = [iptables, "-t", "nat", "-A", "POSTROUTING", "-o", dev, "-j", "MASQUERADE"]
         emit.sh(netns_ops.netns_exec_argv(argv, netns))
 
 
+def _masq_families(security_groups: list[pt.SecurityGroupRef], nodes: list[pt.Model]) -> list[str]:
+    """Resolve security-group references to the address families their
+    `masq` rules cover — the app/nat consumers carry refs, not families."""
+    families: set[str] = set()
+    for ref in security_groups:
+        group = _security_group_by_name(ref.name, nodes)
+        if group is None:
+            raise ValueError(
+                f'kernel app references security group "{ref.name}", which is '
+                "not present in the IR"
+            )
+        for rule in group.data.rules:
+            if rule.kind == "masq":
+                families.add("ipv4" if rule.family == pt.Family.ipv4 else "ipv6")
+    return sorted(families)
+
+
 def _apply_side_network(
-    group: pt.SecurityGroupNode | None,
+    groups: list[pt.SecurityGroupNode],
     ipaddrs: list[str] | None,
     routes: list[pt.KernelRouterRoute] | None,
     netns: str,
@@ -753,7 +833,7 @@ def _apply_side_network(
     for route in routes or []:
         argv = linux_net_ops.add_route_argv(route.dst, dev, route.via, route.metric)
         emit.sh(netns_ops.netns_exec_argv(argv, netns))
-    if group is not None:
+    for group in groups:
         _emit_security_group_rules(group, netns, dev, emit)
 
 
@@ -807,7 +887,7 @@ class _SideContext:
     netns: str
     dev: str
     transit_leg: str | None
-    group: pt.SecurityGroupNode | None
+    groups: list[pt.SecurityGroupNode]
     ipaddrs: list[str]
     routes: list[pt.KernelRouterRoute]
     transit_ipaddrs: list[str]
@@ -815,7 +895,11 @@ class _SideContext:
 
 
 def _emit_kernel_app_rules(
-    apps: list[KernelApp], router: str, emit: Emitter, ctx: _SideContext
+    apps: list[KernelApp],
+    router: str,
+    emit: Emitter,
+    ctx: _SideContext,
+    nodes: list[pt.Model],
 ) -> None:
     """Start (create) / stop (delete) the apps attached to one side of a
     kernel router, INSIDE the router's netns — no per-app systemd units.
@@ -900,14 +984,14 @@ def _emit_kernel_app_rules(
                 )
                 if ctx.transit_leg:
                     _apply_side_network(
-                        None,
+                        [],
                         ctx.transit_ipaddrs,
                         ctx.transit_routes,
                         container,
                         ctx.transit_leg,
                         emit,
                     )
-                _apply_side_network(ctx.group, ctx.ipaddrs, ctx.routes, container, dev, emit)
+                _apply_side_network(ctx.groups, ctx.ipaddrs, ctx.routes, container, dev, emit)
                 emit.py(
                     f"await _docker_exec_wait(job, {emit.label!r}, {container!r}, "
                     f"{list(app.cmd or ['sh'])!r}, {dev!r})"
@@ -961,8 +1045,8 @@ def _emit_kernel_app_rules(
             emit.comment(f"# --- kernel app: wireguard ({app.ifaceName}) in {netns} ---")
             if emit.action == "delete":
                 emit.sh(netns_ops.netns_exec_argv(["wg-quick", "down", conf_path], netns))
-                for family in app.masq or []:
-                    iptables = "iptables" if family == pt.MasqEnum.ipv4 else "ip6tables"
+                for family in _masq_families(list(app.securityGroups), nodes):
+                    iptables = "iptables" if family == "ipv4" else "ip6tables"
                     emit.sh(
                         netns_ops.netns_exec_argv(
                             [
@@ -984,8 +1068,8 @@ def _emit_kernel_app_rules(
             emit.append(conf_path, "\n".join(_wg_conf_lines(app)))
             emit.sh(["chmod", "600", conf_path])
             emit.sh(netns_ops.netns_exec_argv(["wg-quick", "up", conf_path], netns))
-            for family in app.masq or []:
-                iptables = "iptables" if family == pt.MasqEnum.ipv4 else "ip6tables"
+            for family in _masq_families(list(app.securityGroups), nodes):
+                iptables = "iptables" if family == "ipv4" else "ip6tables"
                 emit.sh(
                     netns_ops.netns_exec_argv(
                         [
@@ -1019,7 +1103,7 @@ def _emit_kernel_app_rules(
                     f"kernel app zerotier on {dev} in {netns}: missing networkId/instanceDir"
                 )
             emit.comment(f"# --- kernel app: zerotier in {netns} ---")
-            masq = ["ipv4" if family == pt.MasqEnum.ipv4 else "ipv6" for family in (app.masq or [])]
+            masq = _masq_families(list(app.securityGroups), nodes)
             routes = [route.dst for route in (app.routes or [])]
             if emit.action == "delete":
                 # The daemon is the job's tracked foreground child; the
@@ -1137,16 +1221,18 @@ def _emit_kernel_router_owner(
                         netns=netns,
                         dev=dev,
                         transit_leg=transit_leg,
-                        group=(
-                            _security_group_by_name(side_node.data.securityGroup, nodes)
-                            if side_node.data.securityGroup is not None
-                            else None
+                        groups=_security_groups_from_refs(
+                            list(side_node.data.securityGroups or []),
+                            nodes,
+                            pt.Render.kernel,
+                            f"kernel router {owner.key.name}",
                         ),
                         ipaddrs=list(side_node.data.ipaddrs or []),
                         routes=list(side_node.data.routes or []),
                         transit_ipaddrs=transit_ipaddrs,
                         transit_routes=transit_routes,
                     ),
+                    nodes,
                 )
             if iface is not None and iface.kind == "vlan":
                 real_name = _iface_real_name(iface)
@@ -1251,19 +1337,14 @@ def _emit_kernel_router_owner(
         # The side's static addressing + security-group (masq) rules,
         # applied inside the netns — SAME code as the dhcpcd-in-docker
         # container path (only the target namespace differs).
-        group = (
-            _security_group_by_name(side_node.data.securityGroup, nodes)
-            if side_node.data.securityGroup is not None
-            else None
+        groups = _security_groups_from_refs(
+            list(side_node.data.securityGroups or []),
+            nodes,
+            pt.Render.kernel,
+            f"kernel router {owner.key.name} ({_side(side_node).value})",
         )
-        if side_node.data.securityGroup is not None and group is None:
-            raise ValueError(
-                f"kernel router {owner.key.name} ({_side(side_node).value}) "
-                f'references security group "{side_node.data.securityGroup}" '
-                f"but no such security.group node"
-            )
         _apply_side_network(
-            group,
+            groups,
             list(side_node.data.ipaddrs or []),
             list(side_node.data.routes or []),
             netns,
@@ -1283,16 +1364,18 @@ def _emit_kernel_router_owner(
                     netns=netns,
                     dev=dev,
                     transit_leg=transit_leg,
-                    group=(
-                        _security_group_by_name(side_node.data.securityGroup, nodes)
-                        if side_node.data.securityGroup is not None
-                        else None
+                    groups=_security_groups_from_refs(
+                        list(side_node.data.securityGroups or []),
+                        nodes,
+                        pt.Render.kernel,
+                        f"kernel router {owner.key.name}",
                     ),
                     ipaddrs=list(side_node.data.ipaddrs or []),
                     routes=list(side_node.data.routes or []),
                     transit_ipaddrs=transit_ipaddrs,
                     transit_routes=transit_routes,
                 ),
+                nodes,
             )
 
 

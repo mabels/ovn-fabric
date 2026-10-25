@@ -441,7 +441,7 @@ class ClusterScriptCreateTest(unittest.TestCase):
 
     def test_every_cluster_add_is_idempotent(self) -> None:
         # The create pass must be re-runnable (README's idempotency
-        # guarantee): every add carries --may-exist so a second run
+        # guarantee): every add carries so a second run
         # doesn't abort on objects that already exist (2026-09-19).
         self.assertIn("ovn-nbctl --may-exist ls-add home", self.cluster)
         self.assertIn("ovn-nbctl --may-exist lr-add router-home", self.cluster)
@@ -455,7 +455,7 @@ class ClusterScriptCreateTest(unittest.TestCase):
     def test_lr_add_exactly_once_for_a_two_sided_router(self) -> None:
         # Regression: the removed TypeScript generator called lr-add
         # once per endpoint (left AND right), which only worked because
-        # --may-exist silently no-op'd the second call. The deployer
+        # silently no-op'd the second call. The deployer
         # emits it exactly once for the router.
         self.assertEqual(self.cluster.count("ovn-nbctl --may-exist lr-add router-home"), 1)
 
@@ -1131,8 +1131,8 @@ class KernelRouterCreateTest(unittest.TestCase):
                 key=pt.SecurityGroupKey(name="sg-kernel-0"),
                 data=pt.SecurityGroupData(
                     rules=[
-                        pt.SecurityGroupRule(family=pt.Family.ipv4, kind="masq"),
-                        pt.SecurityGroupRule(family=pt.Family.ipv6, kind="masq"),
+                        pt.SecurityGroupRule2(family=pt.Family.ipv4, kind="masq"),
+                        pt.SecurityGroupRule2(family=pt.Family.ipv6, kind="masq"),
                     ]
                 ),
             ),
@@ -1140,7 +1140,12 @@ class KernelRouterCreateTest(unittest.TestCase):
                 (
                     dataclasses.replace(
                         n,
-                        data=dataclasses.replace(n.data, securityGroup="sg-kernel-0"),
+                        data=dataclasses.replace(
+                            n.data,
+                            securityGroups=[
+                                pt.SecurityGroupRef(render=pt.Render.kernel, name="sg-kernel-0")
+                            ],
+                        ),
                     )
                     if n.kind == "kernel.router" and n.key.side == pt.Side.right
                     else n
@@ -1721,7 +1726,12 @@ class KernelRouterCreateTest(unittest.TestCase):
                                             endpoint="146.70.117.130:51820",
                                         ),
                                     ),
-                                    masq=[pt.MasqEnum.ipv4, pt.MasqEnum.ipv6],
+                                    securityGroups=[
+                                        pt.SecurityGroupRef(
+                                            render=pt.Render.kernel,
+                                            name="masq-mullvad-de",
+                                        )
+                                    ],
                                 )
                             ],
                         ),
@@ -1730,6 +1740,18 @@ class KernelRouterCreateTest(unittest.TestCase):
                     else n
                 )
                 for n in NODES
+            ] + [
+                pt.SecurityGroupNode(
+                    id="securitygroup:masq-mullvad-de",
+                    kind="security.group",
+                    key=pt.SecurityGroupKey(name="masq-mullvad-de"),
+                    data=pt.SecurityGroupData(
+                        rules=[
+                            pt.SecurityGroupRule2(family=pt.Family.ipv4, kind="masq"),
+                            pt.SecurityGroupRule2(family=pt.Family.ipv6, kind="masq"),
+                        ]
+                    ),
+                )
             ]
 
         _, create_hosts = build_ops(with_wireguard(), "create")
@@ -1791,7 +1813,11 @@ class KernelRouterCreateTest(unittest.TestCase):
                                     kind="zerotier",
                                     networkId="02cfbec15c2319ff",
                                     instanceDir="/var/lib/zerotier-one-uplink-zerotier",
-                                    masq=[pt.MasqEnum.ipv4],
+                                    securityGroups=[
+                                        pt.SecurityGroupRef(
+                                            render=pt.Render.kernel, name="masq-zerotier"
+                                        )
+                                    ],
                                     routes=[pt.KernelRouterRoute(dst="192.168.0.0/16")],
                                 )
                             ],
@@ -1801,6 +1827,15 @@ class KernelRouterCreateTest(unittest.TestCase):
                     else n
                 )
                 for n in NODES
+            ] + [
+                pt.SecurityGroupNode(
+                    id="securitygroup:masq-zerotier",
+                    kind="security.group",
+                    key=pt.SecurityGroupKey(name="masq-zerotier"),
+                    data=pt.SecurityGroupData(
+                        rules=[pt.SecurityGroupRule2(family=pt.Family.ipv4, kind="masq")]
+                    ),
+                )
             ]
 
         _, create_hosts = build_ops(with_zerotier(), "create")
@@ -1912,25 +1947,36 @@ class OvnNatTest(unittest.TestCase):
                 "key": {"name": "router-x"},
                 "data": {
                     "options": {"mac_binding_age_threshold": 300},
-                    "nats": [
+                    "securityGroups": [{"render": "ovn", "name": "masq-router-x-ovn"}],
+                },
+            },
+        )
+        sg = hydrate_as(
+            pt.SecurityGroupNode,
+            {
+                "id": "securitygroup:masq-router-x-ovn",
+                "kind": "security.group",
+                "key": {"name": "masq-router-x-ovn"},
+                "data": {
+                    "rules": [
                         {
-                            "type": "snat",
+                            "kind": "snat",
                             "family": "ipv4",
                             "externalIp": "172.22.0.2",
-                            "logicalIp": "10.43.0.0/24",
+                            "logicalIps": ["10.43.0.0/24"],
                         },
                         {
-                            "type": "snat",
+                            "kind": "snat",
                             "family": "ipv6",
                             "externalIp": "2600:db8:1::2",
-                            "logicalIp": "2600:db8::/112",
+                            "logicalIps": ["2600:db8::/112"],
                         },
-                    ],
+                    ]
                 },
             },
         )
         emit = _OpEmitter("create")
-        _emit_router("router-x", [], [], {}, {}, lr, emit)
+        _emit_router("router-x", [], [], {}, {}, lr, [sg], emit)
         self.assertIn(
             ["ovn-nbctl", "lr-nat-add", "router-x", "snat", "172.22.0.2", "10.43.0.0/24"],
             emit.commands,
@@ -1981,8 +2027,8 @@ class BridgeNodeBindingsTest(unittest.TestCase):
         _, hosts = build_ops([*NODES, bridge], "create")
         script = hosts["chassis-1"].bindings
         self.assertIn("ensure_vlan(job, 'test', 'eth0', 'eth0.2280', 2280", script)
-        self.assertIn("--may-exist add-br br-test", script)
-        self.assertIn("--may-exist add-port br-test eth0.2280", script)
+        self.assertIn("add-br br-test", script)
+        self.assertIn("add-port br-test eth0.2280", script)
         # A host-local bridge is not an OVN localnet domain.
         self.assertNotIn("net-br-test:br-test", script)
 
@@ -2173,7 +2219,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         # all-in-one run, create must bring up every host FIRST (each host
         # pass installs its OS dependencies and, on the central, exposes
         # the NB/SB DBs) and run the cluster-wide ovn-nbctl pass LAST —
-        # otherwise `ovn-nbctl ls-add ...` runs on a host that doesn't
+        # otherwise `ovn-nbctl --may-exist ls-add ...` runs on a host that doesn't
         # have ovn installed yet. Delete reverses: cluster first.
         ns = self._exec_runtime()
         order: list[str] = []
@@ -2423,7 +2469,9 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             side_effect=FileNotFoundError(2, "No such file or directory", "ovn-nbctl"),
         ):
             with self.assertLogs("ovn-fabric.deployer", level="WARNING") as logs:
-                _with_job(ns, ns["run_cmd"], "host", ["ovn-nbctl", "ls-add", "home"], False)
+                _with_job(
+                    ns, ns["run_cmd"], "host", ["ovn-nbctl", "--may-exist", "ls-add", "home"], False
+                )
         self.assertTrue(any("cannot run in host" in line for line in logs.output))
 
     def test_write_file_writes_content_with_a_trailing_newline(self) -> None:

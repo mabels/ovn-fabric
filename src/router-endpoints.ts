@@ -28,6 +28,7 @@ import type {
   RouterEndpointRoute,
   RoutingDomain,
   SecurityGroup,
+  SecurityGroupRef,
   TunnelRouterEndpoint,
 } from "./types.ts";
 
@@ -54,8 +55,8 @@ export interface RouterEndpointContext {
   securityGroup(
     name: string,
     build: (group: SecurityGroupBuilder) => void,
-  ): SecurityGroup;
-  securityGroupDeclared(group: SecurityGroup): boolean;
+  ): SecurityGroup<"kernel">;
+  securityGroupDeclared(group: SecurityGroupRef): boolean;
 }
 
 /** Which builder produced an endpoint — part of its identity (see
@@ -251,7 +252,7 @@ export function buildKernelRouterEndpoint(
     ipaddrs,
     ifaces,
     services,
-    securityGroup,
+    securityGroups,
     routes: inputRoutes,
     ...rest
   } = input;
@@ -280,27 +281,27 @@ export function buildKernelRouterEndpoint(
   // have been declared via net.securityGroup() in this same
   // defineNetwork call, same "register + fail fast" split as every
   // other cross-reference here.
-  if (
-    securityGroup &&
-    !ctx.securityGroupDeclared(securityGroup)
-  ) {
-    throw new Error(
-      `kernelRouterEndpoint: security group "${securityGroup.name}" was ` +
-        `not declared via net.securityGroup() in this defineNetwork call`,
-    );
+  for (const securityGroup of securityGroups ?? []) {
+    if (!ctx.securityGroupDeclared(securityGroup)) {
+      throw new Error(
+        `kernelRouterEndpoint: security group "${securityGroup.name}" was ` +
+          `not declared via net.securityGroup() in this defineNetwork call`,
+      );
+    }
   }
   const masqKinds = (kernelServices ?? []).filter((s) =>
     s.kind === "kernel.ipv4.masq" || s.kind === "kernel.ipv6.masq"
   );
-  const securityGroupDef = securityGroup
-    ? securityGroup
-    : masqKinds.length > 0
-    ? ctx.securityGroup(`masq-${routerName}`, (group) => {
-      for (const s of masqKinds) {
-        group.masq(s.kind === "kernel.ipv4.masq" ? "ipv4" : "ipv6");
-      }
-    })
-    : undefined;
+  const securityGroupDefs: readonly SecurityGroupRef<"kernel">[] =
+    securityGroups && securityGroups.length > 0
+      ? securityGroups
+      : masqKinds.length > 0
+      ? [ctx.securityGroup(`masq-${routerName}`, (group) => {
+        for (const s of masqKinds) {
+          group.masq(s.kind === "kernel.ipv4.masq" ? "ipv4" : "ipv6");
+        }
+      })]
+      : [];
   // `kernel.app.*` services resolve into app descriptors running INSIDE
   // the netns on the right side's real interface — independent of the
   // security-group shortcut above (an explicit `securityGroup` does
@@ -423,7 +424,9 @@ export function buildKernelRouterEndpoint(
       ...(input.routes ? { routes: input.routes } : {}),
       ...(ifaces ? { ifaces } : {}),
       ...(apps.length > 0 ? { apps } : {}),
-      ...(securityGroupDef ? { securityGroup: securityGroupDef } : {}),
+      ...(securityGroupDefs.length > 0
+        ? { securityGroups: securityGroupDefs }
+        : {}),
     },
     transitDomain,
     transitPeerAddrs: ovnSideAddrs,
@@ -516,6 +519,13 @@ export function buildTunnelRouterEndpoint(
     );
   }
   const masq = workload.masq ?? [];
+  // The masq families become a SECURITY GROUP; the app and the IR carry
+  // only its reference. The group is the source of what the rules mean.
+  const masqGroup = masq.length > 0
+    ? ctx.securityGroup(`masq-${routerName}-tunnel`, (group) => {
+      for (const family of masq) group.masq(family);
+    })
+    : undefined;
   const ovnServices = (services ?? []).filter(
     (s) => s.kind === "ipv6.slaac" || s.kind === "ipv6.ra",
   );
@@ -525,7 +535,7 @@ export function buildTunnelRouterEndpoint(
         kind: "wireguard",
         ifaceName: workload.ifaceName,
         config: workload.config,
-        masq,
+        securityGroups: masqGroup ? [masqGroup] : [],
       }
       : (() => {
         const ztNetworkId = workload.networkId;
