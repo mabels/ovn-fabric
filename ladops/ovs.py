@@ -67,7 +67,8 @@ def remove_external_id(key: str) -> None:
 
 # ── bridges + ports (real-world binding for ovn.ls collision domains —
 # deployer/ir_common.py's per-host script) ─────────────────────────
-# Both adds take --may-exist: the create pass is re-run as a blunt
+# Both adds FAIL if the object already exists: the create pass is a
+# desired-state pass, not a silent merge.
 # "make it so" (README's idempotency guarantee), and an existing bridge/
 # port is the expected state on every run after the first — without the
 # flag `ovs-vsctl add-br` aborts the whole pass (confirmed live
@@ -76,7 +77,7 @@ def remove_external_id(key: str) -> None:
 
 
 def add_br_argv(bridge: str) -> list[str]:
-    return [*_VSCTL, "--may-exist", "add-br", bridge]
+    return [*_VSCTL, "add-br", bridge]
 
 
 def del_br_argv(bridge: str) -> list[str]:
@@ -125,7 +126,6 @@ def add_afxdp_port_argv(
     `native`, `generic`); `n_rxq` its queue count."""
     return [
         *_VSCTL,
-        "--may-exist",
         "add-port",
         bridge,
         port,
@@ -140,7 +140,7 @@ def add_afxdp_port_argv(
 
 
 def add_port_argv(bridge: str, port: str) -> list[str]:
-    return [*_VSCTL, "--may-exist", "add-port", bridge, port]
+    return [*_VSCTL, "add-port", bridge, port]
 
 
 def del_port_argv(bridge: str, port: str) -> list[str]:

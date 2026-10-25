@@ -119,8 +119,13 @@ class PythonEmitter(Emitter):
         self.lines.append("")
 
     def sh(
-        self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
+        self,
+        argv: Sequence[str | Ref],
+        background: bool = False,
+        optional: bool | None = None,
     ) -> None:
+        if optional is None:
+            optional = self.action == "delete"
         # `background` is only meaningful in the nested shell router-body
         # emitter (_ShellBody) — the Python runtime has no `&` notion.
         # `optional=True` retires the create-action abort for this one
@@ -188,8 +193,13 @@ class PythonBodyEmitter(Emitter):
         self.lines.append(("    " * self._indent + line) if line else "")
 
     def sh(
-        self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
+        self,
+        argv: Sequence[str | Ref],
+        background: bool = False,
+        optional: bool | None = None,
     ) -> None:
+        if optional is None:
+            optional = self.action == "delete"
         # Every job is blocking: `background` (a shell `&`) has no
         # meaning here; the command runs and is awaited.
         abort = "False" if optional else "abort_on_error"
@@ -2002,7 +2012,10 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
             f"custom_installers={custom_installers!r})",
             "    async def create_action(job: Job) -> None:",
             f"        await HOSTS[{host_name!r}]['create'](job, True, False)",
-            f"        await CONFIGURE[{host_name!r}](job)",
+            # The host unit's up job runs CONFIGURE as its first step.
+            # Running it here TOO made HOSTS create and the service race
+            # the same add-br/add-port commands; --may-exist used to hide
+            # that, but create is strict now. Only the service configures.
             "        job.emit({'kind': 'abstract-dep', 'name': 'create-ready', "
             "'state': 'ready'}, queue=True)",
             "    create_job = root.job('ovn-fabric(create)', initiate=True)",

@@ -443,21 +443,21 @@ class ClusterScriptCreateTest(unittest.TestCase):
         # The create pass must be re-runnable (README's idempotency
         # guarantee): every add carries so a second run
         # doesn't abort on objects that already exist (2026-09-19).
-        self.assertIn("ovn-nbctl --may-exist ls-add home", self.cluster)
-        self.assertIn("ovn-nbctl --may-exist lr-add router-home", self.cluster)
-        self.assertIn("ovn-nbctl --may-exist lrp-add router-home", self.cluster)
-        self.assertIn("ovn-nbctl --may-exist lsp-add", self.cluster)
+        self.assertIn("ovn-nbctl ls-add home", self.cluster)
+        self.assertIn("ovn-nbctl lr-add router-home", self.cluster)
+        self.assertIn("ovn-nbctl lrp-add router-home", self.cluster)
+        self.assertIn("ovn-nbctl lsp-add", self.cluster)
 
     def test_ls_add_for_every_switch(self) -> None:
-        self.assertIn("ovn-nbctl --may-exist ls-add home", self.cluster)
-        self.assertIn("ovn-nbctl --may-exist ls-add backbone", self.cluster)
+        self.assertIn("ovn-nbctl ls-add home", self.cluster)
+        self.assertIn("ovn-nbctl ls-add backbone", self.cluster)
 
     def test_lr_add_exactly_once_for_a_two_sided_router(self) -> None:
         # Regression: the removed TypeScript generator called lr-add
         # once per endpoint (left AND right), which only worked because
         # silently no-op'd the second call. The deployer
         # emits it exactly once for the router.
-        self.assertEqual(self.cluster.count("ovn-nbctl --may-exist lr-add router-home"), 1)
+        self.assertEqual(self.cluster.count("ovn-nbctl lr-add router-home"), 1)
 
     def test_router_options_come_from_the_ovn_lr_node(self) -> None:
         # The router's own ovn.lr node carries its FINAL Logical_Router
@@ -466,7 +466,7 @@ class ClusterScriptCreateTest(unittest.TestCase):
         # one that matters today: OVN keeps a learned MAC_Binding forever
         # by default, and a neighbour that came back with another MAC
         # stayed black-holed (confirmed live 2026-10-11).
-        add = "ovn-nbctl --may-exist lr-add router-home"
+        add = "ovn-nbctl lr-add router-home"
         age = "ovn-nbctl set logical_router router-home options:mac_binding_age_threshold=300"
         self.assertIn(age, self.cluster)
         self.assertLess(self.cluster.index(add), self.cluster.index(age))
@@ -491,7 +491,7 @@ class ClusterScriptCreateTest(unittest.TestCase):
         # deployer has no default of its own.
         nodes: list[pt.Model] = [n for n in NODES if n.kind != "ovn.lr"]
         cluster, _ = build_ops(nodes, "create")
-        self.assertIn("ovn-nbctl --may-exist lr-add router-home", cluster)
+        self.assertIn("ovn-nbctl lr-add router-home", cluster)
         self.assertNotIn("set logical_router router-home", cluster)
 
     def test_gateway_chassis_pin_only_on_the_pinned_side(self) -> None:
@@ -538,13 +538,13 @@ class ClusterScriptCreateTest(unittest.TestCase):
 
     def test_lrp_add_carries_mac_and_addresses(self) -> None:
         self.assertIn(
-            "ovn-nbctl --may-exist lrp-add router-home lrp-router-home-left "
+            "ovn-nbctl lrp-add router-home lrp-router-home-left "
             "00:00:00:00:01:01 192.168.1.1/24",
             self.cluster,
         )
 
     def test_switch_side_lsp_bound_to_the_right_lrp(self) -> None:
-        self.assertIn("ovn-nbctl --may-exist lsp-add home lsp-router-home-left", self.cluster)
+        self.assertIn("ovn-nbctl lsp-add home lsp-router-home-left", self.cluster)
         self.assertIn(
             "ovn-nbctl lsp-set-options lsp-router-home-left router-port=lrp-router-home-left",
             self.cluster,
@@ -615,7 +615,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
         self.cluster, self.hosts = build_ops(NODES, "create")
 
     def test_localnet_lsp_emitted_only_for_the_bound_domain(self) -> None:
-        self.assertIn("ovn-nbctl --may-exist lsp-add home lsp-home-localnet", self.cluster)
+        self.assertIn("ovn-nbctl lsp-add home lsp-home-localnet", self.cluster)
         self.assertIn("ovn-nbctl lsp-set-type lsp-home-localnet localnet", self.cluster)
         self.assertIn("ovn-nbctl lsp-set-addresses lsp-home-localnet unknown", self.cluster)
         self.assertIn(
@@ -635,9 +635,9 @@ class IfaceBindingCreateTest(unittest.TestCase):
 
     def test_bridge_created_and_port_attached_on_the_owning_host(self) -> None:
         script = self.hosts["chassis-1"]
-        self.assertIn("ovs-vsctl --may-exist add-br br-home", script)
+        self.assertIn("ovs-vsctl add-br br-home", script)
         self.assertIn("ovs-vsctl set bridge br-home fail-mode=standalone", script)
-        self.assertIn("ovs-vsctl --may-exist add-port br-home eth0.129", script)
+        self.assertIn("ovs-vsctl add-port br-home eth0.129", script)
 
     def test_veth_root_leg_is_left_to_its_router_unit(self) -> None:
         # The binding block only creates the bridge; the kernel-router
@@ -665,7 +665,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
         ]
         _, hosts = build_ops(nodes, "create")
         script = hosts["chassis-1"]
-        self.assertIn("ovs-vsctl --may-exist add-br br-1f5b95ad", script)
+        self.assertIn("ovs-vsctl add-br br-1f5b95ad", script)
         self.assertNotIn("add-port br-1f5b95ad veth-ovn-9adb1d", script)
         self.assertNotIn("ip link set veth-ovn-9adb1d up", script)
 
@@ -697,7 +697,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
         )
         _, hosts = build_ops(nodes, "create")
         script = hosts["chassis-1"]
-        self.assertIn("ovs-vsctl --may-exist add-br br-8d8c0a55", script)
+        self.assertIn("ovs-vsctl add-br br-8d8c0a55", script)
         self.assertIn(
             "external-ids:ovn-bridge-mappings=net-home:br-8d8c0a55",
             script,
@@ -712,8 +712,8 @@ class IfaceBindingCreateTest(unittest.TestCase):
         # Re-running the create pass must not abort on an existing
         # bridge/port/VLAN (2026-09-19).
         script = self.hosts["chassis-1"]
-        self.assertIn("ovs-vsctl --may-exist add-br", script)
-        self.assertIn("ovs-vsctl --may-exist add-port", script)
+        self.assertIn("ovs-vsctl add-br", script)
+        self.assertIn("ovs-vsctl add-port", script)
         self.assertIn("await ensure_vlan(job, 'test', 'eth0', 'eth0.129'", script)
 
 
@@ -781,10 +781,10 @@ class XdpBindingTest(unittest.TestCase):
         script = build_ops(nodes, "create")[1]["chassis-1"]
 
         # One netdev trunk bridge, one AF_XDP port, options from the IR.
-        self.assertIn("ovs-vsctl --may-exist add-br br-xdp", script)
+        self.assertIn("ovs-vsctl add-br br-xdp", script)
         self.assertIn("ovs-vsctl set bridge br-xdp datapath_type=netdev", script)
         self.assertIn(
-            "ovs-vsctl --may-exist add-port br-xdp ovnxdp -- set Interface "
+            "ovs-vsctl add-port br-xdp ovnxdp -- set Interface "
             "ovnxdp type=afxdp options:xdp-mode=generic options:n_rxq=1",
             script,
         )
@@ -798,10 +798,10 @@ class XdpBindingTest(unittest.TestCase):
         suffix = _short_suffix("br-home")
         trunk = f"veth-xdp-{suffix}"
         seg = f"veth-seg-{suffix}"
-        self.assertIn(f"ovs-vsctl --may-exist add-port br-xdp {trunk}", script)
+        self.assertIn(f"ovs-vsctl add-port br-xdp {trunk}", script)
         self.assertIn(f"ovs-vsctl set port {trunk} tag=1128", script)
-        self.assertIn(f"ovs-vsctl --may-exist add-port br-home {seg}", script)
-        self.assertIn("ovs-vsctl --may-exist add-br br-home", script)
+        self.assertIn(f"ovs-vsctl add-port br-home {seg}", script)
+        self.assertIn("ovs-vsctl add-br br-home", script)
 
     def test_one_xdp_parent_trunks_every_segment_it_carries(self) -> None:
         nodes: list[pt.Model] = [
@@ -852,13 +852,13 @@ class XdpBindingTest(unittest.TestCase):
         ]
         script = build_ops(nodes, "create")[1]["chassis-1"]
         self.assertIn(
-            "ovs-vsctl --may-exist add-port br-xdp ovnxdp -- set Interface "
+            "ovs-vsctl add-port br-xdp ovnxdp -- set Interface "
             "ovnxdp type=afxdp options:xdp-mode=best-effort options:n_rxq=1",
             script,
         )
         suffix = _short_suffix("br-home")
-        self.assertIn(f"ovs-vsctl --may-exist add-port br-xdp veth-xdp-{suffix}", script)
-        self.assertIn(f"ovs-vsctl --may-exist add-port br-home veth-seg-{suffix}", script)
+        self.assertIn(f"ovs-vsctl add-port br-xdp veth-xdp-{suffix}", script)
+        self.assertIn(f"ovs-vsctl add-port br-home veth-seg-{suffix}", script)
         # No VLAN, no tag.
         self.assertNotIn(f"ovs-vsctl set port veth-xdp-{suffix} tag=", script)
 
@@ -901,8 +901,8 @@ class FabricServiceTest(unittest.TestCase):
         body = self.hosts["chassis-1"].bindings
         self.assertIn("await ensure_vlan(job, 'test', 'eth0', 'eth0.129', 129", body)
         self.assertIn("ip link set eth0.129 up", body)
-        self.assertIn("ovs-vsctl --may-exist add-br br-home", body)
-        self.assertIn("ovs-vsctl --may-exist add-port br-home eth0.129", body)
+        self.assertIn("ovs-vsctl add-br br-home", body)
+        self.assertIn("ovs-vsctl add-port br-home eth0.129", body)
 
     def test_one_service_runs_the_tree(self) -> None:
         host = self.hosts["chassis-1"]
@@ -2219,7 +2219,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         # all-in-one run, create must bring up every host FIRST (each host
         # pass installs its OS dependencies and, on the central, exposes
         # the NB/SB DBs) and run the cluster-wide ovn-nbctl pass LAST —
-        # otherwise `ovn-nbctl --may-exist ls-add ...` runs on a host that doesn't
+        # otherwise `ovn-nbctl ls-add ...` runs on a host that doesn't
         # have ovn installed yet. Delete reverses: cluster first.
         ns = self._exec_runtime()
         order: list[str] = []
@@ -2469,9 +2469,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             side_effect=FileNotFoundError(2, "No such file or directory", "ovn-nbctl"),
         ):
             with self.assertLogs("ovn-fabric.deployer", level="WARNING") as logs:
-                _with_job(
-                    ns, ns["run_cmd"], "host", ["ovn-nbctl", "--may-exist", "ls-add", "home"], False
-                )
+                _with_job(ns, ns["run_cmd"], "host", ["ovn-nbctl", "ls-add", "home"], False)
         self.assertTrue(any("cannot run in host" in line for line in logs.output))
 
     def test_write_file_writes_content_with_a_trailing_newline(self) -> None:

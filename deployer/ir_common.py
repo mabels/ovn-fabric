@@ -155,9 +155,15 @@ class Emitter:
         self.lines: list[str] = []
 
     def sh(
-        self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
+        self,
+        argv: Sequence[str | Ref],
+        background: bool = False,
+        optional: bool | None = None,
     ) -> None:
-        """`optional=True`: this command failing must NOT stop the rest of
+        """`optional=None`: the action policy — DELETE never aborts (it is
+        tearing down whatever is left; a missing object is not an error),
+        CREATE does. `optional=True` forces non-fatal in either action.
+        `optional=True`: this command failing must NOT stop the rest of
         the pass — it is reported and skipped. Used for per-unit
         `systemctl enable --now` so one broken workload/router can't block
         every other operation (2026-09-16). An argv token may be a `Ref`
@@ -229,8 +235,13 @@ class _ShellBody(Emitter):
     meaningful here — the outer front-end ignores it."""
 
     def sh(
-        self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
+        self,
+        argv: Sequence[str | Ref],
+        background: bool = False,
+        optional: bool | None = None,
     ) -> None:
+        if optional is None:
+            optional = self.action == "delete"
         line = " ".join(_shell_token(token) for token in argv) + (" &" if background else "")
         self.lines.append(line + (" || true" if optional else ""))
 
@@ -426,8 +437,29 @@ def _group_routes_by_router(nodes: list[pt.Model]) -> dict[str, list[RouteNode]]
 def _emit_router_routes(router: str, routes: list[RouteNode], emit: Emitter) -> None:
     if not routes:
         return
-    by_domain: dict[str, list[RouteNode]] = {}
+    # OVN's FIB is one table per router: the same prefix cannot be added
+    # twice (ovn-nbctl rejects it; --ecmp is the only duplicate form, and
+    # the IR has no ECMP intent). Several domains can legitimately learn
+    # the same prefix via the same next hop — dedupe to ONE node using the
+    # lowest metric. Same prefix with different next hops at the same
+    # metric is ambiguous, so fail loudly instead of silently keeping one.
+    by_prefix: dict[str, list[RouteNode]] = {}
     for node in routes:
+        by_prefix.setdefault(node.key.prefix, []).append(node)
+    best: list[RouteNode] = []
+    for prefix, group in by_prefix.items():
+        group.sort(key=lambda n: (n.data.metric, n.data.nexthop))
+        lowest = group[0].data.metric
+        nexthops = {n.data.nexthop for n in group if n.data.metric == lowest}
+        if len(nexthops) > 1:
+            raise ValueError(
+                f"router {router}: prefix {prefix} has ECMP next hops "
+                f"{sorted(nexthops)} at metric {lowest}; the IR has no ECMP "
+                "intent, so refusing an ambiguous route"
+            )
+        best.append(group[0])
+    by_domain: dict[str, list[RouteNode]] = {}
+    for node in best:
         by_domain.setdefault(node.data.domain, []).append(node)
     for domain in sorted(by_domain):
         emit.comment(f"# --- routes: {router} ({domain}) ---")
@@ -1537,6 +1569,10 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
                 if trunk_vlans:
                     emit.sh(ovs_ops.set_port_trunks_argv(name, trunk_vlans))
             emit.blank()
+        # The IR carries one node per OVS bridge with all of its ports
+        # (`ovn.ls.interfaces` or `bridge.ports`). Group by bridge name and
+        # emit add-br/fail-mode ONCE, then only the ports.
+        by_bridge: dict[str, list[tuple[str, pt.OvnLsIface]]] = {}
         for domain, iface in all_bindings:
             if iface.kind not in _BINDABLE_IFACE_KINDS:
                 emit.comment(
@@ -1544,49 +1580,51 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
                     f"{domain} on {host_name} — skipped, see deployer/ir_common.py"
                 )
                 continue
-            bridge = iface.bridge
-            is_xdp = iface.kind == "xdp" or (
-                iface.kind == "vlan" and iface.vlanParent.kind == "xdp"
-            )
-            if iface.kind == "xdp":
-                label = iface.name
-            elif iface.kind == "vlan" and iface.vlanParent.kind == "xdp":
-                label = f"{iface.vlanParent.name} vlan {iface.vlanId}"
-            else:
-                label = _iface_real_name(iface)
-            emit.comment(f"# --- interface: {domain} on {host_name} ({label}) ---")
-            if iface.kind == "vlan" and not is_xdp:
-                emit.py(
-                    f"await ensure_vlan(job, {emit.label!r}, "
-                    f"{iface.vlanParent.name!r}, {_iface_real_name(iface)!r}, "
-                    f"{iface.vlanId}, abort_on_error)"
-                )
-                emit.sh(linux_net_ops.set_link_up_argv(_iface_real_name(iface)))
-            # A transit veth's ROOT leg is created AND upped by its own
-            # kernel-router job (_emit_kernel_router_owner). This block
-            # must not touch it: the boot restore pass runs before those
-            # units, so `ip link set` here failed with "Cannot find
-            # device" and took the whole restore down (confirmed live,
-            # 2026-10-20).
+            by_bridge.setdefault(iface.bridge, []).append((domain, iface))
+        for bridge in sorted(by_bridge):
+            emit.comment(f"# --- bridge: {bridge} on {host_name} ---")
             emit.sh(ovs_ops.add_br_argv(bridge))
             emit.sh(ovs_ops.set_bridge_fail_mode_argv(bridge))
-            if is_xdp:
-                vlan_id = iface.vlanId if iface.kind == "vlan" else None
-                _emit_xdp_leg(bridge, vlan_id, emit)
-            elif iface.kind == "veth":
-                # The root leg is created by the kernel-router job, which
-                # attaches it to this bridge AFTER `ip link add` (the
-                # bindings/configure pass can run before that job).
-                pass
-            else:
-                emit.sh(ovs_ops.add_port_argv(bridge, _iface_real_name(iface)))
-            if domain in ovn_domains:
-                mappings.append(f"{_network_name(domain)}:{bridge}")
+            for domain, iface in by_bridge[bridge]:
+                is_xdp = iface.kind == "xdp" or (
+                    iface.kind == "vlan" and iface.vlanParent.kind == "xdp"
+                )
+                if iface.kind == "xdp":
+                    label = iface.name
+                elif iface.kind == "vlan" and iface.vlanParent.kind == "xdp":
+                    label = f"{iface.vlanParent.name} vlan {iface.vlanId}"
+                else:
+                    label = _iface_real_name(iface)
+                emit.comment(f"# --- interface: {domain} ({label}) ---")
+                if iface.kind == "vlan" and not is_xdp:
+                    emit.py(
+                        f"await ensure_vlan(job, {emit.label!r}, "
+                        f"{iface.vlanParent.name!r}, {_iface_real_name(iface)!r}, "
+                        f"{iface.vlanId}, abort_on_error)"
+                    )
+                    emit.sh(linux_net_ops.set_link_up_argv(_iface_real_name(iface)))
+                # A transit veth's ROOT leg is created AND upped by its own
+                # kernel-router job (_emit_kernel_router_owner). This block
+                # must not touch it (2026-10-20, boot-restore ordering).
+                if is_xdp:
+                    vlan_id = iface.vlanId if iface.kind == "vlan" else None
+                    _emit_xdp_leg(bridge, vlan_id, emit)
+                elif iface.kind == "veth":
+                    pass
+                else:
+                    emit.sh(ovs_ops.add_port_argv(bridge, _iface_real_name(iface)))
+                if domain in ovn_domains:
+                    mappings.append(f"{_network_name(domain)}:{bridge}")
         if mappings:
             emit.sh(ovs_ops.set_external_id_argv("ovn-bridge-mappings", ",".join(mappings)))
     else:
         any_bound = False
         xdp_ports = _xdp_ports(all_bindings)
+        # The IR already carries one `bridge` node with all its ports;
+        # emit the OVS bridge (and its fail-mode) once, not once per
+        # binding. Re-running this per port was only harmless while every
+        # add-br carried --may-exist.
+        seen_bridges: set[str] = set()
         for domain, iface in all_bindings:
             if iface.kind not in _BINDABLE_IFACE_KINDS:
                 continue

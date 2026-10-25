@@ -76,7 +76,7 @@ class BridgeAndPortWriteTest(unittest.TestCase):
     def test_add_br_is_idempotent(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:
             mod.add_br("br-home")
-        run.assert_called_once_with(["ovs-vsctl", "--may-exist", "add-br", "br-home"], None)
+        run.assert_called_once_with(["ovs-vsctl", "add-br", "br-home"], None)
 
     def test_del_br_uses_if_exists(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:
@@ -93,9 +93,7 @@ class BridgeAndPortWriteTest(unittest.TestCase):
     def test_add_port_is_idempotent(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:
             mod.add_port("br-home", "ens18.128")
-        run.assert_called_once_with(
-            ["ovs-vsctl", "--may-exist", "add-port", "br-home", "ens18.128"], None
-        )
+        run.assert_called_once_with(["ovs-vsctl", "add-port", "br-home", "ens18.128"], None)
 
     def test_del_port_uses_if_exists(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:

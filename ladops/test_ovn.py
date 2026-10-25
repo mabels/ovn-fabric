@@ -97,7 +97,6 @@ class WriteTest(unittest.TestCase):
         run.assert_called_once_with(
             [
                 "ovn-nbctl",
-                "--may-exist",
                 "lrp-add",
                 "router-home",
                 "lrp-home",
@@ -115,7 +114,7 @@ class WriteTest(unittest.TestCase):
     def test_lr_add_is_idempotent(self) -> None:
         self.assertEqual(
             mod.lr_add_argv("router-home"),
-            ["ovn-nbctl", "--may-exist", "lr-add", "router-home"],
+            ["ovn-nbctl", "lr-add", "router-home"],
         )
 
     def test_lr_set_option_argv(self) -> None:
@@ -140,7 +139,6 @@ class WriteTest(unittest.TestCase):
             mod.lr_route_add_argv("router-home", "0.0.0.0/0", "172.22.12.80"),
             [
                 "ovn-nbctl",
-                "--may-exist",
                 "lr-route-add",
                 "router-home",
                 "0.0.0.0/0",
@@ -149,7 +147,7 @@ class WriteTest(unittest.TestCase):
         )
 
     def test_ls_add_is_idempotent(self) -> None:
-        self.assertEqual(mod.ls_add_argv("home"), ["ovn-nbctl", "--may-exist", "ls-add", "home"])
+        self.assertEqual(mod.ls_add_argv("home"), ["ovn-nbctl", "ls-add", "home"])
 
     def test_ls_del_uses_if_exists(self) -> None:
         self.assertEqual(mod.ls_del_argv("home"), ["ovn-nbctl", "--if-exists", "ls-del", "home"])
@@ -158,7 +156,7 @@ class WriteTest(unittest.TestCase):
         self.assertEqual(
             mod.lsp_add_router_argv("home", "lsp-router-home-left", "lrp-router-home-left"),
             [
-                ["ovn-nbctl", "--may-exist", "lsp-add", "home", "lsp-router-home-left"],
+                ["ovn-nbctl", "lsp-add", "home", "lsp-router-home-left"],
                 ["ovn-nbctl", "lsp-set-type", "lsp-router-home-left", "router"],
                 ["ovn-nbctl", "lsp-set-addresses", "lsp-router-home-left", "router"],
                 [
@@ -174,7 +172,7 @@ class WriteTest(unittest.TestCase):
         self.assertEqual(
             mod.lsp_add_localnet_argv("home", "lsp-home-localnet", "net-home"),
             [
-                ["ovn-nbctl", "--may-exist", "lsp-add", "home", "lsp-home-localnet"],
+                ["ovn-nbctl", "lsp-add", "home", "lsp-home-localnet"],
                 ["ovn-nbctl", "lsp-set-type", "lsp-home-localnet", "localnet"],
                 ["ovn-nbctl", "lsp-set-addresses", "lsp-home-localnet", "unknown"],
                 ["ovn-nbctl", "lsp-set-options", "lsp-home-localnet", "network_name=net-home"],
