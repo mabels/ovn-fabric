@@ -236,8 +236,18 @@ export const OvnLrKey = type({ name: "string" });
 export const OvnLrOptions = type({
   mac_binding_age_threshold: "number.integer",
 });
+// OVN SNAT rules (src/ir.ts's computeOvnNats, from `ovn.ipv4.masq` /
+// `ovn.ipv6.masq` endpoint services). NAT is router state like the LR
+// itself; `lr-nat-add <router> snat <externalIp> <logicalIp>`.
+export const OvnNatRule = type({
+  type: "'snat'",
+  family: "'ipv4'|'ipv6'",
+  externalIp: "string",
+  logicalIp: "string",
+});
 export const OvnLrData = type({
   options: OvnLrOptions,
+  "nats?": OvnNatRule.array(),
 });
 export const OvnLrNode = type({
   id: "string",
@@ -619,6 +629,7 @@ export type OvnLsNode = DeepReadonly<typeof OvnLsNode.infer>;
 export type OvnLsIface = DeepReadonly<typeof OvnLsIface.infer>;
 export type OvnLsInterface = DeepReadonly<typeof OvnLsInterface.infer>;
 export type OvnLrNode = DeepReadonly<typeof OvnLrNode.infer>;
+export type OvnNatRule = DeepReadonly<typeof OvnNatRule.infer>;
 export type OvnLrpNode = DeepReadonly<typeof OvnLrpNode.infer>;
 export type Ipv6RaConfigs = DeepReadonly<typeof Ipv6RaConfigs.infer>;
 export type ServiceRef = DeepReadonly<typeof ServiceRef.infer>;
@@ -781,6 +792,7 @@ export function buildJsonSchema(): Record<string, unknown> {
     OvnLsData: shape(OvnLsData),
     OvnLrKey: shape(OvnLrKey),
     OvnLrOptions: shape(OvnLrOptions),
+    OvnNatRule: shape(OvnNatRule),
     OvnLrData: shape(OvnLrData),
     OvnLrpKey: shape(OvnLrpKey),
     KernelRouterRoute: shape(KernelRouterRoute),

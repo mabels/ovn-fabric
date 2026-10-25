@@ -61,6 +61,7 @@ import type {
   OvnLrpNode,
   OvnLsInterface,
   OvnLsNode,
+  OvnNatRule,
   RouteNode,
   SecurityGroupNode,
   ServiceRef,
@@ -672,7 +673,63 @@ function collisionDomainToIR(
 // types.ts's resolveOvnRouterOptions), so this is pure serialization —
 // same "the IR carries the final fact" boundary as resolveMac /
 // resolveIpv6RaConfigs below. The deployer only applies each pair.
-function routerToIR(router: Router): OvnLrNode {
+// OVN SNAT: `{kind:"ovn.ipv4.masq"}` / `ovn.ipv6.masq` on an endpoint means
+// "masquerade this router's OTHER endpoint subnets to THIS endpoint's own
+// address of that family". One `lr-nat-add ... snat external logical` row
+// per logical prefix; the deployer owns the imperative side.
+function computeOvnNats(network: NetworkDefinition): Map<string, OvnNatRule[]> {
+  const byRouter = new Map<string, OvnNatRule[]>();
+  for (const router of network.allRouters) {
+    const rules: OvnNatRule[] = [];
+    for (const endpoint of router.endpoints) {
+      for (const service of endpoint.services ?? []) {
+        if (
+          service.kind !== "ovn.ipv4.masq" && service.kind !== "ovn.ipv6.masq"
+        ) continue;
+        const isV4 = service.kind === "ovn.ipv4.masq";
+        const external = endpoint.ipaddrs.find((a) => a.is_ipv4() === isV4);
+        if (external === undefined) {
+          throw new Error(
+            `router "${router.name}" endpoint "${endpoint.name}": ` +
+              `${service.kind} needs a local IPv${isV4 ? 4 : 6} address ` +
+              "to use as the SNAT external IP",
+          );
+        }
+        const externalNet = external.network().to_string();
+        const seen = new Set<string>();
+        for (const other of router.endpoints) {
+          if (other.name === endpoint.name) continue;
+          for (const addr of other.ipaddrs) {
+            if (addr.is_ipv4() !== isV4) continue;
+            const logical = addr.network().to_string();
+            if (logical === externalNet || seen.has(logical)) continue;
+            seen.add(logical);
+            rules.push({
+              type: "snat",
+              family: isV4 ? "ipv4" : "ipv6",
+              externalIp: external.to_s(),
+              logicalIp: logical,
+            });
+          }
+        }
+      }
+    }
+    if (rules.length > 0) {
+      rules.sort((a, b) =>
+        `${a.externalIp}|${a.logicalIp}`.localeCompare(
+          `${b.externalIp}|${b.logicalIp}`,
+        )
+      );
+      byRouter.set(router.name, rules);
+    }
+  }
+  return byRouter;
+}
+
+function routerToIR(
+  router: Router,
+  nats?: readonly OvnNatRule[],
+): OvnLrNode {
   return {
     id: `ovnrouter:${router.name}`,
     kind: "ovn.lr",
@@ -681,6 +738,7 @@ function routerToIR(router: Router): OvnLrNode {
       options: {
         mac_binding_age_threshold: router.options.macBindingAgeThreshold,
       },
+      ...(nats && nats.length > 0 ? { nats: [...nats] } : {}),
     },
   };
 }
@@ -778,6 +836,11 @@ function resolveIpv6RaConfigs(
     // still split off in buildKernelRouterEndpoint before the OVN endpoint
     // is built.
     if (isKernelService(service)) {
+      continue;
+    }
+    if (
+      service.kind === "ovn.ipv4.masq" || service.kind === "ovn.ipv6.masq"
+    ) {
       continue;
     }
     // Config-side workload shortcuts (wireguard/zerotier) are consumed by
@@ -1553,8 +1616,9 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
     nodes[node.id] = node;
   }
 
+  const natsByRouter = computeOvnNats(network);
   for (const router of network.allRouters) {
-    const routerNode = routerToIR(router);
+    const routerNode = routerToIR(router, natsByRouter.get(router.name));
     nodes[routerNode.id] = routerNode;
     for (const endpoint of router.endpoints) {
       if (endpoint.kind !== "ovn") {

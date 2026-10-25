@@ -167,8 +167,10 @@ export type OvnEndpointFn = (
   ep: EndpointBuilder,
 ) => Omit<OvnRouterEndpointSpec, "kind">;
 
-/** The mutable spec handed to `net.service(name, (svc) => {...})` — set
- * `image` (required), `cmd`, `build`. Returns a re-usable Service handle. */
+/** The spec handed to `net.service()`. Either pass it directly (merged over
+ * the default builder), or use a callback that RETURNS it
+ * (`(svc) => ({ ...svc, image, cmd })`). `image` is required. Returns a
+ * re-usable Service handle. */
 export interface ServiceBuilder {
   image: string;
   cmd?: string | readonly string[];

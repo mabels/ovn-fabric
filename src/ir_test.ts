@@ -1442,9 +1442,9 @@ Deno.test("net.service + ep.attachTo -> kernel.service node + endpoint serviceRe
     const host = net.localHost("chassis-1");
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
-    const dns = net.service("dns", (svc) => {
-      svc.image = "ovn-fabric-dns";
-      svc.cmd = ["/usr/sbin/dnsmasq", "--no-daemon"];
+    const dns = net.service("dns", {
+      image: "ovn-fabric-dns",
+      cmd: ["/usr/sbin/dnsmasq", "--no-daemon"],
     });
     return {
       hosts: [host],
@@ -1519,9 +1519,7 @@ Deno.test("route metrics: domain, attachment and per-route precedence", () => {
       metric: 500,
       routes: [{ dst: IPv4.parse("10.9.0.0/24") }],
     });
-    const dns = net.service("dns", (svc) => {
-      svc.image = "x";
-    });
+    const dns = net.service("dns", { image: "x" });
     return {
       hosts: [host],
       routers: [
@@ -1604,9 +1602,7 @@ Deno.test("route metrics fall back to execution order (first NIC lowest)", () =>
     const domain = net.routingDomain("Dom", {
       routes: [{ dst: IPv4.parse("10.9.0.0/24") }],
     });
-    const svc = net.service("svc", (s) => {
-      s.image = "x";
-    });
+    const svc = net.service("svc", { image: "x" });
     return {
       hosts: [host],
       routers: [
@@ -1659,9 +1655,7 @@ Deno.test("resolver: control-plane attachments inherit the platform resolver", (
     const host = net.localHost("chassis-1");
     const controlPlane = net.collisionDomain("control-plane");
     const bb = net.collisionDomain("bb");
-    const app = net.service("app", (s) => {
-      s.image = "x";
-    });
+    const app = net.service("app", { image: "x" });
     const platform = net.createPlatform("plat", {
       controlPlane: {
         collisionDomain: controlPlane,
@@ -1690,9 +1684,11 @@ Deno.test("resolver: control-plane attachments inherit the platform resolver", (
   };
   const refs = refsOf("control-plane");
   const coredns = refs.find((r) =>
-    r.service === "kernel.app.container:platform.dns"
+    r.service === "kernel.app.container:cp-plat-platform.dns"
   )!;
-  const appRef = refs.find((r) => r.service === "kernel.app.container:app")!;
+  const appRef = refs.find((r) =>
+    r.service === "kernel.app.container:cp-plat-app"
+  )!;
   const corednsAddr = coredns.ipaddrs![0]!.split("/")[0]!;
   // The app NIC is fed the CoreDNS address...
   assertEquals(appRef.resolver, { nameservers: [corednsAddr] });
@@ -1706,15 +1702,123 @@ Deno.test("resolver: control-plane attachments inherit the platform resolver", (
   );
 });
 
+// A services[] entry can CLAIM the DNS role, replacing the built-in's
+// Service while keeping its platform semantics (allocation + resolver).
+Deno.test('platform: role "dns" replaces the built-in service and supplies the resolver', () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const controlPlane = net.collisionDomain("control-plane");
+    const bb = net.collisionDomain("bb");
+    const app = net.service("app", { image: "x" });
+    const myDns = net.service("my-dns", {
+      image: "ovn-fabric-plat-coredns:netdebug",
+      cmd: ["-conf", "/etc/coredns/Corefile"],
+    });
+    net.createPlatform("plat", {
+      controlPlane: {
+        collisionDomain: controlPlane,
+        hosts: [host],
+        ipaddrs: [IPv4.parse("10.43.0.1/24")],
+        ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+      },
+      zones: [],
+      services: [
+        { service: myDns, role: "dns" },
+        { service: app },
+      ],
+      egress: [{
+        l2Segment: bb,
+        ipaddrs: [IPv4.parse("172.16.0.1/16")],
+      }],
+    });
+    return { hosts: [host], routers: [] };
+  });
+  const nodes = toIR(network);
+  // The built-in is NOT instantiated.
+  assertThrows(() => node(nodes, "kernel.app.container:cp-plat-platform.dns"));
+  const custom = node(nodes, "kernel.app.container:cp-plat-my-dns");
+  assertEquals(custom.data["image"], "ovn-fabric-plat-coredns:netdebug");
+
+  const router = network.allRouters.find((r) =>
+    r.endpoints.some((e) => e.l2Segment.name === "control-plane")
+  )!;
+  const lrp = node(
+    nodes,
+    `ovnrouter:${router.name}|lrp:${endpointOn(router, "control-plane").name}`,
+  );
+  const refs = lrp.data.serviceRefs ?? [];
+  const dnsRef = refs.find((r) =>
+    r.service === "kernel.app.container:cp-plat-my-dns"
+  )!;
+  const appRef = refs.find((r) =>
+    r.service === "kernel.app.container:cp-plat-app"
+  )!;
+  assertEquals(dnsRef.ipaddrs, ["10.43.0.10/24"]);
+  assertEquals(appRef.resolver, { nameservers: ["10.43.0.10"] });
+  assertEquals(
+    network.platformControlPlane?.resolver?.nameservers.map((n) => n.to_s()),
+    ["10.43.0.10"],
+  );
+});
+
+Deno.test("platform: two services cannot claim the same role", () => {
+  assertThrows(
+    () =>
+      defineNetwork("test-net", (net) => {
+        const host = net.localHost("chassis-1");
+        const controlPlane = net.collisionDomain("control-plane");
+        const dnsA = net.service("dns-a", { image: "a" });
+        const dnsB = net.service("dns-b", { image: "b" });
+        net.createPlatform("plat", {
+          controlPlane: {
+            collisionDomain: controlPlane,
+            hosts: [host],
+            ipaddrs: [IPv4.parse("10.43.0.1/24")],
+          },
+          zones: [],
+          services: [
+            { service: dnsA, role: "dns" },
+            { service: dnsB, role: "dns" },
+          ],
+        });
+        return { hosts: [host], routers: [] };
+      }),
+    Error,
+    'role "dns" is claimed by both',
+  );
+});
+
+Deno.test("platform: a claimed role conflicts with explicit platformServices config", () => {
+  assertThrows(
+    () =>
+      defineNetwork("test-net", (net) => {
+        const host = net.localHost("chassis-1");
+        const controlPlane = net.collisionDomain("control-plane");
+        const dns = net.service("my-dns", { image: "x" });
+        net.createPlatform("plat", {
+          controlPlane: {
+            collisionDomain: controlPlane,
+            hosts: [host],
+            ipaddrs: [IPv4.parse("10.43.0.1/24")],
+          },
+          zones: [],
+          platformServices: { dns: { forwarders: ["1.1.1.1"] } },
+          services: [{ service: dns, role: "dns" }],
+        });
+        return { hosts: [host], routers: [] };
+      }),
+    Error,
+    "also configured via platformServices",
+  );
+});
+
 // An explicit controlPlane.resolver overrides the CoreDNS default.
 Deno.test("resolver: controlPlane.resolver overrides the CoreDNS default", () => {
   const network = defineNetwork("test-net", (net) => {
     const host = net.localHost("chassis-1");
     const controlPlane = net.collisionDomain("control-plane");
     const bb = net.collisionDomain("bb");
-    const app = net.service("app", (s) => {
-      s.image = "x";
-    });
+    const app = net.service("app", { image: "x" });
     const platform = net.createPlatform("plat", {
       controlPlane: {
         collisionDomain: controlPlane,
@@ -1741,7 +1845,8 @@ Deno.test("resolver: controlPlane.resolver overrides the CoreDNS default", () =>
   );
   const refs = lrp.data.serviceRefs ?? [];
   assertEquals(
-    refs.find((r) => r.service === "kernel.app.container:app")!.resolver,
+    refs.find((r) => r.service === "kernel.app.container:cp-plat-app")!
+      .resolver,
     { nameservers: ["9.9.9.9"] },
   );
 });
@@ -1752,9 +1857,7 @@ Deno.test("resolver: attachment resolver is emitted for a plain segment NIC", ()
     const host = net.localHost("chassis-1");
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
-    const svc = net.service("svc", (s) => {
-      s.image = "x";
-    });
+    const svc = net.service("svc", { image: "x" });
     return {
       hosts: [host],
       routers: [
@@ -1799,9 +1902,7 @@ Deno.test("attached service route via must be on the endpoint's segment", () => 
       const host = net.localHost("chassis-1");
       const a = net.collisionDomain("seg-a");
       const b = net.collisionDomain("seg-b");
-      const dns = net.service("dns", (svc) => {
-        svc.image = "x";
-      });
+      const dns = net.service("dns", { image: "x" });
       return {
         hosts: [host],
         routers: [
@@ -1848,9 +1949,7 @@ Deno.test("multiple services attached across endpoints -> one service node each"
     const cp = net.collisionDomain("control-plane");
     const backbone = net.collisionDomain("backbone");
     const dnsFor = (seg: number) =>
-      net.service(`dns-${seg}`, (svc) => {
-        svc.image = "ovn-fabric-dns";
-      });
+      net.service(`dns-${seg}`, { image: "ovn-fabric-dns" });
     const dns128 = dnsFor(128);
     const dns129 = dnsFor(129);
     const seg = (
@@ -2013,9 +2112,7 @@ Deno.test("attachTo records endpointRefs on the service", () => {
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
     const cp = net.collisionDomain("control-plane");
-    dns = net.service("dns", (svc) => {
-      svc.image = "x";
-    });
+    dns = net.service("dns", { image: "x" });
     return {
       hosts: [host],
       routers: [
@@ -2261,9 +2358,7 @@ Deno.test("routingDomain: calculated routes reach a workload via its segment gat
     const bseg = net.collisionDomain("seg-b");
     const bb = net.collisionDomain("bb");
     const d = net.routingDomain("D");
-    const svc = net.service("svc", (s) => {
-      s.image = "img";
-    });
+    const svc = net.service("svc", { image: "img" });
     return {
       hosts: [host],
       routers: [
@@ -2337,9 +2432,7 @@ Deno.test("routingDomain: explicit routes replace the calculated set", () => {
     const d = net.routingDomain("D", {
       routes: [{ dst: IPv4.parse("192.168.129.0/24") }],
     });
-    const svc = net.service("svc", (s) => {
-      s.image = "img";
-    });
+    const svc = net.service("svc", { image: "img" });
     return {
       hosts: [host],
       routers: [
@@ -2390,9 +2483,7 @@ Deno.test("routingDomain: a dst the attachment is on-link for is skipped", () =>
     const d = net.routingDomain("D", {
       routes: [{ dst: IPv4.parse("10.0.0.0/24") }],
     });
-    const svc = net.service("svc", (s) => {
-      s.image = "img";
-    });
+    const svc = net.service("svc", { image: "img" });
     return {
       hosts: [host],
       routers: [
@@ -2448,9 +2539,7 @@ Deno.test("workload routes: a prefix reached from two NICs stays on both (per-NI
     const d2 = net.routingDomain("D2", {
       routes: [{ dst: IPv4.parse("10.5.0.0/24") }],
     });
-    const svc = net.service("svc", (s) => {
-      s.image = "img";
-    });
+    const svc = net.service("svc", { image: "img" });
     return {
       hosts: [host],
       routers: [
@@ -2501,6 +2590,54 @@ Deno.test("workload routes: a prefix reached from two NICs stays on both (per-NI
   assertEquals(withRoute.length, 2);
 });
 
+Deno.test("ovn masq services resolve to SNAT rows on the logical router", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    const cp = net.collisionDomain("cp");
+    const bb = net.collisionDomain("bb");
+    net.defineOvnRouter("router-x", (router) => ({
+      routingDomains: [],
+      endpoints: [
+        router.ovnRouterEndpoint({
+          l2Segment: cp,
+          ipaddrs: [
+            IPv4.parse("10.43.0.1/24"),
+            IPv6.parse("2600:db8::1/112"),
+          ],
+        }),
+        router.ovnRouterEndpoint({
+          l2Segment: bb,
+          ipaddrs: [
+            IPv4.parse("172.22.0.2/16"),
+            IPv6.parse("2600:db8:1::2/64"),
+          ],
+          services: [
+            { kind: "ovn.ipv4.masq" },
+            { kind: "ovn.ipv6.masq" },
+          ],
+        }),
+      ],
+    }));
+    return { hosts: [host], routers: [] };
+  });
+
+  const lr = node(toIR(network), "ovnrouter:router-x");
+  assertEquals(lr.data["nats"], [
+    {
+      type: "snat",
+      family: "ipv4",
+      externalIp: "172.22.0.2",
+      logicalIp: "10.43.0.0/24",
+    },
+    {
+      type: "snat",
+      family: "ipv6",
+      externalIp: "2600:db8:1::2",
+      logicalIp: "2600:db8::/112",
+    },
+  ]);
+});
+
 // ── platform builders (dnsProvider real; certIssuer/createPlatform stubs) ──
 Deno.test("platform: dnsProvider is a plain object, unique by name", () => {
   let provider: DnsProvider | undefined;
@@ -2522,6 +2659,28 @@ Deno.test("platform: dnsProvider is a plain object, unique by name", () => {
   assertEquals(provider?.spec, { kind: "cloudflare", token: "cf-token" });
 });
 
+Deno.test("service: accepts a builder object or a callback that returns one", () => {
+  let plain: Service | undefined;
+  let returned: Service | undefined;
+  defineNetwork("test-net", (net) => {
+    const host = net.localHost("chassis-1");
+    plain = net.service("plain", {
+      image: "img-a",
+      cmd: "sh -c true",
+    });
+    returned = net.service("returned", (svc) => ({
+      ...svc,
+      image: "img-b",
+      files: [{ path: "/etc/x", content: ["a", "b"] }],
+    }));
+    return { hosts: [host], routers: [] };
+  });
+  assertEquals(plain?.image, "img-a");
+  assertEquals(plain?.cmd, ["sh", "-c", "true"]);
+  assertEquals(returned?.image, "img-b");
+  assertEquals(returned?.files, [{ path: "/etc/x", content: ["a", "b"] }]);
+});
+
 Deno.test("platform: createPlatform is a dummy carrying ingressService + publish", () => {
   let platform: Platform | undefined;
   defineNetwork("test-net", (net) => {
@@ -2534,7 +2693,7 @@ Deno.test("platform: createPlatform is a dummy carrying ingressService + publish
     return { hosts: [host], routers: [] };
   });
   assertEquals(platform?.name, "mam-hh-platform");
-  assertEquals(platform?.ingressService.name, "mam-hh-platform-ingress");
+  assertEquals(platform?.ingressService.name, "cp-mam-hh-platform-ingress");
   const published = platform?.publish({
     host: "ui.adviser.com",
     port: "webui",
@@ -2594,7 +2753,7 @@ Deno.test("platform: attachTo(ingressService) injects endpoint + service into pu
   // The injected endpoint is the pre-`services` base (same object
   // EndpointService.endpoint carries), so compare by identity-of-name.
   assertEquals(publish?.[0]?.endpoint?.name, lrp.name);
-  assertEquals(publish?.[0]?.service?.name, "plat-ingress");
+  assertEquals(publish?.[0]?.service?.name, "cp-plat-ingress");
   // The reusable service records the attachment back-reference.
   assertEquals(platform?.ingressService.endpointRefs.length, 1);
 });
@@ -2787,9 +2946,7 @@ Deno.test("routingDomain: calculated routes reach a workload via its segment gat
     const bseg = net.collisionDomain("seg-b");
     const bb = net.collisionDomain("bb");
     const d = net.routingDomain("D");
-    const svc = net.service("svc", (s) => {
-      s.image = "img";
-    });
+    const svc = net.service("svc", { image: "img" });
     return {
       hosts: [host],
       routers: [
@@ -2863,9 +3020,7 @@ Deno.test("routingDomain: explicit routes replace the calculated set", () => {
     const d = net.routingDomain("D", {
       routes: [{ dst: IPv4.parse("192.168.129.0/24") }],
     });
-    const svc = net.service("svc", (s) => {
-      s.image = "img";
-    });
+    const svc = net.service("svc", { image: "img" });
     return {
       hosts: [host],
       routers: [
@@ -2916,9 +3071,7 @@ Deno.test("routingDomain: a dst the attachment is on-link for is skipped", () =>
     const d = net.routingDomain("D", {
       routes: [{ dst: IPv4.parse("10.0.0.0/24") }],
     });
-    const svc = net.service("svc", (s) => {
-      s.image = "img";
-    });
+    const svc = net.service("svc", { image: "img" });
     return {
       hosts: [host],
       routers: [
@@ -2974,9 +3127,7 @@ Deno.test("workload routes: a prefix reached from two NICs stays on both (per-NI
     const d2 = net.routingDomain("D2", {
       routes: [{ dst: IPv4.parse("10.5.0.0/24") }],
     });
-    const svc = net.service("svc", (s) => {
-      s.image = "img";
-    });
+    const svc = net.service("svc", { image: "img" });
     return {
       hosts: [host],
       routers: [
@@ -3060,7 +3211,7 @@ Deno.test("platform: createPlatform is a dummy carrying ingressService + publish
     return { hosts: [host], routers: [] };
   });
   assertEquals(platform?.name, "mam-hh-platform");
-  assertEquals(platform?.ingressService.name, "mam-hh-platform-ingress");
+  assertEquals(platform?.ingressService.name, "cp-mam-hh-platform-ingress");
   const published = platform?.publish({
     host: "ui.adviser.com",
     port: "webui",
@@ -3120,7 +3271,7 @@ Deno.test("platform: attachTo(ingressService) injects endpoint + service into pu
   // The injected endpoint is the pre-`services` base (same object
   // EndpointService.endpoint carries), so compare by identity-of-name.
   assertEquals(publish?.[0]?.endpoint?.name, lrp.name);
-  assertEquals(publish?.[0]?.service?.name, "plat-ingress");
+  assertEquals(publish?.[0]?.service?.name, "cp-plat-ingress");
   // The reusable service records the attachment back-reference.
   assertEquals(platform?.ingressService.endpointRefs.length, 1);
 });

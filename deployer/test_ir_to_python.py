@@ -52,6 +52,7 @@ from .ir_common import (
     _emit_host_script,
     _emit_iface_bindings,
     _emit_kernel_router_owner,
+    _emit_router,
     _emit_service_down,
     _emit_service_up,
     _install_plan,
@@ -1898,6 +1899,57 @@ class KernelRouterDeleteTest(unittest.TestCase):
         self.assertLess(
             down.index("ip netns exec ns-kernel-0 ip link delete eth0.2280"),
             down.index("ip netns delete ns-kernel-0"),
+        )
+
+
+class OvnNatTest(unittest.TestCase):
+    def test_router_nat_rows_emit_lr_nat_add_and_replace_first(self) -> None:
+        lr = hydrate_as(
+            pt.OvnLrNode,
+            {
+                "id": "ovnrouter:router-x",
+                "kind": "ovn.lr",
+                "key": {"name": "router-x"},
+                "data": {
+                    "options": {"mac_binding_age_threshold": 300},
+                    "nats": [
+                        {
+                            "type": "snat",
+                            "family": "ipv4",
+                            "externalIp": "172.22.0.2",
+                            "logicalIp": "10.43.0.0/24",
+                        },
+                        {
+                            "type": "snat",
+                            "family": "ipv6",
+                            "externalIp": "2600:db8:1::2",
+                            "logicalIp": "2600:db8::/112",
+                        },
+                    ],
+                },
+            },
+        )
+        emit = _OpEmitter("create")
+        _emit_router("router-x", [], [], {}, {}, lr, emit)
+        self.assertIn(
+            ["ovn-nbctl", "lr-nat-add", "router-x", "snat", "172.22.0.2", "10.43.0.0/24"],
+            emit.commands,
+        )
+        self.assertIn(
+            [
+                "ovn-nbctl",
+                "lr-nat-add",
+                "router-x",
+                "snat",
+                "2600:db8:1::2",
+                "2600:db8::/112",
+            ],
+            emit.commands,
+        )
+        # SNAT rows are replaced per external IP (lr-nat-add has no --may-exist).
+        self.assertIn(
+            ["ovn-nbctl", "lr-nat-del", "router-x", "snat", "172.22.0.2"],
+            emit.commands,
         )
 
 

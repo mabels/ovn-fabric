@@ -119,7 +119,7 @@ class PlatformImpl implements Platform {
     // The service description the topology attaches to PLACE the ingress;
     // a placeholder until the platform's ingress template exists.
     this.#ingressService = {
-      name: `${name}-ingress`,
+      name: `cp-${name}-ingress`,
       image: "busybox",
       endpointRefs: [],
     };
@@ -179,12 +179,38 @@ class PlatformImpl implements Platform {
     // order (an omitted id takes its default; IGNORE / delPlatformSvc drops
     // it). Resolved BEFORE the leg is built, so they attach through the very
     // same path as the author's own admin NICs.
+    // A services[] entry may CLAIM a built-in role (role: "dns"). It then
+    // replaces that built-in: the built-in is not instantiated, and only
+    // its platform semantics (attachment/address allocation/resolver)
+    // carry over. The Service itself is used verbatim.
+    const claimedRoles = new Map<PlatformServiceId, string>();
+    for (const spec of this.#services) {
+      if (spec.role === undefined) continue;
+      const existing = claimedRoles.get(spec.role);
+      if (existing !== undefined) {
+        throw new Error(
+          `platform "${this.name}": role "${spec.role}" is claimed by both ` +
+            `service "${existing}" and "${spec.service.name}"`,
+        );
+      }
+      claimedRoles.set(spec.role, spec.service.name);
+    }
     const builtIns: PlatformServiceSpec[] = [];
     for (const id of PLATFORM_SERVICE_IDS) {
-      const setting = this.#platformServices[id] ??
-        defaultPlatformServiceSetting(id);
-      if (setting === platformSvc.IGNORE) continue;
-      const resolved = resolvePlatformService(id, setting);
+      const setting = this.#platformServices[id];
+      if (claimedRoles.has(id)) {
+        if (setting !== undefined && setting !== platformSvc.IGNORE) {
+          throw new Error(
+            `platform "${this.name}": role "${id}" is claimed by service ` +
+              `"${claimedRoles.get(id)}" and also configured via ` +
+              `platformServices/cfgPlatformSvc`,
+          );
+        }
+        continue;
+      }
+      const effective = setting ?? defaultPlatformServiceSetting(id);
+      if (effective === platformSvc.IGNORE) continue;
+      const resolved = resolvePlatformService(id, effective);
       if (resolved) builtIns.push(resolved);
     }
     const attached = [...this.#services, ...builtIns];
@@ -210,9 +236,10 @@ class PlatformImpl implements Platform {
           }
         }
       });
-    // Captured while attaching: the platform CoreDNS's control-plane
+    // Captured while attaching: the DNS-role service's control-plane
     // address, which becomes the DEFAULT global resolver when the topology
-    // doesn't set controlPlane.resolver (2026-09-19).
+    // doesn't set controlPlane.resolver (2026-09-19). Identified by ROLE,
+    // not by the built-in's service name, so a custom DNS service works.
     const corednsNameservers: (IPv4 | IPv6)[] = [];
     const controlPlaneLeg = (
       ep: EndpointBuilder,
@@ -226,12 +253,33 @@ class PlatformImpl implements Platform {
         ? {
           services: attached.map((spec) => {
             const addrs = spec.ipaddrs ?? allocateAddrs();
-            if (spec.service.name === "platform.dns") {
+            if (spec.role === "dns") {
               for (const a of addrs) {
                 if (a.is_ipv4()) corednsNameservers.push(a);
               }
             }
-            return ep.attachTo(spec.service, {
+            // Platform-scoped identity: the IR node id and docker
+            // container both derive from the service name, so `cp-<platform>-`
+            // makes `docker ps` show which platform owns it. Local image
+            // tags get the same scope; upstream images are left alone. The
+            // topology's original Service handle is not mutated, and the
+            // clone records its own endpointRefs.
+            const localPrefix = "ovn-fabric-";
+            const image = spec.service.image.startsWith(localPrefix) &&
+                !spec.service.image.startsWith(
+                  `${localPrefix}${this.name}-`,
+                )
+              ? `${localPrefix}${this.name}-${
+                spec.service.image.slice(localPrefix.length)
+              }`
+              : spec.service.image;
+            const service: Service = {
+              ...spec.service,
+              name: `cp-${this.name}-${spec.service.name}`,
+              image,
+              endpointRefs: [],
+            };
+            return ep.attachTo(service, {
               ipaddrs: addrs,
               ...(spec.routes ? { routes: spec.routes } : {}),
               ...(spec.publish
@@ -246,7 +294,7 @@ class PlatformImpl implements Platform {
     // network's router set because the platform defines it THROUGH the
     // network reference it was created with — nothing to report.
     this.#netRef.defineOvnRouter(`router-${this.name}`, (router) => ({
-      routingDomains: cp.routingDomain ? [cp.routingDomain] : [],
+      routingDomains: cp.routingDomains ? [...cp.routingDomains] : [],
       endpoints: [
         router.ovnRouterEndpoint(controlPlaneLeg),
         ...this.#egress.map((input) => router.ovnRouterEndpoint(input)),
@@ -560,9 +608,19 @@ export class NetworkBuilder implements RouterEndpointContext {
    * endpoint's segment; attaching one service at N endpoints is one
    * container with N NICs (the k8s pod model, 2026-09-08). See Service
    * (types.ts). */
-  service(name: string, build: (svc: ServiceBuilder) => void): Service {
-    const svc: ServiceBuilder = { image: "" };
-    build(svc);
+  service(name: string, spec: ServiceBuilder): Service;
+  service(
+    name: string,
+    build: (svc: ServiceBuilder) => ServiceBuilder,
+  ): Service;
+  service(
+    name: string,
+    specOrBuild: ServiceBuilder | ((svc: ServiceBuilder) => ServiceBuilder),
+  ): Service {
+    const build = typeof specOrBuild === "function"
+      ? specOrBuild
+      : (svc: ServiceBuilder) => ({ ...svc, ...specOrBuild });
+    const svc = build({ image: "" });
     if (svc.image === "") {
       throw new Error(`service "${name}": builder must set an image`);
     }

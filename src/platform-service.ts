@@ -105,6 +105,7 @@ export function resolvePlatformService(
       return {
         service: coreDnsService(dns),
         ipaddrs: dns.ipaddrs,
+        role: "dns",
       };
     }
     default:

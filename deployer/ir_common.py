@@ -533,6 +533,18 @@ def _emit_router(
         if data.ipv6RaConfigs is not None:
             for key, value in _ovn_settings(data.ipv6RaConfigs):
                 emit.sh(ovn_ops.lrp_set_ipv6_ra_config_argv(lrp, key, value))
+    # OVN SNAT rows (`ovn.ipv4.masq` / `ovn.ipv6.masq`). lr-nat-add has no
+    # --may-exist, so replace the router's SNAT rules per external IP
+    # before re-adding them; lr-del removes them on teardown.
+    if lr is not None and lr.data.nats:
+        emit.comment(f"# --- router NAT: {router} ---")
+        by_external: dict[str, list[pt.OvnNatRule]] = {}
+        for nat in sorted(lr.data.nats, key=lambda n: (n.externalIp, n.logicalIp)):
+            by_external.setdefault(nat.externalIp, []).append(nat)
+        for external in sorted(by_external):
+            emit.sh(ovn_ops.lr_nat_del_argv(router, "snat", external), optional=True)
+            for nat in by_external[external]:
+                emit.sh(ovn_ops.lr_nat_add_argv(router, nat.type, nat.externalIp, nat.logicalIp))
     _emit_router_routes(router, routes, emit)
     emit.blank()
 

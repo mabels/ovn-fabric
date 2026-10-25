@@ -912,6 +912,12 @@ export type RouterEndpointService =
   }
   | { readonly kind: "kernel.ipv4.masq" }
   | { readonly kind: "kernel.ipv6.masq" }
+  // OVN SNAT on the router itself: masquerade the router's OTHER endpoint
+  // subnets to this (egress) endpoint's own address of that family. This
+  // is router state (`lr-nat-add`), consumed by src/ir.ts's computeOvnNats
+  // and never seen by resolveIpv6RaConfigs.
+  | { readonly kind: "ovn.ipv4.masq" }
+  | { readonly kind: "ovn.ipv6.masq" }
   | {
     readonly kind: "kernel.app.dhcp-client";
     readonly style: "dhclient" | "dhcpcd";
@@ -1177,7 +1183,10 @@ export interface Resolver {
 
 export interface PlatformControlPlane {
   readonly collisionDomain: CollisionDomain;
-  readonly routingDomain?: RoutingDomain;
+  /** RoutingDomain memberships of the platform router. The CONTROL-PLANE
+   * leg (and therefore every workload attached to it) inherits routes
+   * from ALL of them, so an egress domain can supply the default. */
+  readonly routingDomains?: readonly RoutingDomain[];
   readonly hosts: readonly Host[];
   /** The GLOBAL resolver for this control plane — what a control-plane
    * attachment with no `resolver` of its own is fed. Omitted → the
@@ -1252,6 +1261,14 @@ export type PlatformEgressSpec =
  * endpoint, so it does the attach itself. */
 export interface PlatformServiceSpec {
   readonly service: Service;
+  /** Fill a built-in platform role instead of adding a plain admin NIC.
+   * A service with `role: "dns"` REPLACES the built-in `platform.dns`:
+   * the built-in is not instantiated, and only its platform semantics
+   * (control-plane attachment, address allocation, global resolver)
+   * carry over. The Service itself — image, cmd, files, env, build — is
+   * used verbatim; nothing is merged. At most one service may claim a
+   * role. */
+  readonly role?: PlatformServiceId;
   /** Omitted → ALLOCATED from the control-plane leg's network, starting at
    * host +10 and counting up (the k8s convention: .1 is the gateway, the
    * first workload lands at .10) — e.g. a 10.99.77.1/24 leg yields
