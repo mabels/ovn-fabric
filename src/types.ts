@@ -374,8 +374,34 @@ export interface OvnSnatRule {
   readonly logicalIps: readonly (IPv4 | IPv6)[];
 }
 
+export type FilterDirection = "input" | "output" | "forward";
+export type FilterAction = "allow" | "deny" | "reject";
+export type Address = IPv4 | IPv6;
+
+/** A generic L3/L4 filter rule. Family is NOT authored: it is inferred
+ * from the union of `sources`/`destinations`, then expanded into one
+ * concrete per-family IR rule. */
+export interface FilterRule {
+  readonly kind: "filter";
+  readonly direction: FilterDirection;
+  readonly action: FilterAction;
+  readonly sources?: readonly Address[];
+  /** Sources explicitly NOT matched (OVN: `ip4.src != {...}`). */
+  readonly excludeSources?: readonly Address[];
+  readonly destinations?: readonly Address[];
+  readonly protocol?: "tcp" | "udp" | "icmp" | "icmpv6";
+  readonly ports?: readonly { readonly from: number; readonly to: number }[];
+  readonly priority?: number;
+}
+
+export interface DenyInputAllow {
+  readonly protocol?: "tcp" | "udp";
+  readonly ports?: readonly { readonly from: number; readonly to: number }[];
+  readonly sources?: readonly Address[];
+}
+
 export type SecurityGroupRule<R extends SecurityGroupRender> = R extends
-  "kernel" ? KernelMasqRule : OvnSnatRule;
+  "kernel" ? KernelMasqRule | FilterRule : OvnSnatRule | FilterRule;
 
 /** A rendered group. Its `rules` are concrete and backend-specific;
  * the IR only ever sees this. */
@@ -681,6 +707,8 @@ export interface OvnRouterEndpoint
   extends RouterEndpointBase<EndpointService<RouterEndpointService>> {
   readonly kind: "ovn";
   readonly l2Segment: CollisionDomain;
+  /** Security groups attached to this OVN endpoint/LRP. */
+  readonly securityGroups?: readonly SecurityGroupRef<"ovn">[];
 }
 
 /** The input shape for NetworkBuilder.kernelRouterEndpoint() (define.ts)
@@ -940,6 +968,14 @@ export type RouterEndpointService =
   // and never seen by resolveIpv6RaConfigs.
   | { readonly kind: "ovn.ipv4.masq" }
   | { readonly kind: "ovn.ipv6.masq" }
+  | {
+    readonly kind: "ovn.ipv4.block-ingress";
+    readonly allow?: readonly DenyInputAllow[];
+  }
+  | {
+    readonly kind: "ovn.ipv6.block-ingress";
+    readonly allow?: readonly DenyInputAllow[];
+  }
   | {
     readonly kind: "kernel.app.dhcp-client";
     readonly style: "dhclient" | "dhcpcd";

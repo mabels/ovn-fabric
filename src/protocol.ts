@@ -527,20 +527,35 @@ export const IpValue = type("string").narrow((s, ctx) =>
 export const NetworkValue = type("string").narrow((s, ctx) =>
   IPAddress.parse(s) !== undefined ? true : ctx.mustBe("an IP or CIDR")
 );
+export const FilterRule = type({
+  kind: "'filter'",
+  direction: "'input'|'output'|'forward'",
+  action: "'allow'|'deny'|'reject'",
+  family: "'ipv4'|'ipv6'",
+  "sources?": "string[]",
+  "excludeSources?": "string[]",
+  "destinations?": "string[]",
+  "protocol?": "'tcp'|'udp'|'icmp'|'icmpv6'",
+  "ports?": type({ from: "number.integer", to: "number.integer" }).array(),
+  "priority?": "number.integer",
+});
 export const SecurityGroupRule = type({
   family: "'ipv4'|'ipv6'",
   kind: "'masq'",
 }).or(type({
   kind: "'snat'",
   family: "'ipv4'|'ipv6'",
-  // Kept plain strings for JSON-Schema portability; validated with
-  // IpValue/NetworkValue before the node is emitted.
   externalIp: "string",
   logicalIps: "string[]",
-}));
+})).or(FilterRule);
 export const SecurityGroupKey = type({ name: "string" });
 export const SecurityGroupData = type({
   rules: SecurityGroupRule.array(),
+  "default?": type({
+    "input?": "'allow'|'deny'|'reject'",
+    "output?": "'allow'|'deny'|'reject'",
+    "forward?": "'allow'|'deny'|'reject'",
+  }),
 });
 export const SecurityGroupNode = type({
   id: "string",
@@ -840,6 +855,7 @@ export function buildJsonSchema(): Record<string, unknown> {
     BridgeData: shape(BridgeData),
     SecurityGroupKey: shape(SecurityGroupKey),
     SecurityGroupRule: shape(SecurityGroupRule),
+    FilterRule: shape(FilterRule),
     SecurityGroupRef: shape(SecurityGroupRef),
     SecurityGroupData: shape(SecurityGroupData),
     KernelServiceKey: shape(KernelServiceKey),

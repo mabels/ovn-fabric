@@ -497,6 +497,139 @@ def _ovn_settings(record: OvnSettings) -> list[tuple[str, str]]:
 # One flag-taking function per object, create/delete branches adjacent
 # (2026-08-19 — the "write_interface(action)" schema): adding a create
 # command forces you to look at its delete right next to it.
+def _ovn_acl_match(rule: pt.FilterRule, port: pt.Port | None) -> str:
+    parts: list[str] = []
+    family = "ip4" if rule.family == pt.Family.ipv4 else "ip6"
+    if rule.sources:
+        parts.append(f"{family}.src == {{{', '.join(rule.sources)}}}")
+    if rule.excludeSources:
+        parts.append(f"{family}.src != {{{', '.join(rule.excludeSources)}}}")
+    if rule.destinations:
+        parts.append(f"{family}.dst == {{{', '.join(rule.destinations)}}}")
+    proto = rule.protocol.value if rule.protocol is not None else None
+    if proto is not None:
+        if proto == "icmp":
+            parts.append("icmp4")
+        elif proto == "icmpv6":
+            parts.append("icmp6")
+        else:
+            parts.append(proto)
+    if port is not None:
+        if proto not in ("tcp", "udp"):
+            raise ValueError("ACL ports require tcp/udp")
+        if port.from_ == port.to:
+            parts.append(f"{proto}.dst == {port.from_}")
+        else:
+            parts.append(f"{proto}.dst >= {port.from_}")
+            parts.append(f"{proto}.dst <= {port.to}")
+    return " && ".join(parts) if parts else "1"
+
+
+def _emit_router_acl(
+    router: str,
+    ports: list[pt.OvnLrpNode],
+    lr: pt.OvnLrNode | None,
+    nodes: list[pt.Model],
+    domain_names: dict[str, str],
+    emit: Emitter,
+) -> None:
+    if lr is None or not lr.data.securityGroups:
+        return
+    groups = _security_groups_from_refs(
+        list(lr.data.securityGroups), nodes, pt.Render.ovn, f"router {router}"
+    )
+    if not any(
+        rule.kind == "filter" or group.data.default is not None
+        for group in groups
+        for rule in group.data.rules
+    ):
+        return
+    switches = sorted({domain_names[p.data.l2Segment] for p in ports})
+    if not switches:
+        return
+    action_map = {
+        pt.Action.allow: "allow",
+        pt.Action.deny: "drop",
+        pt.Action.reject: "reject",
+    }
+    direction_map = {
+        pt.Direction.input: "to-lport",
+        pt.Direction.output: "from-lport",
+        pt.Direction.forward: "to-lport",
+    }
+    emit.comment(f"# --- router ACL: {router} ---")
+    # This router OWNS the ACL set on these switches/directions. Delete the
+    # old set first: an older build added a broad allow-related at a higher
+    # priority, and an exact-match acl-del would leave it in place forever.
+    used_directions: set[str] = set()
+    for group in groups:
+        for rule in group.data.rules:
+            if rule.kind == "filter":
+                used_directions.add(direction_map[rule.direction])
+        if group.data.default is not None:
+            used_directions.update(("to-lport", "from-lport"))
+    for switch in switches:
+        for direction in sorted(used_directions):
+            emit.sh(
+                ovn_ops.acl_del_argv(switch, direction),
+                optional=True,
+            )
+    for switch in switches:
+        for direction in sorted(used_directions):
+            emit.sh(
+                ovn_ops.acl_add_argv(
+                    switch,
+                    direction,
+                    30000,
+                    "ct.est == 1 || ct.rel == 1",
+                    "allow",
+                )
+            )
+    seen: set[tuple[str, str, int, str, str]] = set()
+
+    def add_acl(switch: str, direction: str, priority: int, match: str, action: str) -> None:
+        key = (switch, direction, priority, match, action)
+        if key in seen:
+            return
+        seen.add(key)
+        emit.sh(ovn_ops.acl_add_argv(switch, direction, priority, match, action))
+
+    for group in groups:
+        filters = [r for r in group.data.rules if r.kind == "filter"]
+        for switch in switches:
+            for rule in filters:
+                direction = direction_map[rule.direction]
+                priority = rule.priority if rule.priority is not None else 100
+                ports_iter: list[pt.Port | None] = list(rule.ports) if rule.ports else [None]
+                for port in ports_iter:
+                    match = _ovn_acl_match(rule, port)
+                    action = action_map[rule.action]
+                    if rule.action == pt.Action.allow:
+                        action = "allow-related"
+                    add_acl(switch, direction, priority, match, action)
+            default = group.data.default
+            if default is not None:
+                for attr, direction in (
+                    ("input", "to-lport"),
+                    ("output", "from-lport"),
+                    ("forward", "to-lport"),
+                ):
+                    default_action = getattr(default, attr, None)
+                    if default_action is None:
+                        continue
+                    add_acl(
+                        switch,
+                        direction,
+                        1,
+                        "1",
+                        {
+                            "allow": "allow",
+                            "deny": "drop",
+                            "reject": "reject",
+                        }[getattr(default_action, "value", default_action)],
+                    )
+
+
 def _emit_router(
     router: str,
     ports: list[pt.OvnLrpNode],
@@ -602,10 +735,9 @@ def _emit_router(
         for group in groups:
             for rule in group.data.rules:
                 if rule.kind != "snat":
-                    raise ValueError(
-                        f"{group.key.name}: rule kind {rule.kind!r} is not an "
-                        "OVN rule; an ovn reference may not carry it"
-                    )
+                    # filter rules in the same group are handled by
+                    # _emit_router_acl; NAT only consumes snat.
+                    continue
                 by_external.setdefault(rule.externalIp, []).append(rule)
         if by_external:
             emit.comment(f"# --- router NAT: {router} ---")
@@ -616,6 +748,7 @@ def _emit_router(
                 for rule in sorted(by_external[external], key=lambda r: r.logicalIps):
                     for logical in rule.logicalIps:
                         emit.sh(ovn_ops.lr_nat_add_argv(router, "snat", external, logical))
+    _emit_router_acl(router, ports, lr, nodes, domain_names, emit)
     _emit_router_routes(router, routes, emit)
     emit.blank()
 
@@ -818,15 +951,109 @@ def _emit_security_group_rules(
     group: pt.SecurityGroupNode, netns: str, dev: str, emit: Emitter
 ) -> None:
     emit.comment(f"# --- security group: {group.key.name} in {netns} on {dev} ---")
+    # Every filter rule is stateful: allow replies first, per family for
+    # every chain the group actually uses.
+    chains: dict[str, set[str]] = {"iptables": set(), "ip6tables": set()}
     for rule in group.data.rules:
-        if rule.kind != "masq":
+        if rule.kind == "filter":
+            chains["iptables" if rule.family == pt.Family.ipv4 else "ip6tables"].add(
+                {
+                    pt.Direction.input: "INPUT",
+                    pt.Direction.output: "OUTPUT",
+                    pt.Direction.forward: "FORWARD",
+                }[rule.direction]
+            )
+    for iptables, used in chains.items():
+        for chain in sorted(used):
+            emit.sh(
+                netns_ops.netns_exec_argv(
+                    [
+                        iptables,
+                        "-A",
+                        chain,
+                        "-m",
+                        "conntrack",
+                        "--ctstate",
+                        "ESTABLISHED,RELATED",
+                        "-j",
+                        "ACCEPT",
+                    ],
+                    netns,
+                )
+            )
+    action_map = {
+        pt.Action.allow: "ACCEPT",
+        pt.Action.deny: "DROP",
+        pt.Action.reject: "REJECT",
+    }
+    for rule in group.data.rules:
+        if rule.kind == "masq":
+            iptables = "iptables" if rule.family == pt.Family.ipv4 else "ip6tables"
+            argv = [
+                iptables,
+                "-t",
+                "nat",
+                "-A",
+                "POSTROUTING",
+                "-o",
+                dev,
+                "-j",
+                "MASQUERADE",
+            ]
+            emit.sh(netns_ops.netns_exec_argv(argv, netns))
+            continue
+        if rule.kind != "filter":
             raise ValueError(
                 f"{group.key.name}: rule kind {rule.kind!r} is not a kernel "
                 "rule; a kernel reference may not carry it"
             )
         iptables = "iptables" if rule.family == pt.Family.ipv4 else "ip6tables"
-        argv = [iptables, "-t", "nat", "-A", "POSTROUTING", "-o", dev, "-j", "MASQUERADE"]
-        emit.sh(netns_ops.netns_exec_argv(argv, netns))
+        chain = {
+            pt.Direction.input: "INPUT",
+            pt.Direction.output: "OUTPUT",
+            pt.Direction.forward: "FORWARD",
+        }[rule.direction]
+        proto = rule.protocol.value if rule.protocol is not None else None
+        ports: list[pt.Port | None] = list(rule.ports) if rule.ports else [None]
+        sources: list[str | None] = list(rule.sources) if rule.sources else [None]
+        destinations: list[str | None] = list(rule.destinations) if rule.destinations else [None]
+        for source in sources:
+            for destination in destinations:
+                for port in ports:
+                    argv = [iptables, "-A", chain]
+                    if source is not None:
+                        argv += ["-s", source]
+                    for excluded in rule.excludeSources or []:
+                        argv += ["!", "-s", excluded]
+                    if destination is not None:
+                        argv += ["-d", destination]
+                    if proto is not None:
+                        argv += ["-p", proto]
+                    if port is not None:
+                        if proto not in ("tcp", "udp"):
+                            raise ValueError(f"{group.key.name}: ports require tcp/udp")
+                        argv += [
+                            "--dport",
+                            str(port.from_) if port.from_ == port.to else f"{port.from_}:{port.to}",
+                        ]
+                    argv += ["-j", action_map[rule.action]]
+                    emit.sh(netns_ops.netns_exec_argv(argv, netns))
+    default = group.data.default
+    if default is not None:
+        for direction, chain in (
+            ("input", "INPUT"),
+            ("output", "OUTPUT"),
+            ("forward", "FORWARD"),
+        ):
+            action = getattr(default, direction, None)
+            if action is None:
+                continue
+            for iptables in ("iptables", "ip6tables"):
+                emit.sh(
+                    netns_ops.netns_exec_argv(
+                        [iptables, "-A", chain, "-j", action_map[action]], netns
+                    )
+                )
 
 
 def _masq_families(security_groups: list[pt.SecurityGroupRef], nodes: list[pt.Model]) -> list[str]:
@@ -1620,11 +1847,6 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
     else:
         any_bound = False
         xdp_ports = _xdp_ports(all_bindings)
-        # The IR already carries one `bridge` node with all its ports;
-        # emit the OVS bridge (and its fail-mode) once, not once per
-        # binding. Re-running this per port was only harmless while every
-        # add-br carried --may-exist.
-        seen_bridges: set[str] = set()
         for domain, iface in all_bindings:
             if iface.kind not in _BINDABLE_IFACE_KINDS:
                 continue

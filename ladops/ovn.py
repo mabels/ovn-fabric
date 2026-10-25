@@ -124,6 +124,24 @@ def lr_del_argv(router: str) -> list[str]:
     return [*_NBCTL, "--if-exists", "lr-del", router]
 
 
+def acl_add_argv(switch: str, direction: str, priority: int, match: str, action: str) -> list[str]:
+    return [*_NBCTL, "acl-add", switch, direction, str(priority), match, action]
+
+
+def acl_del_argv(
+    switch: str,
+    direction: str,
+    priority: int | None = None,
+    match: str | None = None,
+) -> list[str]:
+    argv = [*_NBCTL, "acl-del", switch, direction]
+    if priority is not None:
+        argv.append(str(priority))
+    if match is not None:
+        argv.append(match)
+    return argv
+
+
 def lr_route_add_argv(router: str, prefix: str, nexthop: str) -> list[str]:
     # No separate lr_route_del_argv/delete needed: lr_del_argv above
     # already cascades a router's own static routes away with it — a

@@ -35,6 +35,7 @@ import { fnv1a32, macFromAddrsOrName, macFromV4 } from "./addressing.ts";
 import { IPv4, IPv6 } from "./ip.ts";
 import {
   CollisionDomain,
+  type FilterRule,
   type Host,
   type InterfaceKind,
   type InterfaceParent,
@@ -46,7 +47,6 @@ import {
   type RouterEndpointService,
   type RoutingDomain,
   type SecurityGroup,
-  type SecurityGroupRef,
   type Service,
   type XdpIface,
   type XdpMode,
@@ -493,32 +493,93 @@ function kernelRouterSideToIR(
 // (net.securityGroup(), define.ts — including the implicit `masq-<router>`
 // shortcut expansion); this function is pure serialization, it derives
 // nothing.
+function expandFilterRule(rule: FilterRule): Record<string, unknown>[] {
+  const src = rule.sources ?? [];
+  const dst = rule.destinations ?? [];
+  const families = new Set<"ipv4" | "ipv6">();
+  for (const a of [...src, ...dst]) families.add(a.is_ipv4() ? "ipv4" : "ipv6");
+  if (families.size === 0) {
+    families.add("ipv4");
+    families.add("ipv6");
+  }
+  const srcFams = new Set(src.map((a) => (a.is_ipv4() ? "ipv4" : "ipv6")));
+  const dstFams = new Set(dst.map((a) => (a.is_ipv4() ? "ipv4" : "ipv6")));
+  if (srcFams.size > 0 && dstFams.size > 0) {
+    const shared = [...srcFams].some((f) => dstFams.has(f));
+    if (!shared) {
+      throw new Error(
+        "filter rule: sources and destinations have no address family in common",
+      );
+    }
+  }
+  return [...families].map((family) => {
+    if (rule.protocol === "icmp" && family === "ipv6") {
+      throw new Error("filter rule: icmp requires IPv4 selectors");
+    }
+    if (rule.protocol === "icmpv6" && family === "ipv4") {
+      throw new Error("filter rule: icmpv6 requires IPv6 selectors");
+    }
+    return {
+      kind: "filter",
+      direction: rule.direction,
+      action: rule.action,
+      family,
+      ...(src.length > 0
+        ? {
+          sources: src.filter((a) => a.is_ipv4() === (family === "ipv4"))
+            .map((a) => a.to_string()),
+        }
+        : {}),
+      ...(rule.excludeSources && rule.excludeSources.length > 0
+        ? {
+          excludeSources: rule.excludeSources
+            .filter((a) => a.is_ipv4() === (family === "ipv4"))
+            .map((a) => a.to_string()),
+        }
+        : {}),
+      ...(dst.length > 0
+        ? {
+          destinations: dst.filter((a) => a.is_ipv4() === (family === "ipv4"))
+            .map((a) => a.to_string()),
+        }
+        : {}),
+      ...(rule.protocol ? { protocol: rule.protocol } : {}),
+      ...(rule.ports ? { ports: rule.ports.map((p) => ({ ...p })) } : {}),
+      priority: rule.priority ?? 100,
+    };
+  });
+}
+
 function securityGroupToIR(group: SecurityGroup): SecurityGroupNode {
+  const rules: Record<string, unknown>[] = [];
+  for (const rule of group.rules) {
+    if (rule.kind === "masq") {
+      rules.push({ ...rule });
+    } else if (rule.kind === "filter") {
+      rules.push(...expandFilterRule(rule));
+    } else {
+      const externalIp = rule.externalIp.to_s();
+      const logicalIps = rule.logicalIps.map((a) => a.to_string());
+      if (IpValue(externalIp) instanceof Error) {
+        throw new Error(
+          `security group "${group.name}": bad externalIp ${externalIp}`,
+        );
+      }
+      for (const logicalIp of logicalIps) {
+        if (NetworkValue(logicalIp) instanceof Error) {
+          throw new Error(
+            `security group "${group.name}": bad logicalIp ${logicalIp}`,
+          );
+        }
+      }
+      rules.push({ ...rule, externalIp, logicalIps });
+    }
+  }
   return {
     id: `securitygroup:${group.name}`,
     kind: "security.group",
     key: { name: group.name },
-    data: {
-      rules: group.rules.map((rule) =>
-        rule.kind === "masq" ? rule : (() => {
-          const externalIp = rule.externalIp.to_s();
-          const logicalIps = rule.logicalIps.map((a) => a.to_string());
-          if (IpValue(externalIp) instanceof Error) {
-            throw new Error(
-              `security group "${group.name}": bad externalIp ${externalIp}`,
-            );
-          }
-          for (const logicalIp of logicalIps) {
-            if (NetworkValue(logicalIp) instanceof Error) {
-              throw new Error(
-                `security group "${group.name}": bad logicalIp ${logicalIp}`,
-              );
-            }
-          }
-          return { ...rule, externalIp, logicalIps };
-        })()
-      ),
-    },
+    data: { rules } as unknown as SecurityGroupNode["data"],
   };
 }
 
@@ -720,10 +781,67 @@ function computeOvnSecurityGroups(network: NetworkDefinition): {
 } {
   const byRouter = new Map<string, SecurityGroup<"ovn">>();
   for (const router of network.allRouters) {
-    const rules: OvnSnatRule[] = [];
+    const rules: (OvnSnatRule | FilterRule)[] = [];
     const name = `masq-${router.name}-ovn`;
     for (const endpoint of router.endpoints) {
       for (const service of endpoint.services ?? []) {
+        const denyInput = service.kind === "ovn.ipv4.block-ingress" ||
+          service.kind === "ovn.ipv6.block-ingress";
+        if (denyInput) {
+          const isV4 = service.kind === "ovn.ipv4.block-ingress";
+          const protectedIps = new Set<string>();
+          const externalNet = endpoint.ipaddrs.find((a) => a.is_ipv4() === isV4)
+            ?.network().to_string();
+          for (const other of router.endpoints) {
+            if (other.name === endpoint.name) continue;
+            for (const addr of other.ipaddrs) {
+              if (addr.is_ipv4() !== isV4) continue;
+              const net = addr.network().to_string();
+              if (net !== externalNet) protectedIps.add(net);
+            }
+          }
+          if (protectedIps.size === 0) continue;
+          const destinations = [...protectedIps].map((net) =>
+            isV4 ? IPv4.parse(net) : IPv6.parse(net)
+          );
+          // Every rule is stateful: an explicit outbound allow commits
+          // the control plane's own connections so their replies are
+          // ESTABLISHED. The inbound deny then only has to drop new
+          // connections; established replies hit the group's global
+          // conntrack allow.
+          rules.push({
+            kind: "filter",
+            direction: "output",
+            action: "allow",
+            priority: 200,
+          });
+          for (const allow of service.allow ?? []) {
+            const sources = (allow.sources ?? []).filter(
+              (a) => a.is_ipv4() === isV4,
+            );
+            rules.push({
+              kind: "filter",
+              direction: "input",
+              action: "allow",
+              ...(sources.length > 0 ? { sources } : {}),
+              destinations,
+              ...(allow.protocol ? { protocol: allow.protocol } : {}),
+              ...(allow.ports
+                ? { ports: allow.ports.map((p) => ({ ...p })) }
+                : {}),
+              priority: 200,
+            });
+          }
+          rules.push({
+            kind: "filter",
+            direction: "input",
+            action: "deny",
+            excludeSources: destinations,
+            destinations,
+            priority: 100,
+          });
+          continue;
+        }
         if (
           service.kind !== "ovn.ipv4.masq" && service.kind !== "ovn.ipv6.masq"
         ) continue;
@@ -766,7 +884,7 @@ function computeOvnSecurityGroups(network: NetworkDefinition): {
 
 function routerToIR(
   router: Router,
-  securityGroups: readonly SecurityGroupRef[] = [],
+  securityGroups: readonly { render: "kernel" | "ovn"; name: string }[] = [],
 ): OvnLrNode {
   return {
     id: `ovnrouter:${router.name}`,
@@ -884,7 +1002,9 @@ function resolveIpv6RaConfigs(
       continue;
     }
     if (
-      service.kind === "ovn.ipv4.masq" || service.kind === "ovn.ipv6.masq"
+      service.kind === "ovn.ipv4.masq" || service.kind === "ovn.ipv6.masq" ||
+      service.kind === "ovn.ipv4.block-ingress" ||
+      service.kind === "ovn.ipv6.block-ingress"
     ) {
       continue;
     }
@@ -1678,8 +1798,21 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
     nodes[node.id] = node;
   }
   for (const router of network.allRouters) {
-    const group = ovnGroups.get(router.name);
-    const routerNode = routerToIR(router, group ? [group] : []);
+    const implicit = ovnGroups.get(router.name);
+    const endpointGroups = router.endpoints.flatMap((endpoint) =>
+      (endpoint.securityGroups ?? []).map((g) => ({
+        render: g.render,
+        name: g.name,
+      }))
+    );
+    const refs = [
+      ...endpointGroups,
+      ...(implicit ? [{ render: implicit.render, name: implicit.name }] : []),
+    ];
+    const routerNode = routerToIR(
+      router,
+      refs as readonly { render: "kernel" | "ovn"; name: string }[],
+    );
     nodes[routerNode.id] = routerNode;
     for (const endpoint of router.endpoints) {
       if (endpoint.kind !== "ovn") {

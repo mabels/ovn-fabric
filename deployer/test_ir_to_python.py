@@ -101,8 +101,13 @@ class _OpEmitter(Emitter):
         self.scripts: dict[str, str] = {}
 
     def sh(
-        self, argv: Sequence[str | Ref], background: bool = False, optional: bool = False
+        self,
+        argv: Sequence[str | Ref],
+        background: bool = False,
+        optional: bool | None = None,
     ) -> None:
+        if optional is None:
+            optional = self.action == "delete"
         self.commands.append(list(argv))
         self.optional.append(optional)
         line = " ".join(_shell_token(token) for token in argv) + (" &" if background else "")
