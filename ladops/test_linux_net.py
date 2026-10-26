@@ -60,14 +60,16 @@ FAKE_ROUTE6: list[JsonObject] = [
 ]
 
 
-def _fake_run_ip_json(args: list[str], netns: str | None) -> list[JsonObject]:
+def _fake_run_ip_json(
+    args: list[str], netns: str | None, pid: int | None = None
+) -> list[JsonObject]:
     if args == ["link", "show"]:
         return FAKE_LINK
     if args == ["addr", "show"]:
         return FAKE_ADDR
-    if args == ["route", "show"]:
+    if args == ["-4", "route", "show", "table", "all"]:
         return FAKE_ROUTE4
-    if args == ["-6", "route", "show"]:
+    if args == ["-6", "route", "show", "table", "all"]:
         return FAKE_ROUTE6
     raise AssertionError(f"unexpected ip invocation: {args}")
 
@@ -119,7 +121,17 @@ class ListTest(unittest.TestCase):
         v6 = mod.list_routes(None, "-6")
         self.assertEqual(
             v4,
-            [{"prefix": "default", "dev": "ens19", "nexthop": "192.168.129.1", "family": "ipv4"}],
+            [
+                {
+                    "prefix": "default",
+                    "dev": "ens19",
+                    "nexthop": "192.168.129.1",
+                    "family": "ipv4",
+                    "metric": None,
+                    "table": "main",
+                    "protocol": None,
+                }
+            ],
         )
         self.assertEqual(
             v6,
@@ -129,8 +141,19 @@ class ListTest(unittest.TestCase):
                     "dev": "ens19",
                     "nexthop": "fd00:192:168:129::1",
                     "family": "ipv6",
+                    "metric": None,
+                    "table": "main",
+                    "protocol": None,
                 },
-                {"prefix": "fe80::/64", "dev": "ens19", "nexthop": "ens19", "family": "ipv6"},
+                {
+                    "prefix": "fe80::/64",
+                    "dev": "ens19",
+                    "nexthop": "ens19",
+                    "family": "ipv6",
+                    "metric": None,
+                    "table": "main",
+                    "protocol": None,
+                },
             ],
         )
 

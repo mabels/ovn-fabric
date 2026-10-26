@@ -48,6 +48,21 @@ _RECONCILERS: dict[str, ReconcileFn] = {
 }
 
 
+def _iface_names(node: JsonObject) -> set[str]:
+    data = node.get("data", {})
+    if not isinstance(data, dict):
+        return set()
+    attrs = ("name", "ifname", "iface", "interface", "device", "dev")
+    names = {value for key in attrs for value in (data.get(key),) if isinstance(value, str)}
+    key = node.get("key", {})
+    if isinstance(key, dict):
+        for attr in attrs:
+            value = key.get(attr)
+            if isinstance(value, str):
+                names.add(value)
+    return names
+
+
 def _serialize(nodes: dict[str, JsonObject], nice: bool) -> str:
     # A JSON array of nodes, not an object keyed by node id: every node
     # already carries its own "id" field, so a dict wrapper would just
@@ -98,6 +113,20 @@ def main(argv: list[str] | None = None) -> int:
         help="reconciler(s) to run, repeatable (default: all known kinds)",
     )
     parser.add_argument(
+        "--exclude",
+        action="append",
+        choices=sorted(_RECONCILERS),
+        default=[],
+        help="reconciler kind(s) to exclude (repeatable)",
+    )
+    parser.add_argument(
+        "--exclude-iface",
+        action="append",
+        default=["lo"],
+        metavar="IFACE",
+        help="exclude nodes whose interface name matches (repeatable; default: lo)",
+    )
+    parser.add_argument(
         "--host",
         default=None,
         help="override the discovered hostname used as every node's base scope "
@@ -119,7 +148,13 @@ def main(argv: list[str] | None = None) -> int:
     scope = {"host": args.host if args.host is not None else host_hostname()}
 
     kinds = args.kind if args.kind else sorted(_RECONCILERS)
+    kinds = [kind for kind in kinds if kind not in set(args.exclude)]
     nodes = reconcile_all(kinds, scope, strict=bool(args.kind))
+    if args.exclude_iface:
+        excluded = set(args.exclude_iface)
+        nodes = {
+            node_id: node for node_id, node in nodes.items() if not _iface_names(node) & excluded
+        }
     serialized = _serialize(nodes, args.nice)
 
     if args.output:

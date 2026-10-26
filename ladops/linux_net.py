@@ -23,14 +23,24 @@ from __future__ import annotations
 
 import json
 import shlex
+import subprocess
 from typing import Any
 
 from . import JsonObject
+from .netns import list_netns
 from .netns import run as run_in_netns
 
 
-def _run_ip_json(args: list[str], netns: str | None) -> Any:
-    out = run_in_netns(["ip", "-j", *args], netns).stdout
+def _run_ip_json(args: list[str], netns: str | None, pid: int | None = None) -> Any:
+    if pid is not None:
+        out = subprocess.run(
+            ["nsenter", "-t", str(pid), "-n", "--", "ip", "-j", *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout
+    else:
+        out = run_in_netns(["ip", "-j", *args], netns).stdout
     return json.loads(out)
 
 
@@ -66,13 +76,79 @@ def list_links(netns: str | None) -> list[JsonObject]:
     ]
 
 
-def list_addrs(netns: str | None) -> list[JsonObject]:
+def find_veth_peer(ifname: str) -> JsonObject | None:
+    """The OTHER end of a veth pair, wherever it currently lives.
+
+    The OVS-side leg is in the root namespace; the netns-side leg has the
+    MAC and the peer name the IR cares about. `ip -j link` gives us the
+    peer ifindex via `link_index`; scan the global namespace plus every
+    named netns for the interface with that ifindex.
+    """
+    try:
+        rows = _run_ip_json(["-d", "link", "show", ifname], None)
+    except subprocess.CalledProcessError:
+        return None
+    if not rows:
+        return None
+    link = rows[0]
+    if link.get("linkinfo", {}).get("info_kind") != "veth":
+        return None
+    peer_index = link.get("link_index")
+    if peer_index is None:
+        return None
+    for netns in [None, *list_netns()]:
+        for row in _run_ip_json(["link", "show"], netns):
+            if row.get("ifindex") == peer_index:
+                return {
+                    "netns": netns,
+                    "ifname": row["ifname"],
+                    "mac": row.get("address", ""),
+                }
+    return None
+
+
+def list_links_detail(netns: str | None, pid: int | None = None) -> list[JsonObject]:
+    """Raw link facts, including ifindex/link_index/kind/mac/master."""
+    out: list[JsonObject] = []
+    for entry in _run_ip_json(["-d", "link", "show"], netns, pid):
+        info = entry.get("linkinfo") or {}
+        link_type = info.get("info_kind") or entry.get("link_type", "other")
+        if link_type == "ether":
+            link_type = "physical"
+        elif link_type not in {
+            "physical",
+            "vlan",
+            "veth",
+            "bridge",
+            "internal",
+            "patch",
+            "tun",
+            "loopback",
+        }:
+            link_type = "other"
+        out.append(
+            {
+                "ifname": entry["ifname"],
+                "ifindex": int(entry["ifindex"]),
+                "linkIndex": entry.get("link_index"),
+                "kind": link_type,
+                "mac": entry.get("address"),
+                "mtu": entry.get("mtu"),
+                "master": entry.get("master"),
+                "adminUp": "UP" in entry.get("flags", []),
+                "operState": entry.get("operstate"),
+            }
+        )
+    return out
+
+
+def list_addrs(netns: str | None, pid: int | None = None) -> list[JsonObject]:
     # Deliberately unfiltered — every address including fe80:: link-local
     # ones is returned. Reporting a complete, faithful record of what's
     # real is this module's job; deciding what's relevant (autoconfigured
     # vs. topology-managed) is the caller's.
     out = []
-    for entry in _run_ip_json(["addr", "show"], netns):
+    for entry in _run_ip_json(["addr", "show"], netns, pid):
         ifname = entry["ifname"]
         for a in entry.get("addr_info", []):
             addr = f"{a['local']}/{a['prefixlen']}"
@@ -82,15 +158,19 @@ def list_addrs(netns: str | None) -> list[JsonObject]:
     return out
 
 
-def list_routes(netns: str | None, family: str) -> list[JsonObject]:
+def list_routes(netns: str | None, family: str, pid: int | None = None) -> list[JsonObject]:
     # Family comes from which command produced the entry, not from
     # sniffing the value for ":" — the destination is literally the bare
     # string "default" for BOTH families (confirmed against a real
     # router's `ip route show`/`ip -6 route show`), so string-sniffing
     # silently mislabels every v6 default route as v4.
-    args = ["-6", "route", "show"] if family == "-6" else ["route", "show"]
+    args = (
+        ["-6", "route", "show", "table", "all"]
+        if family == "-6"
+        else ["-4", "route", "show", "table", "all"]
+    )
     out = []
-    for r in _run_ip_json(args, netns):
+    for r in _run_ip_json(args, netns, pid):
         dev = r.get("dev", "unknown")
         out.append(
             {
@@ -98,6 +178,9 @@ def list_routes(netns: str | None, family: str) -> list[JsonObject]:
                 "dev": dev,
                 "nexthop": r.get("gateway") or dev,
                 "family": "ipv6" if family == "-6" else "ipv4",
+                "metric": r.get("metric"),
+                "table": str(r["table"]) if "table" in r else "main",
+                "protocol": r.get("protocol"),
             }
         )
     return out

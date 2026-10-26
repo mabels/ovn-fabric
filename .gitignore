@@ -7,3 +7,5 @@ __pycache__/
 # as source (same policy as reconciler/ir_types/README.md).
 protocol/generated.py
 protocol/ir-nodes.schema.json
+protocol/raw_generated.py
+protocol/raw-snapshot.schema.json

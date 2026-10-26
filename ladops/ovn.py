@@ -51,13 +51,119 @@ _NBCTL = ["ovn-nbctl"]
 _SBCTL = ["ovn-sbctl"]
 
 
+def _as_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, str)]
+    return []
+
+
+def list_logical_switches() -> list[JsonObject]:
+    return [
+        {
+            "name": row["name"],
+            "external_ids": row.get("external_ids", {}),
+        }
+        for row in list_table(_NBCTL, "Logical_Switch")
+    ]
+
+
+def list_logical_routers() -> list[JsonObject]:
+    return [
+        {
+            "name": row["name"],
+            "options": row.get("options", {}),
+            "external_ids": row.get("external_ids", {}),
+        }
+        for row in list_table(_NBCTL, "Logical_Router")
+    ]
+
+
+def list_lsps() -> list[JsonObject]:
+    switch_by_port_uuid: dict[str, str] = {}
+    for switch in list_table(_NBCTL, "Logical_Switch"):
+        for port_uuid in switch["ports"]:
+            switch_by_port_uuid[port_uuid] = switch["name"]
+    return [
+        {
+            "switch": switch_by_port_uuid[port["_uuid"]],
+            "name": port["name"],
+            "type": port.get("type", ""),
+            "addresses": _as_list(port.get("addresses")),
+            "options": port.get("options", {}),
+            "external_ids": port.get("external_ids", {}),
+        }
+        for port in list_table(_NBCTL, "Logical_Switch_Port")
+        if port["_uuid"] in switch_by_port_uuid
+    ]
+
+
+def list_nats() -> list[JsonObject]:
+    router_by_nat_uuid: dict[str, str] = {}
+    for router in list_table(_NBCTL, "Logical_Router"):
+        for nat_uuid in _as_list(router.get("nat")):
+            router_by_nat_uuid[nat_uuid] = router["name"]
+    return [
+        {
+            "router": router_by_nat_uuid[row["_uuid"]],
+            "uuid": row["_uuid"],
+            "type": row.get("type", ""),
+            "externalIp": row.get("external_ip", ""),
+            "logicalIp": row.get("logical_ip", ""),
+            "externalMac": row.get("external_mac", ""),
+            "logicalPort": row.get("logical_port", ""),
+            "external_ids": row.get("external_ids", {}),
+        }
+        for row in list_table(_NBCTL, "NAT")
+        if row["_uuid"] in router_by_nat_uuid
+    ]
+
+
+def list_acls() -> list[JsonObject]:
+    switch_by_acl_uuid: dict[str, str] = {}
+    for switch in list_table(_NBCTL, "Logical_Switch"):
+        for acl_uuid in _as_list(switch.get("acls")):
+            switch_by_acl_uuid[acl_uuid] = switch["name"]
+    return [
+        {
+            "switch": switch_by_acl_uuid[row["_uuid"]],
+            "uuid": row["_uuid"],
+            "direction": row.get("direction", ""),
+            "priority": int(row.get("priority", 0)),
+            "match": row.get("match", ""),
+            "action": row.get("action", ""),
+            "external_ids": row.get("external_ids", {}),
+        }
+        for row in list_table(_NBCTL, "ACL")
+        if row["_uuid"] in switch_by_acl_uuid
+    ]
+
+
+def list_static_routes() -> list[JsonObject]:
+    router_by_route_uuid: dict[str, str] = {}
+    for router in list_table(_NBCTL, "Logical_Router"):
+        for route_uuid in _as_list(router.get("static_routes")):
+            router_by_route_uuid[route_uuid] = router["name"]
+    return [
+        {
+            "router": router_by_route_uuid[route["_uuid"]],
+            "prefix": route["ip_prefix"],
+            "nexthop": route["nexthop"],
+            "external_ids": route.get("external_ids", {}),
+        }
+        for route in list_table(_NBCTL, "Logical_Router_Static_Route")
+        if route["_uuid"] in router_by_route_uuid
+    ]
+
+
 def list_lrps() -> list[JsonObject]:
     """Every real Logical_Router_Port, joined back to its owning
     router's name (the join lives here, not in the reconciler, since
     it's part of "what's really there," not IR shaping)."""
     router_name_by_port_uuid: dict[str, str] = {}
     for router in list_table(_NBCTL, "Logical_Router"):
-        for port_uuid in router["ports"]:
+        for port_uuid in _as_list(router["ports"]):
             router_name_by_port_uuid[port_uuid] = router["name"]
 
     lrps = []
@@ -70,8 +176,10 @@ def list_lrps() -> list[JsonObject]:
                 "router": router_name,
                 "name": port["name"],
                 "mac": port["mac"],
-                "networks": port["networks"],
-                "gatewayChassis": port["gateway_chassis"],
+                "networks": _as_list(port["networks"]),
+                "gatewayChassis": _as_list(port["gateway_chassis"]),
+                "ipv6RaConfigs": port.get("ipv6_ra_configs", {}),
+                "external_ids": port.get("external_ids", {}),
             }
         )
     return lrps
@@ -122,6 +230,16 @@ def lr_del_argv(router: str) -> list[str]:
     # northbound schema — LRPs are strongly referenced from their
     # owning router) — no separate lrp_del_argv() call needed per port.
     return [*_NBCTL, "--if-exists", "lr-del", router]
+
+
+def set_lr_external_id_argv(router: str, key: str, value: str) -> list[str]:
+    return [
+        *_NBCTL,
+        "set",
+        "Logical_Router",
+        router,
+        f"external_ids:{key}={value}",
+    ]
 
 
 def acl_add_argv(switch: str, direction: str, priority: int, match: str, action: str) -> list[str]:

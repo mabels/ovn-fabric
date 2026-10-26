@@ -735,7 +735,7 @@ function canonical(value: JsonValue): string {
 // Two defs may share one shape (every `{name}` key does) — each keeps its
 // own name at the top level. Only a NESTED copy of such a shape has no
 // single name to point at, and that throws rather than picking one.
-function refNamedShapes(
+export function refNamedShapes(
   shapes: Readonly<Record<string, JsonSchema>>,
 ): Record<string, JsonSchema> {
   const namesByShape = new Map<string, string[]>();
@@ -792,7 +792,7 @@ function nodeSchema(kind: string, keyDef: string, dataDef: string) {
 // One named shape's own JSON Schema — without the `$schema` marker
 // ArkType puts on every root (a nested copy carries none, so it would
 // never compare equal to its own definition).
-function shape(schema: { toJsonSchema(): unknown }): JsonSchema {
+export function shape(schema: { toJsonSchema(): unknown }): JsonSchema {
   const { $schema: _dialect, ...rest } = schema.toJsonSchema() as {
     readonly $schema?: string;
     readonly [key: string]: JsonValue | undefined;

@@ -1,45 +1,25 @@
-# reconciler/ovn/reconcile.py — shapes ladops.ovn's real LRP facts into
-# ovn.lrp IR nodes.
-#
-# Thin on purpose: every "how do I actually talk to ovn-nbctl" concern —
-# running `-f json list <table>`, decoding OVSDB atoms, joining a port
-# back to its owning router — lives in ladops/ovn.py, not here. This
-# module's only job is IR shaping.
-#
-# OVN's northbound DB is one cluster-wide store, not namespace-scoped
-# like addr/route/iptables are — reconcile(scope, netns) still takes the
-# same (scope, netns) shape every reconciler does, so cli.py's
-# orchestration loop can call every kind uniformly, but this only
-# produces nodes on the netns=None (global) pass, same pattern as
-# reconciler/host/reconcile.py.
-#
-# `id` extends the ADR's node-kind table (`ovnrouter:<scope>|lrp`) with
-# the port's own name as the local identity (`ovnrouter:<scope>|lrp:
-# <port-name>`) — the table's literal key omits it, but a router
-# legitimately owns more than one LRP (confirmed on the real router:
-# router-home alone has 4 — lrp-home, lrp-home-bb, and two
-# backbone-extra ports), so the bare form collides every LRP under the
-# same router onto one key.
-#
-# `key` is scoped by the owning OVN logical router (`{"ovnrouter":
-# name}`, named precisely — not the bare "router" — once KernelRouter
-# (types.ts) made "router" ambiguous between an OVN router and a real
-# Linux netns; matches src/protocol.ts's OvnLrpKey/RouteKey, confirmed
-# live 2026-08-12), not by `scope`/host — an ovn.lrp's real container is
-# the router it belongs to, not the physical host (this deployment only
-# has one physical host, but OVN's own NB DB isn't host-partitioned the
-# way addr/route/iptables state is). `scope` is accepted only for
-# calling-convention uniformity with every other reconciler; unused
-# here, same as before this envelope redesign.
-#
-# Still deferred, matching the ADR's own "Consequences" section: only
-# each router's LRPs are reconciled here, not logical switches/ports —
-# those aren't in the node-kind table yet.
-
 from __future__ import annotations
 
 from ladops import JsonObject
-from ladops.ovn import list_lrps
+from ladops.ovn import (
+    list_logical_routers,
+    list_logical_switches,
+    list_lrps,
+    list_lsps,
+    list_static_routes,
+)
+
+
+def _tag(external_ids: JsonObject, key: str) -> str | None:
+    value = external_ids.get(f"ovn-fabric:{key}")
+    return value if isinstance(value, str) else None
+
+
+def _security_groups(external_ids: JsonObject) -> list[JsonObject]:
+    raw = _tag(external_ids, "securityGroups")
+    if not raw:
+        return []
+    return [{"render": "ovn", "name": name} for name in raw.split(",") if name]
 
 
 def reconcile(scope: JsonObject, netns: str | None = None) -> dict[str, JsonObject]:
@@ -47,17 +27,76 @@ def reconcile(scope: JsonObject, netns: str | None = None) -> dict[str, JsonObje
         return {}
 
     nodes: dict[str, JsonObject] = {}
+
+    for switch in list_logical_switches():
+        id_ = f"ls:{switch['name']}"
+        nodes[id_] = {
+            "id": id_,
+            "kind": "ovn.ls",
+            "key": {"name": switch["name"]},
+            # Host bindings are not visible from the northbound DB; the
+            # host-side reconciler (OVS/bridge) owns that half.
+            "data": {"interfaces": []},
+        }
+
+    for router in list_logical_routers():
+        id_ = f"ovnrouter:{router['name']}"
+        options = router.get("options", {})
+        security_groups = _security_groups(router["external_ids"])
+        nodes[id_] = {
+            "id": id_,
+            "kind": "ovn.lr",
+            "key": {"name": router["name"]},
+            "data": {
+                "options": (
+                    {"mac_binding_age_threshold": options["mac_binding_age_threshold"]}
+                    if "mac_binding_age_threshold" in options
+                    else {}
+                ),
+                **({"securityGroups": security_groups} if security_groups else {}),
+            },
+        }
+
+    lsp_by_router_port: dict[str, str] = {}
+    for lsp in list_lsps():
+        router_port = lsp["options"].get("router-port")
+        if router_port:
+            lsp_by_router_port[router_port] = lsp["switch"]
+
     for lrp in list_lrps():
         id_ = f"ovnrouter:{lrp['router']}|lrp:{lrp['name']}"
+        ls_name = lsp_by_router_port.get(lrp["name"])
+        if ls_name is None:
+            continue
+        gateway = _tag(lrp["external_ids"], "gatewayChassis")
+        ra = lrp.get("ipv6RaConfigs") or {}
         nodes[id_] = {
             "id": id_,
             "kind": "ovn.lrp",
             "key": {"ovnrouter": lrp["router"], "name": lrp["name"]},
             "data": {
-                "name": lrp["name"],
+                "l2Segment": f"ls:{ls_name}",
+                "addresses": list(lrp["networks"]),
                 "mac": lrp["mac"],
-                "networks": lrp["networks"],
-                "gatewayChassis": lrp["gatewayChassis"],
+                **({"gatewayChassis": gateway} if gateway else {}),
+                **({"ipv6RaConfigs": ra} if ra else {}),
             },
         }
+
+    for route in list_static_routes():
+        prefix = route["prefix"]
+        kind = "ipv6.route" if ":" in prefix else "ipv4.route"
+        id_ = f"ovnrouter:{route['router']}|route:{prefix}"
+        nodes[id_] = {
+            "id": id_,
+            "kind": kind,
+            "key": {"ovnrouter": route["router"], "prefix": prefix},
+            "data": {
+                "nexthop": route["nexthop"],
+                "securityGroups": _security_groups(route["external_ids"]),
+                "domain": _tag(route["external_ids"], "domain") or "live",
+                "metric": int(_tag(route["external_ids"], "metric") or 0),
+            },
+        }
+
     return nodes

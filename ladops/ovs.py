@@ -27,6 +27,59 @@ from .ovsdb import list_table
 _VSCTL = ["ovs-vsctl"]
 
 
+def _uuids(value: object) -> list[str]:
+    # OVSDB decodes a one-element set as a bare scalar, not a list.
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [v for v in value if isinstance(v, str)]
+    return []
+
+
+def list_bridge_ports() -> list[JsonObject]:
+    """Every OVS bridge port, joined to its bridge and interface facts."""
+    iface_by_uuid = {row["_uuid"]: row for row in list_table(_VSCTL, "Interface")}
+    bridge_by_port_uuid: dict[str, str] = {}
+    for bridge in list_table(_VSCTL, "Bridge"):
+        for port_uuid in _uuids(bridge["ports"]):
+            bridge_by_port_uuid[port_uuid] = bridge["name"]
+    result: list[JsonObject] = []
+    for port in list_table(_VSCTL, "Port"):
+        bridge_name = bridge_by_port_uuid.get(port["_uuid"])
+        if bridge_name is None:
+            continue
+        for iface_uuid in _uuids(port["interfaces"]):
+            iface = iface_by_uuid.get(iface_uuid)
+            if iface is None:
+                continue
+            result.append(
+                {
+                    "bridge": bridge_name,
+                    "port": port["name"],
+                    "name": iface["name"],
+                    "type": iface.get("type", ""),
+                    "mac": iface.get("mac_in_use", ""),
+                    "options": iface.get("options", {}),
+                    "external_ids": iface.get("external_ids", {}),
+                }
+            )
+    return result
+
+
+def list_bridge_mappings() -> dict[str, str]:
+    """bridge -> OVN network name from Open_vSwitch.ovn-bridge-mappings."""
+    rows = list_table(_VSCTL, "Open_vSwitch")
+    if not rows:
+        return {}
+    raw = rows[0].get("external_ids", {}).get("ovn-bridge-mappings", "")
+    mappings: dict[str, str] = {}
+    for item in raw.split(","):
+        network, sep, bridge = item.partition(":")
+        if sep and network and bridge:
+            mappings[bridge] = network
+    return mappings
+
+
 def list_interfaces() -> list[JsonObject]:
     return [
         {

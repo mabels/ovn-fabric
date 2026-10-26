@@ -22,6 +22,7 @@ import { pathToFileURL } from "node:url";
 
 import { toIR } from "./ir.ts";
 import { buildJsonSchema } from "./protocol.ts";
+import { buildRawJsonSchema } from "./raw.ts";
 import { parseRuntimeArgs, setRuntimeArgs } from "./runtime.ts";
 import type { NetworkDefinition } from "./define.ts";
 import type { Host, InterfaceKind } from "./types.ts";
@@ -213,6 +214,8 @@ const generateIr = command({
 const BUILD_VENV = ".venv-build";
 const SCHEMA_PATH = "protocol/ir-nodes.schema.json";
 const GENERATED_PY_PATH = "protocol/generated.py";
+const RAW_SCHEMA_PATH = "protocol/raw-snapshot.schema.json";
+const RAW_GENERATED_PY_PATH = "protocol/raw_generated.py";
 
 async function pathExists(path: string): Promise<boolean> {
   try {
@@ -294,6 +297,27 @@ const generatePytypes = command({
       "--disable-timestamp",
     ]);
     console.error(`wrote ${GENERATED_PY_PATH}`);
+
+    const rawSchema = buildRawJsonSchema();
+    await Deno.writeTextFile(
+      RAW_SCHEMA_PATH,
+      JSON.stringify(rawSchema, null, 2) + "\n",
+    );
+    console.error(`wrote ${RAW_SCHEMA_PATH}`);
+    await runCommand(codegen, [
+      "--input",
+      RAW_SCHEMA_PATH,
+      "--input-file-type",
+      "jsonschema",
+      "--output",
+      RAW_GENERATED_PY_PATH,
+      "--output-model-type",
+      "dataclasses.dataclass",
+      "--target-python-version",
+      "3.11",
+      "--disable-timestamp",
+    ]);
+    console.error(`wrote ${RAW_GENERATED_PY_PATH}`);
   },
 });
 

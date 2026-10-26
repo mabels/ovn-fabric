@@ -681,6 +681,14 @@ def _emit_router(
 
     emit.comment(f"# --- router: {router} ---")
     emit.sh(ovn_ops.lr_add_argv(router))
+    if lr is not None and lr.data.securityGroups:
+        emit.sh(
+            ovn_ops.set_lr_external_id_argv(
+                router,
+                "ovn-fabric:securityGroups",
+                ",".join(ref.name for ref in lr.data.securityGroups),
+            )
+        )
     # The router's own options (its ovn.lr node). lr-del cascades them
     # away with the router — no delete twin.
     if lr is not None:
