@@ -30,11 +30,21 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--emit",
-        choices=["python"],
-        default="python",
-        help="the output format — only `python` remains (the all-in-one generated deployer; "
-        "pick what it does with --action/--cluster/--host/--ovn-purge when you run it). "
-        "Kept so existing `--emit python` invocations keep working",
+        choices=["python", "pex"],
+        default="pex",
+        help="output format; both now produce one PEX executable. `python` is "
+        "kept as a legacy alias so existing pipelines keep working",
+    )
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="PEX output path (or - for stdout); default dist/ovn-fabric-deployer, "
+        "or stdout when piped",
+    )
+    parser.add_argument(
+        "--no-compress",
+        action="store_true",
+        help="store PEX zip entries uncompressed",
     )
     args = parser.parse_args(argv)
 
@@ -44,8 +54,43 @@ def main(argv: list[str] | None = None) -> int:
         with open(args.ir_path) as f:
             raw_nodes = json.load(f)
     nodes = hydrate_nodes(raw_nodes)
+    source = generate_python_deployer(nodes)
 
-    print(generate_python_deployer(nodes))
+    import shutil
+    import tempfile
+    from pathlib import Path
+
+    from ovn_fabric.bundle import build_pex, source_root
+
+    root = source_root()
+    stream = args.output == "-" or (args.output is None and not sys.stdout.isatty())
+    temp_dir: Path | None = None
+    if stream:
+        temp_dir = Path(tempfile.mkdtemp(prefix="ovn-fabric-deployer-"))
+        output = temp_dir / "ovn-fabric-deployer"
+    else:
+        output = Path(args.output or "dist/ovn-fabric-deployer")
+        if not output.is_absolute():
+            output = root / output
+        output.parent.mkdir(parents=True, exist_ok=True)
+
+    build_pex(
+        output,
+        "generated_deployer:main",
+        extra_files={"generated_deployer.py": source},
+        no_compress=args.no_compress,
+    )
+    if stream:
+        assert temp_dir is not None
+        try:
+            sys.stdout.buffer.write(output.read_bytes())
+            sys.stdout.buffer.flush()
+        except BrokenPipeError:
+            return 0
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+    else:
+        print(output)
     return 0
 
 

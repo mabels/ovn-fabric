@@ -122,14 +122,15 @@ const site = rt.env["SITE"] ?? "hh"; // SITE=... in the environment
 npx -p @adviser/ovn-fabric ovn-fabric generate-ir --runtime debug=1 topology.ts
 ```
 
-Then hand the IR to the Python deployer, which emits the deployer script:
+Then hand the IR to the Python deployer, which builds one executable PEX:
 
 ```sh
 npx -p @adviser/ovn-fabric ovn-fabric generate-ir topology.ts \
   | python3 -m deployer.cli - > install.py
+chmod +x install.py
 ```
 
-`install.py` needs only `python3` on the target. It holds the cluster-wide
+`install.py` is a single-file PEX and needs only `python3` on the target. It holds the cluster-wide
 OVN pass and every host's own pass, for both directions; pick what runs:
 
 ```sh

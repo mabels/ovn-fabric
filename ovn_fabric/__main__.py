@@ -107,13 +107,11 @@ def _build(argv: list[str]) -> int:
         parser.error("build must run from the source checkout, not from the bundled command")
 
     root = _source_root()
-    pex = _ensure_pex(root)
+    from ovn_fabric.bundle import build_pex
 
     stream = args.output == "-" or (args.output is None and not sys.stdout.isatty())
     temp_output: Path | None = None
     if stream:
-        # The output file must NOT exist: pex appends its bootstrap to an
-        # existing path in a way that corrupts the zipapp header.
         temp_dir = Path(tempfile.mkdtemp(prefix="ovn-fabric-pex-"))
         temp_output = temp_dir / "ovn-fabric"
         output = temp_output
@@ -123,40 +121,12 @@ def _build(argv: list[str]) -> int:
             output = root / output
         output.parent.mkdir(parents=True, exist_ok=True)
 
-    # PEX source directories are ROOTS whose contents land at the archive
-    # root; passing package dirs directly would collide their __init__.py.
-    # Stage the package directories under one root instead.
-    staging = Path(tempfile.mkdtemp(prefix="ovn-fabric-pex-"))
-    try:
-        for package in PACKAGES:
-            shutil.copytree(
-                root / package,
-                staging / package,
-                ignore=shutil.ignore_patterns("__pycache__", "test_*.py"),
-            )
-        cmd = [
-            pex,
-            "-D",
-            str(staging),
-            "-m",
-            "ovn_fabric.__main__:main",
-            "-o",
-            str(output),
-            "--python-shebang",
-            args.python_shebang,
-        ]
-        if args.no_compress:
-            cmd.append("--no-compress")
-        subprocess.run(
-            cmd,
-            check=True,
-            # pex prints the output path on stdout; keep stdout clean for
-            # the streamed artifact.
-            stdout=sys.stderr if stream else None,
-        )
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
-
+    build_pex(
+        output,
+        "ovn_fabric.__main__:main",
+        python_shebang=args.python_shebang,
+        no_compress=args.no_compress,
+    )
     if stream:
         assert temp_output is not None
         try:

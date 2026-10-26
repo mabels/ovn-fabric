@@ -11,7 +11,7 @@ from ladops.ovn import (
 
 
 def _tag(external_ids: JsonObject, key: str) -> str | None:
-    value = external_ids.get(f"ovn-fabric:{key}")
+    value = external_ids.get(f"ovn-fabric.{key}")
     return value if isinstance(value, str) else None
 
 

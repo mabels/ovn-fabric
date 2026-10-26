@@ -685,7 +685,7 @@ def _emit_router(
         emit.sh(
             ovn_ops.set_lr_external_id_argv(
                 router,
-                "ovn-fabric:securityGroups",
+                "ovn-fabric.securityGroups",
                 ",".join(ref.name for ref in lr.data.securityGroups),
             )
         )
