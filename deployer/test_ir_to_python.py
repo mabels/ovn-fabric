@@ -640,8 +640,6 @@ class IfaceBindingCreateTest(unittest.TestCase):
 
     def test_bridge_created_and_port_attached_on_the_owning_host(self) -> None:
         script = self.hosts["chassis-1"]
-        self.assertIn("ovs-vsctl add-br br-home", script)
-        self.assertIn("ovs-vsctl set bridge br-home fail-mode=standalone", script)
         self.assertIn("ovs-vsctl add-port br-home eth0.129", script)
 
     def test_veth_root_leg_is_left_to_its_router_unit(self) -> None:
@@ -670,7 +668,6 @@ class IfaceBindingCreateTest(unittest.TestCase):
         ]
         _, hosts = build_ops(nodes, "create")
         script = hosts["chassis-1"]
-        self.assertIn("ovs-vsctl add-br br-1f5b95ad", script)
         self.assertNotIn("add-port br-1f5b95ad veth-ovn-9adb1d", script)
         self.assertNotIn("ip link set veth-ovn-9adb1d up", script)
 
@@ -702,7 +699,6 @@ class IfaceBindingCreateTest(unittest.TestCase):
         )
         _, hosts = build_ops(nodes, "create")
         script = hosts["chassis-1"]
-        self.assertIn("ovs-vsctl add-br br-8d8c0a55", script)
         self.assertIn(
             "external-ids:ovn-bridge-mappings=net-home:br-8d8c0a55",
             script,
@@ -717,7 +713,6 @@ class IfaceBindingCreateTest(unittest.TestCase):
         # Re-running the create pass must not abort on an existing
         # bridge/port/VLAN (2026-09-19).
         script = self.hosts["chassis-1"]
-        self.assertIn("ovs-vsctl add-br", script)
         self.assertIn("ovs-vsctl add-port", script)
         self.assertIn("await ensure_vlan(job, 'test', 'eth0', 'eth0.129'", script)
 
@@ -732,7 +727,6 @@ class IfaceBindingDeleteTest(unittest.TestCase):
 
     def test_del_br_uses_if_exists_and_cascades(self) -> None:
         script = self.hosts["chassis-1"]
-        self.assertIn("ovs-vsctl --if-exists del-br br-home", script)
         self.assertNotIn("del-port", script)  # del-br cascades its own ports
 
     def test_vlan_link_deleted(self) -> None:
@@ -806,7 +800,6 @@ class XdpBindingTest(unittest.TestCase):
         self.assertIn(f"ovs-vsctl add-port br-xdp {trunk}", script)
         self.assertIn(f"ovs-vsctl set port {trunk} tag=1128", script)
         self.assertIn(f"ovs-vsctl add-port br-home {seg}", script)
-        self.assertIn("ovs-vsctl add-br br-home", script)
 
     def test_one_xdp_parent_trunks_every_segment_it_carries(self) -> None:
         nodes: list[pt.Model] = [
@@ -906,7 +899,6 @@ class FabricServiceTest(unittest.TestCase):
         body = self.hosts["chassis-1"].bindings
         self.assertIn("await ensure_vlan(job, 'test', 'eth0', 'eth0.129', 129", body)
         self.assertIn("ip link set eth0.129 up", body)
-        self.assertIn("ovs-vsctl add-br br-home", body)
         self.assertIn("ovs-vsctl add-port br-home eth0.129", body)
 
     def test_one_service_runs_the_tree(self) -> None:
@@ -931,10 +923,7 @@ class FabricServiceTest(unittest.TestCase):
         _, hosts = build_ops(NODES, "delete")
         script = hosts["chassis-1"]
         self.assertIn("systemctl disable --now ovn-fabric.service", script)
-        self.assertLess(
-            script.index("systemctl disable --now ovn-fabric.service"),
-            script.index("ovs-vsctl --if-exists del-br br-home"),
-        )
+        self.assertIn("ip link delete eth0.129", script)
 
 
 class KernelRouterCreateTest(unittest.TestCase):
@@ -2032,14 +2021,37 @@ class BridgeNodeBindingsTest(unittest.TestCase):
         _, hosts = build_ops([*NODES, bridge], "create")
         script = hosts["chassis-1"].bindings
         self.assertIn("ensure_vlan(job, 'test', 'eth0', 'eth0.2280', 2280", script)
-        self.assertIn("add-br br-test", script)
         self.assertIn("add-port br-test eth0.2280", script)
         # A host-local bridge is not an OVN localnet domain.
         self.assertNotIn("net-br-test:br-test", script)
 
         down_emit = _OpEmitter("delete")
         _emit_iface_bindings("chassis-1", [*NODES, bridge], down_emit)
-        self.assertIn("--if-exists del-br br-test", "\n".join(down_emit.lines))
+        self.assertIn("ip link delete eth0.2280", "\n".join(down_emit.lines))
+
+
+class BridgePrimitiveCommandsTest(unittest.TestCase):
+    def test_bridge_primitive_owns_the_command_stream(self) -> None:
+        primitives = mod._bridge_primitives("chassis-1", NODES)
+        bridge = next(p for p in primitives if p.key == "ovs.bridge:br-home")
+        self.assertIn(
+            ("ovs-vsctl", "add-br", "br-home"),
+            [command.argv for command in bridge.create],
+        )
+        self.assertIn(
+            ("ovs-vsctl", "set", "bridge", "br-home", "fail-mode=standalone"),
+            [command.argv for command in bridge.create],
+        )
+        self.assertEqual(bridge.delete[0].argv, ("ovs-vsctl", "--if-exists", "del-br", "br-home"))
+        self.assertEqual(bridge.exists.argv, ("ovs-vsctl", "br-exists", "br-home"))
+        self.assertEqual(bridge.nodes[0].id, "ovs.bridge:br-home")
+
+    def test_generated_source_contains_both_streams(self) -> None:
+        source = mod.generate_python_deployer(NODES)
+        self.assertIn("PRIMITIVES = {", source)
+        self.assertIn("add-br", source)
+        self.assertIn("LifecycleController(job, LifecycleAction.CREATE", source)
+        self.assertIn("await lc.finish()", source)
 
 
 class UnsupportedIfaceKindTest(unittest.TestCase):

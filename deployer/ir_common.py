@@ -1818,8 +1818,6 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
             by_bridge.setdefault(iface.bridge, []).append((domain, iface))
         for bridge in sorted(by_bridge):
             emit.comment(f"# --- bridge: {bridge} on {host_name} ---")
-            emit.sh(ovs_ops.add_br_argv(bridge))
-            emit.sh(ovs_ops.set_bridge_fail_mode_argv(bridge))
             for domain, iface in by_bridge[bridge]:
                 is_xdp = iface.kind == "xdp" or (
                     iface.kind == "vlan" and iface.vlanParent.kind == "xdp"
@@ -1874,7 +1872,6 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
             if is_xdp:
                 _emit_xdp_leg_delete(bridge, emit)
             else:
-                emit.sh(ovs_ops.del_br_argv(bridge))
                 if iface.kind == "vlan":
                     emit.sh(linux_net_ops.delete_link_argv(_iface_real_name(iface)))
         if xdp_ports:

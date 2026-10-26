@@ -59,6 +59,7 @@ from .ir_common import (
     _python_token,
     _service_faces,
 )
+from .lifecycle import Command, Primitive, RawNodeTemplate
 
 
 def _py_str(s: str) -> str:
@@ -283,6 +284,14 @@ _GENERATED_RUNTIME = r"""#!/usr/bin/env python3
 # create aborts on the first failure, delete warns and keeps going.
 
 from __future__ import annotations
+
+from deployer.lifecycle import (
+    Command,
+    LifecycleAction,
+    LifecycleController,
+    Primitive,
+    RawNodeTemplate,
+)
 
 import argparse
 import asyncio
@@ -1245,6 +1254,10 @@ HOSTS = {
 __HOSTS__
 }
 
+PRIMITIVES = {
+__PRIMITIVES__
+}
+
 SERVICES = __SERVICES__
 
 BIDIRECTIONAL_DEPS = {
@@ -1616,6 +1629,11 @@ def main() -> int:
         "them after this pass; ovn-fabric-restore.service uses it at boot)",
     )
     parser.add_argument(
+        "--explode",
+        metavar="DIR",
+        help="extract this generated PEX into DIR (readable source tree) and exit",
+    )
+    parser.add_argument(
         "--ovn-purge",
         action="store_true",
         help="INSTEAD of an action: wipe the OVS database and, on the central, OVN's NB/SB "
@@ -1637,6 +1655,30 @@ def main() -> int:
         datefmt="%Y-%m-%d %H:%M:%S",
         stream=sys.stderr,
     )
+    if args.explode is not None:
+        import shutil
+        import zipfile
+        from pathlib import Path
+
+        target = Path(args.explode)
+        if target.exists() and any(target.iterdir()):
+            print(
+                f"{RED}error: {target} exists and is not empty{RESET}",
+                file=sys.stderr,
+            )
+            return 2
+        target.mkdir(parents=True, exist_ok=True)
+        try:
+            with zipfile.ZipFile(sys.argv[0]) as archive:
+                archive.extractall(target)
+        except zipfile.BadZipFile:
+            print(
+                f"{RED}error: {sys.argv[0]} is not a PEX/zipapp{RESET}",
+                file=sys.stderr,
+            )
+            return 2
+        print(target)
+        return 0
     if args.job is not None:
         if args.job_action is None:
             parser.error("--job needs --job-action")
@@ -1801,6 +1843,59 @@ def _service_manifest(nodes: list[pt.Model]) -> dict[str, list[dict[str, str]]]:
                 )
         out[node.key.host] = entries
     return out
+
+
+def _bridge_primitives(host_name: str, nodes: list[pt.Model]) -> list[Primitive]:
+    names: set[str] = set()
+    for node in nodes:
+        if node.kind == "bridge":
+            if node.data.host.removeprefix("host:") == host_name:
+                names.add(node.key.name)
+        elif node.kind == "ovn.ls":
+            for entry in node.data.interfaces:
+                if entry.host == host_name:
+                    names.add(entry.iface.bridge)
+    result: list[Primitive] = []
+    for bridge in sorted(names):
+        label = f"{host_name}:bridge {bridge}"
+        result.append(
+            Primitive(
+                key=f"ovs.bridge:{bridge}",
+                nodes=(
+                    RawNodeTemplate(
+                        id=f"ovs.bridge:{bridge}",
+                        kind="ovs.bridge",
+                        fields={
+                            "name": bridge,
+                            "portRefs": [],
+                            "externalIds": {},
+                        },
+                    ),
+                ),
+                create=(
+                    Command(f"{label} (create)", ("ovs-vsctl", "add-br", bridge)),
+                    Command(
+                        f"{label} (fail-mode)",
+                        ("ovs-vsctl", "set", "bridge", bridge, "fail-mode=standalone"),
+                    ),
+                ),
+                delete=(
+                    Command(
+                        f"{label} (delete)",
+                        ("ovs-vsctl", "--if-exists", "del-br", bridge),
+                    ),
+                ),
+                exists=Command(
+                    f"{label} (exists)",
+                    ("ovs-vsctl", "br-exists", bridge),
+                ),
+            )
+        )
+    return result
+
+
+def _primitives_repr(host_name: str, nodes: list[pt.Model]) -> str:
+    return repr(_bridge_primitives(host_name, nodes))
 
 
 def generate_python_deployer(nodes: list[pt.Model]) -> str:
@@ -2011,7 +2106,11 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
             f"repeat=False, with_images=False, "
             f"custom_installers={custom_installers!r})",
             "    async def create_action(job: Job) -> None:",
+            f"        lc = LifecycleController(job, LifecycleAction.CREATE, {host_name!r})",
+            f"        for primitive in PRIMITIVES.get({host_name!r}, []):",
+            "            await lc.run(primitive)",
             f"        await HOSTS[{host_name!r}]['create'](job, True, False)",
+            "        await lc.finish()",
             # The host unit's up job runs CONFIGURE as its first step.
             # Running it here TOO made HOSTS create and the service race
             # the same add-br/add-port commands; --may-exist used to hide
@@ -2057,6 +2156,10 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
             "    async def delete_action(job: Job) -> None:",
             f"        await HOSTS[{host_name!r}]['delete'](job, False, False)",
             *down_calls,
+            f"        lc = LifecycleController(job, LifecycleAction.DELETE, {host_name!r})",
+            f"        for primitive in PRIMITIVES.get({host_name!r}, []):",
+            "            await lc.run(primitive)",
+            "        await lc.finish()",
             "    delete_job = root.job('ovn-fabric(delete)', initiate=True)",
             f"    register(delete_job, {delete_deps!r}, delete_action)",
             "    return root",
@@ -2094,6 +2197,14 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
         .replace("__CONFIGURE__", "\n".join(configure_entries))
         .replace("__TREE_FUNCS__", "\n\n".join(tree_defs))
         .replace("__TREES__", "\n".join(tree_entries))
+        .replace(
+            "__PRIMITIVES__",
+            "\n".join(
+                f"    {node.key.host!r}: {_primitives_repr(node.key.host, nodes)},"
+                for node in nodes
+                if node.kind == "infra.host"
+            ),
+        )
         .replace("__CREATE_FUNCS__", "\n\n".join(create_defs))
         .replace("__DELETE_FUNCS__", "\n\n".join(delete_defs))
         .replace("__CREATE_JOBS__", "\n".join(create_entries))

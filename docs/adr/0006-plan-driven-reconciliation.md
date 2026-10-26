@@ -335,3 +335,43 @@ managed graph, not only the nodes created in this run.
 - Seed journal from live state for kept objects.
 - Add a full round-trip test: deploy -> snapshot -> plan -> empty create
   set -> unchanged snapshot.
+
+## Implementation status (2026-10-26)
+
+Done:
+
+- `deployer/lifecycle.py`: `Command`, `RawNodeTemplate`, `Primitive`,
+  `Runnable`, `RawGraphBuilder`, `LifecycleController`.
+- Primitive command stream: `Primitive.create/delete` execute through
+  `LifecycleController.run_cmd`; probes attach runtime ids.
+- Raw journal: one in-memory graph, validated refs, one atomic dump.
+- OVS bridge primitives are generated as `PRIMITIVES[host]` and wired into
+  the generated `create_action` / `delete_action`; bridge commands were
+  removed from the static binding bodies.
+- `deployer/primitives_ovn.py`: typed `OVNNbCtlLs`, `OVNNbCtlLsp` handles.
+- `deployer/primitives_host.py`: `HostPrimitive` factory with
+  `host.netns(None|name)` and `netns.add_if(...)`.
+- Tests cover primitive command streams, raw nodes, and generated source.
+- `--explode DIR` on the generated PEX and `ovn-fabric explode`.
+
+Not done yet:
+
+- Only OVS bridges are journaled at apply time. Bridge ports, VLANs,
+  veths, addresses, routes, OVS mappings, iptables, services and containers
+  still execute as raw commands.
+- `--action run` is not lifecycle-controller driven.
+- Cluster OVN commands (LR/LSP/LRP/routes/NAT/ACL), kernel router bodies,
+  and Docker/service bodies have not been converted to primitives.
+- The journal is not seeded from live state, so kept objects are absent
+  from the snapshot until their primitives run.
+- The raw snapshot is therefore intentionally partial.
+
+Next slices:
+
+1. Convert all cluster OVN emitters to typed primitives and one LC per
+   cluster action.
+2. Convert host bindings (ports, VLANs, veths, mappings) and seed the
+   journal with kept nodes.
+3. Convert kernel router/netns/address/route/iptables primitives.
+4. Convert services, Docker, and image lifecycle.
+5. Wire `--action run` and add `--plan`.

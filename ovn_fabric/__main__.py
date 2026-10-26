@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 TOOL = "ovn-fabric"
@@ -78,6 +79,35 @@ def _ensure_pex(root: Path) -> str:
     if not pex.is_file():
         raise RuntimeError(f"pex installed but {pex} is missing")
     return str(pex)
+
+
+def _explode(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog=f"{TOOL} explode",
+        description="Extract a PEX/zipapp into a readable filesystem tree.",
+    )
+    parser.add_argument("pex", metavar="PEX")
+    parser.add_argument("output", metavar="DIR")
+    parser.add_argument("--overwrite", action="store_true", help="replace an existing directory")
+    args = parser.parse_args(argv)
+
+    source = Path(args.pex)
+    target = Path(args.output)
+    if not source.is_file():
+        parser.error(f"not a file: {source}")
+    if target.exists() and not args.overwrite:
+        # Failing is safer than mixing two builds' source trees.
+        if any(target.iterdir()):
+            parser.error(f"{target} exists and is not empty (use --overwrite)")
+    if target.exists() and args.overwrite:
+        shutil.rmtree(target)
+    target.mkdir(parents=True, exist_ok=True)
+
+    with zipfile.ZipFile(source) as archive:
+        archive.extractall(target)
+
+    print(target)
+    return 0
 
 
 def _build(argv: list[str]) -> int:
@@ -154,6 +184,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("reconciler", help="read live host state and emit IR (reconciler.cli)")
     sub.add_parser("raw", help="read live host state as the raw graph (raw_reconciler)")
     sub.add_parser("build", help="build the single-file PEX")
+    sub.add_parser("explode", help="extract a PEX into a readable directory")
 
     if not argv or argv[0] in ("-h", "--help"):
         parser.print_help()
@@ -168,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
         return _raw(rest)
     if command == "build":
         return _build(rest)
+    if command == "explode":
+        return _explode(rest)
 
     parser.error(f"unknown command {command!r}")
 
