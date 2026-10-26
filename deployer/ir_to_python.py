@@ -1,9 +1,9 @@
-# deployer/ir_to_python.py — the all-in-one Python deployer generator:
+# deployer/ir_to_python.py — the Python deployer generator:
 # every emitter lives in deployer/ir_common.py and builds through
 # the Emitter interface; this module provides the PYTHON rendering of it
-# (PythonEmitter) and wraps everything into ONE self-contained Python
-# file that picks what to run at runtime (2026-08-19, refactored
-# 2026-08-23):
+# (PythonEmitter) and emits `generated_deployer.py`, the entry module of
+# the deployer PEX. It picks what to run at runtime (2026-08-19,
+# refactored 2026-08-23, PEX layout 2026-10-26):
 #   --action create|delete   (default create; create aborts on the first
 #                             failed command, delete warns and continues)
 #   --cluster                only the cluster-wide ovn-nbctl pass
@@ -28,12 +28,15 @@
 # Python deployment genuinely controllable: no shell syntax (heredocs,
 # redirection) survives into the generated file for the runtime to
 # re-parse.
+#
+# Only the IR-derived parts are generated. The job runtime lives in the
+# `runtime` package, which the PEX ships next to this module, so the
+# generated code imports it instead of carrying an inlined copy.
 # python3 is required on every target host (2026-08-19, confirmed).
 
 from __future__ import annotations
 
 import functools
-import pathlib
 import re
 from collections.abc import Callable, Sequence
 from typing import Any
@@ -60,6 +63,91 @@ from .ir_common import (
     _service_faces,
 )
 from .lifecycle import Command, Primitive, RawNodeTemplate
+from .primitives_ovn import (
+    OVNNbCtlAcl,
+    OVNNbCtlLr,
+    OVNNbCtlLrp,
+    OVNNbCtlLs,
+    OVNNbCtlLsp,
+    OVNNbCtlNat,
+    OVNNbCtlRoute,
+)
+
+
+def _ovn_method_call(primitive: object) -> str:
+    """A child call on a bound router: `add_route(...)` etc."""
+    if isinstance(primitive, OVNNbCtlLsp):
+        return f"bind_switch({primitive.switch!r}, {primitive.name!r})"
+    if isinstance(primitive, OVNNbCtlLrp):
+        gateway = (
+            _python_token(primitive.gateway_chassis)
+            if isinstance(primitive.gateway_chassis, Ref)
+            else repr(primitive.gateway_chassis)
+        )
+        return (
+            f"add_port({primitive.name!r}, {primitive.mac!r}, "
+            f"{primitive.networks!r}, gateway_chassis={gateway}, "
+            f"ipv6_ra_configs={primitive.ipv6_ra_configs!r})"
+        )
+    if isinstance(primitive, OVNNbCtlRoute):
+        return f"add_route({primitive.prefix!r}, {primitive.nexthop!r})"
+    if isinstance(primitive, OVNNbCtlNat):
+        return (
+            f"add_nat({primitive.type!r}, {primitive.external_ip!r}, "
+            f"{primitive.logical_ip!r}, reset={primitive.reset!r})"
+        )
+    if isinstance(primitive, OVNNbCtlAcl):
+        return (
+            f"add_acl({primitive.switch!r}, {primitive.direction!r}, "
+            f"{primitive.priority!r}, {primitive.match!r}, {primitive.action!r})"
+        )
+    raise TypeError(f"{primitive!r} cannot be attached to a router")
+
+
+def _ovn_call(primitive: object) -> str:
+    """A `host.ovn_nbctl_*(...)` expression for one typed primitive."""
+    if isinstance(primitive, OVNNbCtlLs):
+        return f"ovn_nbctl_ls({primitive.name!r})"
+    if isinstance(primitive, OVNNbCtlLsp):
+        return (
+            f"ovn_nbctl_lsp({primitive.switch!r}, {primitive.name!r}, "
+            f"type={primitive.type!r}, addresses={primitive.addresses!r}, "
+            f"options={primitive.options!r})"
+        )
+    if isinstance(primitive, OVNNbCtlLr):
+        return (
+            f"ovn_nbctl_lr({primitive.name!r}, options={primitive.options!r}, "
+            f"external_ids={primitive.external_ids!r})"
+        )
+    if isinstance(primitive, OVNNbCtlLrp):
+        gateway = (
+            _python_token(primitive.gateway_chassis)
+            if isinstance(primitive.gateway_chassis, Ref)
+            else repr(primitive.gateway_chassis)
+        )
+        return (
+            f"ovn_nbctl_lrp({primitive.router!r}, {primitive.name!r}, "
+            f"{primitive.mac!r}, {primitive.networks!r}, "
+            f"gateway_chassis={gateway}, "
+            f"ipv6_ra_configs={primitive.ipv6_ra_configs!r})"
+        )
+    if isinstance(primitive, OVNNbCtlRoute):
+        return (
+            f"ovn_nbctl_route({primitive.router!r}, {primitive.prefix!r}, "
+            f"{primitive.nexthop!r})"
+        )
+    if isinstance(primitive, OVNNbCtlNat):
+        return (
+            f"ovn_nbctl_nat({primitive.router!r}, {primitive.type!r}, "
+            f"{primitive.external_ip!r}, {primitive.logical_ip!r}, "
+            f"reset={primitive.reset!r})"
+        )
+    if isinstance(primitive, OVNNbCtlAcl):
+        return (
+            f"ovn_nbctl_acl({primitive.switch!r}, {primitive.direction!r}, "
+            f"{primitive.priority!r}, {primitive.match!r}, {primitive.action!r})"
+        )
+    raise TypeError(f"unknown OVN primitive {primitive!r}")
 
 
 def _py_str(s: str) -> str:
@@ -137,6 +225,26 @@ class PythonEmitter(Emitter):
         expr = _python_argv_expr(argv)
         self._push(f"await job.run_cmd({self.label!r}, {expr}, {abort})")
 
+    def ovn(
+        self,
+        primitive: object,
+        *,
+        bind: str | None = None,
+        parent: str | None = None,
+    ) -> None:
+        if bind is not None:
+            rhs = (
+                f"{parent}.{_ovn_method_call(primitive)}"
+                if parent is not None
+                else f"host.{_ovn_call(primitive)}"
+            )
+            self._push(f"{bind} = {rhs}")
+            self._push(f"await lc.run({bind})")
+        elif parent is not None:
+            self._push(f"await lc.run({parent}.{_ovn_method_call(primitive)})")
+        else:
+            self._push(f"await lc.run(host.{_ovn_call(primitive)})")
+
     def capture(self, var: str, argv: Sequence[str | Ref]) -> None:
         expr = _python_argv_expr(argv)
         self._push(f"{var} = await job.capture_cmd({self.label!r}, {expr}, abort_on_error)")
@@ -176,6 +284,31 @@ class PythonEmitter(Emitter):
             f"await job.run_cmd({self.label!r}, ['systemctl', 'restart', {unit!r}], " f"{abort})"
         )
         self.end_block()
+
+
+class PythonClusterEmitter(PythonEmitter):
+    """The cluster pass runs under one LifecycleController; there is no
+    per-host `job` parameter in its generated body."""
+
+    def sh(
+        self,
+        argv: Sequence[str | Ref],
+        background: bool = False,
+        optional: bool | None = None,
+    ) -> None:
+        if optional is None:
+            optional = self.action == "delete"
+        abort = "False" if optional else "abort_on_error"
+        expr = _python_argv_expr(argv)
+        self._push(f"await lc.run_cmd({self.label!r}, {expr}, {abort})")
+
+    def capture(self, var: str, argv: Sequence[str | Ref]) -> None:
+        expr = _python_argv_expr(argv)
+        self._push(f"{var} = await lc.capture_cmd({self.label!r}, {expr}, abort_on_error)")
+
+    def wait_capture(self, var: str, argv: Sequence[str | Ref]) -> None:
+        expr = _python_argv_expr(argv)
+        self._push(f"{var} = await wait_for_chassis(lc.job, {self.label!r}, {expr}, 30)")
 
 
 class PythonBodyEmitter(Emitter):
@@ -261,16 +394,17 @@ def _python_body_fn(name: str, label: str, action: Action, body: Callable[[Emitt
 _GENERATED_RUNTIME = r"""#!/usr/bin/env python3
 # Generated by ovn-fabric deployer/ir_to_python.py — DO NOT EDIT.
 #
-# One file for every pass the generator knows: the cluster-wide ovn-nbctl
-# action (run once, from whichever chassis reaches the shared NB DB) and
-# each per-host OVS/netns action (run on the host itself), for both
-# create and delete. Pick what to run with --action / --cluster / --host;
-# with neither --cluster nor --host, create runs every host first (each
-# installs its OS dependencies, then brings up OVS/OVN and, on the
-# central, exposes the NB/SB DBs) and the cluster-wide ovn-nbctl pass
-# LAST — it needs ovn-nbctl installed and the central's DBs reachable, so
-# running it first on a fresh host fails (2026-09-19). Delete reverses
-# that: the cluster topology goes first, then the hosts.
+# The entry module of the deployer PEX. It holds every pass the generator
+# knows: the cluster-wide ovn-nbctl action (run once, from whichever
+# chassis reaches the shared NB DB) and each per-host OVS/netns action
+# (run on the host itself), for both create and delete. Pick what to run
+# with --action / --cluster / --host; with neither --cluster nor --host,
+# create runs every host first (each installs its OS dependencies, then
+# brings up OVS/OVN and, on the central, exposes the NB/SB DBs) and the
+# cluster-wide ovn-nbctl pass LAST — it needs ovn-nbctl installed and the
+# central's DBs reachable, so running it first on a fresh host fails
+# (2026-09-19). Delete reverses that: the cluster topology goes first,
+# then the hosts.
 #
 # The IR's dependency/image data is merged into ONE install object per
 # host (`BIDIRECTIONAL_DEPS[host]`) and executed directly before OVS/OVN.
@@ -279,9 +413,13 @@ _GENERATED_RUNTIME = r"""#!/usr/bin/env python3
 # central, OVN's NB/SB databases, and restarts the daemons — back to the
 # state right after the packages were installed (see ovn_purge below).
 #
-# Every command/file-write is a direct Python call into run_cmd()/
+# Every command/file-write is a direct Python call into job.run_cmd()/
 # write_file()/run_install() below, each with the same error policy:
 # create aborts on the first failure, delete warns and keeps going.
+#
+# The job runtime is NOT inlined: `runtime.service` ships in the same
+# PEX and is imported. Only the IR-derived functions and tables are
+# generated into this module.
 
 from __future__ import annotations
 
@@ -292,6 +430,8 @@ from deployer.lifecycle import (
     Primitive,
     RawNodeTemplate,
 )
+from deployer.primitives_host import HostPrimitive
+from runtime.service import Job, JobError, capture_cmd, run_cmd
 
 import argparse
 import asyncio
@@ -315,8 +455,6 @@ _deploy_log = logging.getLogger("ovn-fabric.deployer")
 
 def _job_logger(name: str) -> logging.Logger:
     return logging.getLogger(f"ovn-fabric.deployer.{name}")
-
-# __RUNTIME_LIB__
 
 
 async def _docker_image_exists(image: str) -> bool:
@@ -794,12 +932,14 @@ def _install_copy(src: str, path: str) -> None:
 
 
 async def install_self(job: Job, label: str, path: str, abort_on_error: bool) -> None:
-    # The install_self() emitter operation: copy THIS generated program to
-    # `path`, so ovn-fabric-restore.service can re-run the host pass at
-    # boot. `__file__` is the script that was invoked; a run from stdin
-    # (`python3 -`) has none — that only warns, and the restore unit's
-    # ExecCondition then skips itself.
-    src = globals().get("__file__")
+    # The install_self() emitter operation: copy THIS deployer to `path`,
+    # so ovn-fabric-restore.service can re-run the host pass at boot.
+    # Inside a PEX, `__file__` points into the archive and is not a real
+    # file; the executable the operator invoked (sys.argv[0]) is. Direct
+    # script runs keep working for the same reason.
+    src = sys.argv[0] if sys.argv else ""
+    if not src or not os.path.isfile(src):
+        src = globals().get("__file__", "")
     if not src or not os.path.isfile(src):
         job.warn(
             f"cannot install the boot restore copy in {label}: "
@@ -1740,12 +1880,22 @@ def main() -> int:
         )
     elif args.cluster:
         cluster = cluster_create if args.action == "create" else cluster_delete
+        action = LifecycleAction.CREATE if args.action == "create" else LifecycleAction.DELETE
+        central = next(
+            (name for name, data in HOSTS.items() if data["role"] == "central"),
+            None,
+        )
+        if central is None:
+            print(f"{RED}error: no central host for --cluster{RESET}", file=sys.stderr)
+            return 2
 
         async def run_cluster() -> None:
             job = Job("ovn-fabric", logger_factory=_job_logger)
             await job.start()
+            lc = LifecycleController(job, action, central)
             try:
-                await cluster(job, abort_on_error)
+                await cluster(lc, HostPrimitive(central), abort_on_error)
+                await lc.finish()
             finally:
                 await job.stop()
 
@@ -1791,29 +1941,26 @@ def _python_fn(
     return f"async def {name}(job, abort_on_error{extra_params}):\n" + "\n".join(body_lines) + "\n"
 
 
+def _python_cluster_fn(
+    name: str,
+    label: str,
+    action: Action,
+    body: Callable[[Emitter], None],
+) -> str:
+    """One cluster action: a single LifecycleController and the central
+    host's primitive factory, never a bare `job.run_cmd` body."""
+    emit = PythonClusterEmitter(label, action)
+    body(emit)
+    lines = [f"    {line}" if line else "" for line in emit.lines]
+    return f"async def {name}(lc, host, abort_on_error):\n" + "\n".join(lines) + "\n"
+
+
 def _host_fn_name(host_name: str, action: str) -> str:
     return f"_host_{re.sub(r'[^A-Za-z0-9]', '_', host_name)}_{action}"
 
 
 def _run_fn_name(host_name: str) -> str:
     return f"_run_{re.sub(r'[^A-Za-z0-9]', '_', host_name)}"
-
-
-def _runtime_code() -> str:
-    """The runtime library, inlined into the generated single file.
-
-    The deployer is copied to hosts that do not have the ovn-fabric
-    package, so `runtime/service.py` is embedded — not imported. Its
-    module docstring and `from __future__` are dropped (the latter must
-    be the first statement of a module).
-    """
-    path = pathlib.Path(__file__).resolve().parents[1] / "runtime" / "service.py"
-    source = path.read_text(encoding="utf-8")
-    if source.startswith('"""'):
-        end = source.index('"""', 3) + 3
-        source = source[end:]
-    source = source.replace("from __future__ import annotations\n", "", 1)
-    return source.strip("\n")
 
 
 def _service_manifest(nodes: list[pt.Model]) -> dict[str, list[dict[str, str]]]:
@@ -2123,7 +2270,9 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
         if cluster:
             create_lines += [
                 "    async def cluster_action(job: Job) -> None:",
-                "        await cluster_create(job, True)",
+                f"        lc = LifecycleController(job, LifecycleAction.CREATE, {host_name!r})",
+                f"        await cluster_create(lc, HostPrimitive({host_name!r}), True)",
+                "        await lc.finish()",
                 "    cluster_job = root.job('cluster-create', initiate=True)",
                 f"    register(cluster_job, "
                 f"[{_abstract('ovn')!r}, {_abstract('create-ready')!r}], cluster_action)",
@@ -2144,7 +2293,9 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
         if cluster:
             delete_lines += [
                 "    async def cluster_action(job: Job) -> None:",
-                "        await cluster_delete(job, False)",
+                f"        lc = LifecycleController(job, LifecycleAction.DELETE, {host_name!r})",
+                f"        await cluster_delete(lc, HostPrimitive({host_name!r}), False)",
+                "        await lc.finish()",
                 "        job.emit({'kind': 'abstract-dep', "
                 "'name': 'cluster-deleted', 'state': 'ready'}, queue=True)",
                 "    cluster_job = root.job('cluster-delete', initiate=True)",
@@ -2170,7 +2321,7 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
             job_entries.append(f"    {name!r}: ({up}, {down}),")
 
     cluster_defs = "\n\n".join(
-        _python_fn(
+        _python_cluster_fn(
             f"cluster_{action}",
             f"cluster ({action})",
             action,
@@ -2209,5 +2360,4 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
         .replace("__DELETE_FUNCS__", "\n\n".join(delete_defs))
         .replace("__CREATE_JOBS__", "\n".join(create_entries))
         .replace("__DELETE_JOBS__", "\n".join(delete_entries))
-        .replace("# __RUNTIME_LIB__", _runtime_code())
     )

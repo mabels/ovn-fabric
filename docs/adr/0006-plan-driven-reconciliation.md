@@ -348,30 +348,47 @@ Done:
 - OVS bridge primitives are generated as `PRIMITIVES[host]` and wired into
   the generated `create_action` / `delete_action`; bridge commands were
   removed from the static binding bodies.
-- `deployer/primitives_ovn.py`: typed `OVNNbCtlLs`, `OVNNbCtlLsp` handles.
+- `deployer/primitives_ovn.py`: typed `OVNNbCtlLs`, `OVNNbCtlLsp`,
+  `OVNNbCtlLr`, `OVNNbCtlLrp`, `OVNNbCtlRoute`, `OVNNbCtlNat`,
+  `OVNNbCtlAcl`.
+- The cluster pass is one `LifecycleController`: generated
+  `cluster_create` / `cluster_delete` take `(lc, host, abort_on_error)`
+  and only call `lc.run(...)`; no `job.run_cmd` remains in the cluster
+  body. Chassis ids are still resolved at runtime and passed to the LRP
+  factory.
+- Router-owned objects are grouped in the generated code:
+  `router_home_v2.add_port(...)`, `.add_route(...)`, `.add_nat(...)`,
+  `.add_acl(...)`, and `lrp_....bind_switch(...)`. Each child is still a
+  separate keyed primitive and raw node.
+- NAT replacement and ACL pruning are deliberately NOT part of the
+  create emitters. They are bulk scope operations and will be implemented
+  as an extension of `LifecycleController`, after the planner owns
+  delete-before-create.
+- Each typed OVN primitive journals its raw node under a semantic key and
+  probes the runtime UUID by name after create.
 - `deployer/primitives_host.py`: `HostPrimitive` factory with
-  `host.netns(None|name)` and `netns.add_if(...)`.
-- Tests cover primitive command streams, raw nodes, and generated source.
+  `host.netns(None|name)`, `netns.add_if(...)`, and the
+  `host.ovn_nbctl_*(...)` cluster factory methods.
+- Tests cover primitive command streams and raw nodes, and assert the
+  generated cluster functions are controller/primitives-driven.
 - `--explode DIR` on the generated PEX and `ovn-fabric explode`.
 
 Not done yet:
 
-- Only OVS bridges are journaled at apply time. Bridge ports, VLANs,
-  veths, addresses, routes, OVS mappings, iptables, services and containers
-  still execute as raw commands.
+- Only OVS bridges and cluster OVN objects are journaled at apply time.
+  Bridge ports, VLANs, veths, addresses, routes, OVS mappings, iptables,
+  services and containers still execute as raw commands.
 - `--action run` is not lifecycle-controller driven.
-- Cluster OVN commands (LR/LSP/LRP/routes/NAT/ACL), kernel router bodies,
-  and Docker/service bodies have not been converted to primitives.
+- Kernel router bodies and Docker/service bodies have not been converted
+  to primitives.
 - The journal is not seeded from live state, so kept objects are absent
   from the snapshot until their primitives run.
 - The raw snapshot is therefore intentionally partial.
 
 Next slices:
 
-1. Convert all cluster OVN emitters to typed primitives and one LC per
-   cluster action.
-2. Convert host bindings (ports, VLANs, veths, mappings) and seed the
+1. Convert host bindings (ports, VLANs, veths, mappings) and seed the
    journal with kept nodes.
-3. Convert kernel router/netns/address/route/iptables primitives.
-4. Convert services, Docker, and image lifecycle.
-5. Wire `--action run` and add `--plan`.
+2. Convert kernel router/netns/address/route/iptables primitives.
+3. Convert services, Docker, and image lifecycle.
+4. Wire `--action run` and add `--plan`.

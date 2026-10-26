@@ -5,7 +5,15 @@ import unittest
 from collections.abc import Sequence
 
 from deployer.lifecycle import LifecycleAction, LifecycleController
-from deployer.primitives_ovn import OVNNbCtlLs, OVNNbCtlLsp
+from deployer.primitives_ovn import (
+    OVNNbCtlAcl,
+    OVNNbCtlLr,
+    OVNNbCtlLrp,
+    OVNNbCtlLs,
+    OVNNbCtlLsp,
+    OVNNbCtlNat,
+    OVNNbCtlRoute,
+)
 
 
 class FakeJob:
@@ -20,7 +28,8 @@ class FakeJob:
         background: bool = False,
     ) -> bool:
         self.commands.append((label, tuple(argv), abort_on_error))
-        return True
+        # `exists` probes use `get`; report "missing" so create runs.
+        return tuple(argv[:2]) != ("ovn-nbctl", "get")
 
     async def capture_cmd(
         self, label: str, argv: Sequence[str], abort_on_error: bool = True
@@ -34,7 +43,10 @@ class OvnnPrimitiveTest(unittest.TestCase):
             job = FakeJob()
             lc = LifecycleController(job, LifecycleAction.CREATE, "h")
             await lc.run(OVNNbCtlLs("backbone"))
-            self.assertEqual(job.commands[0][1], ("ovn-nbctl", "ls-add", "backbone"))
+            self.assertIn(
+                ("ovn-nbctl", "ls-add", "backbone"),
+                [c[1] for c in job.commands],
+            )
             self.assertEqual(lc.graph.nodes["ovn.ls:backbone"]["kind"], "ovn.ls")
 
         asyncio.run(run())
@@ -61,6 +73,108 @@ class OvnnPrimitiveTest(unittest.TestCase):
             )
             node = lc.graph.nodes["ovn.lsp:backbone|lsp-localnet"]
             self.assertEqual(node["switchRef"], "ovn.ls:backbone")
+
+        asyncio.run(run())
+
+    def test_lr_carries_options_external_ids_and_cascading_delete(self) -> None:
+        async def run() -> None:
+            job = FakeJob()
+            lc = LifecycleController(job, LifecycleAction.CREATE, "h")
+            await lc.run(
+                OVNNbCtlLr(
+                    "router-home",
+                    options=(("mac_binding_age_threshold", "300"),),
+                    external_ids=(("ovn-fabric.securityGroups", "web"),),
+                )
+            )
+            argv = [c[1] for c in job.commands]
+            self.assertIn(("ovn-nbctl", "lr-add", "router-home"), argv)
+            self.assertIn(
+                (
+                    "ovn-nbctl",
+                    "set",
+                    "logical_router",
+                    "router-home",
+                    "options:mac_binding_age_threshold=300",
+                ),
+                argv,
+            )
+            node = lc.graph.nodes["ovn.lr:router-home"]
+            self.assertEqual(node["options"], {"mac_binding_age_threshold": "300"})
+
+        asyncio.run(run())
+
+    def test_lrp_pins_a_runtime_gateway_chassis(self) -> None:
+        async def run() -> None:
+            job = FakeJob()
+            lc = LifecycleController(job, LifecycleAction.CREATE, "h")
+            await lc.run(
+                OVNNbCtlLrp(
+                    "router-home",
+                    "lrp-left",
+                    "00:00:00:00:01:01",
+                    ("192.168.1.1/24",),
+                    gateway_chassis="chassis-uuid",
+                    ipv6_ra_configs=(("send_periodic", "true"),),
+                )
+            )
+            argv = [c[1] for c in job.commands]
+            self.assertIn(
+                (
+                    "ovn-nbctl",
+                    "lrp-add",
+                    "router-home",
+                    "lrp-left",
+                    "00:00:00:00:01:01",
+                    "192.168.1.1/24",
+                ),
+                argv,
+            )
+            self.assertIn(
+                (
+                    "ovn-nbctl",
+                    "lrp-set-gateway-chassis",
+                    "lrp-left",
+                    "chassis-uuid",
+                    "100",
+                ),
+                argv,
+            )
+            node = lc.graph.nodes["ovn.lrp:router-home|lrp-left"]
+            self.assertEqual(node["routerRef"], "ovn.lr:router-home")
+            self.assertEqual(node["gatewayChassis"], ["chassis-uuid"])
+
+        asyncio.run(run())
+
+    def test_route_nat_and_acl_use_semantic_keys(self) -> None:
+        async def run() -> None:
+            job = FakeJob()
+            lc = LifecycleController(job, LifecycleAction.CREATE, "h")
+            await lc.run(OVNNbCtlRoute("router-home", "10.0.0.0/24", "192.168.1.254"))
+            await lc.run(OVNNbCtlNat("router-home", "snat", "203.0.113.1", "10.0.0.0/24"))
+            await lc.run(OVNNbCtlAcl("home", "to-lport", 100, "ip4", "allow-related"))
+
+            self.assertIn(
+                "ovn.route:router-home|10.0.0.0/24|192.168.1.254",
+                lc.graph.nodes,
+            )
+            self.assertIn(
+                "ovn.nat:router-home|snat|203.0.113.1|10.0.0.0/24",
+                lc.graph.nodes,
+            )
+            self.assertIn(
+                "ovn.acl:home|to-lport|100|ip4|allow-related",
+                lc.graph.nodes,
+            )
+            argv = [c[1] for c in job.commands]
+            self.assertIn(
+                ("ovn-nbctl", "lr-route-add", "router-home", "10.0.0.0/24", "192.168.1.254"),
+                argv,
+            )
+            self.assertIn(
+                ("ovn-nbctl", "lr-nat-add", "router-home", "snat", "203.0.113.1", "10.0.0.0/24"),
+                argv,
+            )
 
         asyncio.run(run())
 

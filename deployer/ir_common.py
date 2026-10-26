@@ -82,6 +82,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import ipaddress
+import re
 import shlex
 from collections.abc import Sequence
 from typing import Any, Protocol
@@ -92,6 +93,16 @@ from ladops import ovn as ovn_ops
 from ladops import ovs as ovs_ops
 from protocol import KernelApp
 from protocol import generated as pt
+
+from .primitives_ovn import (
+    OVNNbCtlAcl,
+    OVNNbCtlLr,
+    OVNNbCtlLrp,
+    OVNNbCtlLs,
+    OVNNbCtlLsp,
+    OVNNbCtlNat,
+    OVNNbCtlRoute,
+)
 
 Action = str  # "create" | "delete"
 
@@ -153,6 +164,24 @@ class Emitter:
     def __init__(self, action: Action) -> None:
         self.action = action
         self.lines: list[str] = []
+        self._locals: set[str] = set()
+
+    def local(self, name: str) -> str:
+        """A collision-free local variable derived from an OVN object
+        name, so generated code can express ownership:
+        `router_home_v2.add_route(...)`."""
+        stem = re.sub(r"[^0-9A-Za-z_]", "_", name).strip("_") or "ovn"
+        if stem[0].isdigit():
+            stem = f"_{stem}"
+        if stem in {"lc", "host", "abort_on_error", "job"}:
+            stem = f"ovn_{stem}"
+        candidate = stem
+        index = 2
+        while candidate in self._locals:
+            candidate = f"{stem}_{index}"
+            index += 1
+        self._locals.add(candidate)
+        return candidate
 
     def sh(
         self,
@@ -168,6 +197,18 @@ class Emitter:
         `systemctl enable --now` so one broken workload/router can't block
         every other operation (2026-09-16). An argv token may be a `Ref`
         (see above), rendered as a runtime variable."""
+        raise NotImplementedError
+
+    def ovn(
+        self,
+        primitive: Any,
+        *,
+        bind: str | None = None,
+        parent: str | None = None,
+    ) -> None:
+        """A typed OVN northbound object. `bind` runs it and keeps the
+        result in a local variable; `parent` attaches it to an already
+        bound object (`router.add_route(...)`)."""
         raise NotImplementedError
 
     def capture(self, var: str, argv: Sequence[str | Ref]) -> None:
@@ -392,9 +433,8 @@ def _group_router_ports(nodes: list[pt.Model]) -> dict[str, list[pt.OvnLrpNode]]
 
 def _emit_logical_switch(node: pt.OvnLsNode, emit: Emitter) -> None:
     name = node.key.name
-    argv = ovn_ops.ls_add_argv(name) if emit.action == "create" else ovn_ops.ls_del_argv(name)
     emit.comment(f"# --- logical switch: {name} ---")
-    emit.sh(argv)
+    emit.ovn(OVNNbCtlLs(name))
     emit.blank()
 
 
@@ -404,8 +444,15 @@ def _emit_logical_switch(node: pt.OvnLsNode, emit: Emitter) -> None:
 def _emit_localnet_lsp_create(name: str, emit: Emitter) -> None:
     lsp = f"lsp-{name}-localnet"
     emit.comment(f"# --- localnet port: {name} ---")
-    for argv in ovn_ops.lsp_add_localnet_argv(name, lsp, _network_name(name)):
-        emit.sh(argv)
+    emit.ovn(
+        OVNNbCtlLsp(
+            switch=name,
+            name=lsp,
+            type="localnet",
+            addresses=("unknown",),
+            options=(("network_name", _network_name(name)),),
+        )
+    )
     emit.blank()
 
 
@@ -434,7 +481,9 @@ def _group_routes_by_router(nodes: list[pt.Model]) -> dict[str, list[RouteNode]]
 # turns an already-computed fact into the command that applies it.
 # `masq` is carried in the IR but not yet acted on here — NAT has no
 # home in this pipeline yet (see src/ir.ts's own header comment).
-def _emit_router_routes(router: str, routes: list[RouteNode], emit: Emitter) -> None:
+def _emit_router_routes(
+    router: str, router_var: str, routes: list[RouteNode], emit: Emitter
+) -> None:
     if not routes:
         return
     # OVN's FIB is one table per router: the same prefix cannot be added
@@ -464,7 +513,10 @@ def _emit_router_routes(router: str, routes: list[RouteNode], emit: Emitter) -> 
     for domain in sorted(by_domain):
         emit.comment(f"# --- routes: {router} ({domain}) ---")
         for node in sorted(by_domain[domain], key=lambda n: n.key.prefix):
-            emit.sh(ovn_ops.lr_route_add_argv(router, node.key.prefix, node.data.nexthop))
+            emit.ovn(
+                OVNNbCtlRoute(router, node.key.prefix, node.data.nexthop),
+                parent=router_var,
+            )
 
 
 # router name -> the router's own ovn.lr node (src/ir.ts's routerToIR). A
@@ -527,6 +579,7 @@ def _ovn_acl_match(rule: pt.FilterRule, port: pt.Port | None) -> str:
 
 def _emit_router_acl(
     router: str,
+    router_var: str,
     ports: list[pt.OvnLrpNode],
     lr: pt.OvnLrNode | None,
     nodes: list[pt.Model],
@@ -558,9 +611,10 @@ def _emit_router_acl(
         pt.Direction.forward: "to-lport",
     }
     emit.comment(f"# --- router ACL: {router} ---")
-    # This router OWNS the ACL set on these switches/directions. Delete the
-    # old set first: an older build added a broad allow-related at a higher
-    # priority, and an exact-match acl-del would leave it in place forever.
+    # The router owns the ACL set on these switches/directions. Pruning an
+    # older set (including a broad allow-related at a higher priority)
+    # belongs to the LifecycleController's planned delete pass, not to the
+    # create emitter.
     used_directions: set[str] = set()
     for group in groups:
         for rule in group.data.rules:
@@ -570,20 +624,15 @@ def _emit_router_acl(
             used_directions.update(("to-lport", "from-lport"))
     for switch in switches:
         for direction in sorted(used_directions):
-            emit.sh(
-                ovn_ops.acl_del_argv(switch, direction),
-                optional=True,
-            )
-    for switch in switches:
-        for direction in sorted(used_directions):
-            emit.sh(
-                ovn_ops.acl_add_argv(
+            emit.ovn(
+                OVNNbCtlAcl(
                     switch,
                     direction,
                     30000,
                     "ct.est == 1 || ct.rel == 1",
                     "allow",
-                )
+                ),
+                parent=router_var,
             )
     seen: set[tuple[str, str, int, str, str]] = set()
 
@@ -592,7 +641,10 @@ def _emit_router_acl(
         if key in seen:
             return
         seen.add(key)
-        emit.sh(ovn_ops.acl_add_argv(switch, direction, priority, match, action))
+        emit.ovn(
+            OVNNbCtlAcl(switch, direction, priority, match, action),
+            parent=router_var,
+        )
 
     for group in groups:
         filters = [r for r in group.data.rules if r.kind == "filter"]
@@ -641,59 +693,36 @@ def _emit_router(
     emit: Emitter,
 ) -> None:
     if emit.action == "delete":
-        # lr_del_argv cascades, but NAT is removed EXPLICITLY first: the
-        # SNAT rows are referenced from the LR, and an operator reading
-        # the teardown should see them go rather than relying on the
-        # cascade. De-duplicated per external IP.
-        if lr is not None and lr.data.securityGroups:
-            groups = _security_groups_from_refs(
-                list(lr.data.securityGroups),
-                nodes,
-                pt.Render.ovn,
-                f"router {router}",
-            )
-            externals = sorted(
-                {
-                    rule.externalIp
-                    for group in groups
-                    for rule in group.data.rules
-                    if rule.kind == "snat"
-                }
-            )
-            if externals:
-                emit.comment(f"# --- router NAT teardown: {router} ---")
-                for external in externals:
-                    emit.sh(
-                        ovn_ops.lr_nat_del_argv(router, "snat", external),
-                        optional=True,
-                    )
-        # lr_del_argv cascades — deletes the router's own LRPs AND its
-        # own static routes (both are strongly referenced from
-        # Logical_Router, same as ports), and (once the matching
-        # ls_del_argv runs too) the router-type peer LSPs go with their
-        # owning switch. No separate lrp_del_argv/lsp_del_argv/route-
-        # delete calls needed here — see ladops/ovn.py's own doc
-        # comments.
+        # lr_del_argv cascades — it removes the router's own NAT rows,
+        # LRPs, and static routes (all strongly referenced from
+        # Logical_Router), and (once the matching ls_del_argv runs too)
+        # the router-type peer LSPs go with their owning switch. No
+        # separate primitive per child is needed for teardown. Explicit
+        # NAT/ACL pruning on create belongs to the LifecycleController's
+        # planned delete pass.
         emit.comment(f"# --- router: {router} ---")
-        emit.sh(ovn_ops.lr_del_argv(router))
+        emit.ovn(OVNNbCtlLr(router))
         emit.blank()
         return
 
-    emit.comment(f"# --- router: {router} ---")
-    emit.sh(ovn_ops.lr_add_argv(router))
+    external_ids: list[tuple[str, str]] = []
     if lr is not None and lr.data.securityGroups:
-        emit.sh(
-            ovn_ops.set_lr_external_id_argv(
-                router,
+        external_ids.append(
+            (
                 "ovn-fabric.securityGroups",
                 ",".join(ref.name for ref in lr.data.securityGroups),
             )
         )
-    # The router's own options (its ovn.lr node). lr-del cascades them
-    # away with the router — no delete twin.
-    if lr is not None:
-        for key, value in _ovn_settings(lr.data.options):
-            emit.sh(ovn_ops.lr_set_option_argv(router, key, value))
+    router_var = emit.local(router)
+    emit.comment(f"# --- router: {router} ---")
+    emit.ovn(
+        OVNNbCtlLr(
+            router,
+            options=tuple(_ovn_settings(lr.data.options)) if lr is not None else (),
+            external_ids=tuple(external_ids),
+        ),
+        bind=router_var,
+    )
     # Sorted by the port's own name so the emitted block is stable
     # regardless of the IR's input order (the IR out of src/ir.ts is
     # already sorted, but the deployer must not depend on that).
@@ -719,22 +748,40 @@ def _emit_router(
         # blindly: the failure moved earlier and got clearer, it didn't
         # disappear.
         emit.comment(f"# --- router port: {lrp} ({domain}) ---")
-        emit.sh(ovn_ops.lrp_add_argv(router, lrp, data.mac, data.addresses))
-        for argv in ovn_ops.lsp_add_router_argv(domain, lsp, lrp):
-            emit.sh(argv)
-        if data.gatewayChassis is not None:
-            # A runtime `Ref` to the chassis's system-id, resolved once in
-            # _emit_gateway_chassis_refs — NOT the IR host name, which
-            # lrp-set-gateway-chassis can never match.
-            chassis = chassis_refs[data.gatewayChassis]
-            emit.sh(ovn_ops.lrp_set_gateway_chassis_argv(lrp, chassis))
-            emit.sh(ovn_ops.lrp_set_redirect_chassis_argv(lrp))
-        if data.ipv6RaConfigs is not None:
-            for key, value in _ovn_settings(data.ipv6RaConfigs):
-                emit.sh(ovn_ops.lrp_set_ipv6_ra_config_argv(lrp, key, value))
+        gateway_chassis = (
+            chassis_refs[data.gatewayChassis] if data.gatewayChassis is not None else None
+        )
+        lrp_var = emit.local(lrp)
+        emit.ovn(
+            OVNNbCtlLrp(
+                router,
+                lrp,
+                data.mac,
+                tuple(data.addresses),
+                gateway_chassis=gateway_chassis,
+                ipv6_ra_configs=(
+                    tuple(_ovn_settings(data.ipv6RaConfigs))
+                    if data.ipv6RaConfigs is not None
+                    else ()
+                ),
+            ),
+            bind=lrp_var,
+            parent=router_var,
+        )
+        emit.ovn(
+            OVNNbCtlLsp(
+                switch=domain,
+                name=lsp,
+                type="router",
+                addresses=("router",),
+                options=(("router-port", lrp),),
+            ),
+            parent=lrp_var,
+        )
     # OVN SNAT lives in the security.group rules referenced by the LR.
-    # lr-nat-add has no --may-exist, so replace per external IP first;
-    # lr-del removes them on teardown.
+    # Replacing an existing set per external IP (lr-nat-add has no
+    # --may-exist) belongs to the LifecycleController's planned delete
+    # pass; this emitter only adds the desired rows.
     if lr is not None and lr.data.securityGroups:
         groups = _security_groups_from_refs(
             list(lr.data.securityGroups), nodes, pt.Render.ovn, f"router {router}"
@@ -750,14 +797,14 @@ def _emit_router(
         if by_external:
             emit.comment(f"# --- router NAT: {router} ---")
             for external in sorted(by_external):
-                # lr-nat-del is idempotent (exit 0 when nothing matched),
-                # so a MISSING delete is a real failure: let it abort.
-                emit.sh(ovn_ops.lr_nat_del_argv(router, "snat", external))
                 for rule in sorted(by_external[external], key=lambda r: r.logicalIps):
                     for logical in rule.logicalIps:
-                        emit.sh(ovn_ops.lr_nat_add_argv(router, "snat", external, logical))
-    _emit_router_acl(router, ports, lr, nodes, domain_names, emit)
-    _emit_router_routes(router, routes, emit)
+                        emit.ovn(
+                            OVNNbCtlNat(router, "snat", external, logical),
+                            parent=router_var,
+                        )
+    _emit_router_acl(router, router_var, ports, lr, nodes, domain_names, emit)
+    _emit_router_routes(router, router_var, routes, emit)
     emit.blank()
 
 

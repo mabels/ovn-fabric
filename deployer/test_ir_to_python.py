@@ -116,6 +116,20 @@ class _OpEmitter(Emitter):
     def capture(self, var: str, argv: Sequence[str | Ref]) -> None:
         self.lines.append(f"capture {var} " + " ".join(_shell_token(token) for token in argv))
 
+    def ovn(
+        self,
+        primitive: Any,
+        *,
+        bind: str | None = None,
+        parent: str | None = None,
+    ) -> None:
+        materialized = primitive.as_primitive()
+        commands = materialized.create if self.action == "create" else materialized.delete
+        for command in commands:
+            self.commands.append(list(command.argv))
+            self.optional.append(self.action == "delete")
+            self.lines.append(" ".join(_shell_token(token) for token in command.argv))
+
     def append(self, path: str, content: str) -> None:
         self.writes[path] = content
         self.lines.append(f"write_file {path}")
@@ -1986,8 +2000,7 @@ class OvnNatTest(unittest.TestCase):
             ],
             emit.commands,
         )
-        # SNAT rows are replaced per external IP (lr-nat-add has no --may-exist).
-        self.assertIn(
+        self.assertNotIn(
             ["ovn-nbctl", "lr-nat-del", "router-x", "snat", "172.22.0.2"],
             emit.commands,
         )
@@ -2169,7 +2182,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             "--verbose",
             "--no-start",
             "--ovn-purge",
-            "def run_cmd",
+            "from runtime.service import",
             "def write_file",
             "def _install_packages",
             "def _install_image",
@@ -2177,6 +2190,27 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             'choices=["create", "delete", "run"]',
         ):
             self.assertIn(marker, src)
+
+    def test_cluster_functions_run_typed_primitives_under_one_controller(self) -> None:
+        src = mod.generate_python_deployer(NODES)
+        create = src[src.index("async def cluster_create") : src.index("async def cluster_delete")]
+        delete = src[src.index("async def cluster_delete") : src.index("async def _host_")]
+        for marker in (
+            "async def cluster_create(lc, host, abort_on_error):",
+            "await lc.run(host.ovn_nbctl_ls('home'))",
+            "await lc.run(host.ovn_nbctl_lsp('home', 'lsp-home-localnet'",
+            "router_home = host.ovn_nbctl_lr('router-home'",
+            "await lc.run(router_home)",
+            "lrp_router_home_left = router_home.add_port('lrp-router-home-left'",
+            "gateway_chassis=OVN_CHASSIS_chassis_1",
+            "await lc.run(lrp_router_home_left)",
+            "await lc.run(lrp_router_home_left.bind_switch('home', 'lsp-router-home-left'))",
+        ):
+            self.assertIn(marker, create)
+        self.assertNotIn("job.run_cmd", create)
+        self.assertIn("async def cluster_delete(lc, host, abort_on_error):", delete)
+        self.assertIn("await lc.run(host.ovn_nbctl_ls('home'))", delete)
+        self.assertNotIn("job.run_cmd", delete)
 
     def test_host_create_only_installs_the_service(self) -> None:
         # The host pass installs the deployer and the one service; the
@@ -2221,7 +2255,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
                         cluster = (
                             ns["cluster_create"] if action == "create" else ns["cluster_delete"]
                         )
-                        await cluster(j, True)
+                        await cluster(j, None, True)
                     await ns["HOSTS"][name][action](j, True, False)
 
                 job.on_start(start)
@@ -2241,10 +2275,10 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         ns = self._exec_runtime()
         order: list[str] = []
 
-        async def cluster_create(job: Any, a: Any) -> None:
+        async def cluster_create(_lc: Any, _host: Any, a: Any) -> None:
             order.append("cluster:create")
 
-        async def cluster_delete(job: Any, a: Any) -> None:
+        async def cluster_delete(_lc: Any, _host: Any, a: Any) -> None:
             order.append("cluster:delete")
 
         ns["cluster_create"] = cluster_create
@@ -2276,13 +2310,16 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         ns = self._exec_runtime()
         order: list[str] = []
 
-        async def cluster_create(job: Any, a: Any) -> None:
+        async def cluster_create(_lc: Any, _host: Any, a: Any) -> None:
             order.append("cluster:create")
 
         ns["cluster_create"] = cluster_create
         for name, fns in ns["HOSTS"].items():
             fns["create"] = (lambda n: lambda job, a, s: _record(order, f"host:{n}:create"))(name)
-        with mock.patch.object(sys, "argv", ["deployer", "--cluster"]):
+        with (
+            mock.patch.object(ns["LifecycleController"], "finish", new=mock.AsyncMock()),
+            mock.patch.object(sys, "argv", ["deployer", "--cluster"]),
+        ):
             ns["main"]()
         self.assertEqual(order, ["cluster:create"])
 
@@ -2443,7 +2480,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         ns = self._exec_runtime()
         order: list[str] = []
 
-        async def cluster_create(job: Any, a: Any) -> None:
+        async def cluster_create(_lc: Any, _host: Any, a: Any) -> None:
             order.append(f"cluster:create:abort={a}")
 
         ns["cluster_create"] = cluster_create
@@ -2498,6 +2535,21 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             _with_job(ns, ns["write_file"], "host", path, "[Unit]\nDescription=x", False)
             with open(path, encoding="utf-8") as out:
                 self.assertEqual(out.read(), "[Unit]\nDescription=x\n")
+
+    def test_install_self_copies_the_invoked_executable(self) -> None:
+        # In a PEX __file__ points inside the archive, so the boot restore
+        # copy must come from sys.argv[0] instead (2026-10-26).
+        ns = self._exec_runtime()
+        with tempfile.TemporaryDirectory() as tmp:
+            src = os.path.join(tmp, "ovn-fabric-deployer")
+            dest = os.path.join(tmp, "installed")
+            with open(src, "w", encoding="utf-8") as out:
+                out.write("#!/bin/sh\n")
+            with mock.patch.object(sys, "argv", [src]):
+                _with_job(ns, ns["install_self"], "host", dest, False)
+            with open(dest, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "#!/bin/sh\n")
+            self.assertTrue(os.access(dest, os.X_OK))
 
     def test_dpkg_not_installed_is_missing(self) -> None:
         ns = self._exec_runtime()

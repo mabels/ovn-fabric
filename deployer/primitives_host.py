@@ -10,6 +10,15 @@ from .lifecycle import (
     Primitive,
     RawNodeTemplate,
 )
+from .primitives_ovn import (
+    OVNNbCtlAcl,
+    OVNNbCtlLr,
+    OVNNbCtlLrp,
+    OVNNbCtlLs,
+    OVNNbCtlLsp,
+    OVNNbCtlNat,
+    OVNNbCtlRoute,
+)
 
 GLOBAL_NETNS = "*global*"
 
@@ -51,6 +60,92 @@ class HostPrimitive:
 
     def netns(self, name: str | None) -> "NetnsPrimitive":
         return NetnsPrimitive(host=self.name, name=name)
+
+    # -- OVN northbound objects -----------------------------------------
+    # The cluster pass runs on a central chassis; these factory methods
+    # keep the generated body to `lc.run(host.ovn_nbctl_*(...))`.
+
+    def ovn_nbctl_ls(self, name: str) -> OVNNbCtlLs:
+        return OVNNbCtlLs(name)
+
+    def ovn_nbctl_lsp(
+        self,
+        switch: str,
+        name: str,
+        *,
+        type: str | None = None,
+        addresses: Sequence[str] = (),
+        options: Sequence[tuple[str, str]] = (),
+    ) -> OVNNbCtlLsp:
+        return OVNNbCtlLsp(
+            switch=switch,
+            name=name,
+            type=type,
+            addresses=tuple(addresses),
+            options=tuple(options),
+        )
+
+    def ovn_nbctl_lr(
+        self,
+        name: str,
+        *,
+        options: Sequence[tuple[str, str]] = (),
+        external_ids: Sequence[tuple[str, str]] = (),
+    ) -> OVNNbCtlLr:
+        return OVNNbCtlLr(
+            name=name,
+            options=tuple(options),
+            external_ids=tuple(external_ids),
+        )
+
+    def ovn_nbctl_lrp(
+        self,
+        router: str,
+        name: str,
+        mac: str,
+        networks: Sequence[str] = (),
+        *,
+        gateway_chassis: Any = None,
+        ipv6_ra_configs: Sequence[tuple[str, str]] = (),
+    ) -> OVNNbCtlLrp:
+        return OVNNbCtlLrp(
+            router=router,
+            name=name,
+            mac=mac,
+            networks=tuple(networks),
+            gateway_chassis=gateway_chassis,
+            ipv6_ra_configs=tuple(ipv6_ra_configs),
+        )
+
+    def ovn_nbctl_route(self, router: str, prefix: str, nexthop: str) -> OVNNbCtlRoute:
+        return OVNNbCtlRoute(router, prefix, nexthop)
+
+    def ovn_nbctl_nat(
+        self,
+        router: str,
+        nat_type: str,
+        external_ip: str,
+        logical_ip: str,
+        *,
+        reset: bool = False,
+    ) -> OVNNbCtlNat:
+        return OVNNbCtlNat(
+            router=router,
+            type=nat_type,
+            external_ip=external_ip,
+            logical_ip=logical_ip,
+            reset=reset,
+        )
+
+    def ovn_nbctl_acl(
+        self,
+        switch: str,
+        direction: str,
+        priority: int,
+        match: str,
+        action: str,
+    ) -> OVNNbCtlAcl:
+        return OVNNbCtlAcl(switch, direction, priority, match, action)
 
 
 @dataclasses.dataclass(frozen=True)

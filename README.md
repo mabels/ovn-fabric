@@ -5,7 +5,7 @@ hosts, routers, collision domains, VPN tunnels — as plain TypeScript, and
 ovn-fabric emits a desired-state **IR** (JSON): one `{id, kind, key, data}`
 node per host / collision domain / router port / workload. Feed that IR to
 the Python deployer (`deployer/`), which turns it into **one self-contained
-Python script** carrying every host's pass. Copy that script to a host and
+executable PEX** carrying every host's pass. Copy that PEX to a host and
 run it: it creates the OVS bridges/interfaces, builds the full OVN logical
 topology (routers, switches, NAT), and installs the interface bindings,
 kernel routers and workloads as boot-time systemd units — idempotently, so

@@ -181,7 +181,14 @@ class RawGraphBuilder:
 
 
 class LifecycleController:
-    """The only writer of both commands and their raw reflection."""
+    """The only writer of both commands and their raw reflection.
+
+    Bulk scope operations — replacing a NAT set per external IP, pruning
+    an ACL set per switch/direction, deleting drifted objects — belong
+    here, driven by the plan. They are deliberately not modelled as
+    object primitives: they have no single semantic key, no raw node, and
+    no object inverse.
+    """
 
     def __init__(
         self,
