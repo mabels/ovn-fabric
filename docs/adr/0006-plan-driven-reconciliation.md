@@ -367,17 +367,40 @@ Done:
 - Each typed OVN primitive journals its raw node under a semantic key and
   probes the runtime UUID by name after create.
 - `deployer/primitives_host.py`: `HostPrimitive` factory with
-  `host.netns(None|name)`, `netns.add_if(...)`, and the
+  `host.netns(None|name)`, `netns.add_if(...)`, `netns.add_vlan(...)`,
+  `host.ovs_bridge/_port/_afxdp_port/_mapping(...)`, and the
   `host.ovn_nbctl_*(...)` cluster factory methods.
+- Host configure bindings run under one `LifecycleController`: bridges,
+  ports, VLAN links, XDP veth legs, and `ovn-bridge-mappings` are
+  primitives. Host delete bindings use a DELETE controller.
+- Chassis registration is primitive-driven: NB/SB `set-connection`
+  and OVS `external_ids` are `OVNNbCtlConnection` / `OVSExternalId`.
+  IPFIX still uses the command path.
+- Kernel-router up/down bodies run under one `LifecycleController`:
+  netns creation and baseline (lo, forwarding), VLAN/veth/dummy links,
+  addresses, routes, iptables rules, WireGuard (`netns.wireguard`), and
+  Docker containers (`host.docker` + `docker.get_netns()`) are primitives.
+- Workload containers use `host.docker_image(...)` for builds and
+  `host.docker(...)` for run/remove. Service NICs use
+  `netns.add_link(..., rename_to=...)`, `add_addr`, `add_route` with
+  table/family, and `add_ip_rule`.
+- Filesystem effects used by these bodies are primitives:
+  `host.make_dir`, `host.chmod`, `host.remove_file`, `host.remove_tree`.
 - Tests cover primitive command streams and raw nodes, and assert the
   generated cluster functions are controller/primitives-driven.
 - `--explode DIR` on the generated PEX and `ovn-fabric explode`.
 
 Not done yet:
 
-- Only OVS bridges and cluster OVN objects are journaled at apply time.
-  Bridge ports, VLANs, veths, addresses, routes, OVS mappings, iptables,
-  services and containers still execute as raw commands.
+- OVS bridges/ports, VLAN/XDP/veth links, `ovn-bridge-mappings`,
+  cluster OVN objects, kernel-router addresses/routes/iptables, and
+  netns baseline state are journaled at apply time. App-owned network
+  configuration, services, and containers still execute as raw commands.
+- `LifecycleController` has a deferred queue: `lc.run(primitive)` stores the
+  operation, `lc.execute(CREATE)` runs forward, `lc.execute(DELETE)` runs
+  the same queue in reverse, and `OVN_FABRIC_DUMP_QUEUES=1` writes the
+  ordered queue before execution. The cluster pass is the first generated
+  body with a single actionless function (`cluster`) and no `cluster_delete`.
 - `--action run` is not lifecycle-controller driven.
 - Kernel router bodies and Docker/service bodies have not been converted
   to primitives.
@@ -387,8 +410,7 @@ Not done yet:
 
 Next slices:
 
-1. Convert host bindings (ports, VLANs, veths, mappings) and seed the
-   journal with kept nodes.
-2. Convert kernel router/netns/address/route/iptables primitives.
-3. Convert services, Docker, and image lifecycle.
+1. Seed the journal with kept/live nodes across the binding primitives.
+2. Convert the remaining helper-level Docker client-mode attach path,
+   IPFIX, and systemd unit lifecycle.
 4. Wire `--action run` and add `--plan`.

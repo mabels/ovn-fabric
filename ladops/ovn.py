@@ -261,12 +261,16 @@ def acl_del_argv(
 
 
 def lr_route_add_argv(router: str, prefix: str, nexthop: str) -> list[str]:
-    # No separate lr_route_del_argv/delete needed: lr_del_argv above
-    # already cascades a router's own static routes away with it — a
-    # route only ever needs deleting on its own when the ROUTE changes
-    # but the router doesn't. A duplicate add FAILS; the create pass is
-    # desired-state, not a silent merge.
+    # A duplicate add FAILS; the create pass is desired-state, not a
+    # silent merge.
     return [*_NBCTL, "lr-route-add", router, prefix, nexthop]
+
+
+def lr_route_del_argv(router: str, prefix: str, nexthop: str) -> list[str]:
+    # The explicit inverse of lr_route_add_argv. lr_del_argv would cascade
+    # the route away with its router, but a delete rewinds every object it
+    # created on its own — this route, then (later) the router.
+    return [*_NBCTL, "--if-exists", "lr-route-del", router, prefix, nexthop]
 
 
 def lrp_set_gateway_chassis_argv(

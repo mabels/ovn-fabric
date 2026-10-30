@@ -2,22 +2,49 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Sequence
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from .lifecycle import (
     Command,
+    CommandPrimitive,
     LifecycleController,
     Primitive,
     RawNodeTemplate,
 )
+
+if TYPE_CHECKING:
+    from .primitives_docker import DockerImage, DockerPrimitive, DockerPull
+
+from .primitives_fs import ChmodPrimitive, DirectoryPrimitive, RemovePathPrimitive
+from .primitives_net import (
+    AddrPrimitive,
+    DhclientPrimitive,
+    IpRulePrimitive,
+    IptablesRule,
+    NetnsLinkPrimitive,
+    RoutePrimitive,
+    SysctlFilePrimitive,
+    SysctlPrimitive,
+    WireguardPrimitive,
+)
 from .primitives_ovn import (
     OVNNbCtlAcl,
+    OVNNbCtlConnection,
     OVNNbCtlLr,
     OVNNbCtlLrp,
     OVNNbCtlLs,
     OVNNbCtlLsp,
     OVNNbCtlNat,
     OVNNbCtlRoute,
+    OVNSbCtlConnection,
+)
+from .primitives_ovs import (
+    OVSAfxdpPort,
+    OVSBridge,
+    OVSExternalId,
+    OVSIpfix,
+    OVSMapping,
+    OVSPort,
 )
 
 GLOBAL_NETNS = "*global*"
@@ -34,7 +61,7 @@ def _prefix(netns: str | None, argv: Sequence[str]) -> tuple[str, ...]:
 
 
 @dataclasses.dataclass(frozen=True)
-class HostPrimitive:
+class HostPrimitive(CommandPrimitive):
     name: str
 
     @property
@@ -51,15 +78,130 @@ class HostPrimitive:
                     fields={"hostname": self.name},
                 ),
             ),
-            create=(),
-            delete=(),
+            create_cmds=(),
+            delete_cmds=(),
         )
 
-    async def run(self, lc: LifecycleController) -> None:
-        await self.as_primitive().run(lc)
+    def netns(self, name: str | None, *, owned: bool = True) -> "NetnsPrimitive":
+        return NetnsPrimitive(host=self.name, name=name, owned=owned)
 
-    def netns(self, name: str | None) -> "NetnsPrimitive":
-        return NetnsPrimitive(host=self.name, name=name)
+    def container_netns(self, name: str) -> "NetnsPrimitive":
+        """A netns owned by Docker (or another supervisor): journal it,
+        but never create/delete it with `ip netns`."""
+        return self.netns(name, owned=False)
+
+    def rootNs(self) -> "NetnsPrimitive":
+        """The root namespace (`host.netns(None)`), named so generated
+        code binds it once and reads `root.add_port(...)`."""
+        return self.netns(None)
+
+    @property
+    def kernel(self) -> "NetnsPrimitive":
+        return self.rootNs()
+
+    # -- containers -----------------------------------------------------
+
+    def docker(
+        self,
+        name: str,
+        image: str,
+        *,
+        command: Sequence[str] = (),
+        privileged: bool = False,
+        network: str = "none",
+        environment: Sequence[tuple[str, str]] = (),
+        volumes: Sequence[tuple[str, str]] = (),
+        run_flags: Sequence[str] = (),
+        remove_existing: bool = True,
+    ) -> "DockerPrimitive":
+        from .primitives_docker import DockerPrimitive
+
+        return DockerPrimitive(
+            host=self.name,
+            name=name,
+            image=image,
+            command=tuple(command),
+            privileged=privileged,
+            network=network,
+            environment=tuple(environment),
+            volumes=tuple(volumes),
+            run_flags=tuple(run_flags),
+            remove_existing=remove_existing,
+        )
+
+    def docker_image(self, image: str, dockerfile: str, context: str) -> "DockerImage":
+        from .primitives_docker import DockerImage
+
+        return DockerImage(self.name, image, dockerfile, context)
+
+    def docker_pull(self, image: str) -> "DockerPull":
+        from .primitives_docker import DockerPull
+
+        return DockerPull(self.name, image)
+
+    # -- OVS / host bindings --------------------------------------------
+
+    def make_dir(self, path: str) -> DirectoryPrimitive:
+        return DirectoryPrimitive(self.name, path)
+
+    def state_dir(self, path: str) -> DirectoryPrimitive:
+        """A directory this deployer owns with its content (see
+        DirectoryPrimitive)."""
+        return DirectoryPrimitive(self.name, path, owned=True)
+
+    def chmod(self, path: str, mode: str) -> ChmodPrimitive:
+        return ChmodPrimitive(self.name, path, mode)
+
+    def remove_file(self, path: str) -> RemovePathPrimitive:
+        return RemovePathPrimitive(self.name, path)
+
+    def remove_tree(self, path: str) -> RemovePathPrimitive:
+        return RemovePathPrimitive(self.name, path, recursive=True)
+
+    def ovs_bridge(
+        self,
+        name: str,
+        *,
+        datapath: str | None = None,
+        fail_mode: str = "standalone",
+    ) -> OVSBridge:
+        return OVSBridge(name, datapath=datapath, fail_mode=fail_mode)
+
+    def ovs_port(
+        self,
+        bridge: str,
+        port: str,
+        *,
+        tag: int | None = None,
+        trunks: Sequence[int] = (),
+    ) -> OVSPort:
+        return OVSPort(bridge, port, tag=tag, trunks=tuple(trunks))
+
+    def ovs_afxdp_port(
+        self,
+        bridge: str,
+        port: str,
+        mode: str,
+        n_rxq: int,
+        *,
+        trunks: Sequence[int] = (),
+    ) -> OVSAfxdpPort:
+        return OVSAfxdpPort(bridge, port, mode, n_rxq, trunks=tuple(trunks))
+
+    def ovs_mapping(self, mappings: Sequence[str]) -> OVSMapping:
+        return OVSMapping(tuple(mappings))
+
+    def ovs_external_id(self, key: str, value: str) -> OVSExternalId:
+        return OVSExternalId(key, value)
+
+    def ovs_ipfix(self, bridge: str, script: str) -> OVSIpfix:
+        return OVSIpfix(bridge, script)
+
+    def ovn_nb_connection(self) -> OVNNbCtlConnection:
+        return OVNNbCtlConnection()
+
+    def ovn_sb_connection(self) -> OVNSbCtlConnection:
+        return OVNSbCtlConnection()
 
     # -- OVN northbound objects -----------------------------------------
     # The cluster pass runs on a central chassis; these factory methods
@@ -149,16 +291,17 @@ class HostPrimitive:
 
 
 @dataclasses.dataclass(frozen=True)
-class NetnsPrimitive:
+class NetnsPrimitive(CommandPrimitive):
     host: str
     name: str | None
+    owned: bool = True
 
     @property
     def ref(self) -> str:
         return f"netns:{_ns_arg(self.name)}"
 
     def as_primitive(self) -> Primitive:
-        if self.name is None:
+        if self.name is None or not self.owned:
             create: tuple[Command, ...] = ()
             delete: tuple[Command, ...] = ()
         else:
@@ -166,6 +309,34 @@ class NetnsPrimitive:
                 Command(
                     f"{self.host}:netns {self.name} (create)",
                     ("ip", "netns", "add", self.name),
+                ),
+                Command(
+                    f"{self.host}:netns {self.name} (lo up)",
+                    ("ip", "netns", "exec", self.name, "ip", "link", "set", "lo", "up"),
+                ),
+                Command(
+                    f"{self.host}:netns {self.name} (ipv4 forwarding)",
+                    (
+                        "ip",
+                        "netns",
+                        "exec",
+                        self.name,
+                        "sysctl",
+                        "-w",
+                        "net.ipv4.ip_forward=1",
+                    ),
+                ),
+                Command(
+                    f"{self.host}:netns {self.name} (ipv6 forwarding)",
+                    (
+                        "ip",
+                        "netns",
+                        "exec",
+                        self.name,
+                        "sysctl",
+                        "-w",
+                        "net.ipv6.conf.all.forwarding=1",
+                    ),
                 ),
             )
             delete = (
@@ -181,7 +352,11 @@ class NetnsPrimitive:
                     id=self.ref,
                     kind="netns",
                     fields={
-                        "scope": "global" if self.name is None else "isolated",
+                        "scope": (
+                            "global"
+                            if self.name is None
+                            else ("container" if not self.owned else "isolated")
+                        ),
                         "name": _ns_arg(self.name),
                         "linkRefs": [],
                         "routeRefs": [],
@@ -189,12 +364,9 @@ class NetnsPrimitive:
                     },
                 ),
             ),
-            create=create,
-            delete=delete,
+            create_cmds=create,
+            delete_cmds=delete,
         )
-
-    async def run(self, lc: LifecycleController) -> None:
-        await self.as_primitive().run(lc)
 
     def add_if(
         self,
@@ -203,6 +375,7 @@ class NetnsPrimitive:
         kind: str = "dummy",
         peer: str | None = None,
         mac: str | None = None,
+        up: bool = False,
     ) -> "LinkPrimitive":
         return LinkPrimitive(
             host=self.host,
@@ -211,6 +384,111 @@ class NetnsPrimitive:
             kind=kind,
             peer=peer,
             mac=mac,
+            up=up,
+        )
+
+    def add_vlan(self, parent: str, name: str, vlan_id: int) -> "VlanPrimitive":
+        return VlanPrimitive(
+            host=self.host,
+            netns=self.name,
+            parent=parent,
+            name=name,
+            vlan_id=vlan_id,
+        )
+
+    # -- kernel-router children -----------------------------------------
+
+    def add_link(
+        self,
+        name: str,
+        kind: str,
+        *,
+        rename_to: str | None = None,
+        parent: str | None = None,
+        vlan_id: int | None = None,
+        mac: str | None = None,
+        root_leg: str | None = None,
+        bridge: str | None = None,
+    ) -> NetnsLinkPrimitive:
+        if self.name is None:
+            raise ValueError("a kernel link needs a named netns")
+        return NetnsLinkPrimitive(
+            host=self.host,
+            netns=self.name,
+            name=name,
+            kind=kind,
+            rename_to=rename_to,
+            parent=parent,
+            vlan_id=vlan_id,
+            mac=mac,
+            root_leg=root_leg,
+            bridge=bridge,
+        )
+
+    def add_addr(self, link: str, addr: str) -> AddrPrimitive:
+        return AddrPrimitive(host=self.host, netns=self.name, link=link, addr=addr)
+
+    def add_route(
+        self,
+        dst: str,
+        dev: str,
+        via: str | None = None,
+        metric: float | None = None,
+        table: int | None = None,
+        family: int | None = None,
+    ) -> RoutePrimitive:
+        return RoutePrimitive(
+            host=self.host,
+            netns=self.name,
+            dst=dst,
+            dev=dev,
+            via=via,
+            metric=metric,
+            table=table,
+            family=family,
+        )
+
+    def set_sysctl_file(self, path: str, value: str) -> SysctlFilePrimitive:
+        if self.name is None:
+            raise ValueError("a sysctl file needs a named netns")
+        return SysctlFilePrimitive(self.host, self.name, path, value)
+
+    def dhclient(self, dev: str, lease: str) -> DhclientPrimitive:
+        if self.name is None:
+            raise ValueError("dhclient needs a named netns")
+        return DhclientPrimitive(self.host, self.name, dev, lease)
+
+    def wireguard(self, iface: str, conf_path: str) -> WireguardPrimitive:
+        if self.name is None:
+            raise ValueError("wireguard needs a named netns")
+        return WireguardPrimitive(self.host, self.name, iface, conf_path)
+
+    def add_ip_rule(self, source: str, table: int, family: int = 4) -> IpRulePrimitive:
+        return IpRulePrimitive(
+            host=self.host, netns=self.name, source=source, table=table, family=family
+        )
+
+    def set_sysctl(self, key: str, value: str) -> SysctlPrimitive:
+        if self.name is None:
+            raise ValueError("a sysctl needs a named netns")
+        return SysctlPrimitive(host=self.host, netns=self.name, key=key, value=value)
+
+    def add_rule(
+        self,
+        binary: str,
+        table: str,
+        chain: str,
+        args: Sequence[str] = (),
+    ) -> IptablesRule:
+        if self.name is None:
+            raise ValueError("an iptables rule needs a named netns")
+        return IptablesRule(
+            host=self.host,
+            netns=self.name,
+            binary=binary,
+            table=table,
+            chain=chain,
+            args=tuple(args),
         )
 
 
@@ -219,13 +497,14 @@ async def _link_probe(lc: LifecycleController) -> dict[str, Any] | None:
 
 
 @dataclasses.dataclass(frozen=True)
-class LinkPrimitive:
+class LinkPrimitive(CommandPrimitive):
     host: str
     netns: str | None
     name: str
     kind: str = "dummy"
     peer: str | None = None
     mac: str | None = None
+    up: bool = False
 
     @property
     def ref(self) -> str:
@@ -259,7 +538,7 @@ class LinkPrimitive:
                         "ifindex": 0,
                         "linkKind": "veth",
                         "peerRefs": [peer_ref],
-                        "adminUp": False,
+                        "adminUp": self.up,
                     },
                 ),
                 RawNodeTemplate(
@@ -271,7 +550,7 @@ class LinkPrimitive:
                         "ifindex": 0,
                         "linkKind": "veth",
                         "peerRefs": [self.ref],
-                        "adminUp": False,
+                        "adminUp": self.up,
                     },
                 ),
             )
@@ -286,7 +565,7 @@ class LinkPrimitive:
                         "ifname": self.name,
                         "ifindex": 0,
                         "linkKind": "dummy" if self.kind == "dummy" else "other",
-                        "adminUp": False,
+                        "adminUp": self.up,
                         **({"mac": self.mac} if self.mac else {}),
                     },
                 ),
@@ -299,22 +578,96 @@ class LinkPrimitive:
                     _prefix(self.netns, ("ip", "link", "set", self.name, "address", self.mac)),
                 )
             )
+        if self.up:
+            create.append(
+                Command(
+                    f"{self.host}:if {self.name} (up)",
+                    _prefix(self.netns, ("ip", "link", "set", self.name, "up")),
+                )
+            )
+            if self.kind == "veth" and self.peer is not None:
+                create.append(
+                    Command(
+                        f"{self.host}:if {self.peer} (up)",
+                        _prefix(
+                            self.netns,
+                            ("ip", "link", "set", self.peer, "up"),
+                        ),
+                    )
+                )
         return Primitive(
             key=self.ref,
             nodes=nodes,
-            create=tuple(create),
-            delete=(
+            create_cmds=tuple(create),
+            delete_cmds=(
                 Command(
                     f"{self.host}:if {self.name} (delete)",
                     _prefix(self.netns, ("ip", "link", "delete", self.name)),
                 ),
             ),
-            exists=Command(
-                f"{self.host}:if {self.name} (exists)",
-                _prefix(self.netns, ("ip", "link", "show", self.name)),
-            ),
             probe=_link_probe,
         )
 
-    async def run(self, lc: LifecycleController) -> None:
-        await self.as_primitive().run(lc)
+
+@dataclasses.dataclass(frozen=True)
+class VlanPrimitive(CommandPrimitive):
+    """A kernel VLAN sub-interface in the host's netns (or a named one)."""
+
+    host: str
+    netns: str | None
+    parent: str
+    name: str
+    vlan_id: int
+
+    @property
+    def ref(self) -> str:
+        return f"link:{_ns_arg(self.netns)}|{self.name}"
+
+    def as_primitive(self) -> Primitive:
+        return Primitive(
+            key=self.ref,
+            nodes=(
+                RawNodeTemplate(
+                    id=self.ref,
+                    kind="link",
+                    fields={
+                        "netnsRef": f"netns:{_ns_arg(self.netns)}",
+                        "ifname": self.name,
+                        "ifindex": 0,
+                        "linkKind": "vlan",
+                        "adminUp": True,
+                    },
+                ),
+            ),
+            create_cmds=(
+                Command(
+                    f"{self.host}:vlan {self.name} (create)",
+                    _prefix(
+                        self.netns,
+                        (
+                            "ip",
+                            "link",
+                            "add",
+                            "link",
+                            self.parent,
+                            "name",
+                            self.name,
+                            "type",
+                            "vlan",
+                            "id",
+                            str(self.vlan_id),
+                        ),
+                    ),
+                ),
+                Command(
+                    f"{self.host}:vlan {self.name} (up)",
+                    _prefix(self.netns, ("ip", "link", "set", self.name, "up")),
+                ),
+            ),
+            delete_cmds=(
+                Command(
+                    f"{self.host}:vlan {self.name} (delete)",
+                    _prefix(self.netns, ("ip", "link", "delete", self.name)),
+                ),
+            ),
+        )

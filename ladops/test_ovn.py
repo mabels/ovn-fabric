@@ -146,6 +146,19 @@ class WriteTest(unittest.TestCase):
             ],
         )
 
+    def test_lr_route_del_removes_exactly_that_route(self) -> None:
+        self.assertEqual(
+            mod.lr_route_del_argv("router-home", "0.0.0.0/0", "172.22.12.80"),
+            [
+                "ovn-nbctl",
+                "--if-exists",
+                "lr-route-del",
+                "router-home",
+                "0.0.0.0/0",
+                "172.22.12.80",
+            ],
+        )
+
     def test_ls_add_is_idempotent(self) -> None:
         self.assertEqual(mod.ls_add_argv("home"), ["ovn-nbctl", "ls-add", "home"])
 

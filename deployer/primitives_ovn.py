@@ -8,6 +8,7 @@ from ladops import ovn as ovn_ops
 
 from .lifecycle import (
     Command,
+    CommandPrimitive,
     LifecycleController,
     Primitive,
     RawNodeTemplate,
@@ -20,7 +21,7 @@ def _first_line(value: str) -> str:
 
 def _uuid_probe(table: str, command: Command) -> Any:
     async def probe(lc: LifecycleController) -> Mapping[str, Any] | None:
-        value = _first_line(await lc.capture_cmd(command.label, command.argv, False))
+        value = _first_line(await lc.capture_cmd(command.label, command.argv, optional=True))
         if not value:
             return None
         return {"provider": "ovn", "table": table, "uuid": value}
@@ -42,7 +43,7 @@ def _find_probe(table: str, filters: Sequence[tuple[str, object]]) -> Any:
     command = Command(f"{table} (uuid)", argv)
 
     async def probe(lc: LifecycleController) -> Mapping[str, Any] | None:
-        value = _first_line(await lc.capture_cmd(command.label, command.argv, False))
+        value = _first_line(await lc.capture_cmd(command.label, command.argv, optional=True))
         if not value:
             return None
         return {"provider": "ovn", "table": table, "uuid": value}
@@ -51,7 +52,7 @@ def _find_probe(table: str, filters: Sequence[tuple[str, object]]) -> Any:
 
 
 @dataclasses.dataclass(frozen=True)
-class OVNNbCtlLs:
+class OVNNbCtlLs(CommandPrimitive):
     """`ovn-nbctl ls-add` + the raw ovn.ls node."""
 
     name: str
@@ -78,18 +79,18 @@ class OVNNbCtlLs:
                     },
                 ),
             ),
-            create=(Command(f"ls:{self.name} (create)", tuple(ovn_ops.ls_add_argv(self.name))),),
-            delete=(Command(f"ls:{self.name} (delete)", tuple(ovn_ops.ls_del_argv(self.name))),),
-            exists=exists,
+            create_cmds=(
+                Command(f"ls:{self.name} (create)", tuple(ovn_ops.ls_add_argv(self.name))),
+            ),
+            delete_cmds=(
+                Command(f"ls:{self.name} (delete)", tuple(ovn_ops.ls_del_argv(self.name))),
+            ),
             probe=_uuid_probe("Logical_Switch", exists),
         )
 
-    async def run(self, lc: LifecycleController) -> None:
-        await self.as_primitive().run(lc)
-
 
 @dataclasses.dataclass(frozen=True)
-class OVNNbCtlLsp:
+class OVNNbCtlLsp(CommandPrimitive):
     """`ovn-nbctl lsp-add` plus its type/addresses/options setters."""
 
     switch: str
@@ -155,23 +156,19 @@ class OVNNbCtlLsp:
                     },
                 ),
             ),
-            create=tuple(create),
-            delete=(
+            create_cmds=tuple(create),
+            delete_cmds=(
                 Command(
                     f"lsp:{self.name} (delete)",
                     tuple(ovn_ops.lsp_del_argv(self.name)),
                 ),
             ),
-            exists=exists,
             probe=_uuid_probe("Logical_Switch_Port", exists),
         )
 
-    async def run(self, lc: LifecycleController) -> None:
-        await self.as_primitive().run(lc)
-
 
 @dataclasses.dataclass(frozen=True)
-class OVNNbCtlLr:
+class OVNNbCtlLr(CommandPrimitive):
     """`ovn-nbctl lr-add`, its options, and its external_ids."""
 
     name: str
@@ -221,14 +218,12 @@ class OVNNbCtlLr:
                     },
                 ),
             ),
-            create=tuple(create),
-            delete=(Command(f"lr:{self.name} (delete)", tuple(ovn_ops.lr_del_argv(self.name))),),
-            exists=exists,
+            create_cmds=tuple(create),
+            delete_cmds=(
+                Command(f"lr:{self.name} (delete)", tuple(ovn_ops.lr_del_argv(self.name))),
+            ),
             probe=_uuid_probe("Logical_Router", exists),
         )
-
-    async def run(self, lc: LifecycleController) -> None:
-        await self.as_primitive().run(lc)
 
     # -- children scoped to this router ---------------------------------
 
@@ -276,7 +271,7 @@ class OVNNbCtlLr:
 
 
 @dataclasses.dataclass(frozen=True)
-class OVNNbCtlLrp:
+class OVNNbCtlLrp(CommandPrimitive):
     """`ovn-nbctl lrp-add`, gateway pinning, and ipv6_ra_configs."""
 
     router: str
@@ -345,14 +340,12 @@ class OVNNbCtlLrp:
                     },
                 ),
             ),
-            create=tuple(create),
-            delete=(Command(f"lrp:{self.name} (delete)", tuple(ovn_ops.lrp_del_argv(self.name))),),
-            exists=exists,
+            create_cmds=tuple(create),
+            delete_cmds=(
+                Command(f"lrp:{self.name} (delete)", tuple(ovn_ops.lrp_del_argv(self.name))),
+            ),
             probe=_uuid_probe("Logical_Router_Port", exists),
         )
-
-    async def run(self, lc: LifecycleController) -> None:
-        await self.as_primitive().run(lc)
 
     def bind_switch(self, switch: str, lsp: str) -> "OVNNbCtlLsp":
         """The router-type LSP that binds this port to `switch`."""
@@ -366,7 +359,7 @@ class OVNNbCtlLrp:
 
 
 @dataclasses.dataclass(frozen=True)
-class OVNNbCtlRoute:
+class OVNNbCtlRoute(CommandPrimitive):
     """A static route on a logical router."""
 
     router: str
@@ -392,26 +385,27 @@ class OVNNbCtlRoute:
                     },
                 ),
             ),
-            create=(
+            create_cmds=(
                 Command(
                     f"route:{self.prefix} (create)",
                     tuple(ovn_ops.lr_route_add_argv(self.router, self.prefix, self.nexthop)),
                 ),
             ),
-            # lr-del cascades the router's own static routes.
-            delete=(),
+            delete_cmds=(
+                Command(
+                    f"route:{self.prefix} (delete)",
+                    tuple(ovn_ops.lr_route_del_argv(self.router, self.prefix, self.nexthop)),
+                ),
+            ),
             probe=_find_probe(
                 "Logical_Router_Static_Route",
                 (("ip_prefix", self.prefix), ("nexthop", self.nexthop)),
             ),
         )
 
-    async def run(self, lc: LifecycleController) -> None:
-        await self.as_primitive().run(lc)
-
 
 @dataclasses.dataclass(frozen=True)
-class OVNNbCtlNat:
+class OVNNbCtlNat(CommandPrimitive):
     """One SNAT/DNAT mapping. `reset` replaces the whole external IP
     first, matching the create-only emitter (lr-nat-add has no
     --may-exist)."""
@@ -462,8 +456,8 @@ class OVNNbCtlNat:
                     },
                 ),
             ),
-            create=tuple(create),
-            delete=(
+            create_cmds=tuple(create),
+            delete_cmds=(
                 Command(
                     f"nat:{self.router}/{self.external_ip} (delete)",
                     tuple(ovn_ops.lr_nat_del_argv(self.router, self.type, self.external_ip)),
@@ -479,12 +473,9 @@ class OVNNbCtlNat:
             ),
         )
 
-    async def run(self, lc: LifecycleController) -> None:
-        await self.as_primitive().run(lc)
-
 
 @dataclasses.dataclass(frozen=True)
-class OVNNbCtlAcl:
+class OVNNbCtlAcl(CommandPrimitive):
     """One ACL on a logical switch."""
 
     switch: str
@@ -514,7 +505,7 @@ class OVNNbCtlAcl:
                     },
                 ),
             ),
-            create=(
+            create_cmds=(
                 Command(
                     f"acl:{self.switch}/{self.direction} (create)",
                     tuple(
@@ -528,7 +519,7 @@ class OVNNbCtlAcl:
                     ),
                 ),
             ),
-            delete=(
+            delete_cmds=(
                 Command(
                     f"acl:{self.switch}/{self.direction} (delete)",
                     tuple(
@@ -547,5 +538,52 @@ class OVNNbCtlAcl:
             ),
         )
 
-    async def run(self, lc: LifecycleController) -> None:
-        await self.as_primitive().run(lc)
+
+@dataclasses.dataclass(frozen=True)
+class OVNNbCtlConnection(CommandPrimitive):
+    """The northbound `set-connection`/`del-connection` pair."""
+
+    key: str = "ovn.nb.connection"
+
+    def as_primitive(self) -> Primitive:
+        return Primitive(
+            key=self.key,
+            nodes=(
+                RawNodeTemplate(
+                    id=self.key,
+                    kind="ovn.connection",
+                    fields={"service": "nb", "connections": ["ptcp:6641:0.0.0.0"]},
+                ),
+            ),
+            create_cmds=(
+                Command("ovn-nb (set-connection)", tuple(ovn_ops.nb_set_connection_argv())),
+            ),
+            delete_cmds=(
+                Command("ovn-nb (del-connection)", tuple(ovn_ops.nb_del_connection_argv())),
+            ),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class OVNSbCtlConnection(CommandPrimitive):
+    """The southbound `set-connection`/`del-connection` pair."""
+
+    key: str = "ovn.sb.connection"
+
+    def as_primitive(self) -> Primitive:
+        return Primitive(
+            key=self.key,
+            nodes=(
+                RawNodeTemplate(
+                    id=self.key,
+                    kind="ovn.connection",
+                    fields={"service": "sb", "connections": ["ptcp:6642:0.0.0.0"]},
+                ),
+            ),
+            create_cmds=(
+                Command("ovn-sb (set-connection)", tuple(ovn_ops.sb_set_connection_argv())),
+            ),
+            delete_cmds=(
+                Command("ovn-sb (del-connection)", tuple(ovn_ops.sb_del_connection_argv())),
+            ),
+        )

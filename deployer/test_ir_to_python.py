@@ -30,11 +30,14 @@ import contextlib
 import dataclasses
 import importlib
 import io
+import logging
 import os
+import re
 import shlex
 import sys
 import tempfile
 import unittest
+import zipfile
 from collections.abc import Collection, Sequence
 from typing import Any, cast
 from unittest import mock
@@ -48,13 +51,14 @@ from .ir_common import (
     Emitter,
     Ref,
     _emit_cluster_body,
+    _emit_fabric_start,
     _emit_host_configure,
     _emit_host_script,
     _emit_iface_bindings,
     _emit_kernel_router_owner,
     _emit_router,
-    _emit_service_down,
     _emit_service_up,
+    _fabric_unit,
     _install_plan,
     _kernel_router_owners,
     _kernel_router_script,
@@ -88,7 +92,12 @@ class Ops(str):
 class _OpEmitter(Emitter):
     """Records the emitters' operations as Python calls, not shell text:
     `run_cmd argv`, `write_file path`, `install host`, `install_self
-    path`. A test fixture; nothing runs it."""
+    path`. A test fixture; nothing runs it.
+
+    It traces what the LifecycleController would run for its `action`:
+    the declaration's create commands in order, or — for "delete" — each
+    operation's delete commands, rewound (every block lands in front of
+    the ones before it)."""
 
     def __init__(self, action: Action) -> None:
         super().__init__(action)
@@ -99,6 +108,44 @@ class _OpEmitter(Emitter):
         self.writes: dict[str, str] = {}
         self.self_installs: list[str] = []
         self.scripts: dict[str, str] = {}
+        self.bound: dict[str, Any] = {}
+
+    @property
+    def _delete(self) -> bool:
+        return self.action == "delete"
+
+    def _block(
+        self,
+        lines: Sequence[str],
+        commands: Sequence[list[str | Ref]] = (),
+        optional: Sequence[bool] = (),
+    ) -> None:
+        if self._delete:
+            self.lines[0:0] = list(lines)
+            self.commands[0:0] = list(commands)
+            self.optional[0:0] = list(optional)
+        else:
+            self.lines.extend(lines)
+            self.commands.extend(commands)
+            self.optional.extend(optional)
+
+    def _run(self, argvs: Sequence[Sequence[str | Ref]], optional: bool = False) -> None:
+        optional = optional or self._delete
+        self._block(
+            [
+                " ".join(_shell_token(token) for token in argv)
+                + (" # optional" if optional else "")
+                for argv in argvs
+            ],
+            [list(argv) for argv in argvs],
+            [optional] * len(argvs),
+        )
+
+    def comment(self, text: str) -> None:
+        self._block([text])
+
+    def blank(self) -> None:
+        self._block([""])
 
     def sh(
         self,
@@ -106,15 +153,20 @@ class _OpEmitter(Emitter):
         background: bool = False,
         optional: bool | None = None,
     ) -> None:
-        if optional is None:
-            optional = self.action == "delete"
-        self.commands.append(list(argv))
-        self.optional.append(optional)
-        line = " ".join(_shell_token(token) for token in argv) + (" &" if background else "")
-        self.lines.append(line + (" # optional" if optional else ""))
+        self._run([argv], bool(optional))
 
     def capture(self, var: str, argv: Sequence[str | Ref]) -> None:
-        self.lines.append(f"capture {var} " + " ".join(_shell_token(token) for token in argv))
+        if not self._delete:
+            self._block([f"capture {var} " + " ".join(_shell_token(token) for token in argv)])
+
+    def netns_symlink(self, container_expr: str, pid_var: str) -> None:
+        self._block([f"{'unlink' if self._delete else 'symlink'} {container_expr} {pid_var}"])
+
+    def assign(self, primitive: Any, var: str) -> None:
+        self.bound[var] = primitive
+
+    def run_var(self, var: str) -> None:
+        self.ovn(self.bound[var])
 
     def ovn(
         self,
@@ -124,41 +176,70 @@ class _OpEmitter(Emitter):
         parent: str | None = None,
     ) -> None:
         materialized = primitive.as_primitive()
-        commands = materialized.create if self.action == "create" else materialized.delete
-        for command in commands:
-            self.commands.append(list(command.argv))
-            self.optional.append(self.action == "delete")
-            self.lines.append(" ".join(_shell_token(token) for token in command.argv))
+        commands = materialized.delete_cmds if self._delete else materialized.create_cmds
+        self._block(
+            [" ".join(_shell_token(token) for token in command.argv) for command in commands],
+            [list(command.argv) for command in commands],
+            [self._delete] * len(commands),
+        )
 
     def append(self, path: str, content: str) -> None:
+        if self._delete:
+            self._block([f"remove_file {path}"])
+            return
         self.writes[path] = content
-        self.lines.append(f"write_file {path}")
         # The content stays visible for assertions on the written script;
         # _written_file() reads the structured copy above.
-        self.lines.extend(content.splitlines())
-
-    def install(self, host: str) -> None:
-        self.commands.append(["install", host])
-        self.optional.append(False)
-        self.lines.append(f"install {host}")
+        self._block([f"write_file {path}", *content.splitlines()])
 
     def install_self(self, path: str) -> None:
+        if self._delete:
+            self._block([f"remove_file {path}"])
+            return
         self.self_installs.append(path)
-        self.lines.append(f"install_self {path}")
+        self._block([f"install_self {path}"])
 
     def py(self, line: str) -> None:
-        self.lines.append(("    " * self._indent + line) if line else "")
+        self._block([("    " * self._indent + line) if line else ""])
+
+    def helper(
+        self,
+        name: str,
+        *args: object,
+        undo: str | None = None,
+        undo_args: Sequence[object] = (),
+    ) -> None:
+        if self._delete:
+            name, args = undo or "", tuple(undo_args)
+            if not name:
+                return
+        params = "".join(f", {arg!r}" for arg in args)
+        self.py(f"await {name}(job, {self.label!r}{params})")
 
     def begin_block(self, header: str) -> None:
-        self.lines.append(("    " * self._indent + header) if header else "")
+        self.py(header)
         self._indent += 1
 
     def end_block(self) -> None:
         self._indent -= 1
 
+    def daemon_reload(self) -> None:
+        self._run([["systemctl", "daemon-reload"]], optional=True)
+
     def enable_unit(self, unit: str, optional: bool = True) -> None:
-        self.sh(["systemctl", "enable", "--now", unit], optional=optional)
-        self.sh(["systemctl", "restart", unit], optional=optional)
+        if self._delete:
+            self._run([["systemctl", "disable", "--now", unit]], optional=True)
+        else:
+            self._run(
+                [["systemctl", "enable", "--now", unit], ["systemctl", "restart", unit]],
+                optional=optional,
+            )
+
+    def start_unit(self, unit: str) -> None:
+        if self._delete:
+            self._run([["systemctl", "stop", unit]], optional=True)
+        else:
+            self._run([["systemctl", "start", "--no-block", unit]])
 
     def start_script(self, script: str, optional: bool = True) -> None:
         self.sh([script, "up"], optional=optional)
@@ -186,10 +267,25 @@ def build_ops(nodes: list[pt.Model], action: Action) -> tuple[Ops, dict[str, Ops
         _emit_host_script(node, nodes, host)
         host_pass_only = "\n".join(host.lines)
         host_pass_commands = list(host.commands)
+        # The tree applies the configure declaration (chassis, bindings,
+        # IPFIX); include it in the trace the content assertions use. On
+        # delete its rewind runs first (the service's ExecStop, triggered
+        # by the host rewind's `systemctl disable --now`).
+        configure = _OpEmitter(action)
+        _emit_host_configure(node, nodes, configure)
+        # The last scope starts the service; its rewind stops it first.
+        start = _OpEmitter(action)
+        _emit_fabric_start(node, start)
         if action == "create":
-            # The tree applies the configure body (chassis, bindings,
-            # IPFIX); include it in the trace the content assertions use.
-            _emit_host_configure(node, nodes, host)
+            for scope in (configure, start):
+                host.lines += scope.lines
+                host.commands += scope.commands
+                host.optional += scope.optional
+                host.writes.update(scope.writes)
+        else:
+            host.lines[0:0] = start.lines + configure.lines
+            host.commands[0:0] = start.commands + configure.commands
+            host.optional[0:0] = start.optional + configure.optional
         host_only = "\n".join(host.lines)
         # The generated deployer now carries the router/service bodies as
         # Python functions; these are the same bodies, rendered for the
@@ -200,8 +296,8 @@ def build_ops(nodes: list[pt.Model], action: Action) -> tuple[Ops, dict[str, Ops
             router = owner.key.name
             up = _OpEmitter("create")
             down = _OpEmitter("delete")
-            _emit_kernel_router_owner(owner, _netns_name(router), nodes, "create", up)
-            _emit_kernel_router_owner(owner, _netns_name(router), nodes, "delete", down)
+            _emit_kernel_router_owner(owner, _netns_name(router), nodes, up)
+            _emit_kernel_router_owner(owner, _netns_name(router), nodes, down)
             body = _kernel_router_script(router, up.lines, down.lines)
             host.scripts[router] = body
             host.writes[f"/usr/local/sbin/ovn-kernel-{router}.sh"] = body
@@ -217,7 +313,7 @@ def build_ops(nodes: list[pt.Model], action: Action) -> tuple[Ops, dict[str, Ops
             up = _OpEmitter("create")
             down = _OpEmitter("delete")
             _emit_service_up(n, faces, up)
-            _emit_service_down(n, faces, down)
+            _emit_service_up(n, faces, down)
             body = _test_service_script(name, up.lines, down.lines)
             host.scripts[name] = body
             host.writes[f"/usr/local/sbin/ovn-kernel-service-{name}.sh"] = body
@@ -425,6 +521,70 @@ def _with_job(ns: dict[str, Any], fn: Any, *args: Any, **kwargs: Any) -> Any:
             await root.stop()
 
     return asyncio.run(run())
+
+
+def _image_nodes() -> list[Any]:
+    """NODES plus a pulled workload image and a kernel router with a
+    built and a pulled app image."""
+    workload = pt.KernelAppContainerNode(
+        id="kernel.app.container:dns",
+        kind="kernel.app.container",
+        key=pt.KernelServiceKey(name="dns"),
+        data=pt.KernelAppContainerData(host="host:chassis-1", image="coredns/coredns:latest"),
+    )
+    return [
+        (
+            dataclasses.replace(
+                n,
+                data=dataclasses.replace(
+                    n.data,
+                    apps=[
+                        AppDocker(
+                            kind="docker",
+                            image="ovn-fabric-kernel-0",
+                            name="kernel-0-dhcpcd",
+                            cmd=["/sbin/dhcpcd"],
+                            build=pt.DockerBuild(from_="alpine:latest", packages=["dhcpcd"]),
+                        ),
+                        AppDocker(kind="docker", image="ubuntu", name="kernel-0-tool"),
+                    ],
+                ),
+            )
+            if n.kind == "kernel.router" and n.key.side == pt.Side.right
+            else n
+        )
+        for n in NODES
+    ] + [workload]
+
+
+def _with_ctx_job(ns: dict[str, Any], fn: Any, **options: Any) -> Any:
+    """Run a generated `fn(ctx, job)` with a fresh run context built from
+    `options`."""
+    ctx = ns["Ctx"](ns["Options"](**options))
+    return _with_job(ns, lambda job: fn(ctx, job))
+
+
+class _FakeFileOp:
+    """Stands in for WriteFile/InstallSelf in generated code under test:
+    records the path, never touches the filesystem."""
+
+    def __init__(self, path: str, *_args: Any) -> None:
+        self.path = path
+
+    async def create(self, lc: Any) -> None:
+        return None
+
+    async def delete(self, lc: Any) -> None:
+        return None
+
+    def describe(self, action: Any) -> list[str]:
+        return [f"file {self.path}"]
+
+
+def _fake_file_ops(ns: dict[str, Any]) -> None:
+    ns["WriteFile"] = _FakeFileOp
+    ns["InstallSelf"] = _FakeFileOp
+    ns["SymlinkNetns"] = _FakeFileOp
 
 
 def _proc(returncode: int = 0, stdout: bytes = b"") -> mock.Mock:
@@ -644,12 +804,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
 
     def test_vlan_created_and_brought_up_on_the_owning_host(self) -> None:
         script = self.hosts["chassis-1"]
-        # The create is guarded so a re-run tolerates the VLAN already
-        # existing (`ip link add` has no --may-exist).
-        self.assertIn(
-            "await ensure_vlan(job, 'test', 'eth0', 'eth0.129', 129, abort_on_error)",
-            script,
-        )
+        self.assertIn("ip link add link eth0 name eth0.129 type vlan id 129", script)
         self.assertIn("ip link set eth0.129 up", script)
 
     def test_bridge_created_and_port_attached_on_the_owning_host(self) -> None:
@@ -728,7 +883,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
         # bridge/port/VLAN (2026-09-19).
         script = self.hosts["chassis-1"]
         self.assertIn("ovs-vsctl add-port", script)
-        self.assertIn("await ensure_vlan(job, 'test', 'eth0', 'eth0.129'", script)
+        self.assertIn("ip link add link eth0 name eth0.129 type vlan id 129", script)
 
 
 class IfaceBindingDeleteTest(unittest.TestCase):
@@ -739,9 +894,14 @@ class IfaceBindingDeleteTest(unittest.TestCase):
         # ls-del already cascades the localnet LSP away with the switch.
         self.assertNotIn("lsp-add", self.cluster)
 
-    def test_del_br_uses_if_exists_and_cascades(self) -> None:
+    def test_ports_are_deleted_before_their_bridge(self) -> None:
+        # Delete rewinds what create made, one object at a time: the port
+        # explicitly, then the bridge.
         script = self.hosts["chassis-1"]
-        self.assertNotIn("del-port", script)  # del-br cascades its own ports
+        self.assertLess(
+            script.index("ovs-vsctl --if-exists del-port br-home eth0.129"),
+            script.index("ovs-vsctl --if-exists del-br br-home"),
+        )
 
     def test_vlan_link_deleted(self) -> None:
         self.assertIn("ip link delete eth0.129", self.hosts["chassis-1"])
@@ -911,18 +1071,21 @@ class FabricServiceTest(unittest.TestCase):
 
     def test_bindings_are_a_generated_body(self) -> None:
         body = self.hosts["chassis-1"].bindings
-        self.assertIn("await ensure_vlan(job, 'test', 'eth0', 'eth0.129', 129", body)
+        self.assertIn("ip link add link eth0 name eth0.129 type vlan id 129", body)
         self.assertIn("ip link set eth0.129 up", body)
         self.assertIn("ovs-vsctl add-port br-home eth0.129", body)
 
-    def test_one_service_runs_the_tree(self) -> None:
+    def test_one_service_runs_the_lazy_phase_once(self) -> None:
         host = self.hosts["chassis-1"]
         self.assertIn(f"install_self {self.SCRIPT}", host)
         unit = _written_file(host, self.UNIT)
-        self.assertIn("After=network-pre.target ovsdb-server.service ovs-vswitchd.service", unit)
-        self.assertIn(f"ExecStart={self.SCRIPT} --job ovn-fabric-chassis-1 --job-action up", unit)
-        self.assertIn(f"ExecStop={self.SCRIPT} --job ovn-fabric-chassis-1 --job-action down", unit)
-        self.assertIn("systemctl enable --now ovn-fabric.service", host)
+        self.assertIn("Type=oneshot", unit)
+        self.assertIn("TimeoutStartSec=infinity", unit)
+        self.assertIn(f"ExecStart={self.SCRIPT} --action lazy-create --host chassis-1", unit)
+        self.assertNotIn("ExecStop=", unit)
+        # Started in the background, never enabled: it runs once per create.
+        self.assertIn("systemctl start --no-block ovn-fabric.service", host)
+        self.assertNotIn("systemctl enable", host.host_only)
 
     def test_there_are_no_per_purpose_units(self) -> None:
         host = self.hosts["chassis-1"]
@@ -936,7 +1099,7 @@ class FabricServiceTest(unittest.TestCase):
     def test_delete_stops_the_service_before_the_bindings(self) -> None:
         _, hosts = build_ops(NODES, "delete")
         script = hosts["chassis-1"]
-        self.assertIn("systemctl disable --now ovn-fabric.service", script)
+        self.assertIn("systemctl stop ovn-fabric.service", script)
         self.assertIn("ip link delete eth0.129", script)
 
 
@@ -946,12 +1109,12 @@ class KernelRouterCreateTest(unittest.TestCase):
 
     def test_netns_created_once_on_the_owning_host(self) -> None:
         script = self.hosts["chassis-1"]
-        self.assertEqual(script.count("ensure_netns"), 1)
+        self.assertEqual(script.count("ip netns add ns-kernel-0"), 1)
 
     def test_router_is_a_tree_job_not_a_unit(self) -> None:
         script = self.hosts["chassis-1"]
         self.assertNotIn("ovn-kernel-kernel-0.service", script.host_only)
-        self.assertIn("systemctl enable --now ovn-fabric.service", script)
+        self.assertIn("systemctl start --no-block ovn-fabric.service", script)
 
     def test_ipv4_and_ipv6_forwarding_enabled_in_the_netns(self) -> None:
         # A kernel router IS a router — the netns's own forwarding knobs
@@ -991,7 +1154,7 @@ class KernelRouterCreateTest(unittest.TestCase):
         self.assertIn("ip link set dummy-left netns ns-kernel-0", script)
         self.assertGreater(
             script.index("ip link add link eth0 name eth0.2280 type vlan id 2280"),
-            script.index("ensure_netns"),
+            script.index("ip netns add ns-kernel-0"),
         )
         self.assertGreater(
             script.index("ip link set eth0.2280 netns ns-kernel-0"),
@@ -1220,7 +1383,7 @@ class KernelRouterCreateTest(unittest.TestCase):
             create_script,
         )
         self.assertIn(
-            "systemctl enable --now ovn-fabric.service",
+            "systemctl start --no-block ovn-fabric.service",
             create_script,
         )
         router = _router_script(create_script)
@@ -1241,7 +1404,7 @@ class KernelRouterCreateTest(unittest.TestCase):
         _, delete_hosts = build_ops(with_app(), "delete")
         delete_script = delete_hosts["chassis-1"]
         self.assertIn(
-            "systemctl disable --now ovn-fabric.service",
+            "systemctl stop ovn-fabric.service",
             delete_script,
         )
 
@@ -1305,12 +1468,19 @@ class KernelRouterCreateTest(unittest.TestCase):
         up, _ = _router_branches(router)
         # The generated Python starts the container-owned setup and then
         # applies the side's addressing in the container's netns.
-        self.assertIn("await _docker_owns_start(job", up)
+        self.assertIn("/usr/bin/docker", up)
+        self.assertIn(
+            "capture kernel_0_dhcpcd_pid /usr/bin/docker inspect -f '{{.State.Pid}}' "
+            "kernel-0-dhcpcd",
+            up,
+        )
+        self.assertIn("symlink 'kernel-0-dhcpcd' kernel_0_dhcpcd_pid", up)
+        self.assertIn("await _docker_attach_legs(job", up)
         self.assertIn(
             "ip netns exec kernel-0-dhcpcd ip addr add 10.12.80.14/28 dev veth-krn-9adb1d",
             up,
         )
-        self.assertIn("await _docker_exec_wait(job", up)
+        self.assertIn("await _docker_exec(job", up)
         self.assertNotIn(".sh", up)
 
     def test_dependencies_merge_into_one_install_object(self) -> None:
@@ -1421,7 +1591,7 @@ class KernelRouterCreateTest(unittest.TestCase):
         ]
         ns: dict[str, Any] = {}
         exec(mod.generate_python_deployer(nodes), ns)
-        tree = ns["_run_chassis_1"]()
+        tree = ns["_run_chassis_1"](ns["Ctx"]())
         self.assertEqual(
             [job.name for job in tree.children],
             ["install-packages", "configure"],
@@ -1438,35 +1608,7 @@ class KernelRouterCreateTest(unittest.TestCase):
     def test_the_images_of_a_hosts_units_are_in_the_install_object(self) -> None:
         # The plan provides docker images BEFORE the pass starts the
         # units that use them.
-        workload = pt.KernelAppContainerNode(
-            id="kernel.app.container:dns",
-            kind="kernel.app.container",
-            key=pt.KernelServiceKey(name="dns"),
-            data=pt.KernelAppContainerData(host="host:chassis-1", image="coredns/coredns:latest"),
-        )
-        nodes = [
-            (
-                dataclasses.replace(
-                    n,
-                    data=dataclasses.replace(
-                        n.data,
-                        apps=[
-                            AppDocker(
-                                kind="docker",
-                                image="ovn-fabric-kernel-0",
-                                name="kernel-0-dhcpcd",
-                                cmd=["/sbin/dhcpcd"],
-                                build=pt.DockerBuild(from_="alpine:latest", packages=["dhcpcd"]),
-                            ),
-                            AppDocker(kind="docker", image="ubuntu", name="kernel-0-tool"),
-                        ],
-                    ),
-                )
-                if n.kind == "kernel.router" and n.key.side == pt.Side.right
-                else n
-            )
-            for n in NODES
-        ] + [workload]
+        nodes = _image_nodes()
         _, hosts = build_ops(nodes, "create")
         self.assertEqual(
             _install_images(hosts["chassis-1"]),
@@ -1486,21 +1628,96 @@ class KernelRouterCreateTest(unittest.TestCase):
             ],
         )
 
-    def test_delete_removes_the_old_install_queue_before_anything_else(self) -> None:
-        # A host deployed by an older version may still run the consumer;
-        # it must not restart a unit the delete pass is tearing down.
-        _, hosts = build_ops(NODES, "delete")
-        commands = [
-            " ".join(str(token) for token in argv) for argv in _command_lines(hosts["chassis-1"])
+    def test_images_are_declared_in_the_lazy_phase_only(self) -> None:
+        src = mod.generate_python_deployer(_image_nodes())
+        # Every queued statement that builds or pulls an image, or writes
+        # its build context, is lazy (a WriteFile spans several lines).
+        statements = re.findall(r"await lc\.run\(.*?\)\n", src, flags=re.DOTALL)
+        image = [
+            statement
+            for statement in statements
+            if any(marker in statement for marker in ("docker_image(", "docker_pull(", "/build/"))
         ]
+        self.assertEqual(len(image), 5)  # 2 pulls, 1 build: context dir + Dockerfile + build
+        for statement in image:
+            self.assertTrue(statement.endswith(", lazy=True)\n"), statement)
+
+    def test_lazy_phase_runs_each_container_after_its_image(self) -> None:
+        ns: dict[str, Any] = {}
+        exec(mod.generate_python_deployer(_image_nodes()), ns)
+        _fake_file_ops(ns)
+
+        def docker_argvs(run: Any) -> list[str]:
+            with mock.patch(
+                "asyncio.create_subprocess_exec", new_callable=mock.AsyncMock
+            ) as create:
+                create.return_value = _proc(stdout=b"4242")
+                _with_ctx_job(ns, run)
+                return [
+                    " ".join(list(call.args)[1:3])
+                    for call in create.call_args_list
+                    if call.args[0] == "/usr/bin/docker"
+                ]
+
+        lazy = ns["HOSTS"]["chassis-1"]["lazy"]
+        action = ns["LifecycleAction"]
+        # Per container: its image, then — the pull/build fulfilled — run
+        # it and start its app inside (the legs are injected in between).
         self.assertEqual(
-            commands[:5],
+            docker_argvs(lambda ctx, job: lazy(ctx, job, action.LAZY_CREATE)),
             [
-                "systemctl disable --now ovn-fabric.service",
-                "systemctl disable --now ovn-fabric-bindings.service",
-                "systemctl disable --now ovn-fabric-restore.service",
-                "systemctl disable --now ovn-fabric-install.service",
-                "rm -f /etc/systemd/system/ovn-fabric.service",
+                "build -t",
+                "rm -f",
+                "run -d",
+                "exec -d",
+                "pull ubuntu",
+                "rm -f",
+                "run -d",
+                "exec -d",
+                "pull coredns/coredns:latest",
+                "rm -f",
+                "run -d",
+            ],
+        )
+        self.assertEqual(
+            docker_argvs(lambda ctx, job: lazy(ctx, job, action.LAZY_DELETE)),
+            ["rm -f", "image rm", "rm -f", "image rm", "rm -f", "image rm"],
+        )
+        # The router/service `up` bodies (CREATE) touch no container.
+        for name, (up_fn, _down) in ns["JOB_BODIES"].items():
+            if name.startswith("ovn-fabric-"):
+                continue
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                _with_ctx_job(ns, up_fn, dry_run=True)
+            for verb in ("pull", "build", "run"):
+                self.assertNotIn(f"docker {verb}", out.getvalue(), name)
+
+    def test_host_delete_rewinds_exactly_the_host_create(self) -> None:
+        # The host pass declares the program, the unit and the service;
+        # delete stops the service first and removes the program last.
+        _, create = build_ops(NODES, "create")
+        _, delete = build_ops(NODES, "delete")
+        self.assertEqual(
+            create["chassis-1"].host_pass_only.splitlines(),
+            [
+                "# --- fabric service: ovn-fabric.service ---",
+                "install_self /usr/local/sbin/ovn-fabric-deployer.py",
+                "systemctl daemon-reload # optional",
+                "write_file /etc/systemd/system/ovn-fabric.service",
+                *_fabric_unit("chassis-1").splitlines(),
+                "systemctl daemon-reload # optional",
+            ],
+        )
+        self.assertEqual(
+            delete["chassis-1"].host_pass_only.splitlines(),
+            [
+                "",
+                "systemctl daemon-reload # optional",
+                "remove_file /etc/systemd/system/ovn-fabric.service",
+                "systemctl daemon-reload # optional",
+                "remove_file /usr/local/sbin/ovn-fabric-deployer.py",
+                "# --- fabric service: ovn-fabric.service ---",
             ],
         )
 
@@ -1691,19 +1908,19 @@ class KernelRouterCreateTest(unittest.TestCase):
         self.assertIn("'10.200.0.1'", up)
         self.assertNotIn("/bin/sh", up)
         self.assertNotIn("docker-wire.sh", up)
-        # The hard stop (docker rm -f via the daemon) is the router down.
-        self.assertIn("/usr/bin/docker rm -f kernel-0-test-docker", down)
-        self.assertIn("rm -f /var/run/netns/kernel-0-test-docker", down)
+        # The hard stop (docker rm -f via the daemon, and its netns link)
+        # is the helper's undo in the router down.
+        self.assertIn("await _docker_down(job, 'test', 'kernel-0-test-docker')", down)
         self.assertNotIn("ovn-kernel-kernel-0-docker.service", create_script)
         # The down branch stops the container before the netns is deleted.
         self.assertLess(
-            down.index("/usr/bin/docker rm -f kernel-0-test-docker"),
+            down.index("await _docker_down(job"),
             down.index("ip netns delete ns-kernel-0"),
         )
         _, delete_hosts = build_ops(with_docker(), "delete")
         delete_script = delete_hosts["chassis-1"]
         self.assertIn(
-            "systemctl disable --now ovn-fabric.service",
+            "systemctl stop ovn-fabric.service",
             delete_script,
         )
 
@@ -1798,7 +2015,7 @@ class KernelRouterCreateTest(unittest.TestCase):
         _, delete_hosts = build_ops(with_wireguard(), "delete")
         delete_script = delete_hosts["chassis-1"]
         self.assertIn(
-            "systemctl disable --now ovn-fabric.service",
+            "systemctl stop ovn-fabric.service",
             delete_script,
         )
 
@@ -1868,7 +2085,7 @@ class KernelRouterDeleteTest(unittest.TestCase):
         _, hosts = build_ops(NODES, "delete")
         script = hosts["chassis-1"]
         self.assertIn(
-            "systemctl disable --now ovn-fabric.service",
+            "systemctl stop ovn-fabric.service",
             script,
         )
         self.assertNotIn("ip netns delete", script.host_only)
@@ -1886,11 +2103,12 @@ class KernelRouterDeleteTest(unittest.TestCase):
         # still living inside the netns (2026-08-18). The netns teardown
         # now happens inside the router service's `down` (run by
         # `systemctl disable --now`), so that must precede the bindings.
-        _, hosts = build_ops(NODES, "delete")
-        script = hosts["chassis-1"]
-        self.assertGreater(
-            script.index("ip link delete eth0.129"),
-            script.index("systemctl disable --now ovn-fabric.service"),
+        src = mod.generate_python_deployer(NODES)
+        start = src.index("async def _job_chassis_1_all_down")
+        down_all = src[start : src.index("\n\n", start)]
+        self.assertLess(
+            down_all.index("_job_chassis_1_kernel_0_down"),
+            down_all.index("_job_chassis_1_configure_down"),
         )
 
     def test_veth_root_leg_removed_in_delete(self) -> None:
@@ -1924,8 +2142,10 @@ class KernelRouterDeleteTest(unittest.TestCase):
         ]
         _, create_hosts = build_ops(nodes, "create")
         _, down = _router_branches(_router_script(create_hosts["chassis-1"]))
+        # Rewound: the veth (created after the netns) goes first; deleting
+        # its root leg removes the pair.
         self.assertIn("ip link delete veth-ovn-0", down)
-        self.assertGreater(
+        self.assertLess(
             down.index("ip link delete veth-ovn-0"),
             down.index("ip netns delete ns-kernel-0"),
         )
@@ -2033,7 +2253,7 @@ class BridgeNodeBindingsTest(unittest.TestCase):
         )
         _, hosts = build_ops([*NODES, bridge], "create")
         script = hosts["chassis-1"].bindings
-        self.assertIn("ensure_vlan(job, 'test', 'eth0', 'eth0.2280', 2280", script)
+        self.assertIn("ip link add link eth0 name eth0.2280 type vlan id 2280", script)
         self.assertIn("add-port br-test eth0.2280", script)
         # A host-local bridge is not an OVN localnet domain.
         self.assertNotIn("net-br-test:br-test", script)
@@ -2043,28 +2263,25 @@ class BridgeNodeBindingsTest(unittest.TestCase):
         self.assertIn("ip link delete eth0.2280", "\n".join(down_emit.lines))
 
 
-class BridgePrimitiveCommandsTest(unittest.TestCase):
-    def test_bridge_primitive_owns_the_command_stream(self) -> None:
-        primitives = mod._bridge_primitives("chassis-1", NODES)
-        bridge = next(p for p in primitives if p.key == "ovs.bridge:br-home")
-        self.assertIn(
-            ("ovs-vsctl", "add-br", "br-home"),
-            [command.argv for command in bridge.create],
-        )
-        self.assertIn(
-            ("ovs-vsctl", "set", "bridge", "br-home", "fail-mode=standalone"),
-            [command.argv for command in bridge.create],
-        )
-        self.assertEqual(bridge.delete[0].argv, ("ovs-vsctl", "--if-exists", "del-br", "br-home"))
-        self.assertEqual(bridge.exists.argv, ("ovs-vsctl", "br-exists", "br-home"))
-        self.assertEqual(bridge.nodes[0].id, "ovs.bridge:br-home")
-
-    def test_generated_source_contains_both_streams(self) -> None:
+class SingleOwnerTest(unittest.TestCase):
+    def test_every_bridge_is_declared_by_exactly_one_scope(self) -> None:
+        # Strict create: a second declaration of the same bridge would fail
+        # on `add-br`, and its rewind would delete a bridge another scope
+        # still uses. The host's configure owns every bridge.
         source = mod.generate_python_deployer(NODES)
-        self.assertIn("PRIMITIVES = {", source)
-        self.assertIn("add-br", source)
-        self.assertIn("LifecycleController(job, LifecycleAction.CREATE", source)
-        self.assertIn("await lc.finish()", source)
+        bridges = re.findall(r"host\.ovs_bridge\('([^']+)'", source)
+        self.assertTrue(bridges)
+        self.assertEqual(sorted(bridges), sorted(set(bridges)))
+        self.assertNotIn("PRIMITIVES", source)
+
+    def test_up_and_down_apply_the_same_declaration(self) -> None:
+        source = mod.generate_python_deployer(NODES)
+        for scope in ("configure", "kernel_0"):
+            for fn, action in (("up", "CREATE"), ("down", "DELETE")):
+                start = source.index(f"async def _job_chassis_1_{scope}_{fn}")
+                body = source[start : source.index("\n\n", start)]
+                self.assertIn(f"LifecycleAction.{action}", body)
+                self.assertIn(f"_declare_chassis_1_{scope})", body)
 
 
 class UnsupportedIfaceKindTest(unittest.TestCase):
@@ -2150,27 +2367,58 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             # File writes (the router script + unit) are write_file(), not
             # commands, and so is the install object — no-op it so the
             # run_cmd argv stays comparable.
-            ns["write_file"] = mock.AsyncMock()
-            ns["install_self"] = mock.AsyncMock()
-            ns["run_install"] = mock.AsyncMock()
-            _with_job(ns, ns["_host_chassis_1_create"], True, False)
+            _fake_file_ops(ns)
+            _with_ctx_job(
+                ns,
+                lambda ctx, job: ns["_apply"](
+                    ctx,
+                    job,
+                    ns["LifecycleAction"].CREATE,
+                    "chassis-1",
+                    "host:chassis-1",
+                    ns["_declare_chassis_1_host"],
+                ),
+            )
             argv_seen = [list(call.args) for call in create.call_args_list]
         self.assertEqual(shell_commands, argv_seen)
 
-    def test_no_start_enables_without_starting_the_fabric_units(self) -> None:
-        # ovn-fabric-restore.service runs the host pass with --no-start:
-        # the units are ordered After= the restore, so starting one from
-        # inside the pass would wait forever on the pass itself.
+    def test_no_start_installs_without_starting_the_service(self) -> None:
         ns = self._exec_runtime()
-        ns["write_file"] = mock.AsyncMock()
-        ns["install_self"] = mock.AsyncMock()
-        ns["run_install"] = mock.AsyncMock()
+        _fake_file_ops(ns)
         with mock.patch("asyncio.create_subprocess_exec", new_callable=mock.AsyncMock) as create:
             create.return_value = _proc()
-            _with_job(ns, ns["_host_chassis_1_create"], True, True)
+            _with_ctx_job(ns, ns["_host_chassis_1_create"], no_start=True)
             argv = [list(call.args) for call in create.call_args_list]
-        self.assertIn(["systemctl", "enable", "ovn-fabric.service"], argv)
-        self.assertNotIn(["systemctl", "enable", "--now", "ovn-fabric.service"], argv)
+        self.assertFalse([cmd for cmd in argv if cmd[:2] == ["systemctl", "start"]])
+
+    def test_explode_extracts_the_pex_and_does_not_run_an_action(self) -> None:
+        ns = self._exec_runtime()
+        with tempfile.TemporaryDirectory() as tmp:
+            pex = os.path.join(tmp, "deployer.pex")
+            target = os.path.join(tmp, "src")
+            with zipfile.ZipFile(pex, "w") as archive:
+                archive.writestr("generated_deployer.py", "# extracted\n")
+            with mock.patch.object(sys, "argv", [pex, "--explode", target]):
+                self.assertEqual(ns["main"](), 0)
+            self.assertTrue(os.path.isfile(os.path.join(target, "generated_deployer.py")))
+
+    def test_verbose_logs_every_level(self) -> None:
+        ns = self._exec_runtime()
+        with tempfile.TemporaryDirectory() as tmp:
+            pex = os.path.join(tmp, "deployer.pex")
+            with zipfile.ZipFile(pex, "w") as archive:
+                archive.writestr("generated_deployer.py", "# extracted\n")
+            for flags, level in (
+                ([], logging.INFO),
+                (["--verbose"], logging.DEBUG),
+                (["--quiet"], logging.WARNING),
+            ):
+                with (
+                    mock.patch.object(logging, "basicConfig") as basic_config,
+                    mock.patch.object(sys, "argv", [pex, *flags, "--explode", tmp + "/src"]),
+                ):
+                    self.assertEqual(ns["main"](), 0)
+                self.assertEqual(basic_config.call_args.kwargs["level"], level)
 
     def test_runtime_exposes_the_cli_selectors(self) -> None:
         src = mod.generate_python_deployer(NODES)
@@ -2184,19 +2432,18 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             "--ovn-purge",
             "from runtime.service import",
             "def write_file",
-            "def _install_packages",
-            "def _install_image",
+            "install_packages as _install_packages",
+            "install_image as _install_image",
             "argparse.ArgumentParser",
-            'choices=["create", "delete", "run"]',
+            'choices=["create", "delete", "run", "lazy-create", "lazy-delete"]',
         ):
             self.assertIn(marker, src)
 
     def test_cluster_functions_run_typed_primitives_under_one_controller(self) -> None:
         src = mod.generate_python_deployer(NODES)
-        create = src[src.index("async def cluster_create") : src.index("async def cluster_delete")]
-        delete = src[src.index("async def cluster_delete") : src.index("async def _host_")]
+        create = src[src.index("async def cluster(") : src.index("async def _host_")]
         for marker in (
-            "async def cluster_create(lc, host, abort_on_error):",
+            "async def cluster(lc, host):",
             "await lc.run(host.ovn_nbctl_ls('home'))",
             "await lc.run(host.ovn_nbctl_lsp('home', 'lsp-home-localnet'",
             "router_home = host.ovn_nbctl_lr('router-home'",
@@ -2208,9 +2455,55 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         ):
             self.assertIn(marker, create)
         self.assertNotIn("job.run_cmd", create)
-        self.assertIn("async def cluster_delete(lc, host, abort_on_error):", delete)
-        self.assertIn("await lc.run(host.ovn_nbctl_ls('home'))", delete)
-        self.assertNotIn("job.run_cmd", delete)
+        self.assertNotIn("async def cluster_delete", src)
+
+    def test_host_bindings_run_under_a_lifecycle_controller(self) -> None:
+        src = mod.generate_python_deployer(NODES)
+        configure = src[
+            src.index("async def _declare_chassis_1_configure") : src.index(
+                "async def ", src.index("async def _declare_chassis_1_configure") + 10
+            )
+        ]
+        for marker in (
+            "async def _declare_chassis_1_configure(ctx: Ctx, lc: LifecycleController, "
+            "host: HostPrimitive)",
+            "await lc.run(host.ovs_bridge('br-home'",
+            "kernel = host.rootNs()",
+            "await lc.run(kernel)",
+            "await lc.run(kernel.add_vlan('eth0', 'eth0.129', 129))",
+            "await lc.run(host.ovs_port('br-home', 'eth0.129'",
+            "await lc.run(host.ovs_mapping(",
+        ):
+            self.assertIn(marker, configure)
+
+        delete = src[
+            src.index("async def _host_chassis_1_delete") : src.index(
+                "async def ", src.index("async def _host_chassis_1_delete") + 10
+            )
+        ]
+        # Every scope, host first and the service start last (its rewind
+        # runs first).
+        self.assertIn(
+            "await _delete_scopes(ctx, job, 'chassis-1', "
+            "[('host:chassis-1', _declare_chassis_1_host), "
+            "('chassis-1:configure', _declare_chassis_1_configure)",
+            delete,
+        )
+        self.assertIn("('host:chassis-1:start', _declare_chassis_1_start)])", delete)
+
+    def test_kernel_router_body_runs_typed_primitives(self) -> None:
+        src = mod.generate_python_deployer(NODES)
+        start = src.index("async def _declare_chassis_1_kernel_0")
+        up = src[start : src.index("async def ", start + 10)]
+        for marker in (
+            "ns_kernel_0 = host.netns('ns-kernel-0')",
+            "await lc.run(ns_kernel_0)",
+            "ns_kernel_0.add_link('dummy-left', 'dummy'",
+            "ns_kernel_0.add_link('eth0.2280', 'vlan', parent='eth0', vlan_id=2280",
+            "ns_kernel_0.add_addr('dummy-left', '10.99.0.2/28')",
+            "add_route(",
+        ):
+            self.assertIn(marker, up)
 
     def test_host_create_only_installs_the_service(self) -> None:
         # The host pass installs the deployer and the one service; the
@@ -2233,13 +2526,13 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         exec(mod.generate_python_deployer(nodes), ns)
         with mock.patch("asyncio.create_subprocess_exec", new_callable=mock.AsyncMock) as create:
             create.return_value = _proc()
-            ns["write_file"] = mock.AsyncMock()
-            ns["install_self"] = mock.AsyncMock()
-            _with_job(ns, ns["_host_chassis_1_create"], True, False)
+            _fake_file_ops(ns)
+            _with_ctx_job(ns, ns["_host_chassis_1_create"])
             seen = [list(call.args) for call in create.call_args_list]
-        self.assertIn(["systemctl", "enable", "--now", "ovn-fabric.service"], seen)
+        # Started in the background: create does not wait for the lazy phase.
+        self.assertIn(["systemctl", "start", "--no-block", "ovn-fabric.service"], seen)
         self.assertFalse(any("apt-get" in argv or "dpkg-query" in argv for argv in seen))
-        tree = ns["_run_chassis_1"]()
+        tree = ns["_run_chassis_1"](ns["Ctx"]())
         self.assertEqual(
             [job.name for job in tree.children],
             ["install-packages", "configure"],
@@ -2247,16 +2540,13 @@ class GeneratePythonDeployerTest(unittest.TestCase):
 
     def _fake_action_jobs(self, ns: dict[str, Any], action: str) -> None:
         def tree(name: str) -> Any:
-            def make() -> Any:
+            def make(ctx: Any) -> Any:
                 job = ns["Job"](f"ovn-fabric({action}:{name})")
 
                 async def start(j: Any) -> None:
                     if ns["HOSTS"][name]["role"] == "central":
-                        cluster = (
-                            ns["cluster_create"] if action == "create" else ns["cluster_delete"]
-                        )
-                        await cluster(j, None, True)
-                    await ns["HOSTS"][name][action](j, True, False)
+                        await ns["cluster"](action, None)
+                    await ns["HOSTS"][name][action](ctx, j)
 
                 job.on_start(start)
                 return job
@@ -2275,53 +2565,46 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         ns = self._exec_runtime()
         order: list[str] = []
 
-        async def cluster_create(_lc: Any, _host: Any, a: Any) -> None:
-            order.append("cluster:create")
+        async def cluster(_lc: Any, _host: Any) -> None:
+            order.append("cluster")
 
-        async def cluster_delete(_lc: Any, _host: Any, a: Any) -> None:
-            order.append("cluster:delete")
-
-        ns["cluster_create"] = cluster_create
-        ns["cluster_delete"] = cluster_delete
+        ns["cluster"] = cluster
         for name, fns in ns["HOSTS"].items():
-            fns["create"] = (lambda n: lambda job, a, s: _record(order, f"host:{n}:create"))(name)
-            fns["delete"] = (lambda n: lambda job, a, s: _record(order, f"host:{n}:delete"))(name)
+            fns["create"] = (lambda n: lambda ctx, job: _record(order, f"host:{n}:create"))(name)
+            fns["delete"] = (lambda n: lambda ctx, job: _record(order, f"host:{n}:delete"))(name)
         self._fake_action_jobs(ns, "create")
 
         with mock.patch.object(sys, "argv", ["deployer", "--action", "create"]):
             ns["main"]()
-        self.assertIn("cluster:create", order)
+        self.assertIn("cluster", order)
         self.assertEqual(
             sorted(order),
-            sorted([f"host:{n}:create" for n in ns["HOSTS"]] + ["cluster:create"]),
+            sorted([f"host:{n}:create" for n in ns["HOSTS"]] + ["cluster"]),
         )
 
         order.clear()
         self._fake_action_jobs(ns, "delete")
         with mock.patch.object(sys, "argv", ["deployer", "--action", "delete"]):
             ns["main"]()
-        self.assertEqual(order[0], "cluster:delete")
+        self.assertEqual(order[0], "cluster")
         self.assertEqual(
             sorted(order),
-            sorted([f"host:{n}:delete" for n in ns["HOSTS"]] + ["cluster:delete"]),
+            sorted([f"host:{n}:delete" for n in ns["HOSTS"]] + ["cluster"]),
         )
 
     def test_cluster_selector_runs_only_the_cluster_pass(self) -> None:
         ns = self._exec_runtime()
         order: list[str] = []
 
-        async def cluster_create(_lc: Any, _host: Any, a: Any) -> None:
-            order.append("cluster:create")
+        async def cluster(_lc: Any, _host: Any) -> None:
+            order.append("cluster")
 
-        ns["cluster_create"] = cluster_create
+        ns["cluster"] = cluster
         for name, fns in ns["HOSTS"].items():
-            fns["create"] = (lambda n: lambda job, a, s: _record(order, f"host:{n}:create"))(name)
-        with (
-            mock.patch.object(ns["LifecycleController"], "finish", new=mock.AsyncMock()),
-            mock.patch.object(sys, "argv", ["deployer", "--cluster"]),
-        ):
+            fns["create"] = (lambda n: lambda ctx, job: _record(order, f"host:{n}:create"))(name)
+        with mock.patch.object(sys, "argv", ["deployer", "--cluster"]):
             ns["main"]()
-        self.assertEqual(order, ["cluster:create"])
+        self.assertEqual(order, ["cluster"])
 
     # ── --ovn-purge ──────────────────────────────────────────────────
     def _purge(self, *cli: str, system_id: str = '"sys-1"') -> tuple[list[str], mock.Mock, int]:
@@ -2333,9 +2616,9 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         # Purge tests exercise the purge commands, not the package
         # resolver: run the action directly.
         ns["_resolve_dependency_job"] = lambda *args, **kwargs: None
-        ns["register"] = lambda job, deps, action: job.on_start(lambda j: action(j))
+        ns["register"] = lambda job, deps, action, **_kw: job.on_start(lambda j: action(j))
         # A purge must never fall through into a deploy pass.
-        ns["cluster_create"] = ns["cluster_delete"] = mock.AsyncMock(side_effect=AssertionError)
+        ns["cluster"] = mock.AsyncMock(side_effect=AssertionError)
         for fns in ns["HOSTS"].values():
             fns["create"] = fns["delete"] = mock.AsyncMock(side_effect=AssertionError)
 
@@ -2480,16 +2763,16 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         ns = self._exec_runtime()
         order: list[str] = []
 
-        async def cluster_create(_lc: Any, _host: Any, a: Any) -> None:
-            order.append(f"cluster:create:abort={a}")
+        async def cluster(action: Any, _host: Any) -> None:
+            order.append(f"cluster:{action}")
 
-        ns["cluster_create"] = cluster_create
+        ns["cluster"] = cluster
         for fns in ns["HOSTS"].values():
-            fns["create"] = lambda job, a, s: _record(order, "host:create")
+            fns["create"] = lambda ctx, job: _record(order, "host:create")
         self._fake_action_jobs(ns, "create")
         with mock.patch.object(sys, "argv", ["deployer"]):
             self.assertEqual(ns["main"](), 0)
-        self.assertIn("cluster:create:abort=True", order)
+        self.assertIn("cluster:create", order)
 
     def test_run_cmd_warns_for_delete_and_aborts_for_create(self) -> None:
         ns = self._exec_runtime()
@@ -2588,13 +2871,15 @@ class GeneratePythonDeployerTest(unittest.TestCase):
 
     def test_install_image_builds_when_a_dockerfile_is_given(self) -> None:
         ns = self._exec_runtime()
-        with mock.patch("asyncio.create_subprocess_exec", new_callable=mock.AsyncMock) as create:
+        with (
+            mock.patch(
+                "deployer.dependency.docker_image_exists",
+                new=mock.AsyncMock(return_value=False),
+            ),
+            mock.patch("asyncio.create_subprocess_exec", new_callable=mock.AsyncMock) as create,
+            self.assertLogs("ovn-fabric.deployer", level="INFO") as logs,
+        ):
             create.return_value = _proc()
-            ns["write_file"] = mock.AsyncMock()
-            ns["_docker_image_exists"] = mock.AsyncMock(return_value=False)
-            ns["tempfile"] = mock.Mock()
-            ns["tempfile"].mkdtemp.return_value = "/tmp/ctx"
-            ns["shutil"] = mock.Mock()
             _with_job(
                 ns,
                 ns["_install_image"],
@@ -2603,15 +2888,46 @@ class GeneratePythonDeployerTest(unittest.TestCase):
                     "dockerfile": "FROM ubuntu:24.04\nRUN true",
                 },
             )
-            argv = [list(call.args) for call in create.call_args_list]
-        self.assertIn(
-            ["/usr/bin/docker", "build", "-t", "ovn-fabric-router-zerotier", "/tmp/ctx"],
-            argv,
-        )
-        self.assertNotIn(
-            ["/usr/bin/docker", "pull", "ovn-fabric-router-zerotier"],
-            argv,
-        )
+        argv = list(create.call_args.args)
+        self.assertEqual(argv[:4], ["/usr/bin/docker", "build", "-t", "ovn-fabric-router-zerotier"])
+        output = "\n".join(logs.output)
+        self.assertIn("building ovn-fabric-router-zerotier", output)
+        self.assertIn("built ovn-fabric-router-zerotier", output)
+
+    def test_install_image_has_no_timeout_and_retries_a_failed_pull(self) -> None:
+        async def run() -> None:
+            calls: list[float | None] = []
+
+            class Job:
+                async def run_cmd(
+                    self, label: str, cmd: list[str], abort: bool, timeout: float | None = None
+                ) -> bool:
+                    calls.append(timeout)
+                    return len(calls) > 1  # the first pull fails
+
+                def info(self, message: str) -> None:
+                    pass
+
+                warn = error = info
+
+                def emit(self, event: object, queue: bool = False) -> None:
+                    self.event = event
+
+            job = Job()
+            with (
+                mock.patch(
+                    "deployer.dependency.docker_image_exists",
+                    new=mock.AsyncMock(return_value=False),
+                ),
+                mock.patch("asyncio.sleep", new=mock.AsyncMock()),
+            ):
+                from deployer.dependency import install_image
+
+                await install_image(job, {"image": "busybox"})
+            self.assertEqual(calls, [None, None])
+            self.assertEqual(job.event["dep"]["image"], "busybox")  # type: ignore[index]
+
+        asyncio.run(run())
 
     def test_generated_central_log_handler(self) -> None:
         ns: dict[str, Any] = {}
@@ -2674,7 +2990,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
         ]
         ns: dict[str, Any] = {}
         exec(mod.generate_python_deployer(nodes), ns)
-        tree = ns["_run_chassis_1"]()
+        tree = ns["_run_chassis_1"](ns["Ctx"]())
         installer = next(job for job in tree.children if job.name == "install-zerotier")
         self.assertEqual(
             installer.ctx._dependencies,
@@ -2685,7 +3001,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
     def test_generated_tree_has_configure_and_kernel_jobs(self) -> None:
         ns: dict[str, Any] = {}
         exec(mod.generate_python_deployer(NODES), ns)
-        tree = ns["_run_chassis_1"]()
+        tree = ns["_run_chassis_1"](ns["Ctx"]())
         self.assertEqual(tree.name, "ovn-fabric")
         self.assertEqual(
             [job.name for job in tree.children],
@@ -2786,11 +3102,11 @@ class KernelServiceDeployTest(unittest.TestCase):
         self.assertIn("container = 'ovn-fabric-dns'", create)
         # In-container NICs are named after their SEGMENT (IFNAMSIZ-safe).
         self.assertIn(
-            'ip netns exec "$container" ip addr add 192.168.50.53/24 dev container-seg',
+            "ip addr add 192.168.50.53/24 dev container-seg",
             create,
         )
         self.assertIn(
-            'ip netns exec "$container" ip addr add 10.43.0.5/24 dev control-plane',
+            "ip addr add 10.43.0.5/24 dev control-plane",
             create,
         )
         # Per-NIC source-based policy routing: the route goes into its own
@@ -2799,17 +3115,15 @@ class KernelServiceDeployTest(unittest.TestCase):
         # locally-originated traffic can pick a source at all (2026-09-19).
         self.assertRegex(
             create,
-            r'ip netns exec "\$container" ip -4 route add 0\.0\.0\.0/0'
-            r" via 10\.43\.0\.1 metric \d+ table 100\d",
+            r"ip -4 route add 0\.0\.0\.0/0" r" via 10\.43\.0\.1 metric \d+ table 100\d",
         )
         self.assertRegex(
             create,
-            r'ip netns exec "\$container" ip -4 route add 0\.0\.0\.0/0'
-            r" via 10\.43\.0\.1 metric \d+\n",
+            r"ip -4 route add 0\.0\.0\.0/0" r" via 10\.43\.0\.1 metric \d+\n",
         )
         self.assertRegex(
             create,
-            r'ip netns exec "\$container" ip -4 rule add from 10\.43\.0\.0/24 lookup 100\d',
+            r"ip -4 rule add from 10\.43\.0\.0/24 lookup 100\d",
         )
         self.assertIn("ovs-vsctl add-port br-cont sc-", create)
         self.assertIn("ovs-vsctl add-port br-cp sc-", create)
@@ -2818,14 +3132,14 @@ class KernelServiceDeployTest(unittest.TestCase):
             "write_file /etc/systemd/system/ovn-fabric.service",
             create,
         )
-        self.assertIn("systemctl enable --now ovn-fabric.service", create)
+        self.assertIn("systemctl start --no-block ovn-fabric.service", create)
         # The `down` branch (inside the script) removes the container + ports.
         self.assertIn("/usr/bin/docker rm -f ovn-fabric-dns", create)
         self.assertIn("del-port br-cont sc-", create)
         self.assertIn("del-port br-cp sc-", create)
         _, delete_hosts = build_ops(nodes, "delete")
         delete = delete_hosts["chassis-1"]
-        self.assertIn("systemctl disable --now ovn-fabric.service", delete)
+        self.assertIn("systemctl stop ovn-fabric.service", delete)
 
     def test_kernel_service_nic_gets_the_generator_resolved_mac(self) -> None:
         # The container is recreated on every `up`; a NIC with a random
@@ -2942,13 +3256,12 @@ class KernelServiceDeployTest(unittest.TestCase):
         # (hit live 2026-09-16).
         self.assertRegex(
             create,
-            r'ip netns exec "\$container" ip -6 route add 2600:70ff:b3c0:129::/64'
+            r"ip -6 route add 2600:70ff:b3c0:129::/64"
             r" via 2600:70ff:b3c0::cb:1 metric \d+ table 100\d",
         )
         self.assertRegex(
             create,
-            r'ip netns exec "\$container" ip -6 rule add from'
-            r" 2600:70ff:b3c0::cb:0/112 lookup 100\d",
+            r"ip -6 rule add from" r" 2600:70ff:b3c0::cb:0/112 lookup 100\d",
         )
 
 
@@ -3149,28 +3462,26 @@ class DnsServiceEndToEndTest(unittest.TestCase):
         self.assertIn("ovn-kernel-service-dns-129.sh", s)
         # Serving NIC on the real segment, admin NIC on the control plane.
         self.assertIn(
-            'ip netns exec "$container" ip addr add 192.168.129.5/24 dev management-v2',
+            "ip addr add 192.168.129.5/24 dev management-v2",
             s,
         )
         self.assertIn(
-            'ip netns exec "$container" ip addr add 10.43.0.129/24 dev control-plane',
+            "ip addr add 10.43.0.129/24 dev control-plane",
             s,
         )
         self.assertRegex(
             s,
-            r'ip netns exec "\$container" ip -4 route add 0\.0\.0\.0/0'
-            r" via 10\.43\.0\.1 metric \d+ table 100\d",
+            r"ip -4 route add 0\.0\.0\.0/0" r" via 10\.43\.0\.1 metric \d+ table 100\d",
         )
         # ...and the same default ALSO in `main` (no table), so unbound
         # traffic can source-select (2026-09-19).
         self.assertRegex(
             s,
-            r'ip netns exec "\$container" ip -4 route add 0\.0\.0\.0/0'
-            r" via 10\.43\.0\.1 metric \d+\n",
+            r"ip -4 route add 0\.0\.0\.0/0" r" via 10\.43\.0\.1 metric \d+\n",
         )
         self.assertRegex(
             s,
-            r'ip netns exec "\$container" ip -4 rule add from 10\.43\.0\.0/24 lookup 100\d',
+            r"ip -4 rule add from 10\.43\.0\.0/24 lookup 100\d",
         )
         self.assertIn("ovs-vsctl add-port br-management-v2 sc-", s)
         self.assertIn("ovs-vsctl add-port br-control-plane sc-", s)
@@ -3179,7 +3490,7 @@ class DnsServiceEndToEndTest(unittest.TestCase):
             "write_file /etc/systemd/system/ovn-fabric.service",
             s,
         )
-        self.assertIn("systemctl enable --now ovn-fabric.service", s)
+        self.assertIn("systemctl start --no-block ovn-fabric.service", s)
 
 
 # Flow export (2026-10-10): WHERE to export is host-level
@@ -3225,11 +3536,11 @@ class IpfixExportTest(unittest.TestCase):
         self.assertIn('create IPFIX targets=\\"192.168.129.88:4739\\" sampling=512', script)
         self.assertIn("set Bridge br-home ipfix=@ipfix", script)
 
-    def test_a_leg_that_opts_out_clears_its_bridge(self) -> None:
+    def test_a_leg_that_opts_out_gets_no_sampler(self) -> None:
         _, hosts = build_ops(_with_ipfix(NODES, {"home"}), "create")
         script = hosts["chassis-1"]
         self.assertNotIn("create IPFIX", script)
-        self.assertIn("--if-exists clear Bridge br-home ipfix", script)
+        self.assertNotIn("Bridge br-home ipfix", script)
 
     def test_delete_clears_the_sampler(self) -> None:
         _, hosts = build_ops(_with_ipfix(NODES), "delete")
