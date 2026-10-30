@@ -83,6 +83,7 @@ import contextlib
 import dataclasses
 import hashlib
 import ipaddress
+import posixpath
 import re
 import shlex
 from collections.abc import Iterator, Sequence
@@ -1294,6 +1295,7 @@ def _emit_kernel_app_rules(
                 # nothing compiled in (2026-08-30).
                 lease = f"/var/lib/dhcp/dhclient.{router}.leases"
                 emit.comment(f"# --- kernel app: dhcp-client (dhclient) on {dev} in {netns} ---")
+                emit.ovn(host.make_dir(posixpath.dirname(lease)))  # the lease's directory
                 emit.ovn(host.netns(netns).dhclient(dev, lease), parent=netns_var)
             else:
                 emit.comment(

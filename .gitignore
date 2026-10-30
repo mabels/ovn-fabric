@@ -9,9 +9,9 @@ protocol/generated.py
 protocol/ir-nodes.schema.json
 protocol/raw_generated.py
 protocol/raw-snapshot.schema.json
-# Same, from schema/runtime/protocol.ts (`deno run -A schema/runtime/generate.ts`).
-rt/generated.py
-rt/protocol.schema.json
+# Same, from fabric/schema/protocol.ts (`deno run -A fabric/schema/generate.ts`).
+fabric/generated.py
+fabric/protocol.schema.json
 
 # rt-docker.sh: files written for containers
 .rt-files/

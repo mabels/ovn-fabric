@@ -1,11 +1,11 @@
 """The docker images a host runs, from the IR — the `--spec` of
-`python3 -m rt docker-prepare`:
+`python3 -m fabric docker-prepare`:
 
     python3 -m deployer.images py.ir --host net-test-hh-b
     [{"image": "busybox"}, {"image": "ovn-fabric-…", "dockerfile": "FROM …"}]
 
 Each entry is built from its Dockerfile when the IR declares a `build`,
-else pulled. This lives on ovn-fabric's side: the runtime (rt) never
+else pulled. This lives on ovn-fabric's side: the runtime never
 reads the IR.
 """
 

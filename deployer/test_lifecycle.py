@@ -269,16 +269,18 @@ class LifecycleTest(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_write_file_create_is_strict_and_delete_removes_it(self) -> None:
+    def test_write_file_create_overwrites_and_delete_removes_it(self) -> None:
         async def run() -> None:
             path = Path(tempfile.mkdtemp()) / "unit.service"
-            write = WriteFileOperation(str(path), "[Unit]")
+            path.write_text("left over")
+            write = WriteFileOperation(str(path), "[Unit]", mode=0o600)
             create = _controller(FakeJob(), LifecycleAction.CREATE)
             await create.run(write)
             await create.execute()
-            self.assertEqual(path.read_text(), "[Unit]\n")
-            with self.assertRaises(FileExistsError):
-                await create.execute()
+            self.assertEqual(path.read_text(), "[Unit]\n")  # what was there is overwritten
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(list(path.parent.iterdir()), [path])  # no temporary left
+            await create.execute()  # again: still fine
 
             delete = _controller(FakeJob(), LifecycleAction.DELETE)
             await delete.run(write)

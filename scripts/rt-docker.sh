@@ -1,7 +1,8 @@
 #!/bin/sh
-# Run the runtime (rt) in a throwaway Debian container with Python, the
-# checkout mounted read-only, using the HOST's docker daemon (its socket is
-# mounted in — docker-outside-of-docker, no daemon inside the container).
+# Run the runtime with fabric's services (python3 -m fabric) in a throwaway
+# Debian container with Python, the checkout mounted read-only, using the
+# HOST's docker daemon (its socket is mounted in — docker-outside-of-docker,
+# no daemon inside the container).
 #
 #   scripts/rt-docker.sh                      start the server (foreground, Ctrl-C stops it)
 #   scripts/rt-docker.sh serve --log wire=debug
@@ -9,10 +10,15 @@
 #   scripts/rt-docker.sh resolve curl jq
 #   scripts/rt-docker.sh docker-run --image busybox -- echo hi
 #   python3 -m deployer.containers py.ir --host H | scripts/rt-docker.sh docker-run --spec - --name N
+#   scripts/rt-docker.sh ir-put < py.ir   (stored IRs live in .rt-files/state, across restarts)
+#   scripts/rt-docker.sh ir-list
+#   scripts/rt-docker.sh serve --host H   then   scripts/rt-docker.sh ir-apply create < py.ir
 #
 # Environment:
 #   RT_IMAGE   default python:3.12-slim
 #   RT_NAME    default rt
+#   RT_HOST    the container's hostname: which of an IR's hosts the runtime is
+#              (e.g. RT_HOST=net-test-hh-b); default: docker's random one
 #   RT_DOCKER  the host's docker socket, default /var/run/docker.sock
 #   RT_FILES   where containers' files are written, default ./.rt-files — the
 #              HOST daemon resolves bind mounts on the host, so this directory
@@ -26,8 +32,8 @@ SOCKET=/tmp/ovn-fabric.sock   # /src is read-only
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FILES=${RT_FILES:-$ROOT/.rt-files}
 
-if [ ! -f "$ROOT/rt/generated.py" ]; then
-  echo "rt/generated.py is missing: run 'deno run -A schema/runtime/generate.ts' first" >&2
+if [ ! -f "$ROOT/fabric/generated.py" ]; then
+  echo "fabric/generated.py is missing: run 'deno run -A fabric/schema/generate.ts' first" >&2
   exit 1
 fi
 
@@ -40,11 +46,12 @@ if [ "$command" = serve ]; then
   # More grace than the runtime gives its own containers (docker stop -t 10),
   # so it can stop and remove them before it is killed.
   exec docker run --rm -it --name "$NAME" --stop-timeout 30 \
+    ${RT_HOST:+--hostname "$RT_HOST"} \
     -v "$ROOT":/src:ro -w /src \
     -v "$DOCKER_SOCKET":/var/run/docker.sock \
     -v "$FILES":"$FILES" \
     "$IMAGE" \
-    python3 -m rt --socket "$SOCKET" serve --files-root "$FILES" "$@"
+    python3 -m fabric --socket "$SOCKET" serve --files-root "$FILES" --state-root "$FILES/state" "$@"
 fi
 
 # The client runs inside the container without a TTY (stdin may be a
@@ -62,7 +69,7 @@ forward() {
 }
 trap forward INT TERM
 exec 3<&0
-docker exec -i "$NAME" sh -c 'pidfile=$1; shift; echo $$ > "$pidfile"; exec python3 -m rt "$@"' \
+docker exec -i "$NAME" sh -c 'pidfile=$1; shift; echo $$ > "$pidfile"; exec python3 -m fabric "$@"' \
   sh "$PIDFILE" --socket "$SOCKET" "$command" "$@" <&3 &
 child=$!
 status=0

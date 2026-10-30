@@ -1,31 +1,8 @@
-"""The ovn-fabric runtime.
+# rt — the runtime (placeholder name, ADR 0007): the job tree and the bus.
+# It never imports ovn-fabric code (deployer, ladops, protocol).
 
-Independent of the generator: a small async job tree with lifecycle and
-event hooks. See `runtime.service` for the DSL.
+__version__ = "0.1.0"
 
-    python3 -m runtime
-"""
-
-from __future__ import annotations
-
-from .service import (
-    Job,
-    JobState,
-    JobStatus,
-    LogEvent,
-    LogLevel,
-    ProcessStatus,
-    capture_cmd,
-    run_cmd,
-)
-
-__all__ = [
-    "Job",
-    "JobState",
-    "JobStatus",
-    "LogEvent",
-    "LogLevel",
-    "ProcessStatus",
-    "capture_cmd",
-    "run_cmd",
-]
+# The wire protocol's version, answered by VersionReq. Bumped on an
+# incompatible change of the message format.
+PROTOCOL = 1

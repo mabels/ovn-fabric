@@ -36,7 +36,6 @@ class DockerImage(CommandPrimitive):
                 ),
             ),
             create_cmds=(
-                Command(f"image:{self.image} (context)", ("mkdir", "-p", self.context)),
                 Command(
                     f"image:{self.image} (build)",
                     (
@@ -136,13 +135,6 @@ class DockerPrimitive(CommandPrimitive):
                     f"docker:{self.name} (remove old)",
                     ("/usr/bin/docker", "rm", "-f", self.name),
                     optional=True,
-                )
-            )
-        for host_path, _container_path in self.volumes:
-            create.append(
-                Command(
-                    f"docker:{self.name} (mkdir {host_path})",
-                    ("mkdir", "-p", host_path),
                 )
             )
         create.append(Command(f"docker:{self.name} (run)", self._run_argv()))

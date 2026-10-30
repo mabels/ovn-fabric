@@ -67,6 +67,7 @@ from .ir_common import (
     _shell_token,
     _short_suffix,
 )
+from .lifecycle import LifecycleAction
 
 mod = importlib.import_module("deployer.ir_to_python")
 
@@ -175,6 +176,10 @@ class _OpEmitter(Emitter):
         bind: str | None = None,
         parent: str | None = None,
     ) -> None:
+        if not hasattr(primitive, "as_primitive"):  # done in Python (fs.dir, …)
+            action = LifecycleAction.DELETE if self._delete else LifecycleAction.CREATE
+            self._block(primitive.describe(action))
+            return
         materialized = primitive.as_primitive()
         commands = materialized.delete_cmds if self._delete else materialized.create_cmds
         self._block(
@@ -1648,9 +1653,11 @@ class KernelRouterCreateTest(unittest.TestCase):
         _fake_file_ops(ns)
 
         def docker_argvs(run: Any) -> list[str]:
-            with mock.patch(
-                "asyncio.create_subprocess_exec", new_callable=mock.AsyncMock
-            ) as create:
+            with (
+                mock.patch("asyncio.create_subprocess_exec", new_callable=mock.AsyncMock) as create,
+                mock.patch("os.makedirs"),  # the fs primitives are done in Python
+                mock.patch("os.chmod"),
+            ):
                 create.return_value = _proc(stdout=b"4242")
                 _with_ctx_job(ns, run)
                 return [
@@ -2430,7 +2437,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             "--verbose",
             "--no-start",
             "--ovn-purge",
-            "from runtime.service import",
+            "from generator.runtime.service import",
             "def write_file",
             "install_packages as _install_packages",
             "install_image as _install_image",

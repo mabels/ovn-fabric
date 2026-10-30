@@ -31,14 +31,14 @@
     "include": [
       "src/**/*.ts",
       "examples/**/*.ts",
-      "schema/**/*.ts"
+      "fabric/**/*.ts"
     ]
   },
   "lint": {
     "include": [
       "src/**/*.ts",
       "examples/**/*.ts",
-      "schema/**/*.ts"
+      "fabric/**/*.ts"
     ],
     "rules": {
       "exclude": [

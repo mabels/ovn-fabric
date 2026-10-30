@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import stat
+import tempfile
 import unittest
 from collections.abc import Sequence
+from pathlib import Path
 
 from deployer.context import Ctx
 from deployer.lifecycle import LifecycleAction, LifecycleController, Operation
@@ -44,25 +47,38 @@ async def _now(lc: LifecycleController, operation: Operation) -> None:
 
 
 class FilesystemPrimitiveTest(unittest.TestCase):
-    def test_mkdir_chmod_and_remove(self) -> None:
+    def test_mkdir_chmod_and_remove_are_done_in_python(self) -> None:
         async def run() -> None:
+            root = Path(tempfile.mkdtemp())
             job = FakeJob()
             host = HostPrimitive("h")
+            wg = root / "etc/wireguard"
+            conf = wg / "x.conf"
             lc = LifecycleController(Ctx(), job, LifecycleAction.CREATE, "h")
-            await _now(lc, host.make_dir("/etc/wireguard"))
-            await _now(lc, host.chmod("/etc/wireguard/x.conf", "600"))
-            self.assertIn("fs.dir:/etc/wireguard", lc.graph.nodes)
-            self.assertIn("fs.chmod:/etc/wireguard/x.conf", lc.graph.nodes)
+            await _now(lc, host.make_dir(str(wg)))
+            await _now(lc, host.make_dir(str(wg)))  # one already there is fine
+            conf.write_text("[Interface]\n")
+            await _now(lc, host.chmod(str(conf), "600"))
+            self.assertEqual(stat.S_IMODE(conf.stat().st_mode), 0o600)
+            self.assertIn(f"fs.dir:{wg}", lc.graph.nodes)
+            self.assertIn(f"fs.chmod:{conf}", lc.graph.nodes)
 
+            state = root / "var/lib/x"
+            (state / "data").mkdir(parents=True)
+            netns = root / "run/netns/x"
+            netns.parent.mkdir(parents=True)
+            netns.touch()
             delete = LifecycleController(Ctx(), job, LifecycleAction.DELETE, "h")
-            await _now(delete, host.remove_file("/var/run/netns/x"))
-            await _now(delete, host.remove_tree("/var/lib/ovn-fabric/x"))
-            self.assertEqual(
-                job.commands[-2:],
-                [
-                    ("rm", "-f", "/var/run/netns/x"),
-                    ("rm", "-rf", "/var/lib/ovn-fabric/x"),
-                ],
-            )
+            await _now(delete, host.make_dir(str(wg)))  # shared, not empty: stays
+            self.assertTrue(conf.exists())
+            await _now(delete, host.remove_file(str(netns)))
+            await _now(delete, host.remove_file(str(netns)))  # gone already is fine
+            await _now(delete, host.state_dir(str(state)))  # owned: with its content
+            self.assertFalse(netns.exists())
+            self.assertFalse(state.exists())
+            conf.unlink()
+            await _now(delete, host.make_dir(str(wg)))  # empty now: removed
+            self.assertFalse(wg.exists())
+            self.assertEqual(job.commands, [])  # no mkdir/rm/chmod processes
 
         asyncio.run(run())

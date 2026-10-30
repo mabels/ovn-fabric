@@ -16,7 +16,7 @@ PACKAGES = (
     "raw_reconciler",
     "ladops",
     "protocol",
-    "runtime",
+    "generator",
 )
 
 

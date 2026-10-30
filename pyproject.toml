@@ -10,8 +10,8 @@ extend-exclude = '''
   \.venv-build/
   | protocol/generated\.py
   | protocol/raw_generated\.py
-  | runtime/thinking\.py
-  | rt/generated\.py
+  | generator/runtime/thinking\.py
+  | fabric/generated\.py
 )
 '''
 
@@ -22,8 +22,8 @@ extend-exclude = [
     ".venv-build",
     "protocol/generated.py",
     "protocol/raw_generated.py",
-    "runtime/thinking.py",
-    "rt/generated.py",
+    "generator/runtime/thinking.py",
+    "fabric/generated.py",
 ]
 
 [tool.ruff.lint]
@@ -42,5 +42,5 @@ select = ["E", "F", "I"]
 # dataclasses) — so run `generate-pytypes` first, it is not committed.
 strict = true
 python_version = "3.11"
-files = ["ladops", "deployer", "protocol", "reconciler", "raw_reconciler", "runtime", "ovn_fabric", "rt"]
-exclude = ['^\.venv-build/', '^runtime/thinking\.py$']
+files = ["ladops", "deployer", "protocol", "reconciler", "raw_reconciler", "generator", "ovn_fabric", "runtime", "fabric"]
+exclude = ['^\.venv-build/', '^generator/runtime/thinking\.py$']

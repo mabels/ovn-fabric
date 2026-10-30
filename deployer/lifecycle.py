@@ -146,11 +146,14 @@ def _with_newline(content: str) -> str:
 
 def _write_new(path: Path, content: str, mode: int | None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    # "x": an existing file is a pre-existing object, and CREATE fails.
-    with path.open("x", encoding="utf-8") as out:
+    # A file already there is overwritten — atomically: written next to it,
+    # then renamed over it, so nothing ever reads half a file.
+    tmp = path.with_name(f".{path.name}.tmp")
+    with tmp.open("w", encoding="utf-8") as out:
         out.write(_with_newline(content))
     if mode is not None:
-        path.chmod(mode)
+        tmp.chmod(mode)
+    os.replace(tmp, path)
 
 
 def _unlink(path: Path) -> None:
@@ -308,8 +311,8 @@ class SystemdStartOperation:
 
 @dataclasses.dataclass(frozen=True)
 class WriteFileOperation:
-    """A file this deployer owns: CREATE writes it (and fails when it is
-    already there), DELETE removes it."""
+    """A file this deployer owns: CREATE writes it (one already there is
+    overwritten), DELETE removes it."""
 
     path: str
     content: str
@@ -327,6 +330,10 @@ class WriteFileOperation:
         return [f"rm -f {self.path}"]
 
 
+# How long a container's process must stay before its netns is linked.
+SETTLE = 0.5
+
+
 @dataclasses.dataclass(frozen=True)
 class SymlinkNetnsOperation:
     """`/var/run/netns/<container>` -> `/proc/<pid>/ns/net`."""
@@ -339,8 +346,39 @@ class SymlinkNetnsOperation:
         return Path("/var/run/netns") / self.container
 
     async def create(self, lc: LifecycleController) -> None:
+        # The container must be running: an exited one has PID 0 (or a PID
+        # that is gone), and the link would point nowhere — the units after
+        # it would fail with "Invalid netns value" instead of this one.
+        if not await self._running():
+            state = await lc.capture_cmd(
+                f"{self.container} state",
+                [
+                    "/usr/bin/docker",
+                    "inspect",
+                    "-f",
+                    "{{.State.Status}} (exit {{.State.ExitCode}})",
+                    self.container,
+                ],
+                optional=True,
+            )
+            raise RuntimeError(
+                f"container {self.container} is not running: {state or 'unknown'} — "
+                "a container without a long-running command ends at once"
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.symlink_to(Path(f"/proc/{self.pid}/ns/net"))
+
+    async def _running(self) -> bool:
+        """Its process is there — and still there a moment later: a container
+        without a long-running command is gone within a fraction of a second,
+        often right after `docker run` returned."""
+        if not str(self.pid or "").isdigit() or int(self.pid) <= 0:
+            return False
+        proc = Path(f"/proc/{self.pid}")
+        if not proc.exists():
+            return False
+        await asyncio.sleep(SETTLE)
+        return proc.exists()
 
     async def delete(self, lc: LifecycleController) -> None:
         _unlink(self.path)

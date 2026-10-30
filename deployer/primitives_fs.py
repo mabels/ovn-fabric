@@ -1,26 +1,35 @@
+"""File-system objects — done in Python, not by running mkdir/rm/chmod.
+
+Each is a lifecycle operation of its own, like WriteFileOperation; CREATE
+and DELETE also record or drop its node in the raw graph.
+"""
+
 from __future__ import annotations
 
+import asyncio
 import dataclasses
-import posixpath
+import os
+import shutil
+from pathlib import Path
+from typing import TYPE_CHECKING
 
-from .lifecycle import (
-    Command,
-    CommandPrimitive,
-    Primitive,
-    RawNodeTemplate,
-)
+from .lifecycle import LifecycleAction, RawNodeTemplate
+
+if TYPE_CHECKING:
+    from .lifecycle import LifecycleController
 
 
 @dataclasses.dataclass(frozen=True)
-class DirectoryPrimitive(CommandPrimitive):
-    """A directory.
+class DirectoryPrimitive:
+    """A directory. CREATE ensures it with its parents (one already there
+    is fine).
 
-    Shared (`owned=False`, e.g. /etc/wireguard): CREATE ensures it with
-    `mkdir -p`; DELETE removes it and the parents `mkdir -p` made, but
-    only while they are empty — whatever else lives there is untouched.
+    Shared (`owned=False`, e.g. /etc/wireguard): DELETE removes it and its
+    parents, but only while they are empty — whatever else lives there is
+    untouched.
 
-    Owned (`owned=True`, an app's state/volume directory): CREATE fails
-    when it already exists; DELETE removes it with its whole content."""
+    Owned (`owned=True`, an app's state/volume directory): DELETE removes it
+    with its whole content."""
 
     host: str
     path: str
@@ -30,34 +39,31 @@ class DirectoryPrimitive(CommandPrimitive):
     def key(self) -> str:
         return f"fs.dir:{self.path}"
 
-    def as_primitive(self) -> Primitive:
-        create: tuple[Command, ...]
-        delete: tuple[Command, ...]
-        if self.owned:
-            parent = posixpath.dirname(self.path.rstrip("/")) or "/"
-            create = (
-                Command(f"mkdir -p {parent}", ("mkdir", "-p", parent)),
-                Command(f"mkdir {self.path}", ("mkdir", self.path)),
-            )
-            delete = (Command(f"rm -rf {self.path}", ("rm", "-rf", self.path)),)
-        else:
-            create = (Command(f"mkdir -p {self.path}", ("mkdir", "-p", self.path)),)
-            delete = (
-                Command(
-                    f"rmdir -p {self.path}",
-                    ("rmdir", "-p", "--ignore-fail-on-non-empty", self.path),
-                ),
-            )
-        return Primitive(
-            key=self.key,
-            nodes=(RawNodeTemplate(id=self.key, kind="fs.dir", fields={"path": self.path}),),
-            create_cmds=create,
-            delete_cmds=delete,
+    async def create(self, lc: LifecycleController) -> None:
+        await asyncio.to_thread(os.makedirs, self.path, exist_ok=True)
+        lc.graph.upsert(
+            self.key, (RawNodeTemplate(id=self.key, kind="fs.dir", fields={"path": self.path}),)
         )
+
+    async def delete(self, lc: LifecycleController) -> None:
+        if self.owned:
+            await asyncio.to_thread(shutil.rmtree, self.path, True)
+        else:
+            await asyncio.to_thread(_remove_empty_upwards, self.path)
+        lc.graph.remove(self.key)
+
+    def describe(self, action: LifecycleAction) -> list[str]:
+        if action is LifecycleAction.CREATE:
+            return [f"mkdir -p {self.path}"]
+        if self.owned:
+            return [f"rm -rf {self.path}"]
+        return [f"rmdir -p {self.path}"]
 
 
 @dataclasses.dataclass(frozen=True)
-class ChmodPrimitive(CommandPrimitive):
+class ChmodPrimitive:
+    """The mode of a file (octal, e.g. "600"); DELETE leaves it."""
+
     host: str
     path: str
     mode: str
@@ -66,25 +72,29 @@ class ChmodPrimitive(CommandPrimitive):
     def key(self) -> str:
         return f"fs.chmod:{self.path}"
 
-    def as_primitive(self) -> Primitive:
-        return Primitive(
-            key=self.key,
-            nodes=(
+    async def create(self, lc: LifecycleController) -> None:
+        await asyncio.to_thread(os.chmod, self.path, int(self.mode, 8))
+        lc.graph.upsert(
+            self.key,
+            (
                 RawNodeTemplate(
-                    id=self.key,
-                    kind="fs.chmod",
-                    fields={"path": self.path, "mode": self.mode},
+                    id=self.key, kind="fs.chmod", fields={"path": self.path, "mode": self.mode}
                 ),
             ),
-            create_cmds=(
-                Command(f"chmod {self.mode} {self.path}", ("chmod", self.mode, self.path)),
-            ),
-            delete_cmds=(),
         )
+
+    async def delete(self, lc: LifecycleController) -> None:
+        lc.graph.remove(self.key)
+
+    def describe(self, action: LifecycleAction) -> list[str]:
+        return [f"chmod {self.mode} {self.path}"] if action is LifecycleAction.CREATE else []
 
 
 @dataclasses.dataclass(frozen=True)
-class RemovePathPrimitive(CommandPrimitive):
+class RemovePathPrimitive:
+    """A path that only goes away: CREATE does nothing, DELETE removes it
+    (a whole tree with `recursive`). Gone already is fine."""
+
     host: str
     path: str
     recursive: bool = False
@@ -93,11 +103,30 @@ class RemovePathPrimitive(CommandPrimitive):
     def key(self) -> str:
         return f"fs.path:{self.path}"
 
-    def as_primitive(self) -> Primitive:
-        flag = "-rf" if self.recursive else "-f"
-        return Primitive(
-            key=self.key,
-            nodes=(RawNodeTemplate(id=self.key, kind="fs.path", fields={"path": self.path}),),
-            create_cmds=(),
-            delete_cmds=(Command(f"rm {flag} {self.path}", ("rm", flag, self.path)),),
-        )
+    async def create(self, lc: LifecycleController) -> None:
+        return None
+
+    async def delete(self, lc: LifecycleController) -> None:
+        await asyncio.to_thread(_remove, Path(self.path), self.recursive)
+        lc.graph.remove(self.key)
+
+    def describe(self, action: LifecycleAction) -> list[str]:
+        if action is LifecycleAction.CREATE:
+            return []
+        return [f"rm {'-rf' if self.recursive else '-f'} {self.path}"]
+
+
+def _remove_empty_upwards(path: str) -> None:
+    """`rmdir -p --ignore-fail-on-non-empty`: the directory, then its
+    parents, as long as each is empty."""
+    try:
+        os.removedirs(path)
+    except OSError:
+        pass
+
+
+def _remove(path: Path, recursive: bool) -> None:
+    if recursive and path.is_dir() and not path.is_symlink():
+        shutil.rmtree(path, ignore_errors=True)
+    else:
+        path.unlink(missing_ok=True)

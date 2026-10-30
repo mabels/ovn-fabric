@@ -1,5 +1,5 @@
 """The containers a host runs, from the IR — the `--spec` of
-`python3 -m rt docker-run`:
+`python3 -m fabric docker-run`:
 
     python3 -m deployer.containers py.ir --host net-test-hh-b
     [{"name": "router-zerotier-v2-zerotier", "image": "…", "dockerfile": "…",
@@ -13,7 +13,7 @@ Two kinds, as the IR has them:
 
 A workload's `files` go along; docker-run writes and mounts them. Not
 derived yet: its DNS flags (they depend on its NICs). This lives on
-ovn-fabric's side: the runtime (rt) never reads the IR.
+ovn-fabric's side: the runtime never reads the IR.
 """
 
 from __future__ import annotations

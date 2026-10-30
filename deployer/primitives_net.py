@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import dataclasses
 import ipaddress
-import posixpath
 import shlex
 from collections.abc import Sequence
 
@@ -317,10 +316,6 @@ class DhclientPrimitive(CommandPrimitive):
                 ),
             ),
             create_cmds=(
-                Command(
-                    f"{self.host}:dhclient {self.dev} (lease dir)",
-                    _prefix(self.netns, ("mkdir", "-p", posixpath.dirname(self.lease))),
-                ),
                 Command(
                     f"{self.host}:dhclient {self.dev}",
                     _prefix(self.netns, (*dhclient, "-d", self.dev)),

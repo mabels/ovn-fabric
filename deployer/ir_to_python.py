@@ -533,7 +533,7 @@ from deployer.dependency import (
     install_packages as _install_packages,
 )
 from deployer.jobtree import DepWaiter, package_waiters, register
-from runtime.service import Job, JobError, capture_cmd, run_cmd
+from generator.runtime.service import Job, JobError, capture_cmd, run_cmd
 
 import argparse
 import asyncio
