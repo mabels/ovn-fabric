@@ -550,39 +550,51 @@ export function buildTunnelRouterEndpoint(
         const ztRouteCmds = ztRoutes.map((dst) =>
           `ip route add ${dst} dev "$var"`
         );
-        const entrypoint = `
-/usr/sbin/zerotier-one -d /var/lib/zerotier-one
-for i in $(seq 1 30); do
-  zerotier-cli -D/var/lib/zerotier-one info >/dev/null 2>&1 && break
-  sleep 1
-done
-zerotier-cli -D/var/lib/zerotier-one join "${ztNetworkId}" || true
-var=""
-for i in $(seq 1 60); do
-  var=$(zerotier-cli -D/var/lib/zerotier-one -j listnetworks \
-    | jq -r '.[] | select(.nwid=="${ztNetworkId}") | .portDeviceName')
-  [ -n "$var" ] && [ "$var" != "null" ] && break
-  sleep 1
-done
-ip link set "$var" up
-${ztMasq.join("\n")}
-${ztRouteCmds.join("\n")}
-exec sleep infinity
-`;
+        // The container's program, baked into the image at build time
+        // (one image per router) instead of passed as a `sh -c` argument:
+        // join the network, wait for its device, wire it, stay alive.
+        const ztScript = [
+          "#!/bin/sh",
+          "/usr/sbin/zerotier-one -d /var/lib/zerotier-one",
+          "for i in $(seq 1 30); do",
+          "  zerotier-cli -D/var/lib/zerotier-one info >/dev/null 2>&1 && break",
+          "  sleep 1",
+          "done",
+          `zerotier-cli -D/var/lib/zerotier-one join "${ztNetworkId}" || true`,
+          'var=""',
+          "for i in $(seq 1 60); do",
+          `  var=$(zerotier-cli -D/var/lib/zerotier-one -j listnetworks | jq -r '.[] | select(.nwid=="${ztNetworkId}") | .portDeviceName')`,
+          '  [ -n "$var" ] && [ "$var" != "null" ] && break',
+          "  sleep 1",
+          "done",
+          'ip link set "$var" up',
+          ...ztMasq,
+          ...ztRouteCmds,
+          "exec sleep infinity",
+        ];
+        // Written with printf, one single-quoted argument per line — works
+        // with every docker builder (a Dockerfile heredoc needs BuildKit).
+        const ztScriptLines = ztScript
+          .map((line) => `      '${line.replaceAll("'", `'\\''`)}'`)
+          .join(" \\\n");
         const dockerfile = `
 FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      ca-certificates curl jq iproute2 iptables iputils-ping traceroute \
- && curl -fsSL https://install.zerotier.com | bash \
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+      ca-certificates curl jq iproute2 iptables iputils-ping traceroute \\
+ && curl -fsSL https://install.zerotier.com | bash \\
  && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /var/lib/zerotier-one
 ENV ZT_NETWORK_ID=${ztNetworkId}
+RUN printf '%s\\n' \\
+${ztScriptLines} \\
+      > /usr/local/bin/zerotier-up \\
+ && chmod 755 /usr/local/bin/zerotier-up
 `;
         return {
           kind: "docker",
           image: `ovn-fabric-${routerName}-zerotier`,
           name: `${routerName}-zerotier`,
-          cmd: ["/bin/sh", "-c", entrypoint],
+          cmd: ["/usr/local/bin/zerotier-up"],
           build: { from: "ubuntu:24.04", dockerfile },
           volumes: [
             {

@@ -30,13 +30,15 @@
   "fmt": {
     "include": [
       "src/**/*.ts",
-      "examples/**/*.ts"
+      "examples/**/*.ts",
+      "schema/**/*.ts"
     ]
   },
   "lint": {
     "include": [
       "src/**/*.ts",
-      "examples/**/*.ts"
+      "examples/**/*.ts",
+      "schema/**/*.ts"
     ],
     "rules": {
       "exclude": [

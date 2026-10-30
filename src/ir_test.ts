@@ -1184,7 +1184,18 @@ Deno.test("tunnelRouterEndpoint: zerotier is a docker app with its state volume"
     app?.build?.dockerfile?.includes("ZT_NETWORK_ID=02cfbec15c2319ff"),
     true,
   );
-  assertEquals(app?.cmd?.join("\n").includes("192.168.0.0/16"), true);
+  // The program is baked into the image; the app only runs it.
+  assertEquals(app?.cmd, ["/usr/local/bin/zerotier-up"]);
+  assertEquals(
+    app?.build?.dockerfile?.includes(
+      `'ip route add 192.168.0.0/16 dev "$var"'`,
+    ),
+    true,
+  );
+  assertEquals(
+    app?.build?.dockerfile?.includes("> /usr/local/bin/zerotier-up"),
+    true,
+  );
   assertEquals(app?.volumes, [
     {
       host: "/var/lib/ovn-fabric/router-zerotier/zerotier",

@@ -11,13 +11,20 @@ extend-exclude = '''
   | protocol/generated\.py
   | protocol/raw_generated\.py
   | runtime/thinking\.py
+  | rt/generated\.py
 )
 '''
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = [".venv-build", "protocol/generated.py", "protocol/raw_generated.py", "runtime/thinking.py"]
+extend-exclude = [
+    ".venv-build",
+    "protocol/generated.py",
+    "protocol/raw_generated.py",
+    "runtime/thinking.py",
+    "rt/generated.py",
+]
 
 [tool.ruff.lint]
 # E/F: pycodestyle errors + pyflakes (real bugs, unused imports/vars).
@@ -35,5 +42,5 @@ select = ["E", "F", "I"]
 # dataclasses) — so run `generate-pytypes` first, it is not committed.
 strict = true
 python_version = "3.11"
-files = ["ladops", "deployer", "protocol", "reconciler", "raw_reconciler", "runtime", "ovn_fabric"]
+files = ["ladops", "deployer", "protocol", "reconciler", "raw_reconciler", "runtime", "ovn_fabric", "rt"]
 exclude = ['^\.venv-build/', '^runtime/thinking\.py$']
