@@ -10,11 +10,14 @@ from .lifecycle import (
 )
 from .primitives_host import NetnsPrimitive
 
+# A build or pull may take long (a slow link, a big image) — but not forever.
+IMAGE_TIMEOUT = 1800.0
+
 
 @dataclasses.dataclass(frozen=True)
 class DockerImage(CommandPrimitive):
-    """A locally built image. The Dockerfile is written by the caller;
-    this primitive creates the build context and runs `docker build`."""
+    """A locally built image. The Dockerfile and the build context are
+    written by the caller; this primitive runs `docker build`."""
 
     host: str
     image: str
@@ -47,6 +50,7 @@ class DockerImage(CommandPrimitive):
                         self.dockerfile,
                         self.context,
                     ),
+                    timeout=IMAGE_TIMEOUT,
                 ),
             ),
             delete_cmds=(
@@ -77,7 +81,11 @@ class DockerPull(CommandPrimitive):
                 RawNodeTemplate(id=self.key, kind="docker.image", fields={"image": self.image}),
             ),
             create_cmds=(
-                Command(f"image:{self.image} (pull)", ("/usr/bin/docker", "pull", self.image)),
+                Command(
+                    f"image:{self.image} (pull)",
+                    ("/usr/bin/docker", "pull", self.image),
+                    timeout=IMAGE_TIMEOUT,
+                ),
             ),
             delete_cmds=(
                 Command(

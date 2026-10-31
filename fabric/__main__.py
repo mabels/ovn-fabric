@@ -29,6 +29,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from runtime import generated as rg
 from runtime import logconfig
 from runtime.message import ProtocolError, hydrate_part, plain
 from runtime.peer import Peer
@@ -114,7 +115,7 @@ async def _ask(address: str, body: object) -> object | None:
         request = await peer.request(body)
         async for msg in request:
             event = msg.body
-            if isinstance(event, g.LogMsg):
+            if isinstance(event, rg.LogMsg):
                 component = event.component or msg.header.source
                 level = logconfig.LEVELS[event.level.value]
                 if level < _threshold(component):
@@ -159,7 +160,7 @@ async def _ask(address: str, body: object) -> object | None:
                 ready = event.state is g.SystemDepState.ready
                 _show(INFO if ready else WARNING, "cli", f"{event.dep}: {event.state.value}{note}")
         final: object = request.result.body
-        if isinstance(final, g.ErrorRes):
+        if isinstance(final, rg.ErrorRes):
             _show(ERROR, "cli", f"{final.code}: {final.message}")
             return None
         return final
@@ -359,6 +360,7 @@ async def _ir_apply(args: argparse.Namespace) -> int:
         action=g.ApplyAction(args.action),
         host=args.host,
         dryRun=args.dry_run or None,
+        commandTimeout=args.command_timeout,
     )
     res = await _ask(args.address, req)
     if not isinstance(res, g.IrApplyRes):
@@ -406,13 +408,14 @@ async def _bundle(args: argparse.Namespace) -> int:
     root = source_root()
     missing = [
         path
-        for path in ("fabric/generated.py", "protocol/generated.py")
+        for path in ("runtime/generated.py", "fabric/generated.py", "protocol/generated.py")
         if not (root / path).is_file()
     ]
     if missing:
         print(
-            f"error: {', '.join(missing)} missing: run `deno run -A fabric/schema/generate.ts` "
-            "and `deno run -A src/cli.ts generate-pytypes` first",
+            f"error: {', '.join(missing)} missing: run `deno run -A runtime/schema/generate.ts`, "
+            "`deno run -A fabric/schema/generate.ts` and `deno run -A src/cli.ts generate-pytypes` "
+            "first",
             file=sys.stderr,
         )
         return 2
@@ -549,6 +552,12 @@ def main() -> int:
     ir_apply.add_argument("--name", help="with --put: store it under this name")
     ir_apply.add_argument("--host", help="which of the IR's hosts (default: the runtime's)")
     ir_apply.add_argument("--dry-run", action="store_true", help="describe, run nothing")
+    ir_apply.add_argument(
+        "--command-timeout",
+        type=float,
+        metavar="SECONDS",
+        help="kill a command running longer and fail its unit (0: no limit; default 300)",
+    )
     ir_apply.set_defaults(run=_ir_apply)
     bundle = commands.add_parser(
         "bundle", help="package the runtime and fabric's services as one PEX (for a host)"

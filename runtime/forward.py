@@ -16,9 +16,8 @@ import asyncio
 import contextlib
 from collections.abc import AsyncIterator
 
-from fabric import generated as g
-
 from . import command
+from . import generated as g
 from .peer import Outbox, Peer, current_component, current_outbox, current_req
 from .transport import Closed
 

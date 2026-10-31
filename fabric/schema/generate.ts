@@ -1,13 +1,13 @@
-// fabric/schema/generate.ts — regenerate the runtime's protocol for
-// Python: writes fabric/protocol.schema.json (JSON Schema, named $defs) and
-// runs datamodel-codegen into fabric/generated.py (stdlib dataclasses).
+// fabric/schema/generate.ts — regenerate fabric's protocol for Python:
+// writes fabric/protocol.schema.json (JSON Schema, named $defs) and runs
+// datamodel-codegen into fabric/generated.py (stdlib dataclasses), with the
+// runtime's generator. The runtime's own parts are runtime/generated.py
+// (`deno run -A runtime/schema/generate.ts`).
 //
 //   deno run -A fabric/schema/generate.ts
-//
-// Uses the build-only .venv-build/ that `src/cli.ts generate-pytypes`
-// bootstraps; run that once first on a fresh checkout.
 
 import { buildJsonSchema, refNamedShapes, shape } from "../../src/protocol.ts";
+import { generate } from "../../runtime/schema/generate.ts";
 import {
   AbstractDep,
   AbstractDepSpec,
@@ -33,7 +33,6 @@ import {
   DockerRunReq,
   DockerRunRes,
   EnvVar,
-  ErrorRes,
   ImageSpec,
   ImageState,
   ImageStatus,
@@ -52,10 +51,7 @@ import {
   IrPutReq,
   IrPutRes,
   IrPutStatus,
-  LogLevel,
-  LogMsg,
   Mount,
-  MsgHeader,
   PrimitiveStep,
   RawNode,
   RefArg,
@@ -76,15 +72,7 @@ import {
   WriteFileStep,
 } from "./protocol.ts";
 
-const SCHEMA_PATH = "fabric/protocol.schema.json";
-const GENERATED_PY_PATH = "fabric/generated.py";
-const CODEGEN = ".venv-build/bin/datamodel-codegen";
-
 const shapes = refNamedShapes({
-  MsgHeader: shape(MsgHeader),
-  LogLevel: shape(LogLevel),
-  LogMsg: shape(LogMsg),
-  ErrorRes: shape(ErrorRes),
   VersionReq: shape(VersionReq),
   VersionRes: shape(VersionRes),
   SystemDepState: shape(SystemDepState),
@@ -164,34 +152,8 @@ shapes["IrCollection"] = {
   required: ["kind", "collection"],
 };
 
-// No root shape: every part is its own top-level class.
-const schema = {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$defs": { ...ir.$defs, IRNode: { oneOf: ir.oneOf }, ...shapes },
-};
-
-await Deno.writeTextFile(SCHEMA_PATH, JSON.stringify(schema, null, 2) + "\n");
-console.error(`wrote ${SCHEMA_PATH}`);
-
-const { success, stderr } = await new Deno.Command(CODEGEN, {
-  args: [
-    "--input",
-    SCHEMA_PATH,
-    "--input-file-type",
-    "jsonschema",
-    "--output",
-    GENERATED_PY_PATH,
-    "--output-model-type",
-    "dataclasses.dataclass",
-    "--target-python-version",
-    "3.11",
-    "--disable-timestamp",
-  ],
-  stderr: "piped",
-}).output();
-if (!success) {
-  throw new Error(
-    `datamodel-codegen failed:\n${new TextDecoder().decode(stderr)}`,
-  );
-}
-console.error(`wrote ${GENERATED_PY_PATH}`);
+await generate(
+  { ...ir.$defs, IRNode: { oneOf: ir.oneOf }, ...shapes },
+  "fabric/protocol.schema.json",
+  "fabric/generated.py",
+);

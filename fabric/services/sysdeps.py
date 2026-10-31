@@ -47,6 +47,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from typing import Any, Protocol
 
 from runtime import command
+from runtime import generated as rg
 from runtime.message import BodySpec, Msg, ProtocolError, register_bodies
 from runtime.peer import Peer
 from runtime.service import Service
@@ -367,8 +368,8 @@ class SystemDeps:
         async def forward() -> None:
             while (item := await lines.get()) is not None:
                 level, line = item
-                body = g.LogMsg(
-                    kind="LogMsg", level=g.LogLevel(level), message=line, component="sysdeps"
+                body = rg.LogMsg(
+                    kind="LogMsg", level=rg.LogLevel(level), message=line, component="sysdeps"
                 )
                 targets = {w for dep in deps for w in self._watchers.get(dep, [])}
                 for peer, req_id in targets:

@@ -8,6 +8,7 @@ import unittest
 from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
+from unittest import mock
 
 from deployer.context import Ctx, Options
 from deployer.lifecycle import (
@@ -222,6 +223,59 @@ class LifecycleTest(unittest.TestCase):
             )
             await consumer.execute()
             self.assertEqual(job.commands[-1][1], ("ovn-nbctl", "set", "x", "uuid-2"))
+
+        asyncio.run(run())
+
+    def test_a_required_capture_without_a_value_fails_create(self) -> None:
+        async def run() -> None:
+            ctx = Ctx()
+            lc = _controller(FakeJob(capture=""), LifecycleAction.CREATE, ctx)
+            lc.wait_capture("chassis", "lookup", ["ovn-sbctl", "find", "Chassis"], retries=2)
+            with mock.patch("asyncio.sleep", new_callable=mock.AsyncMock):
+                with self.assertRaisesRegex(RuntimeError, "gave no value after 3 attempts"):
+                    await lc.execute()
+            self.assertNotIn("chassis", ctx.store)
+
+            optional = _controller(FakeJob(capture=""), LifecycleAction.CREATE, ctx)
+            optional.capture("maybe", "lookup", ["true"], optional=True)
+            await optional.execute()
+            self.assertIsNone(ctx.store["maybe"])
+
+        asyncio.run(run())
+
+    def test_a_failing_capture_is_retried_and_only_its_last_failure_is_final(self) -> None:
+        class Flaky(FakeJob):
+            def __init__(self) -> None:
+                super().__init__()
+                self.aborts: list[bool] = []
+
+            async def capture_cmd(
+                self,
+                label: str,
+                cmd: list[str],
+                abort_on_error: bool = True,
+                timeout: float | None = None,
+            ) -> str:
+                self.aborts.append(abort_on_error)
+                return "uuid-3" if len(self.aborts) == 3 else ""
+
+        async def run() -> None:
+            ctx = Ctx()
+            job = Flaky()
+            lc = _controller(job, LifecycleAction.CREATE, ctx)
+            lc.wait_capture("chassis", "lookup", ["ovn-sbctl"], retries=3, result_key="ID")
+            with mock.patch("asyncio.sleep", new_callable=mock.AsyncMock):
+                await lc.execute()
+            self.assertEqual(ctx.store["chassis"], {"ID": "uuid-3"})
+            self.assertEqual(job.aborts, [False, False, False])  # a failure is not final yet
+
+            job = Flaky()
+            lc = _controller(job, LifecycleAction.CREATE, ctx)
+            lc.wait_capture("chassis", "lookup", ["ovn-sbctl"], retries=1)
+            with mock.patch("asyncio.sleep", new_callable=mock.AsyncMock):
+                with self.assertRaises(RuntimeError):
+                    await lc.execute()
+            self.assertEqual(job.aborts, [False, True])  # the last one aborts on failure
 
         asyncio.run(run())
 

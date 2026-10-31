@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from deployer.primitives_host import HostPrimitive
+from runtime import generated as rg
 from runtime.message import BodySpec, Msg, from_parts, header, register_bodies, to_parts
 from runtime.peer import Peer
 from runtime.runtime import Runtime
@@ -130,7 +131,7 @@ class ExecuteTest(unittest.TestCase):
             for seen in (created, deleted):
                 self.assertEqual(seen[-1].body.state, DONE)
             # every command reached the requester — from the unit
-            logs = [m.body for m in created if isinstance(m.body, g.LogMsg)]
+            logs = [m.body for m in created if isinstance(m.body, rg.LogMsg)]
             self.assertTrue(any(log.message.startswith("$ sh -c") for log in logs))
             self.assertEqual({log.component for log in logs}, {"test_unit"})
 
@@ -217,6 +218,52 @@ class ExecuteTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_a_failed_capture_says_why_from_its_stderr(self) -> None:
+        async def run() -> None:
+            script = "echo noise; echo 'Error: No such object: c' >&2; exit 1"
+            capture = g.CaptureStep(
+                kind="Capture", name="pid", label="pid", argv=["sh", "-c", script]
+            )
+            async with _client() as client:
+                with self.assertLogs("fabric.unit", "WARNING"):
+                    seen = await _exec(client, _unit(capture), CREATE)
+            res = seen[-1].body
+            self.assertEqual(res.state, FAILED)
+            self.assertTrue(res.message.endswith("failed: Error: No such object: c"))
+            logs = [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
+            self.assertIn("Error: No such object: c", logs)  # in the unit's debug output too
+
+        asyncio.run(run())
+
+    def test_a_command_running_too_long_is_killed_and_fails_its_unit(self) -> None:
+        async def run() -> None:
+            slow = g.PrimitiveStep(
+                kind="Primitive",
+                key="slow",
+                nodes=[],
+                create=[g.StepCommand(label="slow", argv=["sleep", "60"])],
+                delete=[],
+            )
+            own = g.PrimitiveStep(
+                kind="Primitive",
+                key="own",
+                nodes=[],
+                create=[g.StepCommand(label="own", argv=["sleep", "0.5"], timeout=0.2)],
+                delete=[],
+            )
+            async with _client() as client:
+                with self.assertLogs("fabric.unit", "WARNING"):
+                    # The run's limit …
+                    res = (await _exec(client, _unit(slow), CREATE, commandTimeout=0.2))[-1].body
+                    self.assertEqual(res.state, FAILED)
+                    self.assertIn("timed out after 0.2s: sleep 60", res.message)
+                    # … and a command's own, over the run's.
+                    res = (await _exec(client, _unit(own), CREATE, commandTimeout=60))[-1].body
+                    self.assertEqual(res.state, FAILED)
+                    self.assertIn("timed out after 0.2s: sleep 0.5", res.message)
+
+        asyncio.run(run())
+
     def test_dry_run_describes_and_runs_nothing(self) -> None:
         async def run() -> None:
             log = Path(tempfile.mkdtemp()) / "log"
@@ -224,7 +271,7 @@ class ExecuteTest(unittest.TestCase):
             async with _client() as client:
                 seen = await _exec(client, unit, DELETE, dryRun=True)
             self.assertFalse(log.exists())
-            logs = [m.body.message for m in seen if isinstance(m.body, g.LogMsg)]
+            logs = [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
             self.assertEqual(logs[0], "delete (2 steps)")
             lines = [line for line in logs if " --- " in line]  # the described operations
             self.assertEqual(len(lines), 2)

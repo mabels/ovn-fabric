@@ -35,7 +35,7 @@ import uuid
 from collections.abc import Mapping
 from typing import Any, Generic, Literal, TypeVar
 
-from fabric import generated as g
+from . import generated as g
 
 Role = Literal["request", "response", "event"]
 
@@ -257,7 +257,7 @@ def _value(tp: Any, value: object, path: str, req_id: str | None) -> object:
     elif tp is str:
         ok = isinstance(value, str)
     else:
-        raise TypeError(f"{path}: unsupported field type {tp!r} in rt/generated.py")
+        raise TypeError(f"{path}: unsupported field type {tp!r} in a generated module")
     if not ok:
         raise ProtocolError("bad-part", f"{path}: expected {tp.__name__}, got {value!r}", req_id)
     return float(value) if tp is float else value  # type: ignore[arg-type]

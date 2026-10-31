@@ -66,7 +66,10 @@ def _fields(text: str) -> Any:
 
 def _command(command: g.StepCommand) -> Command:
     return Command(
-        command.label, tuple(_arg(a) for a in command.argv), optional=bool(command.optional)
+        command.label,
+        tuple(_arg(a) for a in command.argv),
+        optional=bool(command.optional),
+        timeout=command.timeout,
     )
 
 
@@ -75,6 +78,7 @@ def _to_command(command: Command) -> g.StepCommand:
         label=command.label,
         argv=[_to_arg(a) for a in command.argv],
         optional=command.optional or None,
+        timeout=command.timeout,
     )
 
 

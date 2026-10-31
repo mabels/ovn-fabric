@@ -23,8 +23,7 @@ import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
-from fabric import generated as g
-
+from . import generated as g
 from .message import Msg, ProtocolError, decode, encode, header, new_req_id
 from .transport import Closed, Connection
 

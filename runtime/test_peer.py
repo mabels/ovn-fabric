@@ -10,6 +10,7 @@ from typing import Any
 
 from fabric import generated as g
 from fabric.services import version
+from runtime import generated as rg
 
 from . import PROTOCOL, __version__
 from .message import Msg
@@ -157,7 +158,7 @@ class PeerTest(unittest.TestCase):
 
             async def answer(peer: Peer, msg: Msg[Any]) -> object:
                 # An unrelated push first (no reqId), then the response.
-                await peer.send(g.LogMsg(kind="LogMsg", level=g.LogLevel.info, message="push"))
+                await peer.send(rg.LogMsg(kind="LogMsg", level=rg.LogLevel.info, message="push"))
                 return g.VersionRes(kind="VersionRes", runtime="x", protocol=1)
 
             client = Peer(a, "client", on_event=on_event)

@@ -1,5 +1,6 @@
-# rt — the runtime (placeholder name, ADR 0007): the job tree and the bus.
-# It never imports ovn-fabric code (deployer, ladops, protocol).
+# runtime — the event runtime (ADR 0007): messages, peers, transports,
+# services. Its own message parts are runtime/schema/ -> runtime/generated.py.
+# It never imports application code (fabric, deployer, ladops, protocol).
 
 __version__ = "0.1.0"
 

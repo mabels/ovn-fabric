@@ -3,12 +3,15 @@
 The declarations are the deployer's (deployer/ir_common.py) — the same
 emitter calls that generated the old deployer. A PlanEmitter receives them
 and, instead of rendering Python code, keeps the lifecycle operations
-themselves, cut into units along the declarations' sections: every
-`# --- <kind>: <name> ---` comment opens a unit ("logical switch:
-backbone", "router port: lrp-x (home)", "kernel router side: …"); the
-operations up to the next one belong to it. Operations before the first
-section of a scope go to a unit named for that scope (the chassis
-registration, a kernel router's netns, a workload's container).
+themselves, in the units the declarations open: `with emit.unit(kind,
+subject):` ("logical switch: backbone", "router port: lrp-x (home)",
+"kernel router side: …"). The plan is strict about them:
+
+- every operation is declared inside a unit;
+- a unit declared inside another ends the outer one's share — the outer
+  one declaring more after it is an error (it would land nowhere sensible);
+- a unit's name is unique in the plan; a unit with nothing to do stays in
+  it (and is done at once).
 
 The scopes, in the order the old deployer ran them on create:
 
@@ -25,10 +28,10 @@ all of it, as their own request (deployer/deps.py), not as a unit.
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import functools
-import re
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Any
 
 from deployer.ir_common import (
@@ -41,6 +44,7 @@ from deployer.ir_common import (
     _kernel_router_owners,
     _netns_name,
     _service_faces,
+    unit_name,
 )
 from deployer.lifecycle import (
     CaptureOperation,
@@ -55,11 +59,6 @@ from protocol import generated as pt
 from . import generated as g
 from .units import to_step
 
-_SECTION = re.compile(r"^# --- (.*) ---$")
-# A section's kind: what comes before ": " ("router port: …"), else before
-# " (" ("bridge (…)"), else the whole text.
-_KIND = re.compile(r"^([^:(]+?)(?::| \(|$)")
-
 
 class PlanError(ValueError):
     """The IR declares something a unit cannot hold (yet)."""
@@ -68,33 +67,50 @@ class PlanError(ValueError):
 class PlanEmitter(Emitter):
     """Collects one scope's declarations as units of lifecycle operations."""
 
-    def __init__(self, scope: str, first_unit: str) -> None:
+    def __init__(self, scope: str) -> None:
         super().__init__("create")
         self.label = scope
         self.units: list[g.Unit] = []
-        self._first_unit = first_unit
+        # The units open now, innermost last; and those an inner unit has
+        # ended (they take no more operations).
+        self._open: list[g.Unit] = []
+        self._ended: set[int] = set()
         self._values: dict[str, Any] = {}  # `emit.py("name = literal")`
         self._refs: dict[str, RuntimeRef] = {}  # capture name -> its RuntimeRef
 
-    # -- sections --------------------------------------------------------------
+    # -- units -----------------------------------------------------------------
+
+    @contextlib.contextmanager
+    def unit(
+        self, kind: str, subject: str | None = None, *, key: str | None = None
+    ) -> Iterator[None]:
+        unit = g.Unit(name=unit_name(kind, subject), kind=kind, key=key, scope=self.label, steps=[])
+        if self._open:
+            self._ended.add(id(self._open[-1]))
+        self.units.append(unit)
+        self._open.append(unit)
+        try:
+            yield
+        finally:
+            self._open.pop()
 
     def comment(self, text: str) -> None:
-        match = _SECTION.match(text.strip())
-        if match is None:
-            return  # a plain comment
-        name = match.group(1)
-        kind_match = _KIND.match(name)
-        kind = kind_match.group(1).strip() if kind_match else name
-        self.units.append(g.Unit(name=name, kind=kind, steps=[]))
+        return None
 
     def blank(self) -> None:
         return None
 
     def _add(self, operation: Any) -> None:
-        if not self.units:
-            kind = self._first_unit.split(":", 1)[0]
-            self.units.append(g.Unit(name=self._first_unit, kind=kind, steps=[]))
-        self.units[-1].steps.append(to_step(self._resolve(operation)))
+        step = to_step(self._resolve(operation))
+        if not self._open:
+            raise PlanError(f"{self.label}: {_what(step)} is declared outside any unit")
+        unit = self._open[-1]
+        if id(unit) in self._ended:
+            raise PlanError(
+                f"{unit.name}: {_what(step)} is declared after a unit inside it — "
+                "give it a unit of its own"
+            )
+        unit.steps.append(step)
 
     # -- what the declarations call ----------------------------------------------
 
@@ -256,12 +272,17 @@ _HELPERS: dict[str, Callable[..., Any]] = {
 # -- the plan ----------------------------------------------------------------
 
 
-def _scope(scope: str, first_unit: str, declare: Callable[[Emitter], None]) -> list[g.Unit]:
-    emit = PlanEmitter(scope, first_unit)
+def _what(step: g.UnitStepSpec) -> str:
+    """A step, for an error message."""
+    if isinstance(step, g.PrimitiveStep):
+        return f"{step.key!r}"
+    return f"a {step.kind} step"
+
+
+def _scope(scope: str, declare: Callable[[Emitter], None]) -> list[g.Unit]:
+    emit = PlanEmitter(scope)
     declare(emit)
-    for unit in emit.units:
-        unit.scope = scope
-    return [unit for unit in emit.units if unit.steps]
+    return emit.units
 
 
 def plan_units(nodes: Sequence[pt.Model], host: str) -> list[g.Unit]:
@@ -272,18 +293,13 @@ def plan_units(nodes: Sequence[pt.Model], host: str) -> list[g.Unit]:
     )
     if host_node is None:
         raise PlanError(f"{host} is not a host of this IR")
-    units = _scope(
-        "configure",
-        f"chassis registration: {host}",
-        functools.partial(_emit_host_configure, host_node, all_nodes),
-    )
+    units = _scope("configure", functools.partial(_emit_host_configure, host_node, all_nodes))
     if host_node.data.ovnRole == pt.OvnRole.central:
-        units += _scope("cluster", "cluster", functools.partial(_emit_cluster_body, all_nodes))
+        units += _scope("cluster", functools.partial(_emit_cluster_body, all_nodes))
     for owner in _kernel_router_owners(host_node.id, all_nodes):
         name = owner.key.name
         units += _scope(
             name,
-            f"kernel router: {name}",
             functools.partial(_emit_kernel_router_owner, owner, _netns_name(name), all_nodes),
         )
     for node in all_nodes:
@@ -293,5 +309,10 @@ def plan_units(nodes: Sequence[pt.Model], host: str) -> list[g.Unit]:
             continue
         name = node.key.name
         faces = _service_faces(name, host, all_nodes)
-        units += _scope(name, f"workload: {name}", functools.partial(_emit_service_up, node, faces))
+        units += _scope(name, functools.partial(_emit_service_up, node, faces))
+    names: set[str] = set()
+    for unit in units:
+        if unit.name in names:
+            raise PlanError(f"two units are named {unit.name!r}")
+        names.add(unit.name)
     return units

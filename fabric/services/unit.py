@@ -20,6 +20,7 @@ the caller's (the apply task's) business.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import re
@@ -61,8 +62,10 @@ class CommandJob:
     runtime's command runner, so every command (and its output) is logged
     and reported to the requester."""
 
-    async def run_cmd(self, label: str, cmd: list[str], abort_on_error: bool, /) -> bool:
-        ok, out = await command.run(cmd, log=log, level="debug")
+    async def run_cmd(
+        self, label: str, cmd: list[str], abort_on_error: bool, /, *, timeout: float | None = None
+    ) -> bool:
+        ok, out = await command.run(cmd, log=log, level="debug", timeout=timeout)
         if not ok:
             tail = "\n".join(out.strip().splitlines()[-3:])
             message = f"{label}: {shlex.join(cmd)} failed: {tail}".rstrip(": ")
@@ -71,14 +74,27 @@ class CommandJob:
             self.warn(message)  # not fatal (a delete): reported, the rest goes on
         return ok
 
-    async def capture_cmd(self, label: str, cmd: list[str], abort_on_error: bool, /) -> str:
+    async def capture_cmd(
+        self, label: str, cmd: list[str], abort_on_error: bool, /, *, timeout: float | None = None
+    ) -> str:
         stdout: list[str] = []  # only stdout is the captured value
+        stderr: list[str] = []  # why it failed — and in the unit's debug output
+
+        def on_err(line: str) -> None:
+            stderr.append(line)
+            command.report("debug", line)
+
         ok, out = await command.run(
-            cmd, log=log, on_line=stdout.append, on_err=lambda _: None, level="debug"
+            cmd, log=log, on_line=stdout.append, on_err=on_err, level="debug", timeout=timeout
         )
         if not ok:
             if abort_on_error:
-                raise UnitFailed(f"{label}: {shlex.join(cmd)} failed: {out.strip()[-200:]}")
+                lines = out.strip().splitlines()
+                why = stderr[-3:] if stderr else lines[-3:]
+                if lines and lines[-1].startswith(command.TIMED_OUT) and lines[-1] not in why:
+                    why.append(lines[-1])
+                tail = "\n".join(why)
+                raise UnitFailed(f"{label}: {shlex.join(cmd)} failed: {tail}".rstrip(": "))
             return ""
         return "\n".join(stdout).strip()
 
@@ -103,7 +119,10 @@ class UnitExecutor:
         req = msg.body
         assert isinstance(req, g.UnitExecReq)
         unit = req.unit
-        ctx = Ctx(Options(dry_run=bool(req.dryRun)))
+        options = Options(dry_run=bool(req.dryRun))
+        if req.commandTimeout is not None:
+            options = dataclasses.replace(options, command_timeout=req.commandTimeout)
+        ctx = Ctx(options)
         for value in req.inputs or []:
             ctx.store[value.name] = json.loads(value.json)
         lc = LifecycleController(

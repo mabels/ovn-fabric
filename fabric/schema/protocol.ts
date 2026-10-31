@@ -1,48 +1,14 @@
-// fabric/schema/protocol.ts — the protocol of the runtime and fabric's services: the parts a
-// message is made of. A message on the wire is a COLLECTION of parts,
-// `[{kind: "MsgHeader", ...}, {kind: "VersionReq", ...}]`; every part
-// carries its `kind`. The Python side (runtime/message.py) validates the
-// collection and transposes it into one internal structure per message.
+// fabric/schema/protocol.ts — the parts of fabric's services: their
+// requests, responses and events. They travel next to the runtime's own
+// parts (MsgHeader, LogMsg, ErrorRes: runtime/schema/protocol.ts) in a
+// message's collection.
 //
-// This schema belongs to the runtime, not to ovn-fabric's IR
-// (src/protocol.ts): the runtime owns its message format (ADR 0007).
-// Python dataclasses are generated from it by
+// This schema is not ovn-fabric's IR (src/protocol.ts), though IrCollection
+// carries that IR (ADR 0007). Python dataclasses are generated from it by
 // `deno run -A fabric/schema/generate.ts`.
 
 import { type } from "arktype";
 import { IRNode } from "../../src/protocol.ts";
-
-/** Present on every message. `id` is unique per message; `reqId` ties a
- * request, its response and every log emitted while handling it
- * together; `parentReqId` links a request sent from inside a handler to
- * the request being handled. */
-export const MsgHeader = type({
-  kind: "'MsgHeader'",
-  id: "string",
-  "reqId?": "string",
-  "parentReqId?": "string",
-  time: "number",
-  source: "string",
-});
-
-export const LogLevel = type("'debug' | 'info' | 'warn' | 'error'");
-
-/** A log line, emitted by whoever is handling `MsgHeader.reqId` (if any).
- * `component` names who wrote it — a service (sysdeps, docker, …) or a
- * container for its output — and survives being relayed. */
-export const LogMsg = type({
-  kind: "'LogMsg'",
-  level: LogLevel,
-  message: "string",
-  "component?": "string",
-});
-
-/** The final answer to a request that failed. */
-export const ErrorRes = type({
-  kind: "'ErrorRes'",
-  code: "string",
-  message: "string",
-});
 
 export const VersionReq = type({
   kind: "'VersionReq'",
@@ -323,6 +289,9 @@ export const IrApplyReq = type({
   "host?": "string",
   /** Only describe what would run (per unit of work), run nothing. */
   "dryRun?": "boolean",
+  /** Seconds one command may run before it is killed and its unit has
+   * failed (a command may set its own); 0: no limit. Default: 300. */
+  "commandTimeout?": "number",
 });
 
 export const ApplyState = type(
@@ -376,6 +345,9 @@ export const StepCommand = type({
   label: "string",
   argv: Arg.array(),
   "optional?": "boolean",
+  /** Seconds it may run before it is killed and has failed; default: the
+   * run's commandTimeout; 0: no limit. */
+  "timeout?": "number",
 });
 
 /** What a step creates in the object graph (ADR 0006); `fields` is JSON. */
@@ -465,6 +437,8 @@ export const UnitExecReq = type({
   "host?": "string",
   /** Describe the commands, run nothing. */
   "dryRun?": "boolean",
+  /** As IrApplyReq's. */
+  "commandTimeout?": "number",
 });
 
 export const UnitExecRes = type({

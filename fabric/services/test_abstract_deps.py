@@ -6,6 +6,7 @@ import unittest
 from collections.abc import AsyncIterator
 from typing import Any
 
+from runtime import generated as rg
 from runtime.peer import Peer, RemoteError
 from runtime.runtime import Runtime
 from runtime.transport import connect
@@ -164,7 +165,7 @@ class AbstractDepsTest(unittest.TestCase):
             per_dep = {e.name: e.state for e in _events(seen, g.AbstractDep)}
             self.assertEqual(per_dep, {"quantum": FAILED, "jq": READY})
             self.assertEqual(_events(seen, g.AbstractDepsReady), [])
-            logs = [m.body.message for m in seen if isinstance(m.body, g.LogMsg)]
+            logs = [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
             self.assertIn("quantum: unknown abstract dependency", logs)
 
         asyncio.run(run())

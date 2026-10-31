@@ -10,6 +10,7 @@ from typing import Any
 from unittest import mock
 
 from protocol.hydrate import hydrate_nodes
+from runtime import generated as rg
 from runtime.message import Msg
 from runtime.peer import Peer, RemoteError
 from runtime.runtime import Runtime
@@ -121,7 +122,7 @@ class ApplyTest(unittest.TestCase):
             )
             progress = [m.body.unit for m in seen if isinstance(m.body, g.IrApplyProgress)]
             self.assertEqual([p.state for p in progress[:2]], [g.ApplyState.running, DONE])
-            logs = [m.body.message for m in seen if isinstance(m.body, g.LogMsg)]
+            logs = [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
             self.assertIn(f"create unit: {PLAN[0]}", logs)  # the executor's logs, relayed
 
         asyncio.run(run())

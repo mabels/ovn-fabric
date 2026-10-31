@@ -62,9 +62,13 @@ class Operation(Protocol):
 class JobLike(Protocol):
     """The part of runtime.service.Job a controller uses."""
 
-    async def run_cmd(self, label: str, cmd: list[str], abort_on_error: bool, /) -> bool: ...
+    async def run_cmd(
+        self, label: str, cmd: list[str], abort_on_error: bool, /, *, timeout: float | None = None
+    ) -> bool: ...
 
-    async def capture_cmd(self, label: str, cmd: list[str], abort_on_error: bool, /) -> str: ...
+    async def capture_cmd(
+        self, label: str, cmd: list[str], abort_on_error: bool, /, *, timeout: float | None = None
+    ) -> str: ...
 
     def info(self, message: str, /) -> None: ...
 
@@ -93,6 +97,8 @@ class Command:
     label: str
     argv: tuple[str, ...]
     optional: bool = False
+    # Seconds it may run; None: the run's `command_timeout`, 0: no limit.
+    timeout: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -175,12 +181,16 @@ class Primitive:
 
     async def create(self, lc: LifecycleController) -> None:
         for command in self.create_cmds:
-            await lc.run_cmd(command.label, command.argv, optional=command.optional)
+            await lc.run_cmd(
+                command.label, command.argv, optional=command.optional, timeout=command.timeout
+            )
         lc.graph.upsert(self.key, self.nodes)
 
     async def delete(self, lc: LifecycleController) -> None:
         for command in self.delete_cmds:
-            await lc.run_cmd(command.label, command.argv, optional=command.optional)
+            await lc.run_cmd(
+                command.label, command.argv, optional=command.optional, timeout=command.timeout
+            )
         lc.graph.remove(self.key)
 
     def describe(self, action: LifecycleAction) -> list[str]:
@@ -393,7 +403,11 @@ class SymlinkNetnsOperation:
 class CaptureOperation:
     """A queued capture. CREATE stores the value under `name` in the
     run-wide store; DELETE does nothing (the value is only needed to
-    build create commands)."""
+    build create commands).
+
+    An attempt that fails or answers nothing is retried (`retries`); after
+    the last one a required capture fails CREATE, an `optional` one
+    stores None."""
 
     name: str
     label: str
@@ -404,14 +418,18 @@ class CaptureOperation:
     result_key: str | None = None
 
     async def create(self, lc: LifecycleController) -> None:
-        for attempt in range(self.retries + 1):
-            value = await lc.capture_cmd(self.label, self.argv, optional=self.optional)
+        attempts = self.retries + 1
+        for attempt in range(1, attempts + 1):
+            last = attempt == attempts
+            # Only the last attempt's failure is final: before it, a failing
+            # command is retried like an empty answer.
+            value = await lc.capture_cmd(self.label, self.argv, optional=self.optional or not last)
             if value:
                 lc.ctx.store[self.name] = (
                     {self.result_key: value} if self.result_key is not None else value
                 )
                 return
-            if attempt < self.retries:
+            if not last:
                 if self.restart_unit is not None:
                     await lc.run_cmd(
                         self.label,
@@ -419,6 +437,11 @@ class CaptureOperation:
                         optional=True,
                     )
                 await asyncio.sleep(1)
+        if not self.optional:
+            raise RuntimeError(
+                f"{self.label}: {_argv_line(self.argv)} gave no value"
+                + (f" after {attempts} attempts" if attempts > 1 else "")
+            )
         lc.ctx.store[self.name] = None
 
     async def delete(self, lc: LifecycleController) -> None:
@@ -602,14 +625,33 @@ class LifecycleController:
 
     # -- what operations call while they execute -------------------------
 
-    async def run_cmd(self, label: str, argv: Sequence[str], *, optional: bool = False) -> bool:
+    async def run_cmd(
+        self,
+        label: str,
+        argv: Sequence[str],
+        *,
+        optional: bool = False,
+        timeout: float | None = None,
+    ) -> bool:
         # The error policy: only a non-optional command on CREATE aborts.
         abort = self.action.creating and not optional
-        return await self.job.run_cmd(label, list(argv), abort)
+        return await self.job.run_cmd(label, list(argv), abort, timeout=self._timeout(timeout))
 
-    async def capture_cmd(self, label: str, argv: Sequence[str], *, optional: bool = False) -> str:
+    async def capture_cmd(
+        self,
+        label: str,
+        argv: Sequence[str],
+        *,
+        optional: bool = False,
+        timeout: float | None = None,
+    ) -> str:
         abort = self.action.creating and not optional
-        return await self.job.capture_cmd(label, list(argv), abort)
+        return await self.job.capture_cmd(label, list(argv), abort, timeout=self._timeout(timeout))
+
+    def _timeout(self, timeout: float | None) -> float | None:
+        """A command's limit: its own, else the run's; 0 is none."""
+        seconds = self.ctx.opts.command_timeout if timeout is None else timeout
+        return seconds if seconds > 0 else None
 
     # -- what generated code calls: declaration only ---------------------
 

@@ -19,6 +19,7 @@ class FakeJob:
         argv: Sequence[str],
         abort_on_error: bool = True,
         background: bool = False,
+        timeout: float | None = None,
     ) -> bool:
         self.commands.append((label, tuple(argv)))
         if argv and argv[-1] == "true":
@@ -28,7 +29,11 @@ class FakeJob:
         return True
 
     async def capture_cmd(
-        self, label: str, argv: Sequence[str], abort_on_error: bool = True
+        self,
+        label: str,
+        argv: Sequence[str],
+        abort_on_error: bool = True,
+        timeout: float | None = None,
     ) -> str:
         return ""
 

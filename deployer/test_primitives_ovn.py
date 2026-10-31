@@ -29,13 +29,18 @@ class FakeJob:
         argv: Sequence[str],
         abort_on_error: bool = True,
         background: bool = False,
+        timeout: float | None = None,
     ) -> bool:
         self.commands.append((label, tuple(argv), abort_on_error))
         # `exists` probes use `get`; report "missing" so create runs.
         return tuple(argv[:2]) != ("ovn-nbctl", "get")
 
     async def capture_cmd(
-        self, label: str, argv: Sequence[str], abort_on_error: bool = True
+        self,
+        label: str,
+        argv: Sequence[str],
+        abort_on_error: bool = True,
+        timeout: float | None = None,
     ) -> str:
         return ""
 

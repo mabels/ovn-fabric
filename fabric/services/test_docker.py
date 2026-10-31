@@ -6,6 +6,7 @@ import unittest
 from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
+from runtime import generated as rg
 from runtime.command import report
 from runtime.peer import Peer, RemoteError
 from runtime.runtime import Runtime
@@ -98,12 +99,12 @@ class PipelineTest(unittest.TestCase):
             self.assertIn(("install", "docker.io"), apt.calls)  # through sysdeps
             self.assertEqual(docker.calls, [("info",), ("pull", "busybox"), ("build", "x")])
             self.assertEqual(_states(request.result.body), {"busybox": READY, "x": READY})
-            logs = [m.body.message for m in seen if isinstance(m.body, g.LogMsg)]
+            logs = [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
             self.assertIn("docker: ready (docker.io ready 1.0)", logs)  # the abstract dep, relayed
             self.assertIn("Setting up docker.io (1.0) ...", logs)  # apt's output, relayed
             self.assertIn("pulling busybox", logs)  # docker's output, at debug
             # Each line names its sender, also after being relayed.
-            by = {m.body.message: m.body.component for m in seen if isinstance(m.body, g.LogMsg)}
+            by = {m.body.message: m.body.component for m in seen if isinstance(m.body, rg.LogMsg)}
             self.assertEqual(by["Setting up docker.io (1.0) ..."], "sysdeps")
             self.assertEqual(by["queued for install: docker.io"], "sysdeps")  # two relays on
             self.assertEqual(by["docker: ready (docker.io ready 1.0)"], "docker")
@@ -113,12 +114,12 @@ class PipelineTest(unittest.TestCase):
             infos = [
                 m.body.message
                 for m in seen
-                if isinstance(m.body, g.LogMsg) and m.body.level is g.LogLevel.info
+                if isinstance(m.body, rg.LogMsg) and m.body.level is rg.LogLevel.info
             ]
             self.assertIn("$ apt-get install -y docker.io", infos)
             self.assertEqual(by["$ apt-get install -y docker.io"], "sysdeps")
             self.assertEqual(by["$ docker pull busybox"], "docker")
-            order = [m.body.message if isinstance(m.body, g.LogMsg) else m.kind for m in seen]
+            order = [m.body.message if isinstance(m.body, rg.LogMsg) else m.kind for m in seen]
             self.assertLess(order.index("$ docker pull busybox"), order.index("pulling busybox"))
             self.assertLess(order.index("pulling busybox"), order.index("DockerReady"))
             kinds = [m.kind for m in seen]

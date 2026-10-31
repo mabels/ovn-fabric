@@ -1,6 +1,6 @@
 """Applying a stored IR on this host.
 
-    IrApplyReq { ref, action: create|delete, host?, dryRun? }
+    IrApplyReq { ref, action: create|delete, host?, dryRun?, commandTimeout? }
       → IrApplyProgress { unit }       as each unit of work changes state
       → IrApplyRes { hash, action, host, state, units }
 
@@ -40,6 +40,7 @@ from typing import Any
 from deployer.deps import abstract_deps
 from protocol import generated as pt
 from protocol.hydrate import hydrate_nodes
+from runtime import generated as rg
 from runtime.message import BodySpec, Msg, ProtocolError, plain, register_bodies
 from runtime.peer import Peer, RemoteError
 from runtime.service import Service
@@ -145,10 +146,10 @@ class Apply:
             )
         )
         async for event in request:  # its progress, as ours
-            if isinstance(event.body, g.LogMsg):
+            if isinstance(event.body, rg.LogMsg):
                 await peer.emit(event.body)
         res = request.result.body
-        if isinstance(res, g.ErrorRes):
+        if isinstance(res, rg.ErrorRes):
             return f"abstract deps: {res.code}: {res.message}"
         assert isinstance(res, g.AbstractDepsRes)
         missing = [
@@ -180,13 +181,14 @@ class Apply:
                     inputs=store,
                     host=host,
                     dryRun=req.dryRun,
+                    commandTimeout=req.commandTimeout,
                 )
             )
             async for event in request:  # the executor's logs, as ours
-                if isinstance(event.body, g.LogMsg):
+                if isinstance(event.body, rg.LogMsg):
                     await peer.emit(event.body)
             res = request.result.body
-            if isinstance(res, g.ErrorRes):
+            if isinstance(res, rg.ErrorRes):
                 result = g.ApplyUnit(
                     name=unit.name, state=g.ApplyState.failed, message=f"{res.code}: {res.message}"
                 )

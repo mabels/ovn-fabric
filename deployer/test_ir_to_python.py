@@ -3533,7 +3533,7 @@ class IpfixExportTest(unittest.TestCase):
     def test_ipfix_attaches_to_the_segment_bridge_on_create(self) -> None:
         _, hosts = build_ops(_with_ipfix(NODES), "create")
         script = hosts["chassis-1"]
-        self.assertIn("# --- flow export (IPFIX) ---", script)
+        self.assertIn("# --- flow export: IPFIX ---", script)
         # Idempotent: reuse the bridge's existing IPFIX row, else create.
         # `get` prints the empty-set literal `[]` when the bridge has no
         # IPFIX, so the reuse test must reject that, not just empty output.

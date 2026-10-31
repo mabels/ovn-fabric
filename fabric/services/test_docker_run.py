@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+from runtime import generated as rg
 from runtime.command import LineSink
 from runtime.peer import Peer, RemoteError
 from runtime.runtime import Runtime
@@ -126,10 +127,10 @@ class RunTest(unittest.TestCase):
             self.assertIn(("pull", "busybox"), docker.calls)  # prepared first
             states = [m.body.state for m in seen if isinstance(m.body, g.DockerContainer)]
             self.assertEqual(states, [S.starting, S.started, S.stopped])
-            logs = [(m.body.level, m.body.message) for m in seen if isinstance(m.body, g.LogMsg)]
-            self.assertIn((g.LogLevel.info, "hello"), logs)
-            self.assertIn((g.LogLevel.warn, "oops"), logs)
-            by = {m.body.message: m.body.component for m in seen if isinstance(m.body, g.LogMsg)}
+            logs = [(m.body.level, m.body.message) for m in seen if isinstance(m.body, rg.LogMsg)]
+            self.assertIn((rg.LogLevel.info, "hello"), logs)
+            self.assertIn((rg.LogLevel.warn, "oops"), logs)
+            by = {m.body.message: m.body.component for m in seen if isinstance(m.body, rg.LogMsg)}
             self.assertEqual((by["hello"], by["oops"]), ("t", "t"))  # the container's output
             res = request.result.body
             self.assertEqual((res.state, res.exitCode), (S.stopped, 3))
@@ -158,7 +159,7 @@ class RunTest(unittest.TestCase):
             self.assertEqual(states, [S.starting, S.started])
             self.assertEqual(request.result.body.state, S.started)
             self.assertNotIn(
-                "serving", [m.body.message for m in seen if isinstance(m.body, g.LogMsg)]
+                "serving", [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
             )
             self.assertIn("t: serving", [r.getMessage() for r in logs.records])
             self.assertIn(("stop", "t"), containers.calls)

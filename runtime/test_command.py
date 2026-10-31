@@ -5,6 +5,7 @@ import logging
 import os
 import shlex
 import sys
+import time
 import unittest
 
 from .command import reporting, run
@@ -58,6 +59,32 @@ class RunTest(unittest.TestCase):
                 os.kill(int(pids[0]), 0)
 
         asyncio.run(go())
+
+    def test_a_timeout_kills_the_command_and_what_it_started(self) -> None:
+        async def go() -> tuple[bool, str, list[str]]:
+            pids: list[str] = []
+            # The shell starts a child and waits: both must go.
+            ok, out = await run(
+                ["sh", "-c", "sleep 60 & echo $!; wait"],
+                log=_log(),
+                on_line=pids.append,
+                timeout=0.3,
+            )
+            return ok, out, pids
+
+        with self.assertLogs("runtime.test", "WARNING") as logs:
+            ok, out, pids = asyncio.run(go())
+        self.assertFalse(ok)
+        self.assertTrue(out.splitlines()[-1].startswith("timed out after 0.3s: sh -c"))
+        self.assertIn("timed out after 0.3s", logs.output[0])
+        for _ in range(100):  # the orphaned child is reaped by init, soon
+            try:
+                os.kill(int(pids[0]), 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.01)
+        else:
+            self.fail(f"the command's child {pids[0]} is still running")
 
     def test_the_command_and_its_output_are_reported(self) -> None:
         reported: list[tuple[str, str]] = []

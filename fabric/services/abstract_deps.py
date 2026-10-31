@@ -25,6 +25,7 @@ from __future__ import annotations
 from collections.abc import Awaitable, Callable, Mapping
 from typing import Any
 
+from runtime import generated as rg
 from runtime.message import BodySpec, Msg, ProtocolError, register_bodies
 from runtime.peer import Peer
 from runtime.service import Service
@@ -142,7 +143,7 @@ class AbstractDeps:
             g.ResolveSystemDepsReq(kind="ResolveSystemDepsReq", deps=deps, timeout=timeout)
         )
         async for event in request:
-            if isinstance(event.body, g.LogMsg):  # sysdeps' progress, as our own
+            if isinstance(event.body, rg.LogMsg):  # sysdeps' progress, as our own
                 await peer.emit(event.body)
             elif isinstance(event.body, g.ResolveSystemDep):
                 settled[event.body.dep] = g.DepStatus(
@@ -150,7 +151,7 @@ class AbstractDeps:
                 )
                 await announce_settled()
         final = request.result.body
-        if isinstance(final, g.ErrorRes):
+        if isinstance(final, rg.ErrorRes):
             raise ProtocolError(final.code, f"sysdeps: {final.message}")
         assert isinstance(final, g.ResolveSystemDepsRes)
         for status in final.deps:  # the final word, should an event be missing

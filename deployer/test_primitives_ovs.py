@@ -20,6 +20,7 @@ class FakeJob:
         argv: Sequence[str],
         abort_on_error: bool = True,
         background: bool = False,
+        timeout: float | None = None,
     ) -> bool:
         self.commands.append((label, tuple(argv)))
         # `br-exists` / `port-to-br` report "missing" so create runs.
@@ -34,6 +35,7 @@ class FakeJob:
         label: str,
         argv: Sequence[str],
         abort_on_error: bool = True,
+        timeout: float | None = None,
     ) -> str:
         return ""
 

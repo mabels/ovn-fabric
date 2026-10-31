@@ -9,6 +9,7 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from runtime import generated as rg
 from runtime.command import report
 from runtime.peer import Peer, RemoteError
 from runtime.runtime import Runtime
@@ -261,7 +262,7 @@ class OutputTest(unittest.TestCase):
                 return [
                     m.body.message
                     for m in seen
-                    if isinstance(m.body, g.LogMsg) and m.body.level is g.LogLevel.debug
+                    if isinstance(m.body, rg.LogMsg) and m.body.level is rg.LogLevel.debug
                 ]
 
             self.assertEqual(lines(a), ["Setting up curl (1.0) ...", "Setting up jq (1.0) ..."])
@@ -269,7 +270,7 @@ class OutputTest(unittest.TestCase):
             # The output comes before the dependency's status.
             kinds = [m.kind for m in a]
             self.assertLess(
-                max(i for i, m in enumerate(a) if isinstance(m.body, g.LogMsg)),
+                max(i for i, m in enumerate(a) if isinstance(m.body, rg.LogMsg)),
                 kinds.index("ResolveSystemDep"),
             )
 

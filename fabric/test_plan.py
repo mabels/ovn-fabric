@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import json
 import unittest
+from collections.abc import Callable
 
+from deployer.ir_common import Emitter
+from deployer.primitives_host import HostPrimitive
 from deployer.test_ir_to_python import NODES
 from protocol.hydrate import hydrate_nodes
 from runtime.test_message import IR_SAMPLE
 
 from . import generated as g
-from .plan import PlanError, plan_units
+from .plan import PlanEmitter, PlanError, plan_units
 from .units import to_operation
+
+HOST = HostPrimitive("h")
 
 
 class PlanTest(unittest.TestCase):
@@ -19,7 +24,7 @@ class PlanTest(unittest.TestCase):
         for expected in (
             "logical switch: backbone",
             "localnet port: home",
-            "chassis id for chassis-1 (resolved on this host)",
+            "chassis id: chassis-1 (resolved on this host)",
             "router: router-home",
             "router port: lrp-router-home-left (home)",
         ):
@@ -32,15 +37,17 @@ class PlanTest(unittest.TestCase):
             names,
             [
                 "chassis registration: chassis-1",
+                "root namespace: chassis-1",
                 "bridge: br-home on chassis-1",
                 "interface: home (eth0.129)",
+                "bridge mappings: chassis-1",  # host-wide: after every bridge, its own
                 "kernel router: kernel-0",
                 "kernel router side: kernel-0 (left)",
                 "kernel router side: kernel-0 (right)",
             ],
         )
         self.assertEqual(
-            [u.kind for u in units][3:],
+            [u.kind for u in units][5:],
             ["kernel router", "kernel router side", "kernel router side"],
         )
 
@@ -81,9 +88,69 @@ class PlanTest(unittest.TestCase):
         chassis = {u.name: u.scope for u in plan_units(NODES, "chassis-1")}
         self.assertEqual(chassis["kernel router side: kernel-0 (left)"], "kernel-0")
 
+    def test_a_unit_comes_with_its_ir_node(self) -> None:
+        units = {u.name: u for u in plan_units(NODES, "chassis-1")}
+        self.assertEqual(units["chassis registration: chassis-1"].key, "host:chassis-1")
+        self.assertTrue(units["kernel router: kernel-0"].key)
+
     def test_an_unknown_host(self) -> None:
         with self.assertRaises(PlanError):
             plan_units(NODES, "nowhere")
+
+
+def _plan(declare: Callable[[Emitter], None]) -> list[g.Unit]:
+    emit = PlanEmitter("test")
+    declare(emit)
+    return emit.units
+
+
+class UnitBoundaryTest(unittest.TestCase):
+    """The units are what the declarations open — and nothing is guessed."""
+
+    def test_operations_belong_to_the_unit_they_are_declared_in(self) -> None:
+        def declare(emit: Emitter) -> None:
+            with emit.unit("bridge", "br-a"):
+                emit.ovn(HOST.ovs_bridge("br-a"))
+                with emit.unit("interface", "eth0"):
+                    emit.ovn(HOST.ovs_port("br-a", "eth0"))
+            with emit.unit("nothing", "to do"):
+                pass
+
+        units = _plan(declare)
+        self.assertEqual(
+            [(u.name, u.kind, len(u.steps)) for u in units],
+            [
+                ("bridge: br-a", "bridge", 1),
+                ("interface: eth0", "interface", 1),
+                ("nothing: to do", "nothing", 0),
+            ],
+        )
+        self.assertEqual({u.scope for u in units}, {"test"})
+
+    def test_an_operation_outside_any_unit_is_an_error(self) -> None:
+        def declare(emit: Emitter) -> None:
+            emit.ovn(HOST.ovs_bridge("br-a"))
+
+        with self.assertRaisesRegex(PlanError, "declared outside any unit"):
+            _plan(declare)
+
+    def test_an_operation_after_a_unit_inside_is_an_error(self) -> None:
+        def declare(emit: Emitter) -> None:
+            with emit.unit("bridge", "br-a"):
+                with emit.unit("interface", "eth0"):
+                    emit.ovn(HOST.ovs_port("br-a", "eth0"))
+                emit.ovn(HOST.ovs_mapping(("net:br-a",)))  # would land in "bridge"
+
+        with self.assertRaisesRegex(PlanError, "bridge: br-a: .* after a unit inside it"):
+            _plan(declare)
+
+    def test_comments_cut_nothing(self) -> None:
+        def declare(emit: Emitter) -> None:
+            with emit.unit("bridge", "br-a"):
+                emit.comment("# --- looks like a section ---")
+                emit.ovn(HOST.ovs_bridge("br-a"))
+
+        self.assertEqual([u.name for u in _plan(declare)], ["bridge: br-a"])
 
 
 if __name__ == "__main__":

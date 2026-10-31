@@ -32,10 +32,12 @@ SOCKET=/tmp/ovn-fabric.sock   # /src is read-only
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 FILES=${RT_FILES:-$ROOT/.rt-files}
 
-if [ ! -f "$ROOT/fabric/generated.py" ]; then
-  echo "fabric/generated.py is missing: run 'deno run -A fabric/schema/generate.ts' first" >&2
-  exit 1
-fi
+for schema in runtime fabric; do
+  if [ ! -f "$ROOT/$schema/generated.py" ]; then
+    echo "$schema/generated.py is missing: run 'deno run -A $schema/schema/generate.ts' first" >&2
+    exit 1
+  fi
+done
 
 command=${1:-serve}
 [ $# -gt 0 ] && shift

@@ -50,6 +50,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Protocol
 
 from runtime import command
+from runtime import generated as rg
 from runtime.command import LineSink
 from runtime.message import BodySpec, Msg, ProtocolError, register_bodies
 from runtime.peer import Peer
@@ -302,10 +303,10 @@ class DockerRun:
         image = g.ImageSpec(image=spec.image, dockerfile=spec.dockerfile)
         request = await client.request(g.DockerPrepareReq(kind="DockerPrepareReq", images=[image]))
         async for event in request:  # relay docker prepare's progress as our own
-            if isinstance(event.body, g.LogMsg):
+            if isinstance(event.body, rg.LogMsg):
                 await peer.emit(event.body)
         res = request.result.body
-        if isinstance(res, g.ErrorRes):
+        if isinstance(res, rg.ErrorRes):
             return f"docker prepare: {res.code}: {res.message}"
         assert isinstance(res, g.DockerPrepareRes)
         (status,) = res.images

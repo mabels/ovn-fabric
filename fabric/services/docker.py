@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from runtime import command
+from runtime import generated as rg
 from runtime.message import BodySpec, Msg, ProtocolError, register_bodies
 from runtime.peer import Peer
 from runtime.service import Service
@@ -142,7 +143,7 @@ class Docker:
             )
         )
         async for event in request:  # relay their progress as our own
-            if isinstance(event.body, g.LogMsg):
+            if isinstance(event.body, rg.LogMsg):
                 await peer.emit(event.body)
             elif isinstance(event.body, g.AbstractDep):
                 packages = ", ".join(
@@ -151,7 +152,7 @@ class Docker:
                 )
                 await peer.log("info", f"{event.body.name}: {event.body.state.value} ({packages})")
         res = request.result.body
-        if isinstance(res, g.ErrorRes):
+        if isinstance(res, rg.ErrorRes):
             return f"abstract deps: {res.code}: {res.message}"
         assert isinstance(res, g.AbstractDepsRes)
         missing = [s for s in res.deps if s.state is not g.SystemDepState.ready]

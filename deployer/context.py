@@ -14,6 +14,9 @@ class Options:
 
     dry_run: bool = False
     timeout: float = 180.0
+    # Seconds one command may run before it is killed and has failed
+    # (a Command may set its own); 0: no limit.
+    command_timeout: float = 300.0
     no_start: bool = False
     verbose: bool = False
     state_dir: Path = DEFAULT_ROOT

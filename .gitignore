@@ -9,7 +9,10 @@ protocol/generated.py
 protocol/ir-nodes.schema.json
 protocol/raw_generated.py
 protocol/raw-snapshot.schema.json
-# Same, from fabric/schema/protocol.ts (`deno run -A fabric/schema/generate.ts`).
+# Same, from runtime/schema/protocol.ts and fabric/schema/protocol.ts
+# (`deno run -A runtime/schema/generate.ts`, `… fabric/schema/generate.ts`).
+runtime/generated.py
+runtime/protocol.schema.json
 fabric/generated.py
 fabric/protocol.schema.json
 

@@ -6,6 +6,7 @@ from typing import Any
 
 from fabric import generated as g
 from fabric.services import sysdeps, version
+from runtime import generated as rg
 
 from .message import (
     BodySpec,
@@ -117,7 +118,7 @@ class TransposeTest(unittest.TestCase):
 
     def test_enums_and_numbers_are_typed(self) -> None:
         msg = from_parts([_header(), {"kind": "LogMsg", "level": "warn", "message": "m"}])
-        self.assertIs(msg.body.level, g.LogLevel.warn)
+        self.assertIs(msg.body.level, rg.LogLevel.warn)
         self.assertIsInstance(msg.header.time, float)
 
     def test_invalid_collections(self) -> None:

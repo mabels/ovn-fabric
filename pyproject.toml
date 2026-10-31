@@ -11,6 +11,7 @@ extend-exclude = '''
   | protocol/generated\.py
   | protocol/raw_generated\.py
   | generator/runtime/thinking\.py
+  | runtime/generated\.py
   | fabric/generated\.py
 )
 '''
@@ -23,6 +24,7 @@ extend-exclude = [
     "protocol/generated.py",
     "protocol/raw_generated.py",
     "generator/runtime/thinking.py",
+    "runtime/generated.py",
     "fabric/generated.py",
 ]
 
