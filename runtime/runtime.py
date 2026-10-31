@@ -10,11 +10,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from typing import Any
 
-from .forward import outbox
-from .message import Msg, ProtocolError, register_bodies
-from .peer import Peer, current_component
+from .message import ProtocolError, register_bodies
+from .peer import Call, Peer
 from .service import Handler, Service
 from .transport import Connection, connect, dump_wire, listen, wire_log
 
@@ -70,8 +68,7 @@ class Runtime:
 
     async def client(self) -> Peer:
         """The services' own connection to this runtime (while it serves).
-        A request sent from inside a handler carries the handled request as
-        its parentReqId."""
+        A request sent for a handled one names it: `parent=call.req_id`."""
         async with self._client_lock:
             if self._client is None:
                 client = Peer(await connect(self._internal), f"{self.source}:internal")
@@ -91,13 +88,9 @@ class Runtime:
             with contextlib.suppress(Exception):
                 await conn.close()
 
-    async def _dispatch(self, peer: Peer, msg: Msg[Any]) -> object:
-        handler = self._handlers.get(msg.kind)
+    async def _dispatch(self, call: Call) -> object:
+        handler = self._handlers.get(call.msg.kind)
         if handler is None:
-            raise ProtocolError("unknown-request", f"{msg.kind} is not handled here")
-        # This handler task's own context: its logs (and the tasks it starts)
-        # carry the service's name, and every command it runs is reported
-        # to the requester.
-        current_component.set(self._owners.get(msg.kind, self.source))
-        async with outbox(peer):
-            return await handler(peer, msg)
+            raise ProtocolError("unknown-request", f"{call.msg.kind} is not handled here")
+        # Handled by the service that answers it: its logs carry its name.
+        return await handler(call.with_component(self._owners.get(call.msg.kind, self.source)))

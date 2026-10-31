@@ -8,7 +8,7 @@ import sys
 import time
 import unittest
 
-from .command import reporting, run
+from .command import run
 
 
 class RunTest(unittest.TestCase):
@@ -90,9 +90,14 @@ class RunTest(unittest.TestCase):
         reported: list[tuple[str, str]] = []
         taken: list[str] = []
         script = "print('out')"
-        with reporting(lambda level, line: reported.append((level, line))):
-            asyncio.run(run([sys.executable, "-c", script], log=_log()))
-            asyncio.run(run([sys.executable, "-c", script], log=_log(), on_line=taken.append))
+
+        def report(level: str, line: str) -> None:
+            reported.append((level, line))
+
+        asyncio.run(run([sys.executable, "-c", script], log=_log(), report=report))
+        asyncio.run(
+            run([sys.executable, "-c", script], log=_log(), on_line=taken.append, report=report)
+        )
         command = f"$ {shlex.join([sys.executable, '-c', script])}"
         # The output the caller takes itself is not reported again.
         self.assertEqual(reported, [("info", command), ("debug", "out"), ("info", command)])

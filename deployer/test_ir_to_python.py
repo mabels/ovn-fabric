@@ -176,7 +176,7 @@ class _OpEmitter(Emitter):
         bind: str | None = None,
         parent: str | None = None,
     ) -> None:
-        if not hasattr(primitive, "as_primitive"):  # done in Python (fs.dir, …)
+        if primitive.step_kind != "Primitive":  # done in Python (fs.dir, …)
             action = LifecycleAction.DELETE if self._delete else LifecycleAction.CREATE
             self._block(primitive.describe(action))
             return
@@ -1480,12 +1480,16 @@ class KernelRouterCreateTest(unittest.TestCase):
             up,
         )
         self.assertIn("symlink 'kernel-0-dhcpcd' kernel_0_dhcpcd_pid", up)
-        self.assertIn("await _docker_attach_legs(job", up)
+        # The router's legs are lent to the container (moved back on delete).
+        for leg in ("veth-krn-9adb1d", "eth0.2280"):
+            self.assertIn(f"ip netns exec ns-kernel-0 ip link set {leg} netns kernel-0-dhcpcd", up)
+            self.assertIn(f"ip netns exec kernel-0-dhcpcd ip link set {leg} up", up)
+        self.assertIn("ip netns exec kernel-0-dhcpcd sysctl -w net.ipv4.ip_forward=1", up)
         self.assertIn(
             "ip netns exec kernel-0-dhcpcd ip addr add 10.12.80.14/28 dev veth-krn-9adb1d",
             up,
         )
-        self.assertIn("await _docker_exec(job", up)
+        self.assertIn("/usr/bin/docker exec -d kernel-0-dhcpcd /sbin/dhcpcd eth0.2280", up)
         self.assertNotIn(".sh", up)
 
     def test_dependencies_merge_into_one_install_object(self) -> None:
@@ -1632,73 +1636,6 @@ class KernelRouterCreateTest(unittest.TestCase):
                 {"kind": "image", "image": "ubuntu", "dockerfile": None},
             ],
         )
-
-    def test_images_are_declared_in_the_lazy_phase_only(self) -> None:
-        src = mod.generate_python_deployer(_image_nodes())
-        # Every queued statement that builds or pulls an image, or writes
-        # its build context, is lazy (a WriteFile spans several lines).
-        statements = re.findall(r"await lc\.run\(.*?\)\n", src, flags=re.DOTALL)
-        image = [
-            statement
-            for statement in statements
-            if any(marker in statement for marker in ("docker_image(", "docker_pull(", "/build/"))
-        ]
-        self.assertEqual(len(image), 5)  # 2 pulls, 1 build: context dir + Dockerfile + build
-        for statement in image:
-            self.assertTrue(statement.endswith(", lazy=True)\n"), statement)
-
-    def test_lazy_phase_runs_each_container_after_its_image(self) -> None:
-        ns: dict[str, Any] = {}
-        exec(mod.generate_python_deployer(_image_nodes()), ns)
-        _fake_file_ops(ns)
-
-        def docker_argvs(run: Any) -> list[str]:
-            with (
-                mock.patch("asyncio.create_subprocess_exec", new_callable=mock.AsyncMock) as create,
-                mock.patch("os.makedirs"),  # the fs primitives are done in Python
-                mock.patch("os.chmod"),
-            ):
-                create.return_value = _proc(stdout=b"4242")
-                _with_ctx_job(ns, run)
-                return [
-                    " ".join(list(call.args)[1:3])
-                    for call in create.call_args_list
-                    if call.args[0] == "/usr/bin/docker"
-                ]
-
-        lazy = ns["HOSTS"]["chassis-1"]["lazy"]
-        action = ns["LifecycleAction"]
-        # Per container: its image, then — the pull/build fulfilled — run
-        # it and start its app inside (the legs are injected in between).
-        self.assertEqual(
-            docker_argvs(lambda ctx, job: lazy(ctx, job, action.LAZY_CREATE)),
-            [
-                "build -t",
-                "rm -f",
-                "run -d",
-                "exec -d",
-                "pull ubuntu",
-                "rm -f",
-                "run -d",
-                "exec -d",
-                "pull coredns/coredns:latest",
-                "rm -f",
-                "run -d",
-            ],
-        )
-        self.assertEqual(
-            docker_argvs(lambda ctx, job: lazy(ctx, job, action.LAZY_DELETE)),
-            ["rm -f", "image rm", "rm -f", "image rm", "rm -f", "image rm"],
-        )
-        # The router/service `up` bodies (CREATE) touch no container.
-        for name, (up_fn, _down) in ns["JOB_BODIES"].items():
-            if name.startswith("ovn-fabric-"):
-                continue
-            out = io.StringIO()
-            with contextlib.redirect_stdout(out):
-                _with_ctx_job(ns, up_fn, dry_run=True)
-            for verb in ("pull", "build", "run"):
-                self.assertNotIn(f"docker {verb}", out.getvalue(), name)
 
     def test_host_delete_rewinds_exactly_the_host_create(self) -> None:
         # The host pass declares the program, the unit and the service;
@@ -2442,7 +2379,7 @@ class GeneratePythonDeployerTest(unittest.TestCase):
             "install_packages as _install_packages",
             "install_image as _install_image",
             "argparse.ArgumentParser",
-            'choices=["create", "delete", "run", "lazy-create", "lazy-delete"]',
+            'choices=["create", "delete", "run"]',
         ):
             self.assertIn(marker, src)
 

@@ -8,8 +8,9 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
+from runtime import command
 from runtime import generated as rg
-from runtime.command import LineSink
+from runtime.command import LineSink, Report
 from runtime.peer import Peer, RemoteError
 from runtime.runtime import Runtime
 from runtime.transport import connect
@@ -37,17 +38,19 @@ class FakeContainers:
         self._stopped = asyncio.Event()
         self.run_ok = True
 
-    async def exists(self, name: str) -> bool:
+    async def exists(self, name: str, *, report: Report = command.nowhere) -> bool:
         return name in self.existing
 
-    async def run(self, argv: list[str]) -> tuple[bool, str]:
+    async def run(self, argv: list[str], *, report: Report = command.nowhere) -> tuple[bool, str]:
         self.calls.append(("run", *argv))
         self._stopped = asyncio.Event()  # a new container
         if not self.run_ok:
             return False, "Error response from daemon: invalid flag"
         return True, "0123456789abcdef"
 
-    async def logs(self, name: str, on_out: LineSink, on_err: LineSink) -> None:
+    async def logs(
+        self, name: str, on_out: LineSink, on_err: LineSink, *, report: Report = command.nowhere
+    ) -> None:
         for line in self.out:
             on_out(line)
         for line in self.err:
@@ -55,17 +58,19 @@ class FakeContainers:
         if self.forever:
             await self._stopped.wait()
 
-    async def wait(self, name: str) -> int:
+    async def wait(self, name: str, *, report: Report = command.nowhere) -> int:
         if self.forever:
             await self._stopped.wait()
             return 137
         return self.code
 
-    async def stop(self, name: str) -> None:
+    async def stop(self, name: str, *, report: Report = command.nowhere) -> None:
         self.calls.append(("stop", name))
         self._stopped.set()
 
-    async def remove(self, name: str) -> None:  # docker rm -f: ends it if it runs
+    async def remove(
+        self, name: str, *, report: Report = command.nowhere
+    ) -> None:  # docker rm -f: ends it if it runs
         self.calls.append(("remove", name))
         self.existing.discard(name)
         self._stopped.set()
@@ -310,7 +315,9 @@ class RunTest(unittest.TestCase):
             containers = FakeContainers()
             seen: list[str] = []
 
-            async def logs(name: str, on_out: LineSink, on_err: LineSink) -> None:
+            async def logs(
+                name: str, on_out: LineSink, on_err: LineSink, *, report: Report = command.nowhere
+            ) -> None:
                 seen.append((Path(root) / "dns/etc/coredns/Corefile").read_text())
 
             containers.logs = logs  # type: ignore[method-assign]
@@ -334,7 +341,9 @@ class RunTest(unittest.TestCase):
             containers = FakeContainers()
             seen: list[list[str]] = []
 
-            async def logs(name: str, on_out: LineSink, on_err: LineSink) -> None:
+            async def logs(
+                name: str, on_out: LineSink, on_err: LineSink, *, report: Report = command.nowhere
+            ) -> None:
                 seen.append(sorted(p.name for p in (Path(root) / "t/etc").iterdir()))
 
             containers.logs = logs  # type: ignore[method-assign]

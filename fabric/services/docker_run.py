@@ -41,19 +41,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import contextvars
 import logging
 import re
 import shutil
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Protocol
 
 from runtime import command
 from runtime import generated as rg
-from runtime.command import LineSink
-from runtime.message import BodySpec, Msg, ProtocolError, register_bodies
-from runtime.peer import Peer
+from runtime.command import LineSink, Report
+from runtime.message import BodySpec, ProtocolError, register_bodies
+from runtime.peer import Call, Peer
 from runtime.service import Service
 from runtime.transport import Closed
 
@@ -80,49 +79,56 @@ STOP_TIMEOUT = 10
 
 
 class ContainerCli(Protocol):
-    """What running a container needs from docker."""
+    """What running a container needs from docker. `report`: where the
+    commands go — the request's, while one waits on them."""
 
-    async def exists(self, name: str) -> bool: ...
+    async def exists(self, name: str, *, report: Report = command.nowhere) -> bool: ...
 
-    async def run(self, argv: list[str]) -> tuple[bool, str]:
+    async def run(self, argv: list[str], *, report: Report = command.nowhere) -> tuple[bool, str]:
         """`docker run -d …` (argv after `docker`); (ok, container id or error)."""
 
-    async def logs(self, name: str, on_out: LineSink, on_err: LineSink) -> None:
+    async def logs(
+        self, name: str, on_out: LineSink, on_err: LineSink, *, report: Report = command.nowhere
+    ) -> None:
         """Follow the output until the container stops."""
 
-    async def wait(self, name: str) -> int:
+    async def wait(self, name: str, *, report: Report = command.nowhere) -> int:
         """The exit code, once it stopped."""
 
-    async def stop(self, name: str) -> None: ...
+    async def stop(self, name: str, *, report: Report = command.nowhere) -> None: ...
 
-    async def remove(self, name: str) -> None: ...
+    async def remove(self, name: str, *, report: Report = command.nowhere) -> None: ...
 
 
 class SystemContainers:
     """The host's docker CLI."""
 
-    async def exists(self, name: str) -> bool:
-        ok, _ = await command.run(["docker", "container", "inspect", name], log=log)
+    async def exists(self, name: str, *, report: Report = command.nowhere) -> bool:
+        ok, _ = await command.run(["docker", "container", "inspect", name], log=log, report=report)
         return ok
 
-    async def run(self, argv: list[str]) -> tuple[bool, str]:
-        return await command.run(["docker", *argv], log=log)
+    async def run(self, argv: list[str], *, report: Report = command.nowhere) -> tuple[bool, str]:
+        return await command.run(["docker", *argv], log=log, report=report)
 
-    async def logs(self, name: str, on_out: LineSink, on_err: LineSink) -> None:
-        await command.run(["docker", "logs", "-f", name], log=log, on_line=on_out, on_err=on_err)
+    async def logs(
+        self, name: str, on_out: LineSink, on_err: LineSink, *, report: Report = command.nowhere
+    ) -> None:
+        await command.run(
+            ["docker", "logs", "-f", name], log=log, on_line=on_out, on_err=on_err, report=report
+        )
 
-    async def wait(self, name: str) -> int:
-        ok, out = await command.run(["docker", "wait", name], log=log)
+    async def wait(self, name: str, *, report: Report = command.nowhere) -> int:
+        ok, out = await command.run(["docker", "wait", name], log=log, report=report)
         try:
             return int(out.strip().splitlines()[-1])
         except (ValueError, IndexError):
             return -1
 
-    async def stop(self, name: str) -> None:
-        await command.run(["docker", "stop", "-t", str(STOP_TIMEOUT), name], log=log)
+    async def stop(self, name: str, *, report: Report = command.nowhere) -> None:
+        await command.run(["docker", "stop", "-t", str(STOP_TIMEOUT), name], log=log, report=report)
 
-    async def remove(self, name: str) -> None:
-        await command.run(["docker", "rm", "-f", name], log=log)
+    async def remove(self, name: str, *, report: Report = command.nowhere) -> None:
+        await command.run(["docker", "rm", "-f", name], log=log, report=report)
 
 
 def run_argv(spec: g.ContainerSpec, files: Sequence[tuple[str, str]] = ()) -> list[str]:
@@ -184,8 +190,8 @@ class DockerRun:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def run(self, peer: Peer, msg: Msg[Any]) -> object:
-        req = msg.body
+    async def run(self, call: Call) -> object:
+        req = call.body
         assert isinstance(req, g.DockerRunReq)
         spec = req.container
         if not _NAME.match(spec.name):
@@ -197,36 +203,36 @@ class DockerRun:
             if not path.is_absolute() or ".." in path.parts:
                 raise ProtocolError("bad-request", f"not an absolute file path: {file.path!r}")
 
-        problem = await self._prepare(peer, spec)
+        problem = await self._prepare(call, spec)
         if problem is not None:
-            return await self._end(peer, spec.name, g.ContainerState.failed, message=problem)
+            return await self._end(call, spec.name, g.ContainerState.failed, message=problem)
         # One start per name at a time: replace whatever runs under it, then
         # start the new one (the lock is held until it is registered).
         lock = self._locks.setdefault(spec.name, asyncio.Lock())
         await lock.acquire()
         locked = True
         try:
-            await self._replace(peer, spec.name)
-            await self._state(peer, spec.name, g.ContainerState.starting)
+            await self._replace(call, spec.name)
+            await self._state(call, spec.name, g.ContainerState.starting)
             files_dir = self._files_root / spec.name
             if files_dir.exists():
                 # Nothing runs under this name any more (replaced above): a
                 # leftover of a runtime that ended before it could clean up.
                 log.warning("%s: replacing the leftover %s", spec.name, files_dir)
-                await peer.log("warn", f"replacing the leftover {files_dir}")
+                await call.log("warn", f"replacing the leftover {files_dir}")
             try:
                 files = await asyncio.to_thread(_write_files, files_dir, spec.files or [])
             except OSError as exc:
                 return await self._end(
-                    peer, spec.name, g.ContainerState.failed, message=f"writing its files: {exc}"
+                    call, spec.name, g.ContainerState.failed, message=f"writing its files: {exc}"
                 )
             handed_over = False
             done = asyncio.Event()
             try:
-                ok, out = await self._containers.run(run_argv(spec, files))
+                ok, out = await self._containers.run(run_argv(spec, files), report=call.report)
                 if not ok:
                     return await self._end(
-                        peer,
+                        call,
                         spec.name,
                         g.ContainerState.failed,
                         message=f"docker run: {out.strip()}",
@@ -236,12 +242,12 @@ class DockerRun:
                     self._own(spec.name, files_dir)
                     handed_over = True
                     return await self._end(
-                        peer, spec.name, g.ContainerState.started, message=out.strip()[:12]
+                        call, spec.name, g.ContainerState.started, message=out.strip()[:12]
                     )
                 self._following[spec.name] = done
                 lock.release()
                 locked = False
-                return await self._follow(peer, spec, out)
+                return await self._follow(call, spec, out)
             finally:  # the files live exactly as long as the container
                 if not handed_over:
                     await asyncio.to_thread(shutil.rmtree, files_dir, True)
@@ -252,7 +258,7 @@ class DockerRun:
             if locked:
                 lock.release()
 
-    async def _replace(self, peer: Peer, name: str) -> None:
+    async def _replace(self, call: Call, name: str) -> None:
         """Make the name free: a container of the runtime is stopped by its
         owner (which also removes its files); anything else of that name —
         a leftover, a container started by hand — is removed."""
@@ -262,49 +268,52 @@ class DockerRun:
             what = "the runtime's running container"
         elif following is not None:
             what = "the running container of another request"
-        elif await self._containers.exists(name):
+        elif await self._containers.exists(name, report=call.report):
             what = "an existing container"
         else:
             return
         log.warning("%s: replacing %s", name, what)
-        await peer.log("warn", f"{name}: replacing {what}")
+        await call.log("warn", f"{name}: replacing {what}")
         if owned is not None:
             owned.cancel()  # its watcher stops and removes it, with its files
             await asyncio.gather(owned, return_exceptions=True)
         elif following is not None:
-            await self._containers.remove(name)  # that request sees it stop, and cleans up
+            # that request sees it stop, and cleans up
+            await self._containers.remove(name, report=call.report)
             await following.wait()
         else:
-            await self._containers.remove(name)
+            await self._containers.remove(name, report=call.report)
 
-    async def _follow(self, peer: Peer, spec: g.ContainerSpec, started: str) -> g.DockerRunRes:
+    async def _follow(self, call: Call, spec: g.ContainerSpec, started: str) -> g.DockerRunRes:
         """The request owns the container: stream it until it stops."""
         try:
             await self._state(
-                peer, spec.name, g.ContainerState.started, message=started.strip()[:12]
+                call, spec.name, g.ContainerState.started, message=started.strip()[:12]
             )
-            async with _forward(peer, spec.name) as (on_out, on_err):
+            async with _forward(call, spec.name) as (on_out, on_err):
                 following = asyncio.get_running_loop().create_task(
-                    self._containers.logs(spec.name, on_out, on_err)
+                    self._containers.logs(spec.name, on_out, on_err, report=call.report)
                 )
-                code = await self._containers.wait(spec.name)
+                code = await self._containers.wait(spec.name, report=call.report)
                 await following  # the rest of the output, up to the end
         except BaseException:
             # The request ended early: the container does not outlive it.
             with contextlib.suppress(Exception):
                 await asyncio.shield(self._stop(spec.name))
             raise
-        await self._containers.remove(spec.name)
-        return await self._end(peer, spec.name, g.ContainerState.stopped, exit_code=code)
+        await self._containers.remove(spec.name, report=call.report)
+        return await self._end(call, spec.name, g.ContainerState.stopped, exit_code=code)
 
-    async def _prepare(self, peer: Peer, spec: g.ContainerSpec) -> str | None:
+    async def _prepare(self, call: Call, spec: g.ContainerSpec) -> str | None:
         """None when the image is present, else why not."""
         client = await self._client()
         image = g.ImageSpec(image=spec.image, dockerfile=spec.dockerfile)
-        request = await client.request(g.DockerPrepareReq(kind="DockerPrepareReq", images=[image]))
+        request = await client.request(
+            g.DockerPrepareReq(kind="DockerPrepareReq", images=[image]), parent=call.req_id
+        )
         async for event in request:  # relay docker prepare's progress as our own
             if isinstance(event.body, rg.LogMsg):
-                await peer.emit(event.body)
+                await call.emit(event.body)
         res = request.result.body
         if isinstance(res, rg.ErrorRes):
             return f"docker prepare: {res.code}: {res.message}"
@@ -320,10 +329,10 @@ class DockerRun:
         await self._containers.remove(name)
 
     def _own(self, name: str, files_dir: Path) -> None:
-        # A fresh context: the watcher belongs to the runtime, not to the
-        # request that started it (its logs carry no reqId).
+        # The watcher belongs to the runtime, not to the request that started
+        # it: it gets no Call, so nothing it does goes to that request.
         task = asyncio.get_running_loop().create_task(
-            self._watch(name, files_dir), name=f"container:{name}", context=contextvars.Context()
+            self._watch(name, files_dir), name=f"container:{name}"
         )
         self._owned[name] = task
         task.add_done_callback(lambda _: self._owned.pop(name, None))
@@ -355,16 +364,16 @@ class DockerRun:
             await asyncio.shield(asyncio.to_thread(shutil.rmtree, files_dir, True))
 
     async def _state(
-        self, peer: Peer, name: str, state: g.ContainerState, message: str | None = None
+        self, call: Call, name: str, state: g.ContainerState, message: str | None = None
     ) -> None:
         with contextlib.suppress(Closed):
-            await peer.emit(
+            await call.emit(
                 g.DockerContainer(kind="DockerContainer", name=name, state=state, message=message)
             )
 
     async def _end(
         self,
-        peer: Peer,
+        call: Call,
         name: str,
         state: g.ContainerState,
         *,
@@ -372,7 +381,7 @@ class DockerRun:
         message: str | None = None,
     ) -> g.DockerRunRes:
         with contextlib.suppress(Closed):
-            await peer.emit(
+            await call.emit(
                 g.DockerContainer(
                     kind="DockerContainer",
                     name=name,
@@ -401,7 +410,7 @@ def _write_files(directory: Path, files: Sequence[g.ContainerFile]) -> list[tupl
 
 
 @contextlib.asynccontextmanager
-async def _forward(peer: Peer, component: str) -> AsyncIterator[tuple[LineSink, LineSink]]:
+async def _forward(call: Call, component: str) -> AsyncIterator[tuple[LineSink, LineSink]]:
     """Two line sinks — stdout and stderr — whose lines go, in order, as
     info/warn LogMsg of the request being handled, from `component` (the
     container)."""
@@ -411,9 +420,9 @@ async def _forward(peer: Peer, component: str) -> AsyncIterator[tuple[LineSink, 
         while (item := await lines.get()) is not None:
             level, line = item
             with contextlib.suppress(Closed):
-                await peer.log(level, line, component)
+                await call.log(level, line, component)
 
-    task = asyncio.get_running_loop().create_task(forward())  # inherits the request
+    task = asyncio.get_running_loop().create_task(forward())
     try:
         yield (
             lambda line: lines.put_nowait(("info", line)),

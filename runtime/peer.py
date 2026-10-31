@@ -8,58 +8,81 @@ routed by its `reqId` —
   the final response), or
 - to this side's request handler, when it is a request.
 
-While a handler runs, the request's `reqId` is the *current request*
-(a contextvar): every `log()` made inside it carries that reqId, and a
-request sent from inside it carries it as `parentReqId` — without the
-handler passing ids around.
+A handler gets the request as a `Call`: everything it emits goes through
+that object — nothing is found implicitly (no contextvars), so whatever
+works for the request (a helper, a task it starts, a command) is handed
+the Call, and a request sent on its behalf names it as parent:
+`client.request(body, parent=call.req_id)`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import contextvars
 import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from . import generated as g
+from .forward import Outbox
 from .message import Msg, ProtocolError, decode, encode, header, new_req_id
 from .transport import Closed, Connection
 
 log = logging.getLogger("runtime.peer")
 
-# The reqId of the request being handled in this task, if any.
-current_req: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "current_req", default=None
-)
 
-# Who is handling it — the service the runtime dispatched it to; a log
-# line carries it as its component.
-current_component: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "current_component", default=None
-)
+class Call:
+    """A request being handled — what its handler gets.
 
+    Everything emitted through it (events, log lines, the lines its
+    commands report) goes out tied to the request, in emission order, and
+    before the response. `component` is who handles it: a log line carries
+    it unless it names its own."""
 
-class Outbox:
-    """Everything a handler emits for its request, in emission order: its
-    events, its logs and the commands it reports. The runtime opens one per
-    dispatched request (runtime/forward.py) and drains it before the
-    response, so nothing overtakes anything — the response last."""
-
-    def __init__(self, peer: Peer) -> None:
+    def __init__(self, peer: Peer, msg: Msg[Any], component: str, outbox: Outbox) -> None:
+        assert msg.req_id is not None
         self.peer = peer
-        self.queue: asyncio.Queue[tuple[object, str | None] | None] = asyncio.Queue()
-        self.open = True
+        self.msg = msg
+        self.req_id: str = msg.req_id
+        self.component = component
+        self._outbox = outbox
+
+    @property
+    def body(self) -> Any:
+        return self.msg.body
+
+    def with_component(self, component: str) -> Call:
+        """The same request, handled by `component` (a part of the handler
+        with its own name in the logs, such as a unit of work)."""
+        return Call(self.peer, self.msg, component, self._outbox)
+
+    async def emit(self, body: object) -> None:
+        """An event of the request — after the response, sent on its own."""
+        if not self._outbox.put(body):
+            await self.peer.send(body, req_id=self.req_id)
+
+    async def log(self, level: str, message: str, component: str | None = None) -> None:
+        """A log line of the request, from `component` (default: the Call's)."""
+        await self.emit(self._log(level, message, component))
+
+    def report(self, level: str, line: str) -> None:
+        """A line about the work (a command and its output; see
+        runtime/command.py) — synchronous, so a command's reader can call
+        it. After the response it is dropped."""
+        self._outbox.put(self._log(level, line, None))
+
+    def _log(self, level: str, message: str, component: str | None) -> g.LogMsg:
+        return g.LogMsg(
+            kind="LogMsg",
+            level=g.LogLevel(level),
+            message=message,
+            component=component or self.component,
+        )
 
 
-current_outbox: contextvars.ContextVar[Outbox | None] = contextvars.ContextVar(
-    "current_outbox", default=None
-)
-
-# A request handler gets the peer and the request, and returns the body of
-# the final response. An exception becomes an ErrorRes.
-OnRequest = Callable[["Peer", Msg[Any]], Awaitable[object]]
+# A request handler gets the request as a Call and returns the body of the
+# final response. An exception becomes an ErrorRes.
+OnRequest = Callable[[Call], Awaitable[object]]
 OnEvent = Callable[["Peer", Msg[Any]], Awaitable[None]]
 
 
@@ -139,12 +162,13 @@ class Peer:
         msg = Msg(header=header(self.source, req_id=req_id), body=body)
         await self.conn.send(encode(msg))
 
-    async def request(self, body: object) -> Request:
-        """Send a request; returns at once with its handle."""
+    async def request(self, body: object, parent: str | None = None) -> Request:
+        """Send a request; returns at once with its handle. `parent`: the
+        reqId of the request it is sent for (a Call's), if any."""
         req_id = new_req_id()
         request = self._pending[req_id] = Request(req_id)
         msg = Msg(
-            header=header(self.source, req_id=req_id, parent_req_id=current_req.get()),
+            header=header(self.source, req_id=req_id, parent_req_id=parent),
             body=body,
         )
         try:
@@ -154,9 +178,11 @@ class Peer:
             raise
         return request
 
-    async def ask(self, body: object, timeout: float | None = 10.0) -> Msg[Any]:
+    async def ask(
+        self, body: object, timeout: float | None = 10.0, parent: str | None = None
+    ) -> Msg[Any]:
         """Send a request and return its final response (ErrorRes raises)."""
-        request = await self.request(body)
+        request = await self.request(body, parent)
         try:
             final = await request.wait(timeout)
         finally:
@@ -164,27 +190,6 @@ class Peer:
         if isinstance(final.body, g.ErrorRes):
             raise RemoteError(final.body)
         return final
-
-    async def emit(self, body: object) -> None:
-        """An event, tied to the request being handled (if any) — in order
-        with everything else the handler emits."""
-        outbox = current_outbox.get()
-        if outbox is not None and outbox.peer is self and outbox.open:
-            outbox.queue.put_nowait((body, current_req.get()))
-            return
-        await self.send(body, req_id=current_req.get())
-
-    async def log(self, level: str, message: str, component: str | None = None) -> None:
-        """A log line, tied to the request being handled (if any), from
-        `component` — by default the service handling it."""
-        await self.emit(
-            g.LogMsg(
-                kind="LogMsg",
-                level=g.LogLevel(level),
-                message=message,
-                component=component or current_component.get(),
-            )
-        )
 
     async def close(self) -> None:
         await self.conn.close()
@@ -242,20 +247,25 @@ class Peer:
     async def _handle(self, msg: Msg[Any]) -> None:
         req_id = msg.req_id
         assert req_id is not None
-        current_req.set(req_id)  # this task's own context
+        outbox = Outbox(self, req_id)
         try:
             if self._on_request is None:
                 raise ProtocolError("unknown-request", f"{msg.kind} is not handled here")
-            body = await self._on_request(self, msg)
+            body = await self._on_request(Call(self, msg, self.source, outbox))
+            await outbox.close()  # what it emitted first, the response last
             await self.send(body, req_id=req_id)
         except asyncio.CancelledError:
+            outbox.abort()
             raise
         except Closed:
+            outbox.abort()
             return
         except ProtocolError as exc:
+            await outbox.close()
             await self._error(req_id, exc.code, str(exc))
         except Exception as exc:  # noqa: BLE001 — every failure answers the request
             log.exception("%s: %s failed", self.conn.peer, msg.kind)
+            await outbox.close()
             await self._error(req_id, "failed", f"{type(exc).__name__}: {exc}")
 
     async def _error(self, req_id: str, code: str, message: str) -> None:

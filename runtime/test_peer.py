@@ -14,7 +14,7 @@ from runtime import generated as rg
 
 from . import PROTOCOL, __version__
 from .message import Msg
-from .peer import Peer, RemoteError
+from .peer import Call, Peer, RemoteError
 from .runtime import Runtime
 from .transport import Closed, connect, dump_wire, mem_pair
 
@@ -92,7 +92,7 @@ class VersionTest(unittest.TestCase, _Transports):
 
     def test_a_failing_handler_answers_error(self) -> None:
         async def test(client: Peer, runtime: Runtime) -> None:
-            async def broken(_peer: Peer, _msg: Msg[Any]) -> object:
+            async def broken(_call: Call) -> object:
                 raise RuntimeError("boom")
 
             runtime.handle("VersionReq", broken)
@@ -107,8 +107,8 @@ class VersionTest(unittest.TestCase, _Transports):
         async def test(client: Peer, runtime: Runtime) -> None:
             release = asyncio.Event()
 
-            async def slow(peer: Peer, msg: Msg[Any]) -> object:
-                await peer.log("info", "waiting")
+            async def slow(call: Call) -> object:
+                await call.log("info", "waiting")
                 await release.wait()
                 return g.VersionRes(kind="VersionRes", runtime="slow", protocol=0)
 
@@ -128,7 +128,7 @@ class DumpWireTest(unittest.TestCase):
         async def run() -> None:
             a, b = mem_pair()
 
-            async def answer(_peer: Peer, _msg: Msg[Any]) -> object:
+            async def answer(_call: Call) -> object:
                 return g.VersionRes(kind="VersionRes", runtime="x", protocol=1)
 
             client = Peer(dump_wire(a), "client")
@@ -156,9 +156,11 @@ class PeerTest(unittest.TestCase):
             async def on_event(_peer: Peer, msg: Msg[Any]) -> None:
                 events.append(msg)
 
-            async def answer(peer: Peer, msg: Msg[Any]) -> object:
+            async def answer(call: Call) -> object:
                 # An unrelated push first (no reqId), then the response.
-                await peer.send(rg.LogMsg(kind="LogMsg", level=rg.LogLevel.info, message="push"))
+                await call.peer.send(
+                    rg.LogMsg(kind="LogMsg", level=rg.LogLevel.info, message="push")
+                )
                 return g.VersionRes(kind="VersionRes", runtime="x", protocol=1)
 
             client = Peer(a, "client", on_event=on_event)
@@ -176,7 +178,7 @@ class PeerTest(unittest.TestCase):
         async def run() -> None:
             a, b = mem_pair()
 
-            async def never(_peer: Peer, _msg: Msg[Any]) -> object:
+            async def never(_call: Call) -> object:
                 await asyncio.Event().wait()
                 raise AssertionError
 
@@ -220,17 +222,19 @@ class PeerTest(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_a_request_from_a_handler_carries_the_parent_req_id(self) -> None:
+    def test_a_request_sent_for_a_handled_one_carries_its_req_id_as_parent(self) -> None:
         async def run() -> None:
             a, b = mem_pair()
             seen: list[Msg[Any]] = []
 
-            async def inner(_peer: Peer, msg: Msg[Any]) -> object:
-                seen.append(msg)
+            async def inner(call: Call) -> object:
+                seen.append(call.msg)
                 return g.VersionRes(kind="VersionRes", runtime="inner", protocol=1)
 
-            async def outer(peer: Peer, _msg: Msg[Any]) -> object:
-                return (await peer.ask(g.VersionReq(kind="VersionReq"))).body
+            async def outer(call: Call) -> object:
+                # Sent for the handled request: it names it as its parent.
+                req = g.VersionReq(kind="VersionReq")
+                return (await call.peer.ask(req, parent=call.req_id)).body
 
             # Both sides answer: the client's handler is the nested one.
             client = Peer(a, "client", on_request=inner)
@@ -245,7 +249,7 @@ class PeerTest(unittest.TestCase):
         asyncio.run(run())
 
 
-async def _unreachable(_peer: Peer, _msg: Msg[Any]) -> object:
+async def _unreachable(_call: Call) -> object:
     raise AssertionError("must not be called")
 
 

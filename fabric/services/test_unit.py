@@ -4,6 +4,7 @@ import asyncio
 import contextlib
 import json
 import tempfile
+import typing
 import unittest
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -17,7 +18,7 @@ from runtime.runtime import Runtime
 from runtime.transport import connect
 
 from .. import generated as g
-from ..units import to_operation, to_step
+from ..units import _KINDS, to_operation, to_step
 from .unit import UnitExecutor, component_name
 
 CREATE, DELETE = g.ApplyAction.create, g.ApplyAction.delete
@@ -87,6 +88,13 @@ class SerializationTest(unittest.TestCase):
         for step in steps:
             with self.subTest(kind=step.kind):
                 self.assertEqual(to_step(to_operation(step)), step)
+
+    def test_every_step_kind_of_the_schema_has_its_entry(self) -> None:
+        schema = {
+            typing.get_args(typing.get_type_hints(cls)["kind"])[0]
+            for cls in typing.get_args(g.UnitStepSpec)
+        }
+        self.assertEqual(set(_KINDS), schema)
 
     def test_a_typed_primitive_becomes_a_primitive_step(self) -> None:
         step = to_step(HostPrimitive("h").ovn_nbctl_ls("backbone"))

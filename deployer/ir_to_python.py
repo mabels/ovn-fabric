@@ -340,10 +340,6 @@ class PythonEmitter(Emitter):
         # end_block() bracket a conditional block (e.g. the docker build).
         # _python_fn adds the function body's own
         # single level on top of this.
-        if self._lazy and line.startswith("await lc.run(") and line.endswith(")"):
-            # Inside `with emit.lazy()`: the controller runs it only in the
-            # lazy phase.
-            line = line[:-1] + ", lazy=True)"
         self.lines.append(("    " * self._indent + line) if line else "")
 
     def begin_block(self, header: str) -> None:
@@ -1182,28 +1178,14 @@ async def _apply(
 
 
 async def _create_scopes(ctx: Ctx, job: Job, host: str, scopes: list) -> None:
-    # Every scope's synchronous part, in order; the last scope starts the
-    # service, which runs the lazy phase (see _lazy_scopes).
+    # Every scope, in order.
     for label, declare in scopes:
         await _apply(ctx, job, LifecycleAction.CREATE, host, f"{label} (create)", declare)
 
 
-async def _lazy_scopes(
-    ctx: Ctx, job: Job, action: LifecycleAction, host: str, scopes: list
-) -> None:
-    # The lazy phase of every scope: images, then the containers that
-    # need them — forward on LAZY_CREATE, rewound on LAZY_DELETE.
-    for label, declare in scopes if action.creating else reversed(scopes):
-        await _apply(ctx, job, action, host, f"{label} ({action.value})", declare)
-
-
 async def _delete_scopes(ctx: Ctx, job: Job, host: str, scopes: list) -> None:
-    # The exact rewind of create plus the lazy phase it started: stop the
-    # service (the last scope), rewind the lazy phase, then every scope.
-    *rest, (label, declare) = scopes
-    await _apply(ctx, job, LifecycleAction.DELETE, host, f"{label} (delete)", declare)
-    await _lazy_scopes(ctx, job, LifecycleAction.LAZY_DELETE, host, scopes)
-    for label, declare in reversed(rest):
+    # The exact rewind of create: every scope, last first.
+    for label, declare in reversed(scopes):
         await _apply(ctx, job, LifecycleAction.DELETE, host, f"{label} (delete)", declare)
 
 
@@ -1359,10 +1341,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="ovn-fabric generated deployer")
     parser.add_argument(
         "--action",
-        choices=["create", "delete", "run", "lazy-create", "lazy-delete"],
-        help="create (default) aborts on the first failed command; delete warns and continues. "
-        "lazy-create/lazy-delete run only the lazy phase (image pulls/builds): create starts "
-        "the lazy-create unit, delete removes the images last",
+        choices=["create", "delete", "run"],
+        help="create (default) aborts on the first failed command; delete warns and continues.",
     )
     parser.add_argument(
         "--cluster",
@@ -1507,32 +1487,6 @@ def main() -> int:
             parser.error("--ovn-purge replaces the action; run --action as a separate step")
         return asyncio.run(purge(ctx, args.host, args.cluster))
     args.action = args.action or "create"
-
-    if args.action in ("lazy-create", "lazy-delete"):
-        if args.cluster:
-            parser.error("--cluster has no lazy phase")
-        lazy_action = LifecycleAction(args.action)
-        hosts = [args.host] if args.host is not None else list(HOSTS)
-        unknown = [name for name in hosts if name not in HOSTS]
-        if unknown:
-            print(
-                f"{RED}error: unknown host {unknown[0]!r}; known hosts: {', '.join(HOSTS)}{RESET}",
-                file=sys.stderr,
-            )
-            return 2
-
-        async def run_lazy() -> None:
-            root = _root_job()
-            await root.start()
-            try:
-                for name in hosts:
-                    job = root.job(f"ovn-fabric({args.action}:{name})")
-                    await HOSTS[name]["lazy"](ctx, job, lazy_action)
-            finally:
-                await root.stop()
-
-        asyncio.run(run_lazy())
-        return 0
 
     if args.host is not None:
         if args.host not in HOSTS:
@@ -1773,8 +1727,8 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
             continue
         host_name = node.key.host
 
-        # Every scope of this host, in declaration order: the lazy phase
-        # walks them all (forward to create, rewound to delete).
+        # Every scope of this host, in declaration order (forward to
+        # create, rewound to delete).
         scopes: list[tuple[str, str]] = []
 
         def scope(name: str, label: str, body: Callable[[Emitter], None]) -> str:
@@ -1790,7 +1744,6 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
             f"    {host_name!r}: {{\n"
             f'        "create": {_host_fn_name(host_name, "create")},\n'
             f'        "delete": {_host_fn_name(host_name, "delete")},\n'
-            f'        "lazy": {_host_fn_name(host_name, "lazy")},\n'
             f'        "role": {role!r},\n'
             "    },"
         )
@@ -1855,19 +1808,13 @@ def generate_python_deployer(nodes: list[pt.Model]) -> str:
         # scope's synchronous part is there; its rewind stops it first.
         scope("start", f"host:{host_name}:start", functools.partial(_emit_fabric_start, node))
         scope_list = "[" + ", ".join(f"({label!r}, {declare})" for label, declare in scopes) + "]"
-        for action in ("create", "delete", "lazy"):
-            signature = (
-                "ctx: Ctx, job: Job, action: LifecycleAction"
-                if action == "lazy"
-                else "ctx: Ctx, job: Job"
-            )
+        for action in ("create", "delete"):
             call = {
                 "create": f"_create_scopes(ctx, job, {host_name!r}, {scope_list})",
                 "delete": f"_delete_scopes(ctx, job, {host_name!r}, {scope_list})",
-                "lazy": f"_lazy_scopes(ctx, job, action, {host_name!r}, {scope_list})",
             }[action]
             host_defs.append(
-                f"async def {_host_fn_name(host_name, action)}({signature}) -> None:\n"
+                f"async def {_host_fn_name(host_name, action)}(ctx: Ctx, job: Job) -> None:\n"
                 f"    await {call}\n"
             )
         down_calls = [

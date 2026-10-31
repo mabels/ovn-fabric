@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Sequence
 
 from .lifecycle import (
     Command,
@@ -122,6 +123,10 @@ class DockerPrimitive(CommandPrimitive):
         the namespace itself."""
         return NetnsPrimitive(host=self.host, name=self.name, owned=False)
 
+    def exec_detached(self, argv: Sequence[str]) -> DockerExecPrimitive:
+        """Start `argv` inside the running container (`docker exec -d`)."""
+        return DockerExecPrimitive(host=self.host, container=self.name, argv=tuple(argv))
+
     def _run_argv(self) -> tuple[str, ...]:
         argv = ["/usr/bin/docker", "run", "-d"]
         if self.privileged:
@@ -168,4 +173,31 @@ class DockerPrimitive(CommandPrimitive):
                     ("/usr/bin/docker", "rm", "-f", self.name),
                 ),
             ),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class DockerExecPrimitive(CommandPrimitive):
+    """A process started inside a running container (`docker exec -d`).
+    Removing the container ends it, so DELETE does nothing."""
+
+    host: str
+    container: str
+    argv: tuple[str, ...]
+
+    @property
+    def key(self) -> str:
+        return f"docker.exec:{self.container}"
+
+    def as_primitive(self) -> Primitive:
+        return Primitive(
+            key=self.key,
+            nodes=(),
+            create_cmds=(
+                Command(
+                    f"{self.container} app",
+                    ("/usr/bin/docker", "exec", "-d", self.container, *self.argv),
+                ),
+            ),
+            delete_cmds=(),
         )

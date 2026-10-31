@@ -6,11 +6,10 @@ import io
 import logging
 import tempfile
 import unittest
-from typing import Any
 
+from runtime import generated as rg
 from runtime import logconfig
-from runtime.message import Msg
-from runtime.peer import Peer
+from runtime.peer import Call
 from runtime.runtime import Runtime
 from runtime.service import Service
 from runtime.test_message import IR_SAMPLE
@@ -27,11 +26,11 @@ from .services.test_ir import _put
 class FailingUnits(Fakes):
     """Every unit logs a debug line; the second one fails."""
 
-    async def unit(self, peer: Peer, msg: Msg[Any]) -> object:
-        await peer.log("debug", f"$ doing {msg.body.unit.name}")
-        if msg.body.unit.name == PLAN[1]:
+    async def unit(self, call: Call) -> object:
+        await call.log("debug", f"$ doing {call.body.unit.name}")
+        if call.body.unit.name == PLAN[1]:
             self.fail = PLAN[1]
-        return await super().unit(peer, msg)
+        return await super().unit(call)
 
 
 def _run_cli(debug: bool, components: dict[str, int] | None = None) -> str:
@@ -96,6 +95,14 @@ class FailedUnitDebugTest(unittest.TestCase):
         self.assertNotIn("--- what the failed unit", out)
         self.assertEqual(out.count(f"$ doing {PLAN[1]}"), 1)
         self.assertIn(f"$ doing {PLAN[0]}", out)
+
+
+class ShowTableTest(unittest.TestCase):
+    def test_every_kind_the_cli_shows_is_a_message_kind(self) -> None:
+        for kind in cli._SHOW:
+            with self.subTest(kind=kind):
+                part = getattr(g, kind, None) or getattr(rg, kind, None)
+                self.assertIsNotNone(part, f"{kind} is no message part")
 
 
 if __name__ == "__main__":

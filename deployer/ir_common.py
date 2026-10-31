@@ -79,14 +79,13 @@
 
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import hashlib
 import ipaddress
 import posixpath
 import re
 import shlex
-from collections.abc import Iterator, Sequence
+from collections.abc import Sequence
 from typing import Any, Protocol
 
 from ladops import linux_net as linux_net_ops
@@ -172,18 +171,6 @@ class Emitter:
         self.action = action
         self.lines: list[str] = []
         self._locals: set[str] = set()
-        self._lazy = 0
-
-    @contextlib.contextmanager
-    def lazy(self) -> Iterator[None]:
-        """Everything declared inside belongs to the lazy phase: run once,
-        in the background, by the lazy-create unit (image pulls/builds);
-        removed only by an explicit delete."""
-        self._lazy += 1
-        try:
-            yield
-        finally:
-            self._lazy -= 1
 
     def local(self, name: str) -> str:
         """A collision-free local variable derived from an OVN object
@@ -298,19 +285,17 @@ class Emitter:
         restore to finish)."""
         raise NotImplementedError
 
-    @contextlib.contextmanager
-    def unit(
-        self, kind: str, subject: str | None = None, *, key: str | None = None
-    ) -> Iterator[None]:
-        """A unit of work: everything declared inside belongs to it — one
-        logical switch, one router port, one kernel app. `kind` is what it
-        is ("router port"), `subject` which one ("lrp-x (home)"); `key` the
-        IR node it comes from. A unit declared inside another one ends the
-        outer unit's share: the outer one may declare nothing after it.
+    def unit(self, kind: str, subject: str | None = None, *, key: str | None = None) -> Emitter:
+        """Open a unit of work and return it: what is declared on the
+        returned emitter belongs to it — one logical switch, one router
+        port, one kernel app. `kind` is what it is ("router port"),
+        `subject` which one ("lrp-x (home)"); `key` the IR node it comes
+        from. Only the newest unit takes operations (see fabric/plan.py).
 
-        Here (the generated code): a section comment, `# --- <name> ---`."""
+        Here (the generated code) it is a section comment,
+        `# --- <name> ---`, and the unit is this same emitter."""
         self.comment(f"# --- {unit_name(kind, subject)} ---")
-        yield
+        return self
 
     def comment(self, text: str) -> None:
         self.lines.append(text)
@@ -495,9 +480,9 @@ def _group_router_ports(nodes: list[pt.Model]) -> dict[str, list[pt.OvnLrpNode]]
 
 def _emit_logical_switch(node: pt.OvnLsNode, emit: Emitter) -> None:
     name = node.key.name
-    with emit.unit("logical switch", name):
-        emit.ovn(OVNNbCtlLs(name))
-        emit.blank()
+    switch_unit = emit.unit("logical switch", name)
+    switch_unit.ovn(OVNNbCtlLs(name))
+    switch_unit.blank()
 
 
 # Create-only: on delete, ls_del_argv already cascades every LSP the
@@ -505,17 +490,17 @@ def _emit_logical_switch(node: pt.OvnLsNode, emit: Emitter) -> None:
 # _emit_router not needing a separate lsp_del_argv call.
 def _emit_localnet_lsp_create(name: str, emit: Emitter) -> None:
     lsp = f"lsp-{name}-localnet"
-    with emit.unit("localnet port", name):
-        emit.ovn(
-            OVNNbCtlLsp(
-                switch=name,
-                name=lsp,
-                type="localnet",
-                addresses=("unknown",),
-                options=(("network_name", _network_name(name)),),
-            )
+    localnet_unit = emit.unit("localnet port", name)
+    localnet_unit.ovn(
+        OVNNbCtlLsp(
+            switch=name,
+            name=lsp,
+            type="localnet",
+            addresses=("unknown",),
+            options=(("network_name", _network_name(name)),),
         )
-        emit.blank()
+    )
+    localnet_unit.blank()
 
 
 RouteNode = pt.Ipv4RouteNode | pt.Ipv6RouteNode
@@ -573,12 +558,12 @@ def _emit_router_routes(
     for node in best:
         by_domain.setdefault(node.data.domain, []).append(node)
     for domain in sorted(by_domain):
-        with emit.unit("routes", f"{router} ({domain})"):
-            for node in sorted(by_domain[domain], key=lambda n: n.key.prefix):
-                emit.ovn(
-                    OVNNbCtlRoute(router, node.key.prefix, node.data.nexthop),
-                    parent=router_var,
-                )
+        routes_unit = emit.unit("routes", f"{router} ({domain})")
+        for node in sorted(by_domain[domain], key=lambda n: n.key.prefix):
+            routes_unit.ovn(
+                OVNNbCtlRoute(router, node.key.prefix, node.data.nexthop),
+                parent=router_var,
+            )
 
 
 # router name -> the router's own ovn.lr node (src/ir.ts's routerToIR). A
@@ -672,76 +657,76 @@ def _emit_router_acl(
         pt.Direction.output: "from-lport",
         pt.Direction.forward: "to-lport",
     }
-    with emit.unit("router ACL", router):
-        # The router owns the ACL set on these switches/directions. Pruning an
-        # older set (including a broad allow-related at a higher priority)
-        # belongs to the LifecycleController's planned delete pass, not to the
-        # create emitter.
-        used_directions: set[str] = set()
-        for group in groups:
-            for rule in group.data.rules:
-                if rule.kind == "filter":
-                    used_directions.add(direction_map[rule.direction])
-            if group.data.default is not None:
-                used_directions.update(("to-lport", "from-lport"))
-        for switch in switches:
-            for direction in sorted(used_directions):
-                emit.ovn(
-                    OVNNbCtlAcl(
-                        switch,
-                        direction,
-                        30000,
-                        "ct.est == 1 || ct.rel == 1",
-                        "allow",
-                    ),
-                    parent=router_var,
-                )
-        seen: set[tuple[str, str, int, str, str]] = set()
-
-        def add_acl(switch: str, direction: str, priority: int, match: str, action: str) -> None:
-            key = (switch, direction, priority, match, action)
-            if key in seen:
-                return
-            seen.add(key)
-            emit.ovn(
-                OVNNbCtlAcl(switch, direction, priority, match, action),
+    acl_unit = emit.unit("router ACL", router)
+    # The router owns the ACL set on these switches/directions. Pruning an
+    # older set (including a broad allow-related at a higher priority)
+    # belongs to the LifecycleController's planned delete pass, not to the
+    # create emitter.
+    used_directions: set[str] = set()
+    for group in groups:
+        for rule in group.data.rules:
+            if rule.kind == "filter":
+                used_directions.add(direction_map[rule.direction])
+        if group.data.default is not None:
+            used_directions.update(("to-lport", "from-lport"))
+    for switch in switches:
+        for direction in sorted(used_directions):
+            acl_unit.ovn(
+                OVNNbCtlAcl(
+                    switch,
+                    direction,
+                    30000,
+                    "ct.est == 1 || ct.rel == 1",
+                    "allow",
+                ),
                 parent=router_var,
             )
+    seen: set[tuple[str, str, int, str, str]] = set()
 
-        for group in groups:
-            filters = [r for r in group.data.rules if r.kind == "filter"]
-            for switch in switches:
-                for rule in filters:
-                    direction = direction_map[rule.direction]
-                    priority = rule.priority if rule.priority is not None else 100
-                    ports_iter: list[pt.Port | None] = list(rule.ports) if rule.ports else [None]
-                    for port in ports_iter:
-                        match = _ovn_acl_match(rule, port)
-                        action = action_map[rule.action]
-                        if rule.action == pt.Action.allow:
-                            action = "allow-related"
-                        add_acl(switch, direction, priority, match, action)
-                default = group.data.default
-                if default is not None:
-                    for attr, direction in (
-                        ("input", "to-lport"),
-                        ("output", "from-lport"),
-                        ("forward", "to-lport"),
-                    ):
-                        default_action = getattr(default, attr, None)
-                        if default_action is None:
-                            continue
-                        add_acl(
-                            switch,
-                            direction,
-                            1,
-                            "1",
-                            {
-                                "allow": "allow",
-                                "deny": "drop",
-                                "reject": "reject",
-                            }[getattr(default_action, "value", default_action)],
-                        )
+    def add_acl(switch: str, direction: str, priority: int, match: str, action: str) -> None:
+        key = (switch, direction, priority, match, action)
+        if key in seen:
+            return
+        seen.add(key)
+        acl_unit.ovn(
+            OVNNbCtlAcl(switch, direction, priority, match, action),
+            parent=router_var,
+        )
+
+    for group in groups:
+        filters = [r for r in group.data.rules if r.kind == "filter"]
+        for switch in switches:
+            for rule in filters:
+                direction = direction_map[rule.direction]
+                priority = rule.priority if rule.priority is not None else 100
+                ports_iter: list[pt.Port | None] = list(rule.ports) if rule.ports else [None]
+                for port in ports_iter:
+                    match = _ovn_acl_match(rule, port)
+                    action = action_map[rule.action]
+                    if rule.action == pt.Action.allow:
+                        action = "allow-related"
+                    add_acl(switch, direction, priority, match, action)
+            default = group.data.default
+            if default is not None:
+                for attr, direction in (
+                    ("input", "to-lport"),
+                    ("output", "from-lport"),
+                    ("forward", "to-lport"),
+                ):
+                    default_action = getattr(default, attr, None)
+                    if default_action is None:
+                        continue
+                    add_acl(
+                        switch,
+                        direction,
+                        1,
+                        "1",
+                        {
+                            "allow": "allow",
+                            "deny": "drop",
+                            "reject": "reject",
+                        }[getattr(default_action, "value", default_action)],
+                    )
 
 
 def _emit_router(
@@ -763,98 +748,98 @@ def _emit_router(
             )
         )
     router_var = emit.local(router)
-    with emit.unit("router", router):
-        emit.ovn(
-            OVNNbCtlLr(
-                router,
-                options=tuple(_ovn_settings(lr.data.options)) if lr is not None else (),
-                external_ids=tuple(external_ids),
-            ),
-            bind=router_var,
+    router_unit = emit.unit("router", router)
+    router_unit.ovn(
+        OVNNbCtlLr(
+            router,
+            options=tuple(_ovn_settings(lr.data.options)) if lr is not None else (),
+            external_ids=tuple(external_ids),
+        ),
+        bind=router_var,
+    )
+    # Sorted by the port's own name so the emitted block is stable
+    # regardless of the IR's input order (the IR out of src/ir.ts is
+    # already sorted, but the deployer must not depend on that).
+    for node in sorted(ports, key=lambda n: n.key.name):
+        data = node.data
+        # The port name is the endpoint's own identity
+        # (EndpointBase.name, src/ir.ts's routerEndpointToIR) — carried in
+        # the KEY, like `side` was, never duplicated into data. The peer
+        # LSP name is derived from it (the router-type LSP that binds the
+        # switch's port to this LRP).
+        lrp = node.key.name
+        lsp = f"lsp-{lrp.removeprefix('lrp-')}"
+        # data.l2Segment/gatewayChassis are the referenced ovn.ls/
+        # infra.host node's own id (`ls:<name>`/`host:<name>` —
+        # 2026-08-12, src/ir.ts), resolved back to the real name every
+        # ovn-nbctl argument needs via domain_names/host_names.
+        domain = domain_names[data.l2Segment]
+        # No "is mac None" check here anymore: OvnLrpData.mac is a
+        # required (non-Optional) str field — a raw IR node missing it
+        # already failed inside protocol/hydrate.py's hydrate_node(),
+        # long before this function ever ran. That's the typed
+        # protocol actually doing its job, not this module trusting
+        # blindly: the failure moved earlier and got clearer, it didn't
+        # disappear.
+        port_unit = router_unit.unit("router port", f"{lrp} ({domain})")
+        gateway_chassis = (
+            chassis_refs[data.gatewayChassis] if data.gatewayChassis is not None else None
         )
-        # Sorted by the port's own name so the emitted block is stable
-        # regardless of the IR's input order (the IR out of src/ir.ts is
-        # already sorted, but the deployer must not depend on that).
-        for node in sorted(ports, key=lambda n: n.key.name):
-            data = node.data
-            # The port name is the endpoint's own identity
-            # (EndpointBase.name, src/ir.ts's routerEndpointToIR) — carried in
-            # the KEY, like `side` was, never duplicated into data. The peer
-            # LSP name is derived from it (the router-type LSP that binds the
-            # switch's port to this LRP).
-            lrp = node.key.name
-            lsp = f"lsp-{lrp.removeprefix('lrp-')}"
-            # data.l2Segment/gatewayChassis are the referenced ovn.ls/
-            # infra.host node's own id (`ls:<name>`/`host:<name>` —
-            # 2026-08-12, src/ir.ts), resolved back to the real name every
-            # ovn-nbctl argument needs via domain_names/host_names.
-            domain = domain_names[data.l2Segment]
-            # No "is mac None" check here anymore: OvnLrpData.mac is a
-            # required (non-Optional) str field — a raw IR node missing it
-            # already failed inside protocol/hydrate.py's hydrate_node(),
-            # long before this function ever ran. That's the typed
-            # protocol actually doing its job, not this module trusting
-            # blindly: the failure moved earlier and got clearer, it didn't
-            # disappear.
-            with emit.unit("router port", f"{lrp} ({domain})"):
-                gateway_chassis = (
-                    chassis_refs[data.gatewayChassis] if data.gatewayChassis is not None else None
-                )
-                lrp_var = emit.local(lrp)
-                emit.ovn(
-                    OVNNbCtlLrp(
-                        router,
-                        lrp,
-                        data.mac,
-                        tuple(data.addresses),
-                        gateway_chassis=gateway_chassis,
-                        ipv6_ra_configs=(
-                            tuple(_ovn_settings(data.ipv6RaConfigs))
-                            if data.ipv6RaConfigs is not None
-                            else ()
-                        ),
-                    ),
-                    bind=lrp_var,
-                    parent=router_var,
-                )
-                emit.ovn(
-                    OVNNbCtlLsp(
-                        switch=domain,
-                        name=lsp,
-                        type="router",
-                        addresses=("router",),
-                        options=(("router-port", lrp),),
-                    ),
-                    parent=lrp_var,
-                )
-        # OVN SNAT lives in the security.group rules referenced by the LR.
-        # Replacing an existing set per external IP (lr-nat-add has no
-        # --may-exist) belongs to the LifecycleController's planned delete
-        # pass; this emitter only adds the desired rows.
-        if lr is not None and lr.data.securityGroups:
-            groups = _security_groups_from_refs(
-                list(lr.data.securityGroups), nodes, pt.Render.ovn, f"router {router}"
-            )
-            by_external: dict[str, list[pt.SecurityGroupRule1]] = {}
-            for group in groups:
-                for rule in group.data.rules:
-                    if rule.kind != "snat":
-                        # filter rules in the same group are handled by
-                        # _emit_router_acl; NAT only consumes snat.
-                        continue
-                    by_external.setdefault(rule.externalIp, []).append(rule)
-            if by_external:
-                with emit.unit("router NAT", router):
-                    for external in sorted(by_external):
-                        for rule in sorted(by_external[external], key=lambda r: r.logicalIps):
-                            for logical in rule.logicalIps:
-                                emit.ovn(
-                                    OVNNbCtlNat(router, "snat", external, logical),
-                                    parent=router_var,
-                                )
-        _emit_router_acl(router, router_var, ports, lr, nodes, domain_names, emit)
-        _emit_router_routes(router, router_var, routes, emit)
-        emit.blank()
+        lrp_var = port_unit.local(lrp)
+        port_unit.ovn(
+            OVNNbCtlLrp(
+                router,
+                lrp,
+                data.mac,
+                tuple(data.addresses),
+                gateway_chassis=gateway_chassis,
+                ipv6_ra_configs=(
+                    tuple(_ovn_settings(data.ipv6RaConfigs))
+                    if data.ipv6RaConfigs is not None
+                    else ()
+                ),
+            ),
+            bind=lrp_var,
+            parent=router_var,
+        )
+        port_unit.ovn(
+            OVNNbCtlLsp(
+                switch=domain,
+                name=lsp,
+                type="router",
+                addresses=("router",),
+                options=(("router-port", lrp),),
+            ),
+            parent=lrp_var,
+        )
+    # OVN SNAT lives in the security.group rules referenced by the LR.
+    # Replacing an existing set per external IP (lr-nat-add has no
+    # --may-exist) belongs to the LifecycleController's planned delete
+    # pass; this emitter only adds the desired rows.
+    if lr is not None and lr.data.securityGroups:
+        groups = _security_groups_from_refs(
+            list(lr.data.securityGroups), nodes, pt.Render.ovn, f"router {router}"
+        )
+        by_external: dict[str, list[pt.SecurityGroupRule1]] = {}
+        for group in groups:
+            for rule in group.data.rules:
+                if rule.kind != "snat":
+                    # filter rules in the same group are handled by
+                    # _emit_router_acl; NAT only consumes snat.
+                    continue
+                by_external.setdefault(rule.externalIp, []).append(rule)
+        if by_external:
+            nat_unit = router_unit.unit("router NAT", router)
+            for external in sorted(by_external):
+                for rule in sorted(by_external[external], key=lambda r: r.logicalIps):
+                    for logical in rule.logicalIps:
+                        nat_unit.ovn(
+                            OVNNbCtlNat(router, "snat", external, logical),
+                            parent=router_var,
+                        )
+    _emit_router_acl(router, router_var, ports, lr, nodes, domain_names, router_unit)
+    _emit_router_routes(router, router_var, routes, router_unit)
+    router_unit.blank()
 
 
 def _chassis_var(host_name: str) -> str:
@@ -892,9 +877,9 @@ def _emit_gateway_chassis_refs(
     for host_id in host_ids:
         host_name = host_names[host_id]
         var = _chassis_var(host_name)
-        with emit.unit("chassis id", f"{host_name} (resolved on this host)"):
-            emit.wait_capture(var, ovn_ops.sb_chassis_id_by_hostname_argv(host_name))
-            refs[host_id] = Ref(var)
+        chassis_unit = emit.unit("chassis id", f"{host_name} (resolved on this host)")
+        chassis_unit.wait_capture(var, ovn_ops.sb_chassis_id_by_hostname_argv(host_name))
+        refs[host_id] = Ref(var)
     if refs:
         emit.blank()
     return refs
@@ -1062,122 +1047,120 @@ def _emit_security_group_rules(
     netns_primitive: NetnsPrimitive | None = None,
     netns_var: str | None = None,
 ) -> None:
-    with emit.unit("security group", f"{group.key.name} in {netns} on {dev}"):
-        # Every filter rule is stateful: allow replies first, per family for
-        # every chain the group actually uses.
-        chains: dict[str, set[str]] = {"iptables": set(), "ip6tables": set()}
-        for rule in group.data.rules:
-            if rule.kind == "filter":
-                chains["iptables" if rule.family == pt.Family.ipv4 else "ip6tables"].add(
-                    {
-                        pt.Direction.input: "INPUT",
-                        pt.Direction.output: "OUTPUT",
-                        pt.Direction.forward: "FORWARD",
-                    }[rule.direction]
-                )
-        for iptables, used in chains.items():
-            for chain in sorted(used):
-                _emit_iptables(
-                    emit,
-                    netns_primitive,
-                    netns_var,
-                    netns,
-                    iptables,
-                    "filter",
-                    chain,
-                    ("-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"),
-                )
-        action_map = {
-            pt.Action.allow: "ACCEPT",
-            pt.Action.deny: "DROP",
-            pt.Action.reject: "REJECT",
-        }
-        for rule in group.data.rules:
-            if rule.kind == "masq":
-                iptables = "iptables" if rule.family == pt.Family.ipv4 else "ip6tables"
-                _emit_iptables(
-                    emit,
-                    netns_primitive,
-                    netns_var,
-                    netns,
-                    iptables,
-                    "nat",
-                    "POSTROUTING",
-                    ("-o", dev, "-j", "MASQUERADE"),
-                )
-                continue
-            if rule.kind != "filter":
-                raise ValueError(
-                    f"{group.key.name}: rule kind {rule.kind!r} is not a kernel "
-                    "rule; a kernel reference may not carry it"
-                )
-            iptables = "iptables" if rule.family == pt.Family.ipv4 else "ip6tables"
-            chain = {
-                pt.Direction.input: "INPUT",
-                pt.Direction.output: "OUTPUT",
-                pt.Direction.forward: "FORWARD",
-            }[rule.direction]
-            proto = rule.protocol.value if rule.protocol is not None else None
-            ports: list[pt.Port | None] = list(rule.ports) if rule.ports else [None]
-            sources: list[str | None] = list(rule.sources) if rule.sources else [None]
-            destinations: list[str | None] = (
-                list(rule.destinations) if rule.destinations else [None]
+    group_unit = emit.unit("security group", f"{group.key.name} in {netns} on {dev}")
+    # Every filter rule is stateful: allow replies first, per family for
+    # every chain the group actually uses.
+    chains: dict[str, set[str]] = {"iptables": set(), "ip6tables": set()}
+    for rule in group.data.rules:
+        if rule.kind == "filter":
+            chains["iptables" if rule.family == pt.Family.ipv4 else "ip6tables"].add(
+                {
+                    pt.Direction.input: "INPUT",
+                    pt.Direction.output: "OUTPUT",
+                    pt.Direction.forward: "FORWARD",
+                }[rule.direction]
             )
-            for source in sources:
-                for destination in destinations:
-                    for port in ports:
-                        argv = [iptables, "-A", chain]
-                        if source is not None:
-                            argv += ["-s", source]
-                        for excluded in rule.excludeSources or []:
-                            argv += ["!", "-s", excluded]
-                        if destination is not None:
-                            argv += ["-d", destination]
-                        if proto is not None:
-                            argv += ["-p", proto]
-                        if port is not None:
-                            if proto not in ("tcp", "udp"):
-                                raise ValueError(f"{group.key.name}: ports require tcp/udp")
-                            argv += [
-                                "--dport",
-                                (
-                                    str(port.from_)
-                                    if port.from_ == port.to
-                                    else f"{port.from_}:{port.to}"
-                                ),
-                            ]
-                        argv += ["-j", action_map[rule.action]]
-                        _emit_iptables(
-                            emit,
-                            netns_primitive,
-                            netns_var,
-                            netns,
-                            iptables,
-                            "filter",
-                            chain,
-                            tuple(argv[3:]),
-                        )
-        default = group.data.default
-        if default is not None:
-            for direction, chain in (
-                ("input", "INPUT"),
-                ("output", "OUTPUT"),
-                ("forward", "FORWARD"),
-            ):
-                action = getattr(default, direction, None)
-                if action is None:
-                    continue
-                for iptables in ("iptables", "ip6tables"):
+    for iptables, used in chains.items():
+        for chain in sorted(used):
+            _emit_iptables(
+                group_unit,
+                netns_primitive,
+                netns_var,
+                netns,
+                iptables,
+                "filter",
+                chain,
+                ("-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"),
+            )
+    action_map = {
+        pt.Action.allow: "ACCEPT",
+        pt.Action.deny: "DROP",
+        pt.Action.reject: "REJECT",
+    }
+    for rule in group.data.rules:
+        if rule.kind == "masq":
+            iptables = "iptables" if rule.family == pt.Family.ipv4 else "ip6tables"
+            _emit_iptables(
+                group_unit,
+                netns_primitive,
+                netns_var,
+                netns,
+                iptables,
+                "nat",
+                "POSTROUTING",
+                ("-o", dev, "-j", "MASQUERADE"),
+            )
+            continue
+        if rule.kind != "filter":
+            raise ValueError(
+                f"{group.key.name}: rule kind {rule.kind!r} is not a kernel "
+                "rule; a kernel reference may not carry it"
+            )
+        iptables = "iptables" if rule.family == pt.Family.ipv4 else "ip6tables"
+        chain = {
+            pt.Direction.input: "INPUT",
+            pt.Direction.output: "OUTPUT",
+            pt.Direction.forward: "FORWARD",
+        }[rule.direction]
+        proto = rule.protocol.value if rule.protocol is not None else None
+        ports: list[pt.Port | None] = list(rule.ports) if rule.ports else [None]
+        sources: list[str | None] = list(rule.sources) if rule.sources else [None]
+        destinations: list[str | None] = list(rule.destinations) if rule.destinations else [None]
+        for source in sources:
+            for destination in destinations:
+                for port in ports:
+                    argv = [iptables, "-A", chain]
+                    if source is not None:
+                        argv += ["-s", source]
+                    for excluded in rule.excludeSources or []:
+                        argv += ["!", "-s", excluded]
+                    if destination is not None:
+                        argv += ["-d", destination]
+                    if proto is not None:
+                        argv += ["-p", proto]
+                    if port is not None:
+                        if proto not in ("tcp", "udp"):
+                            raise ValueError(f"{group.key.name}: ports require tcp/udp")
+                        argv += [
+                            "--dport",
+                            (
+                                str(port.from_)
+                                if port.from_ == port.to
+                                else f"{port.from_}:{port.to}"
+                            ),
+                        ]
+                    argv += ["-j", action_map[rule.action]]
                     _emit_iptables(
-                        emit,
+                        group_unit,
                         netns_primitive,
                         netns_var,
                         netns,
                         iptables,
                         "filter",
                         chain,
-                        ("-j", action_map[action]),
+                        tuple(argv[3:]),
                     )
+    default = group.data.default
+    if default is not None:
+        for direction, chain in (
+            ("input", "INPUT"),
+            ("output", "OUTPUT"),
+            ("forward", "FORWARD"),
+        ):
+            action = getattr(default, direction, None)
+            if action is None:
+                continue
+            for iptables in ("iptables", "ip6tables"):
+                _emit_iptables(
+                    group_unit,
+                    netns_primitive,
+                    netns_var,
+                    netns,
+                    iptables,
+                    "filter",
+                    chain,
+                    ("-j", action_map[action]),
+                )
 
 
 def _masq_families(security_groups: list[pt.SecurityGroupRef], nodes: list[pt.Model]) -> list[str]:
@@ -1319,9 +1302,9 @@ def _emit_kernel_app_rules(
                 # /var/lib/dhcp/dhclient.leases) — runtime-configurable,
                 # nothing compiled in (2026-08-30).
                 lease = f"/var/lib/dhcp/dhclient.{router}.leases"
-                with emit.unit("kernel app", f"dhcp-client (dhclient) on {dev} in {netns}"):
-                    emit.ovn(host.make_dir(posixpath.dirname(lease)))  # the lease's directory
-                    emit.ovn(host.netns(netns).dhclient(dev, lease), parent=netns_var)
+                app_unit = emit.unit("kernel app", f"dhcp-client (dhclient) on {dev} in {netns}")
+                app_unit.ovn(host.make_dir(posixpath.dirname(lease)))  # the lease's directory
+                app_unit.ovn(host.netns(netns).dhclient(dev, lease), parent=netns_var)
             else:
                 emit.comment(
                     f'# unsupported dhcp-client style "{app.style}" on {dev} in {netns} — '
@@ -1345,92 +1328,103 @@ def _emit_kernel_app_rules(
             # says "own the interfaces", so this is decided here, not by a
             # TS concept name (2026-08-31).
             if app.ip is None:
-                with emit.unit(
+                app_unit = emit.unit(
                     "kernel app", f"docker (owns the interfaces) ({container}) on {dev} in {netns}"
-                ):
-                    # The whole container is lazy: its image, then — once the
-                    # pull/build is fulfilled — run, inject the legs, address
-                    # them, start the app.
-                    with emit.lazy():
-                        image = app.image or f"ovn-fabric-{container}"
-                        volumes = [
-                            {"host": volume.host, "container": volume.container}
-                            for volume in (app.volumes or [])
-                        ]
-                        identity = (
-                            {"public": app.identity.public, "secret": app.identity.secret}
-                            if app.identity
-                            else None
+                )
+                # Its image, then the container: run, inject the legs,
+                # address them, start the app.
+                image = app.image or f"ovn-fabric-{container}"
+                volumes = [
+                    {"host": volume.host, "container": volume.container}
+                    for volume in (app.volumes or [])
+                ]
+                identity = (
+                    {"public": app.identity.public, "secret": app.identity.secret}
+                    if app.identity
+                    else None
+                )
+                dockerfile = _docker_dockerfile(app.build) if app.build else None
+                _emit_image(
+                    host, image, dockerfile, f"/var/lib/ovn-fabric/build/{container}", app_unit
+                )
+                # The app owns its volume directories: DELETE removes them
+                # with whatever the app wrote into them.
+                for volume in volumes:
+                    app_unit.ovn(host.state_dir(volume["host"]))
+                if identity is not None:
+                    state_dir = next(
+                        (
+                            volume["host"]
+                            for volume in volumes
+                            if volume["container"] == "/var/lib/zerotier-one"
+                        ),
+                        None,
+                    )
+                    if state_dir is not None:
+                        public = f"{state_dir}/identity.public"
+                        secret = f"{state_dir}/identity.secret"
+                        app_unit.append(public, identity["public"])
+                        app_unit.append(secret, identity["secret"])
+                        app_unit.ovn(host.chmod(public, "644"))
+                        app_unit.ovn(host.chmod(secret, "600"))
+                docker = host.docker(
+                    container,
+                    image,
+                    command=("sleep", "infinity"),
+                    privileged=True,
+                    volumes=tuple((volume["host"], volume["container"]) for volume in volumes),
+                    run_flags=tuple(app.run or ()),
+                )
+                container_var = app_unit.local(container)
+                app_unit.ovn(docker, bind=container_var)
+                pid_var = app_unit.local(f"{container}-pid")
+                app_unit.capture(
+                    pid_var,
+                    ["/usr/bin/docker", "inspect", "-f", "{{.State.Pid}}", container],
+                )
+                app_unit.netns_symlink(repr(container), pid_var)
+                container_ns = docker.get_netns()
+                container_ns_var = app_unit.local(f"{container}-netns")
+                app_unit.ovn(container_ns, bind=container_ns_var)
+                # The router's legs are lent to the container — it IS the
+                # router now; their rewind moves them back, so the router's
+                # own delete finds them.
+                router_ns = host.netns(netns)
+                for leg in (ctx.transit_leg, dev):
+                    if leg:
+                        app_unit.ovn(
+                            router_ns.move_link(leg, container_ns), parent=container_ns_var
                         )
-                        dockerfile = _docker_dockerfile(app.build) if app.build else None
-                        _emit_image(
-                            host, image, dockerfile, f"/var/lib/ovn-fabric/build/{container}", emit
-                        )
-                        # The app owns its volume directories: DELETE removes them
-                        # with whatever the app wrote into them.
-                        for volume in volumes:
-                            emit.ovn(host.state_dir(volume["host"]))
-                        if identity is not None:
-                            state_dir = next(
-                                (
-                                    volume["host"]
-                                    for volume in volumes
-                                    if volume["container"] == "/var/lib/zerotier-one"
-                                ),
-                                None,
-                            )
-                            if state_dir is not None:
-                                public = f"{state_dir}/identity.public"
-                                secret = f"{state_dir}/identity.secret"
-                                emit.append(public, identity["public"])
-                                emit.append(secret, identity["secret"])
-                                emit.ovn(host.chmod(public, "644"))
-                                emit.ovn(host.chmod(secret, "600"))
-                        docker = host.docker(
-                            container,
-                            image,
-                            command=("sleep", "infinity"),
-                            privileged=True,
-                            volumes=tuple(
-                                (volume["host"], volume["container"]) for volume in volumes
-                            ),
-                            run_flags=tuple(app.run or ()),
-                        )
-                        container_var = emit.local(container)
-                        emit.ovn(docker, bind=container_var)
-                        pid_var = emit.local(f"{container}-pid")
-                        emit.capture(
-                            pid_var,
-                            ["/usr/bin/docker", "inspect", "-f", "{{.State.Pid}}", container],
-                        )
-                        emit.netns_symlink(repr(container), pid_var)
-                        emit.helper("_docker_attach_legs", container, netns, dev, ctx.transit_leg)
-                        container_ns = docker.get_netns()
-                        container_ns_var = emit.local(f"{container}-netns")
-                        emit.ovn(container_ns, bind=container_ns_var)
-                        if ctx.transit_leg:
-                            _apply_side_network(
-                                [],
-                                ctx.transit_ipaddrs,
-                                ctx.transit_routes,
-                                container,
-                                ctx.transit_leg,
-                                emit,
-                                container_ns,
-                                container_ns_var,
-                            )
-                        _apply_side_network(
-                            ctx.groups,
-                            ctx.ipaddrs,
-                            ctx.routes,
-                            container,
-                            dev,
-                            emit,
-                            container_ns,
-                            container_ns_var,
-                        )
-                        emit.helper("_docker_exec", container, list(app.cmd or ["sh"]), dev)
-                    continue
+                app_unit.ovn(
+                    container_ns.set_sysctl("net.ipv4.ip_forward", "1"), parent=container_ns_var
+                )
+                app_unit.ovn(
+                    container_ns.set_sysctl("net.ipv6.conf.all.forwarding", "1"),
+                    parent=container_ns_var,
+                )
+                if ctx.transit_leg:
+                    _apply_side_network(
+                        [],
+                        ctx.transit_ipaddrs,
+                        ctx.transit_routes,
+                        container,
+                        ctx.transit_leg,
+                        app_unit,
+                        container_ns,
+                        container_ns_var,
+                    )
+                _apply_side_network(
+                    ctx.groups,
+                    ctx.ipaddrs,
+                    ctx.routes,
+                    container,
+                    dev,
+                    app_unit,
+                    container_ns,
+                    container_ns_var,
+                )
+                app_unit.ovn(docker.exec_detached([*(app.cmd or ["sh"]), dev]))
+                continue
             # Else: the client mode — one veth injected into the router netns
             # (CNI/Multus-style interface injection — the same primitive
             # a k8s pod + Multus uses, 2026-08-23). `--network host`
@@ -1445,27 +1439,27 @@ def _emit_kernel_app_rules(
                     f'kernel app docker "{container}": the veth injection needs an `ip` '
                     "(the container's address on the router's services segment)"
                 )
-            with emit.unit("kernel app", f"docker ({container}) on {dev} in {netns}"):
-                veth = app.vethName or ("ve-" + hashlib.md5(container.encode()).hexdigest()[:8])
-                gateway = app.routerIp.split("/")[0]
-                image = app.image or f"ovn-fabric-{container}"
-                emit.helper(
-                    "_docker_veth_up",
-                    container,
-                    image,
-                    _docker_dockerfile(app.build) if app.build else None,
-                    list(app.cmd or []),
-                    netns,
-                    veth,
-                    app.routerIp,
-                    app.ip,
-                    gateway,
-                    # Stopping a docker container is done THE HARD WAY — an
-                    # explicit `docker rm -f` via the daemon (SIGTERM through
-                    # the router's stop is not a reliable container shutdown).
-                    undo="_docker_down",
-                    undo_args=(container,),
-                )
+            app_unit = emit.unit("kernel app", f"docker ({container}) on {dev} in {netns}")
+            veth = app.vethName or ("ve-" + hashlib.md5(container.encode()).hexdigest()[:8])
+            gateway = app.routerIp.split("/")[0]
+            image = app.image or f"ovn-fabric-{container}"
+            app_unit.helper(
+                "_docker_veth_up",
+                container,
+                image,
+                _docker_dockerfile(app.build) if app.build else None,
+                list(app.cmd or []),
+                netns,
+                veth,
+                app.routerIp,
+                app.ip,
+                gateway,
+                # Stopping a docker container is done THE HARD WAY — an
+                # explicit `docker rm -f` via the daemon (SIGTERM through
+                # the router's stop is not a reliable container shutdown).
+                undo="_docker_down",
+                undo_args=(container,),
+            )
         elif app.kind == "wireguard":
             # A WireGuard tunnel inside the netns (the tunnelRouterEndpoint's
             # middle leg): write the conf (PrivateKey included — the
@@ -1480,26 +1474,26 @@ def _emit_kernel_app_rules(
                     f"kernel app wireguard on {dev} in {netns}: missing ifaceName/config"
                 )
             conf_path = f"/etc/wireguard/{app.ifaceName}.conf"
-            with emit.unit("kernel app", f"wireguard ({app.ifaceName}) in {netns}"):
-                emit.ovn(host.make_dir("/etc/wireguard"))
-                emit.append(conf_path, "\n".join(_wg_conf_lines(app)))
-                emit.ovn(host.chmod(conf_path, "600"))
-                netns_primitive = host.netns(netns)
-                emit.ovn(
-                    netns_primitive.wireguard(app.ifaceName, conf_path),
+            app_unit = emit.unit("kernel app", f"wireguard ({app.ifaceName}) in {netns}")
+            app_unit.ovn(host.make_dir("/etc/wireguard"))
+            app_unit.append(conf_path, "\n".join(_wg_conf_lines(app)))
+            app_unit.ovn(host.chmod(conf_path, "600"))
+            netns_primitive = host.netns(netns)
+            app_unit.ovn(
+                netns_primitive.wireguard(app.ifaceName, conf_path),
+                parent=netns_var,
+            )
+            for family in _masq_families(list(app.securityGroups), nodes):
+                iptables = "iptables" if family == "ipv4" else "ip6tables"
+                app_unit.ovn(
+                    netns_primitive.add_rule(
+                        iptables,
+                        "nat",
+                        "POSTROUTING",
+                        ("-o", app.ifaceName, "-j", "MASQUERADE"),
+                    ),
                     parent=netns_var,
                 )
-                for family in _masq_families(list(app.securityGroups), nodes):
-                    iptables = "iptables" if family == "ipv4" else "ip6tables"
-                    emit.ovn(
-                        netns_primitive.add_rule(
-                            iptables,
-                            "nat",
-                            "POSTROUTING",
-                            ("-o", app.ifaceName, "-j", "MASQUERADE"),
-                        ),
-                        parent=netns_var,
-                    )
         elif app.kind == "zerotier":
             # A ZeroTier tunnel inside the netns (the tunnelRouterEndpoint's
             # middle leg): the zerotier-one daemon runs confined to the
@@ -1516,12 +1510,12 @@ def _emit_kernel_app_rules(
                 raise ValueError(
                     f"kernel app zerotier on {dev} in {netns}: missing networkId/instanceDir"
                 )
-            with emit.unit("kernel app", f"zerotier in {netns}"):
-                masq = _masq_families(list(app.securityGroups), nodes)
-                routes = [route.dst for route in (app.routes or [])]
-                # The daemon is the job's tracked foreground child; the runtime
-                # kills it on stop, and its rules/routes go with the netns.
-                emit.helper("_zerotier_up", netns, app.instanceDir, app.networkId, masq, routes)
+            app_unit = emit.unit("kernel app", f"zerotier in {netns}")
+            masq = _masq_families(list(app.securityGroups), nodes)
+            routes = [route.dst for route in (app.routes or [])]
+            # The daemon is the job's tracked foreground child; the runtime
+            # kills it on stop, and its rules/routes go with the netns.
+            app_unit.helper("_zerotier_up", netns, app.instanceDir, app.networkId, masq, routes)
         else:
             emit.comment(
                 f'# unsupported kernel app kind "{app.kind}" on {dev} in {netns} — '
@@ -1602,9 +1596,9 @@ def _emit_kernel_router_owner(
                 transit_leg = f"veth-krn-{iface.shortName}"
             transit_ipaddrs = list(side_node.data.ipaddrs or [])
             transit_routes = list(side_node.data.routes or [])
-    with emit.unit("kernel router", owner.key.name, key=owner.id):
-        emit.ovn(host.rootNs(), bind=kernel_var)
-        emit.ovn(kernel_netns, bind=netns_var)
+    netns_unit = emit.unit("kernel router", owner.key.name, key=owner.id)
+    netns_unit.ovn(host.rootNs(), bind=kernel_var)
+    netns_unit.ovn(kernel_netns, bind=netns_var)
     for side_node in _kernel_router_sides(owner.key.name, nodes):
         iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
         if iface is not None and iface.kind not in _BINDABLE_IFACE_KINDS:
@@ -1625,103 +1619,103 @@ def _emit_kernel_router_owner(
             dev = f"veth-krn-{iface.shortName}"
         else:
             dev = _iface_real_name(iface) if iface is not None else _dummy_name(_side(side_node))
-        with emit.unit("kernel router side", f"{owner.key.name} ({_side(side_node).value})"):
-            if iface is not None:
-                if iface.kind == "vlan":
-                    emit.ovn(
-                        kernel_netns.add_link(
-                            dev,
-                            "vlan",
-                            parent=iface.vlanParent.name,
-                            vlan_id=iface.vlanId,
-                        ),
-                        parent=netns_var,
-                    )
-                elif iface.kind == "veth":
-                    # `mac` (src/ir.ts's kernelRouterSideToIR) pins the
-                    # netns-side leg's MAC so the OVN router's MAC_Binding
-                    # for this side stays valid across a down/up.
-                    root_leg = f"veth-ovn-{iface.shortName}"
-                    # The bridge itself belongs to the host's configure
-                    # declaration (_emit_iface_bindings); the router only
-                    # plugs its root leg into it.
-                    bridge = _veth_root_bridge(root_leg, nodes)
-                    emit.ovn(
-                        kernel_netns.add_link(
-                            dev,
-                            "veth",
-                            mac=iface.mac,
-                            root_leg=root_leg,
-                            bridge=bridge,
-                        ),
-                        parent=netns_var,
-                    )
-                elif iface.kind == "physical":
-                    emit.ovn(kernel_netns.add_link(dev, "physical"), parent=netns_var)
-            else:
-                emit.ovn(kernel_netns.add_link(dev, "dummy"), parent=netns_var)
-            # A kernel router's REAL-WORLD side (right) learns its IPv6 via
-            # RA/SLAAC — the config's via-less `::/0` means exactly that.
-            # `accept_ra=2` forces it to keep accepting RAs even though the
-            # netns has forwarding on (which would otherwise force
-            # accept_ra=0) — without it the WAN leg never gets an IPv6
-            # default/address and clients' v6 dies at the kernel router
-            # (confirmed live, 2026-08-30). Written to the proc file
-            # directly: `sysctl` splits its key on every dot, so a vlan
-            # iface name (`eth0.2280`) can't be a sysctl key component
-            # ("cannot stat .../eth0/2280/accept_ra").
-            if side_node.key.side == pt.Side.right:
-                emit.ovn(
-                    kernel_netns.set_sysctl_file(f"/proc/sys/net/ipv6/conf/{dev}/accept_ra", "2"),
+        side_unit = emit.unit("kernel router side", f"{owner.key.name} ({_side(side_node).value})")
+        if iface is not None:
+            if iface.kind == "vlan":
+                side_unit.ovn(
+                    kernel_netns.add_link(
+                        dev,
+                        "vlan",
+                        parent=iface.vlanParent.name,
+                        vlan_id=iface.vlanId,
+                    ),
                     parent=netns_var,
                 )
-            # The side's static addressing + security-group (masq) rules,
-            # applied inside the netns — SAME code as the dhcpcd-in-docker
-            # container path (only the target namespace differs).
-            groups = _security_groups_from_refs(
-                list(side_node.data.securityGroups or []),
-                nodes,
-                pt.Render.kernel,
-                f"kernel router {owner.key.name} ({_side(side_node).value})",
-            )
-            _apply_side_network(
-                groups,
-                list(side_node.data.ipaddrs or []),
-                list(side_node.data.routes or []),
-                netns,
-                dev,
-                emit,
-                kernel_netns,
-                netns_var,
-            )
-            # The side's apps (right side in practice) run inside the
-            # netns on this interface — started after the interface is up
-            # and bound, so the DHCP client can immediately acquire a
-            # lease on a ready device.
-            if side_node.data.apps:
-                _emit_kernel_app_rules(
-                    side_node.data.apps,
-                    owner.key.name,
-                    host,
-                    netns_var,
-                    emit,
-                    _SideContext(
-                        netns=netns,
-                        dev=dev,
-                        transit_leg=transit_leg,
-                        groups=_security_groups_from_refs(
-                            list(side_node.data.securityGroups or []),
-                            nodes,
-                            pt.Render.kernel,
-                            f"kernel router {owner.key.name}",
-                        ),
-                        ipaddrs=list(side_node.data.ipaddrs or []),
-                        routes=list(side_node.data.routes or []),
-                        transit_ipaddrs=transit_ipaddrs,
-                        transit_routes=transit_routes,
+            elif iface.kind == "veth":
+                # `mac` (src/ir.ts's kernelRouterSideToIR) pins the
+                # netns-side leg's MAC so the OVN router's MAC_Binding
+                # for this side stays valid across a down/up.
+                root_leg = f"veth-ovn-{iface.shortName}"
+                # The bridge itself belongs to the host's configure
+                # declaration (_emit_iface_bindings); the router only
+                # plugs its root leg into it.
+                bridge = _veth_root_bridge(root_leg, nodes)
+                side_unit.ovn(
+                    kernel_netns.add_link(
+                        dev,
+                        "veth",
+                        mac=iface.mac,
+                        root_leg=root_leg,
+                        bridge=bridge,
                     ),
-                    nodes,
+                    parent=netns_var,
                 )
+            elif iface.kind == "physical":
+                side_unit.ovn(kernel_netns.add_link(dev, "physical"), parent=netns_var)
+        else:
+            side_unit.ovn(kernel_netns.add_link(dev, "dummy"), parent=netns_var)
+        # A kernel router's REAL-WORLD side (right) learns its IPv6 via
+        # RA/SLAAC — the config's via-less `::/0` means exactly that.
+        # `accept_ra=2` forces it to keep accepting RAs even though the
+        # netns has forwarding on (which would otherwise force
+        # accept_ra=0) — without it the WAN leg never gets an IPv6
+        # default/address and clients' v6 dies at the kernel router
+        # (confirmed live, 2026-08-30). Written to the proc file
+        # directly: `sysctl` splits its key on every dot, so a vlan
+        # iface name (`eth0.2280`) can't be a sysctl key component
+        # ("cannot stat .../eth0/2280/accept_ra").
+        if side_node.key.side == pt.Side.right:
+            side_unit.ovn(
+                kernel_netns.set_sysctl_file(f"/proc/sys/net/ipv6/conf/{dev}/accept_ra", "2"),
+                parent=netns_var,
+            )
+        # The side's static addressing + security-group (masq) rules,
+        # applied inside the netns — SAME code as the dhcpcd-in-docker
+        # container path (only the target namespace differs).
+        groups = _security_groups_from_refs(
+            list(side_node.data.securityGroups or []),
+            nodes,
+            pt.Render.kernel,
+            f"kernel router {owner.key.name} ({_side(side_node).value})",
+        )
+        _apply_side_network(
+            groups,
+            list(side_node.data.ipaddrs or []),
+            list(side_node.data.routes or []),
+            netns,
+            dev,
+            side_unit,
+            kernel_netns,
+            netns_var,
+        )
+        # The side's apps (right side in practice) run inside the
+        # netns on this interface — started after the interface is up
+        # and bound, so the DHCP client can immediately acquire a
+        # lease on a ready device.
+        if side_node.data.apps:
+            _emit_kernel_app_rules(
+                side_node.data.apps,
+                owner.key.name,
+                host,
+                netns_var,
+                side_unit,
+                _SideContext(
+                    netns=netns,
+                    dev=dev,
+                    transit_leg=transit_leg,
+                    groups=_security_groups_from_refs(
+                        list(side_node.data.securityGroups or []),
+                        nodes,
+                        pt.Render.kernel,
+                        f"kernel router {owner.key.name}",
+                    ),
+                    ipaddrs=list(side_node.data.ipaddrs or []),
+                    routes=list(side_node.data.routes or []),
+                    transit_ipaddrs=transit_ipaddrs,
+                    transit_routes=transit_routes,
+                ),
+                nodes,
+            )
 
 
 def _kernel_router_script(router: str, up_lines: list[str], down_lines: list[str]) -> str:
@@ -1879,25 +1873,25 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
     host = HostPrimitive(host_name)
     # The root namespace is the parent of every host-local link node.
     kernel_var = emit.local("kernel")
-    with emit.unit("root namespace", host_name):
-        emit.ovn(host.rootNs(), bind=kernel_var)
+    root_unit = emit.unit("root namespace", host_name)
+    root_unit.ovn(host.rootNs(), bind=kernel_var)
     mappings: list[str] = []
     xdp_ports = _xdp_ports(all_bindings)
     xdp_trunks = _xdp_trunks(all_bindings)
     if xdp_ports:
-        with emit.unit("XDP trunk", "userspace datapath, one port for all segments"):
-            emit.ovn(host.ovs_bridge(_XDP_TRUNK_BRIDGE, datapath="netdev"))
-            for name, port in xdp_ports.items():
-                emit.ovn(
-                    host.ovs_afxdp_port(
-                        _XDP_TRUNK_BRIDGE,
-                        name,
-                        port.mode.value,
-                        port.nRxq,
-                        trunks=sorted(set(xdp_trunks.get(name, []))),
-                    )
+        trunk_unit = emit.unit("XDP trunk", "userspace datapath, one port for all segments")
+        trunk_unit.ovn(host.ovs_bridge(_XDP_TRUNK_BRIDGE, datapath="netdev"))
+        for name, port in xdp_ports.items():
+            trunk_unit.ovn(
+                host.ovs_afxdp_port(
+                    _XDP_TRUNK_BRIDGE,
+                    name,
+                    port.mode.value,
+                    port.nRxq,
+                    trunks=sorted(set(xdp_trunks.get(name, []))),
                 )
-            emit.blank()
+            )
+        trunk_unit.blank()
     # The IR carries one node per OVS bridge with all of its ports
     # (`ovn.ls.interfaces` or `bridge.ports`). Group by bridge name and
     # emit ensure-bridge ONCE, then only the ports.
@@ -1911,45 +1905,45 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
             continue
         by_bridge.setdefault(iface.bridge, []).append((domain, iface))
     for bridge in sorted(by_bridge):
-        with emit.unit("bridge", f"{bridge} on {host_name}"):
-            emit.ovn(host.ovs_bridge(bridge))
-            for domain, iface in by_bridge[bridge]:
-                is_xdp = iface.kind == "xdp" or (
-                    iface.kind == "vlan" and iface.vlanParent.kind == "xdp"
+        bridge_unit = emit.unit("bridge", f"{bridge} on {host_name}")
+        bridge_unit.ovn(host.ovs_bridge(bridge))
+        for domain, iface in by_bridge[bridge]:
+            is_xdp = iface.kind == "xdp" or (
+                iface.kind == "vlan" and iface.vlanParent.kind == "xdp"
+            )
+            if iface.kind == "xdp":
+                label = iface.name
+            elif iface.kind == "vlan" and iface.vlanParent.kind == "xdp":
+                label = f"{iface.vlanParent.name} vlan {iface.vlanId}"
+            else:
+                label = _iface_real_name(iface)
+            iface_unit = bridge_unit.unit("interface", f"{domain} ({label})")
+            if iface.kind == "vlan" and not is_xdp:
+                iface_unit.ovn(
+                    host.rootNs().add_vlan(
+                        iface.vlanParent.name,
+                        _iface_real_name(iface),
+                        iface.vlanId,
+                    ),
+                    parent=kernel_var,
                 )
-                if iface.kind == "xdp":
-                    label = iface.name
-                elif iface.kind == "vlan" and iface.vlanParent.kind == "xdp":
-                    label = f"{iface.vlanParent.name} vlan {iface.vlanId}"
-                else:
-                    label = _iface_real_name(iface)
-                with emit.unit("interface", f"{domain} ({label})"):
-                    if iface.kind == "vlan" and not is_xdp:
-                        emit.ovn(
-                            host.rootNs().add_vlan(
-                                iface.vlanParent.name,
-                                _iface_real_name(iface),
-                                iface.vlanId,
-                            ),
-                            parent=kernel_var,
-                        )
-                    # A transit veth's ROOT leg is created AND upped by its own
-                    # kernel-router job (_emit_kernel_router_owner). This block
-                    # must not touch it (2026-10-20, boot-restore ordering).
-                    if is_xdp:
-                        vlan_id = iface.vlanId if iface.kind == "vlan" else None
-                        _emit_xdp_leg(host, kernel_var, bridge, vlan_id, emit)
-                    elif iface.kind == "veth":
-                        pass
-                    else:
-                        emit.ovn(host.ovs_port(bridge, _iface_real_name(iface)))
-                    if domain in ovn_domains:
-                        mappings.append(f"{_network_name(domain)}:{bridge}")
+            # A transit veth's ROOT leg is created AND upped by its own
+            # kernel-router job (_emit_kernel_router_owner). This block
+            # must not touch it (2026-10-20, boot-restore ordering).
+            if is_xdp:
+                vlan_id = iface.vlanId if iface.kind == "vlan" else None
+                _emit_xdp_leg(host, kernel_var, bridge, vlan_id, iface_unit)
+            elif iface.kind == "veth":
+                pass
+            else:
+                iface_unit.ovn(host.ovs_port(bridge, _iface_real_name(iface)))
+            if domain in ovn_domains:
+                mappings.append(f"{_network_name(domain)}:{bridge}")
     if mappings:
         # Host-wide (one `ovn-bridge-mappings` for all bridges), so its own
         # unit — after every bridge it names exists.
-        with emit.unit("bridge mappings", host_name):
-            emit.ovn(host.ovs_mapping(tuple(mappings)))
+        mappings_unit = emit.unit("bridge mappings", host_name)
+        mappings_unit.ovn(host.ovs_mapping(tuple(mappings)))
     if len(emit.lines) > before:
         emit.blank()
 
@@ -1986,16 +1980,15 @@ def _fabric_unit(host_name: str) -> str:
 def _emit_image(
     host: HostPrimitive, image: str, dockerfile: str | None, build_dir: str, emit: Emitter
 ) -> None:
-    """A container's image, in the lazy phase: built from its Dockerfile
-    (context dir, Dockerfile, build) or pulled from the registry."""
-    with emit.lazy():
-        if dockerfile is None:
-            emit.ovn(host.docker_pull(image))
-            return
-        dockerfile_path = f"{build_dir}/Dockerfile"
-        emit.ovn(host.make_dir(build_dir))
-        emit.append(dockerfile_path, dockerfile)
-        emit.ovn(host.docker_image(image, dockerfile_path, build_dir))
+    """A container's image: built from its Dockerfile (context dir,
+    Dockerfile, build) or pulled from the registry."""
+    if dockerfile is None:
+        emit.ovn(host.docker_pull(image))
+        return
+    dockerfile_path = f"{build_dir}/Dockerfile"
+    emit.ovn(host.make_dir(build_dir))
+    emit.append(dockerfile_path, dockerfile)
+    emit.ovn(host.docker_image(image, dockerfile_path, build_dir))
 
 
 def _emit_fabric_unit(host_node: pt.InfraHostNode, emit: Emitter) -> None:
@@ -2004,12 +1997,12 @@ def _emit_fabric_unit(host_node: pt.InfraHostNode, emit: Emitter) -> None:
     removes the unit and the program. A daemon-reload on each side of the
     unit file keeps systemd's view right in both directions."""
     host_name = host_node.key.host
-    with emit.unit("fabric service", _FABRIC_UNIT):
-        emit.install_self(_RESTORE_SCRIPT)
-        emit.daemon_reload()
-        emit.append(_FABRIC_UNIT_PATH, _fabric_unit(host_name))
-        emit.daemon_reload()
-        emit.blank()
+    service_unit = emit.unit("fabric service", _FABRIC_UNIT)
+    service_unit.install_self(_RESTORE_SCRIPT)
+    service_unit.daemon_reload()
+    service_unit.append(_FABRIC_UNIT_PATH, _fabric_unit(host_name))
+    service_unit.daemon_reload()
+    service_unit.blank()
 
 
 def _emit_fabric_start(host_node: pt.InfraHostNode, emit: Emitter) -> None:
@@ -2088,11 +2081,11 @@ def _emit_ipfix(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitte
     if not flags:
         return
     host = HostPrimitive(host_node.key.host)
-    with emit.unit("flow export", "IPFIX"):
-        for bridge in sorted(flags):
-            if flags[bridge]:
-                emit.ovn(host.ovs_ipfix(bridge, _ipfix_enable_script(bridge, ipfix)))
-        emit.blank()
+    ipfix_unit = emit.unit("flow export", "IPFIX")
+    for bridge in sorted(flags):
+        if flags[bridge]:
+            ipfix_unit.ovn(host.ovs_ipfix(bridge, _ipfix_enable_script(bridge, ipfix)))
+    ipfix_unit.blank()
 
 
 # Abstract dependency -> concrete distro package (Ubuntu/Debian apt
@@ -2359,10 +2352,9 @@ def _emit_service_up(
     faces: list[Face],
     emit: Emitter,
 ) -> None:
-    """A workload is lazy as a whole: its image, then — once the
-    pull/build is fulfilled — its container, NICs and addresses."""
-    with emit.unit("workload", node.key.name, key=node.id), emit.lazy():
-        _emit_service_body(node, faces, emit)
+    """A workload: its image, then its container, NICs and addresses."""
+    workload_unit = emit.unit("workload", node.key.name, key=node.id)
+    _emit_service_body(node, faces, workload_unit)
 
 
 def _emit_service_body(
@@ -2450,54 +2442,54 @@ def _emit_service_body(
         # matching that NIC's own source prefix, keeps every path intact.
         table = 1000 + i
         networks = [str(ipaddress.ip_interface(a).network) for a in (ref.ipaddrs or [])]
-        with emit.unit("NIC", f"{nic} on {bridge}"):
-            emit.ovn(
-                container_ns.add_link(
-                    peer,
-                    "veth",
-                    rename_to=nic,
-                    mac=ref.mac,
-                    root_leg=dev,
-                    bridge=bridge,
-                ),
+        nic_unit = emit.unit("NIC", f"{nic} on {bridge}")
+        nic_unit.ovn(
+            container_ns.add_link(
+                peer,
+                "veth",
+                rename_to=nic,
+                mac=ref.mac,
+                root_leg=dev,
+                bridge=bridge,
+            ),
+            parent=container_ns_var,
+        )
+        for address in ref.ipaddrs or []:
+            nic_unit.ovn(
+                container_ns.add_addr(nic, address),
                 parent=container_ns_var,
             )
-            for address in ref.ipaddrs or []:
-                emit.ovn(
-                    container_ns.add_addr(nic, address),
+        if ref.routes:
+            for route in ref.routes:
+                family = 6 if ":" in route.dst else 4
+                nic_unit.ovn(
+                    container_ns.add_route(
+                        route.dst,
+                        nic,
+                        via=route.via,
+                        metric=route.metric,
+                        table=table,
+                        family=family,
+                    ),
                     parent=container_ns_var,
                 )
-            if ref.routes:
-                for route in ref.routes:
-                    family = 6 if ":" in route.dst else 4
-                    emit.ovn(
+                if route.dst in ("0.0.0.0/0", "::/0"):
+                    nic_unit.ovn(
                         container_ns.add_route(
                             route.dst,
                             nic,
                             via=route.via,
                             metric=route.metric,
-                            table=table,
                             family=family,
                         ),
                         parent=container_ns_var,
                     )
-                    if route.dst in ("0.0.0.0/0", "::/0"):
-                        emit.ovn(
-                            container_ns.add_route(
-                                route.dst,
-                                nic,
-                                via=route.via,
-                                metric=route.metric,
-                                family=family,
-                            ),
-                            parent=container_ns_var,
-                        )
-                for network in networks:
-                    family = 6 if ":" in network else 4
-                    emit.ovn(
-                        container_ns.add_ip_rule(network, table, family),
-                        parent=container_ns_var,
-                    )
+            for network in networks:
+                family = 6 if ":" in network else 4
+                nic_unit.ovn(
+                    container_ns.add_ip_rule(network, table, family),
+                    parent=container_ns_var,
+                )
 
 
 def _emit_chassis_registration(
@@ -2548,8 +2540,8 @@ def _emit_host_configure(host_node: pt.InfraHostNode, nodes: list[pt.Model], emi
     """The idempotent part of the host pass: chassis registration,
     interface bindings and IPFIX. The job tree's configure job."""
     host_name = host_node.key.host
-    with emit.unit("chassis registration", host_name, key=host_node.id):
-        _emit_chassis_registration(host_node, nodes, emit)
+    registration_unit = emit.unit("chassis registration", host_name, key=host_node.id)
+    _emit_chassis_registration(host_node, nodes, registration_unit)
     _emit_iface_bindings(host_name, nodes, emit)
     _emit_ipfix(host_node, nodes, emit)
 

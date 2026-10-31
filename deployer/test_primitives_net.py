@@ -49,7 +49,6 @@ async def _now(lc: LifecycleController, operation: Operation) -> None:
     await lc.run(operation)
     await lc.execute()
     lc.queue.clear()
-    lc.lazy.clear()
 
 
 class NetnsPrimitiveTest(unittest.TestCase):
@@ -218,6 +217,65 @@ class NetnsPrimitiveTest(unittest.TestCase):
             )
 
         asyncio.run(run())
+
+    def test_a_lent_link_moves_to_the_container_and_back(self) -> None:
+        async def run() -> None:
+            host = HostPrimitive("h")
+            router_ns = host.netns("ns-router")
+            container_ns = host.docker("c", "img").get_netns()
+            move = router_ns.move_link("eth0.2280", container_ns)
+
+            job = FakeJob()
+            lc = LifecycleController(Ctx(), job, LifecycleAction.CREATE, "h")
+            await _now(lc, move)
+            self.assertEqual(
+                [argv for _label, argv in job.commands],
+                [
+                    (
+                        "ip",
+                        "netns",
+                        "exec",
+                        "ns-router",
+                        "ip",
+                        "link",
+                        "set",
+                        "eth0.2280",
+                        "netns",
+                        "c",
+                    ),
+                    ("ip", "netns", "exec", "c", "ip", "link", "set", "eth0.2280", "up"),
+                ],
+            )
+            # It is the container's link now.
+            self.assertEqual(lc.graph.nodes["link:c|eth0.2280"]["netnsRef"], "netns:c")
+
+            job = FakeJob()
+            lc = LifecycleController(Ctx(), job, LifecycleAction.DELETE, "h")
+            await _now(lc, move)
+            self.assertEqual(
+                [argv for _label, argv in job.commands],
+                [
+                    (
+                        "ip",
+                        "netns",
+                        "exec",
+                        "c",
+                        "ip",
+                        "link",
+                        "set",
+                        "eth0.2280",
+                        "netns",
+                        "ns-router",
+                    )
+                ],
+            )
+
+        asyncio.run(run())
+
+    def test_moving_a_link_needs_two_named_namespaces(self) -> None:
+        host = HostPrimitive("h")
+        with self.assertRaises(ValueError):
+            host.rootNs().move_link("eth0", host.netns("ns-x"))
 
     def test_rule_create_appends_and_delete_uses_delete(self) -> None:
         # Strict create: no `-C` existence probe; a duplicate rule is the

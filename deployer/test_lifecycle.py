@@ -279,29 +279,6 @@ class LifecycleTest(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_lazy_operations_run_only_in_the_lazy_phase(self) -> None:
-        image = _primitive("image:x", ("docker", "pull", "x"), ("docker", "image", "rm", "x"))
-
-        async def run(action: LifecycleAction) -> list[str]:
-            job = FakeJob()
-            lc = _controller(job, action)
-            await lc.run(image, lazy=True)
-            await lc.run(BRIDGE)
-            await lc.run(PORT, lazy=True)
-            await lc.execute()
-            return [" ".join(command[1]) for command in job.commands]
-
-        self.assertEqual(asyncio.run(run(LifecycleAction.CREATE)), ["ovs-vsctl add-br br-x"])
-        self.assertEqual(asyncio.run(run(LifecycleAction.DELETE)), ["ovs-vsctl del-br br-x"])
-        self.assertEqual(
-            asyncio.run(run(LifecycleAction.LAZY_CREATE)),
-            ["docker pull x", "ovs-vsctl add-port br-x eth0"],
-        )
-        self.assertEqual(
-            asyncio.run(run(LifecycleAction.LAZY_DELETE)),
-            ["ovs-vsctl del-port br-x eth0", "docker image rm x"],
-        )
-
     def test_dry_run_describes_the_ordered_queue_and_runs_nothing(self) -> None:
         async def run() -> None:
             job = FakeJob()

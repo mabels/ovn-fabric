@@ -12,7 +12,7 @@ from unittest import mock
 from protocol.hydrate import hydrate_nodes
 from runtime import generated as rg
 from runtime.message import Msg
-from runtime.peer import Peer, RemoteError
+from runtime.peer import Call, Peer, RemoteError
 from runtime.runtime import Runtime
 from runtime.service import Service
 from runtime.test_message import IR_SAMPLE
@@ -37,19 +37,19 @@ class Fakes:
         self.calls: list[tuple[str, Any]] = []
         self.fail, self.deps_fail = fail, deps_fail
 
-    async def deps(self, peer: Peer, msg: Msg[Any]) -> object:
-        self.calls.append(("deps", [d.name for d in msg.body.deps]))
+    async def deps(self, call: Call) -> object:
+        self.calls.append(("deps", [d.name for d in call.body.deps]))
         state = g.SystemDepState.failed if self.deps_fail else g.SystemDepState.ready
         return g.AbstractDepsRes(
             kind="AbstractDepsRes",
-            deps=[g.AbstractDepStatus(name=d.name, state=state, deps=[]) for d in msg.body.deps],
+            deps=[g.AbstractDepStatus(name=d.name, state=state, deps=[]) for d in call.body.deps],
         )
 
-    async def unit(self, peer: Peer, msg: Msg[Any]) -> object:
-        req = msg.body
+    async def unit(self, call: Call) -> object:
+        req = call.body
         inputs = {v.name: json.loads(v.json) for v in req.inputs or []}
         self.calls.append((req.unit.name, (req.action.value, inputs, req.dryRun)))
-        await peer.log("info", f"{req.action.value} unit: {req.unit.name}")
+        await call.log("info", f"{req.action.value} unit: {req.unit.name}")
         failed = req.unit.name == self.fail
         outputs = {**inputs, f"seen-{len(self.calls)}": req.unit.name}
         return g.UnitExecRes(

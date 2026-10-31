@@ -115,10 +115,13 @@ Consequences of this model:
   start or a restart all converge the same way. No replay is ever needed.
 - **Single writer.** A component never writes another component's subject;
   it sends a request. This is the bus form of "one owner per object".
-- **Correlation flows automatically.** Inside a request handler the runtime
-  holds the request's correlation in a `contextvar`; every log, progress and
-  event emitted there carries it. A client following its request sees exactly
-  its own logs.
+- **Correlation is explicit.** A handler gets its request as a `Call` and
+  emits every log, progress and event through it, so each carries the
+  request's correlation; a command reports to `call.report`, and a request
+  sent on its behalf names it as parent. A client following its request sees
+  exactly its own logs. *(Amended 2026-10-31: this was a `contextvar`. Hidden
+  per-task state needs knowledge of the runtime to read, and gets hard to
+  follow once there is real concurrency; the handle is passed instead.)*
 - `auth` exists from day one and stays empty for now (see 6).
 
 ### 4. The registry and the service declaration

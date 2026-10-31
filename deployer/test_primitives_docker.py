@@ -45,7 +45,6 @@ async def _now(lc: LifecycleController, operation: Operation) -> None:
     await lc.run(operation)
     await lc.execute()
     lc.queue.clear()
-    lc.lazy.clear()
 
 
 class DockerPrimitiveTest(unittest.TestCase):
@@ -123,6 +122,22 @@ class DockerPrimitiveTest(unittest.TestCase):
                 argv,
             )
             self.assertIn("docker.image:ovn-fabric-dns", lc.graph.nodes)
+
+        asyncio.run(run())
+
+    def test_a_process_started_in_the_container_ends_with_it(self) -> None:
+        async def run() -> None:
+            app = HostPrimitive("h").docker("c", "img").exec_detached(["/sbin/dhcpcd", "eth0"])
+            for action in (LifecycleAction.CREATE, LifecycleAction.DELETE):
+                job = FakeJob()
+                await _now(LifecycleController(Ctx(), job, action, "h"), app)
+                if action is LifecycleAction.CREATE:
+                    self.assertEqual(
+                        job.commands[-1][1],
+                        ("/usr/bin/docker", "exec", "-d", "c", "/sbin/dhcpcd", "eth0"),
+                    )
+                else:
+                    self.assertEqual(job.commands, [])  # removing the container ends it
 
         asyncio.run(run())
 

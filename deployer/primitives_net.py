@@ -598,3 +598,56 @@ class NetnsLinkPrimitive(CommandPrimitive):
             create_cmds=tuple(create),
             delete_cmds=tuple(delete),
         )
+
+
+@dataclasses.dataclass(frozen=True)
+class LinkMovePrimitive(CommandPrimitive):
+    """An existing link lent by its namespace (`netns`, its owner's) to
+    another one (`to`): CREATE moves it there and sets it up; DELETE moves
+    it back, so its owner finds it again for its own delete. Neither
+    creates nor deletes the link."""
+
+    host: str
+    netns: str
+    name: str
+    to: str
+
+    @property
+    def ref(self) -> str:
+        return f"link:{self.to}|{self.name}"
+
+    def as_primitive(self) -> Primitive:
+        return Primitive(
+            key=self.ref,
+            nodes=(
+                RawNodeTemplate(
+                    id=self.ref,
+                    kind="link",
+                    fields={
+                        "netnsRef": f"netns:{self.to}",
+                        "ifname": self.name,
+                        "ifindex": 0,
+                        "linkKind": "other",
+                        "peerRefs": [],
+                        "adminUp": True,
+                    },
+                ),
+            ),
+            create_cmds=(
+                Command(
+                    f"{self.host}:link {self.name} -> {self.to}",
+                    _prefix(self.netns, ("ip", "link", "set", self.name, "netns", self.to)),
+                ),
+                Command(
+                    f"{self.host}:link {self.name} (up)",
+                    _prefix(self.to, ("ip", "link", "set", self.name, "up")),
+                ),
+            ),
+            delete_cmds=(
+                Command(
+                    f"{self.host}:link {self.name} -> {self.netns}",
+                    _prefix(self.to, ("ip", "link", "set", self.name, "netns", self.netns)),
+                    optional=True,
+                ),
+            ),
+        )

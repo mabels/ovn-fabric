@@ -21,6 +21,7 @@ from .primitives_net import (
     DhclientPrimitive,
     IpRulePrimitive,
     IptablesRule,
+    LinkMovePrimitive,
     NetnsLinkPrimitive,
     RoutePrimitive,
     SysctlFilePrimitive,
@@ -467,6 +468,12 @@ class NetnsPrimitive(CommandPrimitive):
         return IpRulePrimitive(
             host=self.host, netns=self.name, source=source, table=table, family=family
         )
+
+    def move_link(self, name: str, to: NetnsPrimitive) -> LinkMovePrimitive:
+        """Lend this namespace's link `name` to `to` (moved back on delete)."""
+        if self.name is None or to.name is None:
+            raise ValueError("moving a link needs two named namespaces")
+        return LinkMovePrimitive(host=self.host, netns=self.name, name=name, to=to.name)
 
     def set_sysctl(self, key: str, value: str) -> SysctlPrimitive:
         if self.name is None:

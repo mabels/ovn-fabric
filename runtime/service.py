@@ -14,12 +14,12 @@ import dataclasses
 from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from typing import Any
 
-from .message import BodySpec, Msg
-from .peer import Peer
+from .message import BodySpec
+from .peer import Call
 
-# Gets the peer the request came from and the request; returns the body of
-# the final response. An exception becomes an ErrorRes.
-Handler = Callable[[Peer, Msg[Any]], Awaitable[object]]
+# Gets the request as a Call (runtime/peer.py); returns the body of the
+# final response. An exception becomes an ErrorRes.
+Handler = Callable[[Call], Awaitable[object]]
 
 
 @dataclasses.dataclass(frozen=True)

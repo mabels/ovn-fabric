@@ -11,7 +11,7 @@ import sys
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, ClassVar, Protocol
 
 from .context import DEFAULT_ROOT, Ctx
 
@@ -22,25 +22,16 @@ LATEST_LINK = "rawIR.snapshot"
 class LifecycleAction(enum.Enum):
     CREATE = "create"
     DELETE = "delete"
-    # The lazy phase of the same declarations: only the operations queued
-    # with `lazy=True` (image pulls/builds), run once by the lazy-create
-    # unit that CREATE starts, and removed only by an explicit delete.
-    LAZY_CREATE = "lazy-create"
-    LAZY_DELETE = "lazy-delete"
     RUN = "run"
 
     @property
     def creating(self) -> bool:
-        return self in (LifecycleAction.CREATE, LifecycleAction.LAZY_CREATE)
-
-    @property
-    def lazy(self) -> bool:
-        return self in (LifecycleAction.LAZY_CREATE, LifecycleAction.LAZY_DELETE)
+        return self is LifecycleAction.CREATE
 
     @property
     def direction(self) -> LifecycleAction:
         """CREATE or DELETE: what an operation's create/delete/describe
-        sees, whichever phase runs it."""
+        sees."""
         return LifecycleAction.CREATE if self.creating else LifecycleAction.DELETE
 
 
@@ -173,6 +164,9 @@ class Primitive:
     `nodes` are its raw-graph reflection; `probe` is kept for the coming
     object graph and is not run today."""
 
+    # Its kind as a unit step (fabric/units.py; the schema's `kind`).
+    step_kind: ClassVar[str] = "Primitive"
+
     key: str
     nodes: tuple[RawNodeTemplate, ...]
     create_cmds: tuple[Command, ...]
@@ -197,10 +191,16 @@ class Primitive:
         commands = self.create_cmds if action is LifecycleAction.CREATE else self.delete_cmds
         return [_argv_line(command.argv) for command in commands]
 
+    def as_primitive(self) -> Primitive:
+        return self
+
 
 class CommandPrimitive:
     """Base of every typed primitive that renders to one `Primitive`
-    (`as_primitive()`): its create/delete/describe are that Primitive's."""
+    (`as_primitive()`): its create/delete/describe are that Primitive's,
+    and so is its step kind."""
+
+    step_kind: ClassVar[str] = "Primitive"
 
     def as_primitive(self) -> Primitive:
         raise NotImplementedError
@@ -324,6 +324,9 @@ class WriteFileOperation:
     """A file this deployer owns: CREATE writes it (one already there is
     overwritten), DELETE removes it."""
 
+    # Its kind as a unit step (fabric/units.py; the schema's `kind`).
+    step_kind: ClassVar[str] = "WriteFile"
+
     path: str
     content: str
     mode: int | None = None
@@ -347,6 +350,9 @@ SETTLE = 0.5
 @dataclasses.dataclass(frozen=True)
 class SymlinkNetnsOperation:
     """`/var/run/netns/<container>` -> `/proc/<pid>/ns/net`."""
+
+    # Its kind as a unit step (fabric/units.py; the schema's `kind`).
+    step_kind: ClassVar[str] = "SymlinkNetns"
 
     container: str
     pid: Any
@@ -408,6 +414,9 @@ class CaptureOperation:
     An attempt that fails or answers nothing is retried (`retries`); after
     the last one a required capture fails CREATE, an `optional` one
     stores None."""
+
+    # Its kind as a unit step (fabric/units.py; the schema's `kind`).
+    step_kind: ClassVar[str] = "Capture"
 
     name: str
     label: str
@@ -603,15 +612,13 @@ class LifecycleController:
         name: str | None = None,
     ) -> None:
         if action is LifecycleAction.RUN:
-            raise ValueError("a LifecycleController runs CREATE/DELETE or their lazy phase")
+            raise ValueError("a LifecycleController runs CREATE or DELETE")
         self.ctx = ctx
         self.job = job
         self.action = action
         self.graph = RawGraphBuilder(host)
         self.name = name or host
         self.queue: list[Operation] = []
-        # Parallel to `queue`: was the operation queued with `lazy=True`?
-        self.lazy: list[bool] = []
 
     @property
     def dry_run(self) -> bool:
@@ -655,12 +662,9 @@ class LifecycleController:
 
     # -- what generated code calls: declaration only ---------------------
 
-    async def run(self, operation: Operation, *, lazy: bool = False) -> None:
-        """Queue an operation; nothing executes until `execute()`. A
-        `lazy` operation runs only in the lazy phase (LAZY_CREATE /
-        LAZY_DELETE), every other one only in CREATE / DELETE."""
+    async def run(self, operation: Operation) -> None:
+        """Queue an operation; nothing executes until `execute()`."""
         self.queue.append(operation)
-        self.lazy.append(lazy)
 
     def capture(
         self,
@@ -671,7 +675,6 @@ class LifecycleController:
         optional: bool = False,
     ) -> RuntimeRef:
         self.queue.append(CaptureOperation(name, label, tuple(argv), optional))
-        self.lazy.append(False)
         return RuntimeRef(name)
 
     def wait_capture(
@@ -694,7 +697,6 @@ class LifecycleController:
                 result_key,
             )
         )
-        self.lazy.append(False)
         return RuntimeRef(name, result_key)
 
     def result(self, name: str) -> Any:
@@ -705,13 +707,8 @@ class LifecycleController:
     # -- execution -------------------------------------------------------
 
     def _ordered(self) -> list[Operation]:
-        # This phase's operations: forward when creating, rewound when
-        # deleting.
-        operations = [
-            operation
-            for operation, lazy in zip(self.queue, self.lazy, strict=True)
-            if lazy is self.action.lazy
-        ]
+        # Forward when creating, rewound when deleting.
+        operations = list(self.queue)
         if not self.action.creating:
             operations.reverse()
         return operations

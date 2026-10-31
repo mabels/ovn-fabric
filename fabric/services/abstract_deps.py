@@ -23,11 +23,10 @@ timeout, then ready); one with none is ready at once.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping
-from typing import Any
 
 from runtime import generated as rg
-from runtime.message import BodySpec, Msg, ProtocolError, register_bodies
-from runtime.peer import Peer
+from runtime.message import BodySpec, ProtocolError, register_bodies
+from runtime.peer import Call, Peer
 from runtime.service import Service
 
 from .. import generated as g
@@ -82,8 +81,8 @@ class AbstractDeps:
             name="abstract_deps", bodies=BODIES, handlers={"AbstractDepsReq": self.resolve}
         )
 
-    async def resolve(self, peer: Peer, msg: Msg[Any]) -> object:
-        req = msg.body
+    async def resolve(self, call: Call) -> object:
+        req = call.body
         assert isinstance(req, g.AbstractDepsReq)
         names = [spec.name for spec in req.deps]
         if len(set(names)) != len(names):
@@ -97,8 +96,8 @@ class AbstractDeps:
                 announced[spec.name] = g.AbstractDepStatus(
                     name=spec.name, state=g.SystemDepState.failed, deps=[]
                 )
-                await peer.log("warn", f"{spec.name}: unknown abstract dependency")
-                await peer.emit(
+                await call.log("warn", f"{spec.name}: unknown abstract dependency")
+                await call.emit(
                     g.AbstractDep(
                         kind="AbstractDep", name=spec.name, state=g.SystemDepState.failed, deps=[]
                     )
@@ -114,7 +113,7 @@ class AbstractDeps:
                 status = announced[name] = g.AbstractDepStatus(
                     name=name, state=_state(statuses), deps=statuses
                 )
-                await peer.emit(
+                await call.emit(
                     g.AbstractDep(
                         kind="AbstractDep", name=name, state=status.state, deps=status.deps
                     )
@@ -123,16 +122,16 @@ class AbstractDeps:
         await announce_settled()  # the ones without system dependencies
         system = list(dict.fromkeys(dep for deps in wanted.values() for dep in deps))
         if system:
-            await self._system(peer, system, req.timeout, settled, announce_settled)
+            await self._system(call, system, req.timeout, settled, announce_settled)
 
         res = [announced[name] for name in names]
         if all(status.state is g.SystemDepState.ready for status in res):
-            await peer.emit(g.AbstractDepsReady(kind="AbstractDepsReady", names=names))
+            await call.emit(g.AbstractDepsReady(kind="AbstractDepsReady", names=names))
         return g.AbstractDepsRes(kind="AbstractDepsRes", deps=res)
 
     async def _system(
         self,
-        peer: Peer,
+        call: Call,
         deps: list[str],
         timeout: float | None,
         settled: dict[str, g.DepStatus],
@@ -140,11 +139,12 @@ class AbstractDeps:
     ) -> None:
         client = await self._client()
         request = await client.request(
-            g.ResolveSystemDepsReq(kind="ResolveSystemDepsReq", deps=deps, timeout=timeout)
+            g.ResolveSystemDepsReq(kind="ResolveSystemDepsReq", deps=deps, timeout=timeout),
+            parent=call.req_id,
         )
         async for event in request:
             if isinstance(event.body, rg.LogMsg):  # sysdeps' progress, as our own
-                await peer.emit(event.body)
+                await call.emit(event.body)
             elif isinstance(event.body, g.ResolveSystemDep):
                 settled[event.body.dep] = g.DepStatus(
                     dep=event.body.dep, state=event.body.state, message=event.body.message

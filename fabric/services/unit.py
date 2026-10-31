@@ -26,13 +26,12 @@ import logging
 import re
 import shlex
 import socket
-from typing import Any
 
 from deployer.context import Ctx, Options
 from deployer.lifecycle import LifecycleAction, LifecycleController
 from runtime import command
-from runtime.message import BodySpec, Msg, register_bodies
-from runtime.peer import Peer, current_component
+from runtime.message import BodySpec, register_bodies
+from runtime.peer import Call
 from runtime.service import Service
 
 from .. import generated as g
@@ -60,12 +59,17 @@ class UnitFailed(RuntimeError):
 class CommandJob:
     """The JobLike a LifecycleController runs its commands through: the
     runtime's command runner, so every command (and its output) is logged
-    and reported to the requester."""
+    and reported to the request the unit runs for (`call`)."""
+
+    def __init__(self, call: Call) -> None:
+        self.call = call
 
     async def run_cmd(
         self, label: str, cmd: list[str], abort_on_error: bool, /, *, timeout: float | None = None
     ) -> bool:
-        ok, out = await command.run(cmd, log=log, level="debug", timeout=timeout)
+        ok, out = await command.run(
+            cmd, log=log, level="debug", timeout=timeout, report=self.call.report
+        )
         if not ok:
             tail = "\n".join(out.strip().splitlines()[-3:])
             message = f"{label}: {shlex.join(cmd)} failed: {tail}".rstrip(": ")
@@ -82,10 +86,16 @@ class CommandJob:
 
         def on_err(line: str) -> None:
             stderr.append(line)
-            command.report("debug", line)
+            self.call.report("debug", line)
 
         ok, out = await command.run(
-            cmd, log=log, on_line=stdout.append, on_err=on_err, level="debug", timeout=timeout
+            cmd,
+            log=log,
+            on_line=stdout.append,
+            on_err=on_err,
+            level="debug",
+            timeout=timeout,
+            report=self.call.report,
         )
         if not ok:
             if abort_on_error:
@@ -101,11 +111,11 @@ class CommandJob:
     def info(self, message: str, /) -> None:
         # The controller's per-operation lines: details of the unit — debug.
         log.debug("%s", message)
-        command.report("debug", message)
+        self.call.report("debug", message)
 
     def warn(self, message: str, /) -> None:
         log.warning("%s", message)
-        command.report("warn", message)
+        self.call.report("warn", message)
 
 
 class UnitExecutor:
@@ -115,8 +125,8 @@ class UnitExecutor:
     def service(self) -> Service:
         return Service(name="unit", bodies=BODIES, handlers={"UnitExecReq": self.execute})
 
-    async def execute(self, peer: Peer, msg: Msg[Any]) -> object:
-        req = msg.body
+    async def execute(self, call: Call) -> object:
+        req = call.body
         assert isinstance(req, g.UnitExecReq)
         unit = req.unit
         options = Options(dry_run=bool(req.dryRun))
@@ -125,32 +135,32 @@ class UnitExecutor:
         ctx = Ctx(options)
         for value in req.inputs or []:
             ctx.store[value.name] = json.loads(value.json)
+        # The unit is the sender of everything it logs and runs, as one token
+        # ("NIC_management-v2_on_br-d0868885") — greppable, and a client can
+        # pick its level: --log NIC_management-v2_on_br-d0868885=debug.
+        call = call.with_component(component_name(unit.name))
         lc = LifecycleController(
             ctx,
-            CommandJob(),
+            CommandJob(call),
             LifecycleAction(req.action.value),
             req.host or self.host,
             name=unit.name,
         )
         for step in unit.steps:
             await lc.run(to_operation(step, lc.graph.host))
-        # The unit is the sender of everything it logs and runs from here,
-        # as one token ("NIC_management-v2_on_br-d0868885") — greppable, and
-        # a client can pick its level: --log NIC_management-v2_on_br-d0868885=debug.
-        current_component.set(component_name(unit.name))
-        await peer.log("info", f"{req.action.value} ({len(unit.steps)} steps)")
+        await call.log("info", f"{req.action.value} ({len(unit.steps)} steps)")
 
         state, message = g.IrApplyOutcome.done, None
         if req.dryRun:
             for line in lc.plan_lines():
-                await peer.log("info", line)
+                await call.log("info", line)
         else:
             try:
                 await lc.execute()  # create forward (strict), delete rewound (best effort)
             except Exception as exc:  # noqa: BLE001 — a failed unit is an answer, not an error
                 state, message = g.IrApplyOutcome.failed, str(exc)
                 log.warning("%s: %s", unit.name, message)
-                await peer.log("warn", message)
+                await call.log("warn", message)
         return g.UnitExecRes(
             kind="UnitExecRes",
             unit=unit.name,

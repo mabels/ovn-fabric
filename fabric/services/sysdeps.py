@@ -37,21 +37,19 @@ later request finds the package installed.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import dataclasses
 import logging
 import os
 import re
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
-from typing import Any, Protocol
+from collections.abc import Awaitable, Callable, Sequence
+from typing import Protocol
 
 from runtime import command
-from runtime import generated as rg
-from runtime.message import BodySpec, Msg, ProtocolError, register_bodies
-from runtime.peer import Peer
+from runtime.command import Report
+from runtime.message import BodySpec, ProtocolError, register_bodies
+from runtime.peer import Call
 from runtime.service import Service
-from runtime.transport import Closed
 
 from .. import generated as g
 
@@ -76,16 +74,21 @@ RETRIES = 6
 
 
 class Apt(Protocol):
-    """What the resolver needs from the package manager."""
+    """What the resolver needs from the package manager. `report`: where
+    the commands and their output go (the waiting requests)."""
 
-    async def version(self, package: str) -> str | None:
+    async def version(self, package: str, *, report: Report = command.nowhere) -> str | None:
         """The installed version, or None when it is not installed."""
 
-    async def update(self) -> tuple[bool, str]: ...
+    async def update(self, *, report: Report = command.nowhere) -> tuple[bool, str]: ...
 
-    async def install(self, packages: Sequence[str]) -> tuple[bool, str]: ...
+    async def install(
+        self, packages: Sequence[str], *, report: Report = command.nowhere
+    ) -> tuple[bool, str]: ...
 
-    async def upgrade(self, packages: Sequence[str]) -> tuple[bool, str]: ...
+    async def upgrade(
+        self, packages: Sequence[str], *, report: Report = command.nowhere
+    ) -> tuple[bool, str]: ...
 
 
 class SystemApt:
@@ -107,27 +110,29 @@ class SystemApt:
         "DPkg::Lock::Timeout=600",
     )
 
-    async def version(self, package: str) -> str | None:
-        ok, out = await self._run(["dpkg-query", "-W", "-f=${Status} ${Version}", package])
+    async def version(self, package: str, *, report: Report = command.nowhere) -> str | None:
+        ok, out = await self._run(["dpkg-query", "-W", "-f=${Status} ${Version}", package], report)
         if not ok or not out.startswith("install ok installed"):
             return None
         return out.rsplit(" ", 1)[-1].strip()
 
-    async def update(self) -> tuple[bool, str]:
-        return await self._run(["apt-get", *self._OPTIONS, "update"])
+    async def update(self, *, report: Report = command.nowhere) -> tuple[bool, str]:
+        return await self._run(["apt-get", *self._OPTIONS, "update"], report)
 
-    async def install(self, packages: Sequence[str]) -> tuple[bool, str]:
-        return await self._run(["apt-get", *self._OPTIONS, "install", "-y", *packages])
+    async def install(
+        self, packages: Sequence[str], *, report: Report = command.nowhere
+    ) -> tuple[bool, str]:
+        return await self._run(["apt-get", *self._OPTIONS, "install", "-y", *packages], report)
 
-    async def upgrade(self, packages: Sequence[str]) -> tuple[bool, str]:
+    async def upgrade(
+        self, packages: Sequence[str], *, report: Report = command.nowhere
+    ) -> tuple[bool, str]:
         return await self._run(
-            ["apt-get", *self._OPTIONS, "install", "--only-upgrade", "-y", *packages]
+            ["apt-get", *self._OPTIONS, "install", "--only-upgrade", "-y", *packages], report
         )
 
-    async def _run(self, argv: list[str]) -> tuple[bool, str]:
-        # The command and its output are reported to whoever waits (see
-        # SystemDeps._reporting).
-        return await command.run(argv, log=log, env=self._ENV)
+    async def _run(self, argv: list[str], report: Report) -> tuple[bool, str]:
+        return await command.run(argv, log=log, env=self._ENV, report=report)
 
 
 # apt errors no retry can fix (unlike a held lock or a network failure).
@@ -171,8 +176,8 @@ class SystemDeps:
         # Every dependency queued or being installed → its coming status.
         self._pending: dict[str, asyncio.Future[g.DepStatus]] = {}
         # Every dependency queued or being installed → the requests waiting
-        # on it (peer, reqId): they get the apt output of its job.
-        self._watchers: dict[str, list[tuple[Peer, str]]] = {}
+        # on it: they get the apt output of its job.
+        self._watchers: dict[str, list[Call]] = {}
         # Every dependency made ready: what the regular refresh upgrades.
         self._known: set[str] = set()
         # Set once something is known: before that there is nothing to refresh.
@@ -189,8 +194,8 @@ class SystemDeps:
 
     # -- the request ---------------------------------------------------------
 
-    async def resolve(self, peer: Peer, msg: Msg[Any]) -> object:
-        req = msg.body
+    async def resolve(self, call: Call) -> object:
+        req = call.body
         assert isinstance(req, g.ResolveSystemDepsReq)
         deps = list(dict.fromkeys(req.deps))  # deduplicated, in request order
         bad = [dep for dep in deps if not _PACKAGE.match(dep)]
@@ -202,34 +207,33 @@ class SystemDeps:
         missing: list[str] = []
         for dep in deps:
             if dep not in self._pending:
-                version = await self._apt.version(dep)
+                version = await self._apt.version(dep, report=call.report)
                 if version is not None:
                     settled[dep] = self._ready(dep, version)
-                    await self._emit(peer, settled[dep])
+                    await self._emit(call, settled[dep])
                     continue
             future = self._pending.get(dep)  # it may have been queued meanwhile
             if future is None:
                 future = self._pending[dep] = asyncio.get_running_loop().create_future()
                 missing.append(dep)
             waiting[dep] = future
-            assert msg.req_id is not None
-            self._watchers.setdefault(dep, []).append((peer, msg.req_id))
+            self._watchers.setdefault(dep, []).append(call)
         if missing:
-            await peer.log("info", f"queued for install: {' '.join(missing)}")
+            await call.log("info", f"queued for install: {' '.join(missing)}")
             self._queue.put_nowait(_Install(missing))
 
         try:
-            return await self._wait(peer, req, deps, settled, waiting)
+            return await self._wait(call, req, deps, settled, waiting)
         finally:  # done (or timed out): no more apt output for this request
             for dep in deps:
                 watchers = self._watchers.get(dep, [])
-                watchers[:] = [w for w in watchers if w != (peer, msg.req_id)]
+                watchers[:] = [w for w in watchers if w is not call]
                 if not watchers:
                     self._watchers.pop(dep, None)
 
     async def _wait(
         self,
-        peer: Peer,
+        call: Call,
         req: g.ResolveSystemDepsReq,
         deps: list[str],
         settled: dict[str, g.DepStatus],
@@ -247,14 +251,14 @@ class SystemDeps:
                 if future in done:
                     settled[dep] = future.result()
                     del waiting[dep]
-                    await self._emit(peer, settled[dep])
+                    await self._emit(call, settled[dep])
         for dep in waiting:
             settled[dep] = g.DepStatus(
                 dep=dep,
                 state=g.SystemDepState.timeout,
                 message=f"not settled within {req.timeout:g}s; the install continues",
             )
-            await self._emit(peer, settled[dep])
+            await self._emit(call, settled[dep])
         return g.ResolveSystemDepsRes(
             kind="ResolveSystemDepsRes", deps=[settled[dep] for dep in deps]
         )
@@ -264,8 +268,8 @@ class SystemDeps:
         self._something_known.set()
         return g.DepStatus(dep=dep, state=g.SystemDepState.ready, message=version)
 
-    async def _emit(self, peer: Peer, status: g.DepStatus) -> None:
-        await peer.emit(
+    async def _emit(self, call: Call, status: g.DepStatus) -> None:
+        await call.emit(
             g.ResolveSystemDep(
                 kind="ResolveSystemDep", dep=status.dep, state=status.state, message=status.message
             )
@@ -316,76 +320,59 @@ class SystemDeps:
                     job.done.set()
 
     async def _install(self, deps: list[str]) -> None:
-        async with self._reporting(deps):
-            if time.time() - self._last_update > UPDATE_EVERY:
-                await self._update()
-            ok, out = await self._retry("apt-get install", lambda: self._apt.install(deps))
-            outputs = {dep: (ok, out) for dep in deps}
-            if not ok and len(deps) > 1:
-                # apt refuses the whole transaction for one bad package: try
-                # each on its own, so one only fails itself.
-                log.warning("installing %s together failed; one by one", " ".join(deps))
-                for dep in deps:
-                    outputs[dep] = await self._retry(
-                        f"apt-get install {dep}",
-                        lambda dep=dep: self._apt.install([dep]),  # type: ignore[misc]
-                    )
-            # The check after the install is reported to the waiting requests
-            # too; their statuses only go out after it (below).
-            results: list[g.DepStatus] = []
+        report = self._report_to(deps)
+        if time.time() - self._last_update > UPDATE_EVERY:
+            await self._update(report)
+        ok, out = await self._retry(
+            "apt-get install", lambda: self._apt.install(deps, report=report)
+        )
+        outputs = {dep: (ok, out) for dep in deps}
+        if not ok and len(deps) > 1:
+            # apt refuses the whole transaction for one bad package: try
+            # each on its own, so one only fails itself.
+            log.warning("installing %s together failed; one by one", " ".join(deps))
             for dep in deps:
-                version = await self._apt.version(dep)
-                if version is not None:
-                    results.append(self._ready(dep, version))
-                    log.info("%s installed (%s)", dep, version)
-                else:
-                    dep_ok, dep_out = outputs[dep]
-                    message = (
-                        _tail(dep_out)
-                        if not dep_ok
-                        else "apt-get succeeded but it is not installed"
-                    )
-                    results.append(
-                        g.DepStatus(dep=dep, state=g.SystemDepState.failed, message=message)
-                    )
-                    log.warning("%s not installed: %s", dep, message)
+                outputs[dep] = await self._retry(
+                    f"apt-get install {dep}",
+                    lambda dep=dep: self._apt.install([dep], report=report),  # type: ignore[misc]
+                )
+        # The check after the install is reported to the waiting requests
+        # too; their statuses only go out after it (below).
+        results: list[g.DepStatus] = []
+        for dep in deps:
+            version = await self._apt.version(dep, report=report)
+            if version is not None:
+                results.append(self._ready(dep, version))
+                log.info("%s installed (%s)", dep, version)
+            else:
+                dep_ok, dep_out = outputs[dep]
+                message = (
+                    _tail(dep_out) if not dep_ok else "apt-get succeeded but it is not installed"
+                )
+                results.append(g.DepStatus(dep=dep, state=g.SystemDepState.failed, message=message))
+                log.warning("%s not installed: %s", dep, message)
         for status in results:
             self._finish(status.dep, status)
 
     async def _refresh(self) -> None:
         known = sorted(self._known)
-        if not known or not await self._update():
+        if not known or not await self._update(command.nowhere):  # no one waits on it
             return
         await self._retry("apt-get --only-upgrade", lambda: self._apt.upgrade(known))
 
-    @contextlib.asynccontextmanager
-    async def _reporting(self, deps: list[str]) -> AsyncIterator[None]:
-        """Report the commands of a job for `deps` (and their output): each
-        line goes, in order, as a LogMsg to every request waiting on one of
-        them — the worker runs outside any request, so it fans out itself."""
-        lines: asyncio.Queue[tuple[str, str] | None] = asyncio.Queue()
+    def _report_to(self, deps: list[str]) -> Report:
+        """A Report for a job for `deps`: each line goes, in order, to every
+        request waiting on one of them — the worker runs outside any
+        request, so it fans out itself."""
 
-        async def forward() -> None:
-            while (item := await lines.get()) is not None:
-                level, line = item
-                body = rg.LogMsg(
-                    kind="LogMsg", level=rg.LogLevel(level), message=line, component="sysdeps"
-                )
-                targets = {w for dep in deps for w in self._watchers.get(dep, [])}
-                for peer, req_id in targets:
-                    with contextlib.suppress(Closed):
-                        await peer.send(body, req_id=req_id)
+        def report(level: str, line: str) -> None:
+            for call in {call for dep in deps for call in self._watchers.get(dep, [])}:
+                call.report(level, line)
 
-        task = asyncio.get_running_loop().create_task(forward())
-        try:
-            with command.reporting(lambda level, line: lines.put_nowait((level, line))):
-                yield
-        finally:
-            lines.put_nowait(None)
-            await task
+        return report
 
-    async def _update(self) -> bool:
-        ok, _ = await self._retry("apt-get update", self._apt.update)
+    async def _update(self, report: Report) -> bool:
+        ok, _ = await self._retry("apt-get update", lambda: self._apt.update(report=report))
         if ok:
             self._last_update = time.time()
             try:

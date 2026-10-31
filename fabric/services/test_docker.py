@@ -7,7 +7,7 @@ from collections.abc import AsyncIterator, Sequence
 from typing import Any
 
 from runtime import generated as rg
-from runtime.command import report
+from runtime.command import Report
 from runtime.peer import Peer, RemoteError
 from runtime.runtime import Runtime
 from runtime.transport import connect
@@ -29,20 +29,20 @@ class FakeDocker:
         self.calls: list[tuple[str, ...]] = []
         self.gate: asyncio.Event | None = None
 
-    async def info(self) -> tuple[bool, str]:
+    async def info(self, report: Report) -> tuple[bool, str]:
         self.calls.append(("info",))
         return (True, "26.1.5") if self.daemon_up else (False, "Cannot connect to the daemon")
 
-    async def present(self, image: str) -> bool:
+    async def present(self, image: str, report: Report) -> bool:
         return image in self.images
 
-    async def pull(self, image: str) -> tuple[bool, str]:
-        return await self._make("pull", image)
+    async def pull(self, image: str, report: Report) -> tuple[bool, str]:
+        return await self._make("pull", image, report)
 
-    async def build(self, image: str, dockerfile: str) -> tuple[bool, str]:
-        return await self._make("build", image)
+    async def build(self, image: str, dockerfile: str, report: Report) -> tuple[bool, str]:
+        return await self._make("build", image, report)
 
-    async def _make(self, verb: str, image: str) -> tuple[bool, str]:
+    async def _make(self, verb: str, image: str, report: Report) -> tuple[bool, str]:
         self.calls.append((verb, image))
         if self.gate is not None:
             await self.gate.wait()

@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any
-
 from runtime import PROTOCOL, __version__
-from runtime.message import BodySpec, Msg, register_bodies
-from runtime.peer import Peer
+from runtime.message import BodySpec, register_bodies
+from runtime.peer import Call
 from runtime.service import Service
 
 from .. import generated as g
@@ -18,8 +16,8 @@ BODIES = {
 register_bodies(BODIES)  # clients decode these too
 
 
-async def version(peer: Peer, msg: Msg[Any]) -> object:
-    await peer.log("info", f"version requested by {msg.header.source}")
+async def version(call: Call) -> object:
+    await call.log("info", f"version requested by {call.msg.header.source}")
     return g.VersionRes(kind="VersionRes", runtime=__version__, protocol=PROTOCOL)
 
 

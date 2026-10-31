@@ -11,7 +11,7 @@ import dataclasses
 import os
 import shutil
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 from .lifecycle import LifecycleAction, RawNodeTemplate
 
@@ -30,6 +30,9 @@ class DirectoryPrimitive:
 
     Owned (`owned=True`, an app's state/volume directory): DELETE removes it
     with its whole content."""
+
+    # Its kind as a unit step (fabric/units.py; the schema's `kind`).
+    step_kind: ClassVar[str] = "Directory"
 
     host: str
     path: str
@@ -64,6 +67,9 @@ class DirectoryPrimitive:
 class ChmodPrimitive:
     """The mode of a file (octal, e.g. "600"); DELETE leaves it."""
 
+    # Its kind as a unit step (fabric/units.py; the schema's `kind`).
+    step_kind: ClassVar[str] = "Chmod"
+
     host: str
     path: str
     mode: str
@@ -94,6 +100,9 @@ class ChmodPrimitive:
 class RemovePathPrimitive:
     """A path that only goes away: CREATE does nothing, DELETE removes it
     (a whole tree with `recursive`). Gone already is fine."""
+
+    # Its kind as a unit step (fabric/units.py; the schema's `kind`).
+    step_kind: ClassVar[str] = "RemovePath"
 
     host: str
     path: str

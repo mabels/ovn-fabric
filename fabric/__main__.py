@@ -26,12 +26,13 @@ import logging
 import signal
 import sys
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from runtime import generated as rg
 from runtime import logconfig
-from runtime.message import ProtocolError, hydrate_part, plain
+from runtime.message import Msg, ProtocolError, hydrate_part, plain
 from runtime.peer import Peer
 from runtime.runtime import Runtime
 from runtime.transport import Closed, connect, dump_wire, wire_log
@@ -96,6 +97,81 @@ def _show(level: int, component: str, message: str, *, force: bool = False) -> N
         remote_log.handle(record)
 
 
+# -- how the CLI shows what a request emits: one entry per message kind --------
+# `hidden` holds the lines of the running unit of work that were not shown
+# (its debug): shown should it fail.
+
+Hidden = list[tuple[int, str, str]]
+
+
+def _show_log(msg: Msg[Any], hidden: Hidden) -> None:
+    event: rg.LogMsg = msg.body
+    component = event.component or msg.header.source
+    level = logconfig.LEVELS[event.level.value]
+    if level < _threshold(component):
+        hidden.append((level, component, event.message))
+    _show(level, component, event.message)
+
+
+def _show_container(msg: Msg[Any], hidden: Hidden) -> None:
+    event: g.DockerContainer = msg.body
+    code = f" (exit {event.exitCode})" if event.exitCode is not None else ""
+    note = f" — {event.message}" if event.message else ""
+    failed = event.state is g.ContainerState.failed
+    _show(WARNING if failed else INFO, "cli", f"{event.name}: {event.state.value}{code}{note}")
+
+
+def _show_abstract_dep(msg: Msg[Any], hidden: Hidden) -> None:
+    event: g.AbstractDep = msg.body
+    packages = ", ".join(f"{s.dep} {s.state.value}" for s in event.deps)
+    ready = event.state is g.SystemDepState.ready
+    _show(INFO if ready else WARNING, "cli", f"{event.name}: {event.state.value} ({packages})")
+
+
+def _show_deps_ready(msg: Msg[Any], hidden: Hidden) -> None:
+    event: g.AbstractDepsReady = msg.body
+    _show(INFO, "cli", f"all ready: {' '.join(event.names)}")
+
+
+def _show_apply_progress(msg: Msg[Any], hidden: Hidden) -> None:
+    event: g.IrApplyProgress = msg.body
+    unit = event.unit
+    if unit.state is g.ApplyState.running:
+        hidden.clear()  # a new unit
+    note = f" — {unit.message}" if unit.message else ""
+    level = INFO if unit.state in (g.ApplyState.running, g.ApplyState.done) else WARNING
+    _show(level, "cli", f"{unit.name}: {unit.state.value}{note}")
+    if unit.state is g.ApplyState.failed and hidden:
+        _show(WARNING, "cli", f"--- what the failed unit {unit.name} did ---")
+        for line_level, component, line in hidden:
+            _show(line_level, component, line, force=True)
+        _show(WARNING, "cli", "---")
+        hidden.clear()
+
+
+def _show_docker_ready(msg: Msg[Any], hidden: Hidden) -> None:
+    _show(INFO, "cli", "docker ready")
+
+
+def _show_system_dep(msg: Msg[Any], hidden: Hidden) -> None:
+    event: g.ResolveSystemDep = msg.body
+    note = f" — {event.message}" if event.message else ""
+    ready = event.state is g.SystemDepState.ready
+    _show(INFO if ready else WARNING, "cli", f"{event.dep}: {event.state.value}{note}")
+
+
+# A kind not listed (a response, an event nobody shows) is not printed.
+_SHOW: dict[str, Callable[[Msg[Any], Hidden], None]] = {
+    "LogMsg": _show_log,
+    "DockerContainer": _show_container,
+    "AbstractDep": _show_abstract_dep,
+    "AbstractDepsReady": _show_deps_ready,
+    "IrApplyProgress": _show_apply_progress,
+    "DockerReady": _show_docker_ready,
+    "ResolveSystemDep": _show_system_dep,
+}
+
+
 async def _ask(address: str, body: object) -> object | None:
     """Send one request; show everything carrying its reqId as it comes;
     return the final response's body (None when it never arrived)."""
@@ -110,55 +186,13 @@ async def _ask(address: str, body: object) -> object | None:
     reader = asyncio.create_task(peer.run())
     # The lines of the unit of work running now that were not shown (its
     # debug): shown should it fail.
-    hidden: list[tuple[int, str, str]] = []
+    hidden: Hidden = []
     try:
         request = await peer.request(body)
         async for msg in request:
-            event = msg.body
-            if isinstance(event, rg.LogMsg):
-                component = event.component or msg.header.source
-                level = logconfig.LEVELS[event.level.value]
-                if level < _threshold(component):
-                    hidden.append((level, component, event.message))
-                _show(level, component, event.message)
-            elif isinstance(event, g.DockerContainer):
-                code = f" (exit {event.exitCode})" if event.exitCode is not None else ""
-                note = f" — {event.message}" if event.message else ""
-                failed = event.state is g.ContainerState.failed
-                _show(
-                    WARNING if failed else INFO,
-                    "cli",
-                    f"{event.name}: {event.state.value}{code}{note}",
-                )
-            elif isinstance(event, g.AbstractDep):
-                packages = ", ".join(f"{s.dep} {s.state.value}" for s in event.deps)
-                ready = event.state is g.SystemDepState.ready
-                _show(
-                    INFO if ready else WARNING,
-                    "cli",
-                    f"{event.name}: {event.state.value} ({packages})",
-                )
-            elif isinstance(event, g.AbstractDepsReady):
-                _show(INFO, "cli", f"all ready: {' '.join(event.names)}")
-            elif isinstance(event, g.IrApplyProgress):
-                unit = event.unit
-                if unit.state is g.ApplyState.running:
-                    hidden.clear()  # a new unit
-                note = f" — {unit.message}" if unit.message else ""
-                level = INFO if unit.state in (g.ApplyState.running, g.ApplyState.done) else WARNING
-                _show(level, "cli", f"{unit.name}: {unit.state.value}{note}")
-                if unit.state is g.ApplyState.failed and hidden:
-                    _show(WARNING, "cli", f"--- what the failed unit {unit.name} did ---")
-                    for line_level, component, line in hidden:
-                        _show(line_level, component, line, force=True)
-                    _show(WARNING, "cli", "---")
-                    hidden.clear()
-            elif isinstance(event, g.DockerReady):
-                _show(INFO, "cli", "docker ready")
-            elif isinstance(event, g.ResolveSystemDep):
-                note = f" — {event.message}" if event.message else ""
-                ready = event.state is g.SystemDepState.ready
-                _show(INFO if ready else WARNING, "cli", f"{event.dep}: {event.state.value}{note}")
+            show = _SHOW.get(msg.kind)
+            if show is not None:
+                show(msg, hidden)
         final: object = request.result.body
         if isinstance(final, rg.ErrorRes):
             _show(ERROR, "cli", f"{final.code}: {final.message}")

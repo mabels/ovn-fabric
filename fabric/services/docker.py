@@ -26,12 +26,13 @@ import re
 import tempfile
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Protocol
 
 from runtime import command
 from runtime import generated as rg
-from runtime.message import BodySpec, Msg, ProtocolError, register_bodies
-from runtime.peer import Peer
+from runtime.command import Report
+from runtime.message import BodySpec, ProtocolError, register_bodies
+from runtime.peer import Call, Peer
 from runtime.service import Service
 
 from .. import generated as g
@@ -57,37 +58,41 @@ _IMAGE = re.compile(r"^[a-z0-9][A-Za-z0-9._/:@-]*$")
 class DockerCli(Protocol):
     """What the pipeline needs from docker."""
 
-    async def info(self) -> tuple[bool, str]: ...
+    # `report`: where the commands and their output go (the request's).
 
-    async def present(self, image: str) -> bool: ...
+    async def info(self, report: Report) -> tuple[bool, str]: ...
 
-    async def pull(self, image: str) -> tuple[bool, str]: ...
+    async def present(self, image: str, report: Report) -> bool: ...
 
-    async def build(self, image: str, dockerfile: str) -> tuple[bool, str]: ...
+    async def pull(self, image: str, report: Report) -> tuple[bool, str]: ...
+
+    async def build(self, image: str, dockerfile: str, report: Report) -> tuple[bool, str]: ...
 
 
 class SystemDocker:
     """The host's docker CLI."""
 
-    async def info(self) -> tuple[bool, str]:
-        return await command.run(["docker", "info", "--format", "{{.ServerVersion}}"], log=log)
+    async def info(self, report: Report) -> tuple[bool, str]:
+        return await command.run(
+            ["docker", "info", "--format", "{{.ServerVersion}}"], log=log, report=report
+        )
 
-    async def present(self, image: str) -> bool:
+    async def present(self, image: str, report: Report) -> bool:
         ok, _ = await command.run(
-            ["docker", "image", "inspect", "--format", "{{.Id}}", image], log=log
+            ["docker", "image", "inspect", "--format", "{{.Id}}", image], log=log, report=report
         )
         return ok
 
-    # Their commands and output reach the requester through the runtime's
-    # reporter (runtime/command.py).
-    async def pull(self, image: str) -> tuple[bool, str]:
-        return await command.run(["docker", "pull", image], log=log)
+    async def pull(self, image: str, report: Report) -> tuple[bool, str]:
+        return await command.run(["docker", "pull", image], log=log, report=report)
 
-    async def build(self, image: str, dockerfile: str) -> tuple[bool, str]:
+    async def build(self, image: str, dockerfile: str, report: Report) -> tuple[bool, str]:
         with tempfile.TemporaryDirectory(prefix="rt-build-") as context:
             Path(context, "Dockerfile").write_text(dockerfile)
             return await command.run(
-                ["docker", "build", "--progress=plain", "-t", image, context], log=log
+                ["docker", "build", "--progress=plain", "-t", image, context],
+                log=log,
+                report=report,
             )
 
 
@@ -113,44 +118,45 @@ class Docker:
     def service(self) -> Service:
         return Service(name="docker", bodies=BODIES, handlers={"DockerPrepareReq": self.prepare})
 
-    async def prepare(self, peer: Peer, msg: Msg[Any]) -> object:
-        req = msg.body
+    async def prepare(self, call: Call) -> object:
+        req = call.body
         assert isinstance(req, g.DockerPrepareReq)
         bad = [spec.image for spec in req.images if not _IMAGE.match(spec.image)]
         if bad:
             raise ProtocolError("bad-request", f"not an image reference: {', '.join(bad)}")
 
-        problem = await self._docker_ready(peer)
+        problem = await self._docker_ready(call)
         if problem is not None:
             return g.DockerPrepareRes(
                 kind="DockerPrepareRes",
                 images=[self._failed(spec.image, problem) for spec in req.images],
             )
-        statuses = [await self._image(peer, spec) for spec in req.images]
+        statuses = [await self._image(call, spec) for spec in req.images]
         if all(status.state is g.ImageState.ready for status in statuses):
-            await peer.emit(g.DockerReady(kind="DockerReady", images=statuses))
+            await call.emit(g.DockerReady(kind="DockerReady", images=statuses))
         return g.DockerPrepareRes(kind="DockerPrepareRes", images=statuses)
 
     # -- 1 + 2: docker itself ------------------------------------------------
 
-    async def _docker_ready(self, peer: Peer) -> str | None:
+    async def _docker_ready(self, call: Call) -> str | None:
         """None when docker is usable, else why not."""
-        await peer.log("info", f"resolving docker's dependencies: {' '.join(self._deps)}")
+        await call.log("info", f"resolving docker's dependencies: {' '.join(self._deps)}")
         client = await self._client()
         request = await client.request(
             g.AbstractDepsReq(
                 kind="AbstractDepsReq", deps=[g.AbstractDepSpec(name=dep) for dep in self._deps]
-            )
+            ),
+            parent=call.req_id,
         )
         async for event in request:  # relay their progress as our own
             if isinstance(event.body, rg.LogMsg):
-                await peer.emit(event.body)
+                await call.emit(event.body)
             elif isinstance(event.body, g.AbstractDep):
                 packages = ", ".join(
                     f"{d.dep} {d.state.value}" + (f" {d.message}" if d.message else "")
                     for d in event.body.deps
                 )
-                await peer.log("info", f"{event.body.name}: {event.body.state.value} ({packages})")
+                await call.log("info", f"{event.body.name}: {event.body.state.value} ({packages})")
         res = request.result.body
         if isinstance(res, rg.ErrorRes):
             return f"abstract deps: {res.code}: {res.message}"
@@ -165,9 +171,9 @@ class Docker:
 
         deadline = asyncio.get_running_loop().time() + self._daemon_wait
         while True:
-            ok, out = await self._docker.info()
+            ok, out = await self._docker.info(call.report)
             if ok:
-                await peer.log("info", f"docker daemon {out.strip()} is ready")
+                await call.log("info", f"docker daemon {out.strip()} is ready")
                 return None
             if asyncio.get_running_loop().time() >= deadline:
                 return f"the docker daemon does not answer: {_tail(out)}"
@@ -175,21 +181,21 @@ class Docker:
 
     # -- 3: one image --------------------------------------------------------
 
-    async def _image(self, peer: Peer, spec: g.ImageSpec) -> g.ImageStatus:
+    async def _image(self, call: Call, spec: g.ImageSpec) -> g.ImageStatus:
         async with self._locks.setdefault(spec.image, asyncio.Lock()):
-            if await self._docker.present(spec.image):
-                await peer.log("info", f"{spec.image}: present")
+            if await self._docker.present(spec.image, call.report):
+                await call.log("info", f"{spec.image}: present")
                 return g.ImageStatus(image=spec.image, state=g.ImageState.ready, message="present")
             verb = "pull" if spec.dockerfile is None else "build"
-            await peer.log("info", f"{spec.image}: {verb}")
+            await call.log("info", f"{spec.image}: {verb}")
             if spec.dockerfile is None:
-                ok, out = await self._docker.pull(spec.image)
+                ok, out = await self._docker.pull(spec.image, call.report)
             else:
-                ok, out = await self._docker.build(spec.image, spec.dockerfile)
+                ok, out = await self._docker.build(spec.image, spec.dockerfile, call.report)
             if not ok:
                 log.warning("%s: %s failed: %s", spec.image, verb, _tail(out))
                 return self._failed(spec.image, f"{verb} failed: {_tail(out)}")
-            await peer.log("info", f"{spec.image}: {verb} done")
+            await call.log("info", f"{spec.image}: {verb} done")
             return g.ImageStatus(image=spec.image, state=g.ImageState.ready, message=verb)
 
     @staticmethod

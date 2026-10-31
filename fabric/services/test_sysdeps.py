@@ -9,8 +9,9 @@ from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
 from typing import Any
 
+from runtime import command
 from runtime import generated as rg
-from runtime.command import report
+from runtime.command import Report
 from runtime.peer import Peer, RemoteError
 from runtime.runtime import Runtime
 from runtime.transport import connect
@@ -31,10 +32,10 @@ class FakeApt:
         self.transient = 0  # fail the next N installs with a transient error
         self._active = 0
 
-    async def version(self, package: str) -> str | None:
+    async def version(self, package: str, *, report: Report = command.nowhere) -> str | None:
         return self.installed.get(package)
 
-    async def update(self) -> tuple[bool, str]:
+    async def update(self, *, report: Report = command.nowhere) -> tuple[bool, str]:
         self.calls.append(("update",))
         report("info", "$ apt-get update")
         if self.update_fails:
@@ -42,7 +43,9 @@ class FakeApt:
             return False, "E: temporary failure resolving"
         return True, ""
 
-    async def install(self, packages: Sequence[str]) -> tuple[bool, str]:
+    async def install(
+        self, packages: Sequence[str], *, report: Report = command.nowhere
+    ) -> tuple[bool, str]:
         self.calls.append(("install", *packages))
         report("info", f"$ apt-get install -y {' '.join(packages)}")  # as command.run does
         for package in packages:
@@ -65,7 +68,9 @@ class FakeApt:
         finally:
             self._active -= 1
 
-    async def upgrade(self, packages: Sequence[str]) -> tuple[bool, str]:
+    async def upgrade(
+        self, packages: Sequence[str], *, report: Report = command.nowhere
+    ) -> tuple[bool, str]:
         self.calls.append(("upgrade", *packages))
         return True, ""
 

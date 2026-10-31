@@ -56,7 +56,6 @@ async def _now(lc: LifecycleController, operation: Operation) -> None:
     await lc.run(operation)
     await lc.execute()
     lc.queue.clear()
-    lc.lazy.clear()
 
 
 class OvnnPrimitiveTest(unittest.TestCase):

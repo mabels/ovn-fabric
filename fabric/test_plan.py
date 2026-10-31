@@ -107,14 +107,13 @@ def _plan(declare: Callable[[Emitter], None]) -> list[g.Unit]:
 class UnitBoundaryTest(unittest.TestCase):
     """The units are what the declarations open — and nothing is guessed."""
 
-    def test_operations_belong_to_the_unit_they_are_declared_in(self) -> None:
+    def test_operations_belong_to_the_unit_they_are_declared_on(self) -> None:
         def declare(emit: Emitter) -> None:
-            with emit.unit("bridge", "br-a"):
-                emit.ovn(HOST.ovs_bridge("br-a"))
-                with emit.unit("interface", "eth0"):
-                    emit.ovn(HOST.ovs_port("br-a", "eth0"))
-            with emit.unit("nothing", "to do"):
-                pass
+            bridge = emit.unit("bridge", "br-a")
+            bridge.ovn(HOST.ovs_bridge("br-a"))
+            port = bridge.unit("interface", "eth0")  # opened from a unit: the next one
+            port.ovn(HOST.ovs_port("br-a", "eth0"))
+            emit.unit("nothing", "to do")
 
         units = _plan(declare)
         self.assertEqual(
@@ -134,21 +133,21 @@ class UnitBoundaryTest(unittest.TestCase):
         with self.assertRaisesRegex(PlanError, "declared outside any unit"):
             _plan(declare)
 
-    def test_an_operation_after_a_unit_inside_is_an_error(self) -> None:
+    def test_an_operation_on_an_older_unit_is_an_error(self) -> None:
         def declare(emit: Emitter) -> None:
-            with emit.unit("bridge", "br-a"):
-                with emit.unit("interface", "eth0"):
-                    emit.ovn(HOST.ovs_port("br-a", "eth0"))
-                emit.ovn(HOST.ovs_mapping(("net:br-a",)))  # would land in "bridge"
+            bridge = emit.unit("bridge", "br-a")
+            port = bridge.unit("interface", "eth0")
+            port.ovn(HOST.ovs_port("br-a", "eth0"))
+            bridge.ovn(HOST.ovs_mapping(("net:br-a",)))  # would run before the port
 
-        with self.assertRaisesRegex(PlanError, "bridge: br-a: .* after a unit inside it"):
+        with self.assertRaisesRegex(PlanError, "bridge: br-a: .* after the unit 'interface: eth0'"):
             _plan(declare)
 
     def test_comments_cut_nothing(self) -> None:
         def declare(emit: Emitter) -> None:
-            with emit.unit("bridge", "br-a"):
-                emit.comment("# --- looks like a section ---")
-                emit.ovn(HOST.ovs_bridge("br-a"))
+            bridge = emit.unit("bridge", "br-a")
+            bridge.comment("# --- looks like a section ---")
+            bridge.ovn(HOST.ovs_bridge("br-a"))
 
         self.assertEqual([u.name for u in _plan(declare)], ["bridge: br-a"])
 

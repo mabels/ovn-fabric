@@ -3,13 +3,18 @@
 The declarations are the deployer's (deployer/ir_common.py) — the same
 emitter calls that generated the old deployer. A PlanEmitter receives them
 and, instead of rendering Python code, keeps the lifecycle operations
-themselves, in the units the declarations open: `with emit.unit(kind,
-subject):` ("logical switch: backbone", "router port: lrp-x (home)",
-"kernel router side: …"). The plan is strict about them:
+themselves, in the units the declarations open:
 
-- every operation is declared inside a unit;
-- a unit declared inside another ends the outer one's share — the outer
-  one declaring more after it is an error (it would land nowhere sensible);
+    port_unit = emit.unit("router port", f"{lrp} ({domain})")
+    port_unit.ovn(...)
+
+`emit.unit()` returns the unit — an emitter of its own; what is declared
+on it belongs to it ("logical switch: backbone", "router port: lrp-x
+(home)", "kernel router side: …"). The plan is strict about them:
+
+- every operation is declared on a unit, none on the scope itself;
+- only the newest unit takes operations — declaring on an older one
+  (after a later unit was opened) is an error: it would run out of order;
 - a unit's name is unique in the plan; a unit with nothing to do stays in
   it (and is done at once).
 
@@ -28,10 +33,9 @@ all of it, as their own request (deployer/deps.py), not as a unit.
 from __future__ import annotations
 
 import ast
-import contextlib
 import dataclasses
 import functools
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from deployer.ir_common import (
@@ -48,8 +52,6 @@ from deployer.ir_common import (
 )
 from deployer.lifecycle import (
     CaptureOperation,
-    Command,
-    Primitive,
     RuntimeRef,
     SymlinkNetnsOperation,
     WriteFileOperation,
@@ -64,35 +66,37 @@ class PlanError(ValueError):
     """The IR declares something a unit cannot hold (yet)."""
 
 
-class PlanEmitter(Emitter):
-    """Collects one scope's declarations as units of lifecycle operations."""
+@dataclasses.dataclass
+class _Plan:
+    """What a scope's emitter and the units opened from it share."""
 
-    def __init__(self, scope: str) -> None:
+    scope: str
+    units: list[g.Unit] = dataclasses.field(default_factory=list)
+    values: dict[str, Any] = dataclasses.field(default_factory=dict)  # `emit.py("x = 1")`
+    refs: dict[str, RuntimeRef] = dataclasses.field(default_factory=dict)  # capture -> ref
+
+
+class PlanEmitter(Emitter):
+    """Collects one scope's declarations as units of lifecycle operations.
+    The scope's own emitter only opens units; each unit is a PlanEmitter of
+    its own (`unit`), sharing the scope's `plan`."""
+
+    def __init__(self, scope: str, plan: _Plan | None = None, unit: g.Unit | None = None) -> None:
         super().__init__("create")
         self.label = scope
-        self.units: list[g.Unit] = []
-        # The units open now, innermost last; and those an inner unit has
-        # ended (they take no more operations).
-        self._open: list[g.Unit] = []
-        self._ended: set[int] = set()
-        self._values: dict[str, Any] = {}  # `emit.py("name = literal")`
-        self._refs: dict[str, RuntimeRef] = {}  # capture name -> its RuntimeRef
+        self.plan = plan if plan is not None else _Plan(scope)
+        self._unit = unit
+
+    @property
+    def units(self) -> list[g.Unit]:
+        return self.plan.units
 
     # -- units -----------------------------------------------------------------
 
-    @contextlib.contextmanager
-    def unit(
-        self, kind: str, subject: str | None = None, *, key: str | None = None
-    ) -> Iterator[None]:
+    def unit(self, kind: str, subject: str | None = None, *, key: str | None = None) -> PlanEmitter:
         unit = g.Unit(name=unit_name(kind, subject), kind=kind, key=key, scope=self.label, steps=[])
-        if self._open:
-            self._ended.add(id(self._open[-1]))
-        self.units.append(unit)
-        self._open.append(unit)
-        try:
-            yield
-        finally:
-            self._open.pop()
+        self.plan.units.append(unit)
+        return PlanEmitter(self.label, self.plan, unit)
 
     def comment(self, text: str) -> None:
         return None
@@ -102,15 +106,15 @@ class PlanEmitter(Emitter):
 
     def _add(self, operation: Any) -> None:
         step = to_step(self._resolve(operation))
-        if not self._open:
+        if self._unit is None:
             raise PlanError(f"{self.label}: {_what(step)} is declared outside any unit")
-        unit = self._open[-1]
-        if id(unit) in self._ended:
+        newest = self.plan.units[-1]
+        if self._unit is not newest:
             raise PlanError(
-                f"{unit.name}: {_what(step)} is declared after a unit inside it — "
+                f"{self._unit.name}: {_what(step)} is declared after the unit {newest.name!r} — "
                 "give it a unit of its own"
             )
-        unit.steps.append(step)
+        self._unit.steps.append(step)
 
     # -- what the declarations call ----------------------------------------------
 
@@ -123,13 +127,13 @@ class PlanEmitter(Emitter):
         self._add(WriteFileOperation(path, content))
 
     def capture(self, var: str, argv: Sequence[str | Ref]) -> None:
-        self._refs[var] = RuntimeRef(var)
+        self.plan.refs[var] = RuntimeRef(var)
         self._add(CaptureOperation(var, self.label, tuple(argv)))  # type: ignore[arg-type]
 
     def wait_capture(self, var: str, argv: Sequence[str | Ref]) -> None:
         # As the controller's wait_capture: retried, restarting
         # ovn-controller, the value published under CHASSIS_ID.
-        self._refs[var] = RuntimeRef(var, "CHASSIS_ID")
+        self.plan.refs[var] = RuntimeRef(var, "CHASSIS_ID")
         self._add(
             CaptureOperation(
                 var,
@@ -143,7 +147,7 @@ class PlanEmitter(Emitter):
 
     def netns_symlink(self, container_expr: str, pid_var: str) -> None:
         container = self._value(container_expr)
-        self._add(SymlinkNetnsOperation(container, self._refs[pid_var]))
+        self._add(SymlinkNetnsOperation(container, self.plan.refs[pid_var]))
 
     def py(self, line: str) -> None:
         # Only `name = <literal>` (a workload's container/image name).
@@ -155,15 +159,14 @@ class PlanEmitter(Emitter):
             and isinstance(statement.targets[0], ast.Name)
         ):
             raise PlanError(f"{self.label}: cannot plan the code line {line!r}")
-        self._values[statement.targets[0].id] = ast.literal_eval(statement.value)
+        self.plan.values[statement.targets[0].id] = ast.literal_eval(statement.value)
 
     def helper(
         self, name: str, *args: object, undo: str | None = None, undo_args: Sequence[object] = ()
     ) -> None:
-        translate = _HELPERS.get(name)
-        if translate is None:
-            raise PlanError(f"{self.label}: {name} cannot be planned as a unit yet")
-        self._add(translate(*args))
+        # A helper of the old generated deployer (zerotier, the docker
+        # veth): no typed primitive for it yet.
+        raise PlanError(f"{self.label}: {name} cannot be planned as a unit yet")
 
     def sh(self, argv: Sequence[str | Ref], background: bool = False, optional: Any = None) -> None:
         raise PlanError(f"{self.label}: a bare command {list(argv)!r} has no inverse")
@@ -175,18 +178,18 @@ class PlanEmitter(Emitter):
         try:
             return ast.literal_eval(expr)
         except (ValueError, SyntaxError):
-            if expr in self._values:
-                return self._values[expr]
+            if expr in self.plan.values:
+                return self.plan.values[expr]
             raise PlanError(f"{self.label}: unknown value {expr!r}") from None
 
     def _resolve(self, value: Any) -> Any:
         """Replace every Ref: a name set by `emit.py` by its value, a capture
         by its RuntimeRef (filled in when the operation runs)."""
         if isinstance(value, Ref):
-            if value.name in self._values:
-                return self._values[value.name]
-            if value.name in self._refs:
-                return self._refs[value.name]
+            if value.name in self.plan.values:
+                return self.plan.values[value.name]
+            if value.name in self.plan.refs:
+                return self.plan.refs[value.name]
             raise PlanError(f"{self.label}: {value.name} is captured nowhere")
         if dataclasses.is_dataclass(value) and not isinstance(value, type):
             return dataclasses.replace(
@@ -204,69 +207,6 @@ class PlanEmitter(Emitter):
         if isinstance(value, dict):
             return {key: self._resolve(item) for key, item in value.items()}
         return value
-
-
-# -- the old deployer's helper lambdas, as plain operations ------------------------
-
-
-def _attach_legs(container: str, netns: str, dev: str, transit_leg: str | None) -> Primitive:
-    """Hand a kernel router's legs to its docker app's container; their
-    rewind moves them back, so the router's own delete finds them."""
-    legs = [leg for leg in (transit_leg, dev) if leg]
-    create: list[Command] = []
-    delete: list[Command] = []
-    for leg in legs:
-        create += [
-            Command(
-                f"{leg} -> {container}",
-                ("ip", "netns", "exec", netns, "ip", "link", "set", leg, "netns", container),
-            ),
-            Command(
-                f"{leg} up", ("ip", "netns", "exec", container, "ip", "link", "set", leg, "up")
-            ),
-        ]
-        delete.append(
-            Command(
-                f"{leg} -> {netns}",
-                ("ip", "netns", "exec", container, "ip", "link", "set", leg, "netns", netns),
-                optional=True,
-            )
-        )
-    create += [
-        Command(
-            "forwarding",
-            ("ip", "netns", "exec", container, "sysctl", "-w", "net.ipv4.ip_forward=1"),
-        ),
-        Command(
-            "forwarding",
-            ("ip", "netns", "exec", container, "sysctl", "-w", "net.ipv6.conf.all.forwarding=1"),
-        ),
-    ]
-    return Primitive(
-        key=f"docker.legs:{container}",
-        nodes=(),
-        create_cmds=tuple(create),
-        delete_cmds=tuple(reversed(delete)),
-    )
-
-
-def _docker_exec(container: str, cmd: Sequence[str], dev: str) -> Primitive:
-    """Start the app inside the running container (detached); removing the
-    container ends it, so its rewind does nothing."""
-    return Primitive(
-        key=f"docker.exec:{container}",
-        nodes=(),
-        create_cmds=(
-            Command(f"{container} app", ("/usr/bin/docker", "exec", "-d", container, *cmd, dev)),
-        ),
-        delete_cmds=(),
-    )
-
-
-_HELPERS: dict[str, Callable[..., Any]] = {
-    "_docker_attach_legs": _attach_legs,
-    "_docker_exec": _docker_exec,
-}
 
 
 # -- the plan ----------------------------------------------------------------

@@ -4,10 +4,10 @@ Each command is logged on the caller's logger: the command line (`$ …`) at
 info, every output line as it comes (`| …`; with `on_err`, stderr lines as
 `! …`) and the exit (`exit N after Xs`) at debug.
 
-The command is also *reported* — to whoever is waiting on the work: the
-runtime sets a reporter for each request it dispatches (see `reporting`),
-so the client sees every command its request starts (info) and, unless the
-caller takes the output itself (`on_line`/`on_err`), its output (debug).
+The command is also *reported* to `report`, if given — whoever waits on the
+work (a request's `call.report`, runtime/peer.py): every command line
+(info) and, unless the caller takes the output itself (`on_line`/`on_err`),
+its output (debug).
 
 Without `on_err`, stdout and stderr are merged in order; with it, stderr
 goes there instead. The full output is returned for the caller's own use
@@ -21,13 +21,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import contextvars
 import logging
 import os
 import shlex
 import signal
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 
 LineSink = Callable[[str], None]
 # The last output line of a command that ran too long: "timed out after 5s: …".
@@ -35,25 +34,10 @@ TIMED_OUT = "timed out after"
 # (level, line): where commands and their output are reported.
 Report = Callable[[str, str], None]
 
-_report: contextvars.ContextVar[Report | None] = contextvars.ContextVar("report", default=None)
 
-
-@contextlib.contextmanager
-def reporting(report: Report | None) -> Iterator[None]:
-    """Report the commands run inside (in this task and the tasks it starts)
-    to `report`."""
-    token = _report.set(report)
-    try:
-        yield
-    finally:
-        _report.reset(token)
-
-
-def report(level: str, line: str) -> None:
-    """Report a line to whoever waits on the current work (if anyone)."""
-    sink = _report.get()
-    if sink is not None:
-        sink(level, line)
+def nowhere(level: str, line: str) -> None:
+    """A Report that drops everything (no one waits on the work)."""
+    return None
 
 
 async def run(
@@ -65,6 +49,7 @@ async def run(
     on_err: LineSink | None = None,
     level: str = "info",
     timeout: float | None = None,
+    report: Report = nowhere,
 ) -> tuple[bool, str]:
     """Run `argv`; (exited 0, all its output). `level` is the command line's
     (logged and reported); its output is always debug. A command still

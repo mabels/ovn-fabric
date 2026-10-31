@@ -35,14 +35,13 @@ import asyncio
 import logging
 import socket
 from collections.abc import Awaitable, Callable
-from typing import Any
 
 from deployer.deps import abstract_deps
 from protocol import generated as pt
 from protocol.hydrate import hydrate_nodes
 from runtime import generated as rg
-from runtime.message import BodySpec, Msg, ProtocolError, plain, register_bodies
-from runtime.peer import Peer, RemoteError
+from runtime.message import BodySpec, ProtocolError, plain, register_bodies
+from runtime.peer import Call, Peer, RemoteError
 from runtime.service import Service
 
 from .. import generated as g
@@ -96,10 +95,10 @@ class Apply:
     def service(self) -> Service:
         return Service(name="apply", bodies=BODIES, handlers={"IrApplyReq": self.apply})
 
-    async def apply(self, peer: Peer, msg: Msg[Any]) -> object:
-        req = msg.body
+    async def apply(self, call: Call) -> object:
+        req = call.body
         assert isinstance(req, g.IrApplyReq)
-        info, ir = await self._resolve(req.ref)
+        info, ir = await self._resolve(call, req.ref)
         host = req.host or self.host
         if host not in info.hosts:
             raise ProtocolError(
@@ -107,7 +106,7 @@ class Apply:
                 f"{host} is not a host of {info.hash} (its hosts: {', '.join(info.hosts) or '-'})",
             )
         if self._lock.locked():
-            await peer.log("info", "another apply runs: waiting for it")
+            await call.log("info", "another apply runs: waiting for it")
         async with self._lock:
             mode = " (dry run)" if req.dryRun else ""
             # The deployer's declarations take the IR as its own types.
@@ -116,38 +115,39 @@ class Apply:
                 plan = plan_units(nodes, host)
             except PlanError as exc:
                 raise ProtocolError("bad-ir", str(exc)) from None
-            await peer.log(
+            await call.log(
                 "info",
                 f"{req.action.value} {info.hash} on {host}{mode}: {len(ir.collection)} nodes, "
                 f"{len(plan)} units",
             )
             creating = req.action is g.ApplyAction.create
             if creating and not req.dryRun:
-                problem = await self._deps(peer, nodes, host)
+                problem = await self._deps(call, nodes, host)
                 if problem is not None:
-                    await peer.log("warn", problem)
+                    await call.log("warn", problem)
                     return self._result(info.hash, req, host, g.IrApplyOutcome.failed, [])
-            results = await self._run(peer, plan if creating else plan[::-1], req, host)
+            results = await self._run(call, plan if creating else plan[::-1], req, host)
             failed = any(r.state is g.ApplyState.failed for r in results)
             outcome = g.IrApplyOutcome.failed if failed else g.IrApplyOutcome.done
             return self._result(info.hash, req, host, outcome, results)
 
-    async def _deps(self, peer: Peer, nodes: list[pt.Model], host: str) -> str | None:
+    async def _deps(self, call: Call, nodes: list[pt.Model], host: str) -> str | None:
         """Resolve the host's abstract dependencies; None when all are ready."""
         host_node = next(n for n in nodes if isinstance(n, pt.InfraHostNode) and n.key.host == host)
         deps, notes = abstract_deps(host_node)
         for note in notes:
-            await peer.log("info", f"deps: {note}")
+            await call.log("info", f"deps: {note}")
         client = await self._client()
         request = await client.request(
             g.AbstractDepsReq(
                 kind="AbstractDepsReq",
                 deps=[g.AbstractDepSpec(name=d["name"], systemDeps=d["systemDeps"]) for d in deps],
-            )
+            ),
+            parent=call.req_id,
         )
         async for event in request:  # its progress, as ours
             if isinstance(event.body, rg.LogMsg):
-                await peer.emit(event.body)
+                await call.emit(event.body)
         res = request.result.body
         if isinstance(res, rg.ErrorRes):
             return f"abstract deps: {res.code}: {res.message}"
@@ -158,7 +158,7 @@ class Apply:
         return f"dependencies not ready: {', '.join(missing)}" if missing else None
 
     async def _run(
-        self, peer: Peer, units: list[g.Unit], req: g.IrApplyReq, host: str
+        self, call: Call, units: list[g.Unit], req: g.IrApplyReq, host: str
     ) -> list[g.ApplyUnit]:
         client = await self._client()
         store: list[g.UnitValue] = []
@@ -170,9 +170,9 @@ class Apply:
                     name=unit.name, state=g.ApplyState.skipped, message=failed.why(unit)
                 )
                 results.append(skipped)
-                await self._progress(peer, skipped)
+                await self._progress(call, skipped)
                 continue
-            await self._progress(peer, g.ApplyUnit(name=unit.name, state=g.ApplyState.running))
+            await self._progress(call, g.ApplyUnit(name=unit.name, state=g.ApplyState.running))
             request = await client.request(
                 g.UnitExecReq(
                     kind="UnitExecReq",
@@ -182,11 +182,12 @@ class Apply:
                     host=host,
                     dryRun=req.dryRun,
                     commandTimeout=req.commandTimeout,
-                )
+                ),
+                parent=call.req_id,
             )
             async for event in request:  # the executor's logs, as ours
                 if isinstance(event.body, rg.LogMsg):
-                    await peer.emit(event.body)
+                    await call.emit(event.body)
             res = request.result.body
             if isinstance(res, rg.ErrorRes):
                 result = g.ApplyUnit(
@@ -203,14 +204,14 @@ class Apply:
                     message=res.message,
                 )
             results.append(result)
-            await self._progress(peer, result)
+            await self._progress(call, result)
             if result.state is g.ApplyState.failed:
                 failed.add(unit)
         return results
 
     @staticmethod
-    async def _progress(peer: Peer, unit: g.ApplyUnit) -> None:
-        await peer.emit(g.IrApplyProgress(kind="IrApplyProgress", unit=unit))
+    async def _progress(call: Call, unit: g.ApplyUnit) -> None:
+        await call.emit(g.IrApplyProgress(kind="IrApplyProgress", unit=unit))
 
     @staticmethod
     def _result(
@@ -229,11 +230,13 @@ class Apply:
             units=units,
         )
 
-    async def _resolve(self, ref: str) -> tuple[g.IrInfo, g.IrCollection]:
+    async def _resolve(self, call: Call, ref: str) -> tuple[g.IrInfo, g.IrCollection]:
         """The stored IR `ref` names (a hash or a name): its info and nodes."""
         client = await self._client()
         try:
-            res = await client.ask(g.IrGetReq(kind="IrGetReq", ref=ref), timeout=None)
+            res = await client.ask(
+                g.IrGetReq(kind="IrGetReq", ref=ref), timeout=None, parent=call.req_id
+            )
         except RemoteError as exc:  # e.g. not-found: the requester's answer too
             raise ProtocolError(exc.code, exc.message) from None
         assert isinstance(res.body, g.IrGetRes)

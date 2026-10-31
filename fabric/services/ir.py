@@ -38,8 +38,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from runtime.message import BodySpec, Msg, ProtocolError, hydrate_part, plain, register_bodies
-from runtime.peer import Peer
+from runtime.message import BodySpec, ProtocolError, hydrate_part, plain, register_bodies
+from runtime.peer import Call
 from runtime.service import Service
 
 from .. import generated as g
@@ -105,8 +105,8 @@ class IrStore:
 
     # -- requests ------------------------------------------------------------
 
-    async def put(self, peer: Peer, msg: Msg[Any]) -> object:
-        req = msg.body
+    async def put(self, call: Call) -> object:
+        req = call.body
         assert isinstance(req, g.IrPutReq)
         if req.name is not None:
             self._check_name(req.name)
@@ -139,7 +139,7 @@ class IrStore:
                 status = g.IrPutStatus.created if previous is None else g.IrPutStatus.replaced
         was = f", was {previous}" if status is g.IrPutStatus.replaced else ""
         called = "" if name == digest else f" as {name}"
-        await peer.log(
+        await call.log(
             "info", f"{digest}{called}: {status.value} ({len(req.ir.collection)} nodes{was})"
         )
         return g.IrPutRes(
@@ -151,13 +151,13 @@ class IrStore:
             previous=previous if status is g.IrPutStatus.replaced else None,
         )
 
-    async def list(self, peer: Peer, msg: Msg[Any]) -> object:
+    async def list(self, call: Call) -> object:
         refs = await asyncio.to_thread(self._read_refs)
         infos = [await asyncio.to_thread(self._info, name, digest) for name, digest in refs.items()]
         return g.IrListRes(kind="IrListRes", irs=sorted(infos, key=lambda info: info.name))
 
-    async def get(self, peer: Peer, msg: Msg[Any]) -> object:
-        req = msg.body
+    async def get(self, call: Call) -> object:
+        req = call.body
         assert isinstance(req, g.IrGetReq)
         refs = await asyncio.to_thread(self._read_refs)
         if _HASH.match(req.ref):
@@ -175,8 +175,8 @@ class IrStore:
         info = await asyncio.to_thread(self._info, name, digest)
         return g.IrGetRes(kind="IrGetRes", info=info, ir=ir)
 
-    async def delete(self, peer: Peer, msg: Msg[Any]) -> object:
-        req = msg.body
+    async def delete(self, call: Call) -> object:
+        req = call.body
         assert isinstance(req, g.IrDeleteReq)
         async with self._lock:
             refs = await asyncio.to_thread(self._read_refs)
@@ -191,7 +191,7 @@ class IrStore:
             await asyncio.to_thread(self._write_refs, refs)
             await asyncio.to_thread(self._collect, digest, refs)
         called = "" if req.ref == digest else f" as {req.ref}"
-        await peer.log("info", f"{digest}{called}: deleted")
+        await call.log("info", f"{digest}{called}: deleted")
         return g.IrDeleteRes(kind="IrDeleteRes", name=req.ref, hash=digest)
 
     # -- storage -------------------------------------------------------------
