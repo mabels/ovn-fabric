@@ -209,7 +209,7 @@ ip link set tap-c1 address 02:00:00:00:c1:01
 ovs-vsctl add-port br-xdp tap-c1
 
 # then move it into the workload's netns (docker --network none):
-pid=$(docker inspect -f '{{.State.Pid}}' c1)
+{% raw %}pid=$(docker inspect -f '{{.State.Pid}}' c1){% endraw %}
 mkdir -p /var/run/netns && ln -sfn "/proc/$pid/ns/net" /var/run/netns/c1
 ip link set tap-c1 netns c1
 ip netns exec c1 ip link set tap-c1 name eth0
