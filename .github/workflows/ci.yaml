@@ -89,10 +89,10 @@ jobs:
           .venv-build/bin/pip install --quiet black ruff mypy
 
       - name: Python format check (black)
-        run: .venv-build/bin/black --check ladops/ deployer/ protocol/ reconciler/
+        run: .venv-build/bin/black --check ladops/ deployer/ protocol/ reconciler/ runtime/ fabric/
 
       - name: Python lint (ruff)
-        run: .venv-build/bin/ruff check ladops/ deployer/ protocol/ reconciler/
+        run: .venv-build/bin/ruff check ladops/ deployer/ protocol/ reconciler/ runtime/ fabric/
 
       # protocol/generated.py doesn't exist until this runs — it's
       # ephemeral, regenerated here fresh every CI run (see .gitignore),
@@ -107,13 +107,20 @@ jobs:
         # env var itself.
         run: npx deno run --allow-read --allow-write --allow-run --allow-net --allow-env src/cli.ts generate-pytypes
 
-      # AFTER generate-pytypes: the deployer is typed against
-      # protocol/generated.py, which only exists once that has run.
-      # Configured in pyproject.toml ([tool.mypy], strict).
+      # The runtime and fabric have their own protocol schemas. They are
+      # gitignored and must exist before mypy/tests import them. runtime
+      # first: fabric/schema/generate.ts imports the runtime generator.
+      - name: Generate runtime/generated.py and fabric/generated.py
+        run: |
+          npx deno run --allow-read --allow-write --allow-run --allow-net --allow-env runtime/schema/generate.ts
+          npx deno run --allow-read --allow-write --allow-run --allow-net --allow-env fabric/schema/generate.ts
+
+      # AFTER the generated modules: mypy imports runtime.generated and
+      # fabric.generated. Configured in pyproject.toml ([tool.mypy], strict).
       - name: Python type check (mypy)
         run: .venv-build/bin/mypy
 
-      - name: Python unit tests (ladops, reconciler, deployer, protocol)
+      - name: Python unit tests (ladops, reconciler, deployer, protocol, runtime, fabric)
         run: python3 -m unittest discover -s . -p "test_*.py" -v
 
   publish:
