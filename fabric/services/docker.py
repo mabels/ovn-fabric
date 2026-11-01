@@ -125,7 +125,7 @@ class Docker:
         if bad:
             raise ProtocolError("bad-request", f"not an image reference: {', '.join(bad)}")
 
-        problem = await self._docker_ready(call)
+        problem = await self._docker_ready(call, req.packageManager)
         if problem is not None:
             return g.DockerPrepareRes(
                 kind="DockerPrepareRes",
@@ -138,13 +138,33 @@ class Docker:
 
     # -- 1 + 2: docker itself ------------------------------------------------
 
-    async def _docker_ready(self, call: Call) -> str | None:
-        """None when docker is usable, else why not."""
+    async def _docker_ready(self, call: Call, manager: g.PackageManager | None) -> str | None:
+        """None when docker is usable, else why not. Its packages are made
+        present when the request names the host's package manager;
+        without one docker must already be installed."""
+        if manager is not None:
+            problem = await self._packages_ready(call, manager)
+            if problem is not None:
+                return problem
+        deadline = asyncio.get_running_loop().time() + self._daemon_wait
+        while True:
+            ok, out = await self._docker.info(call.report)
+            if ok:
+                await call.log("info", f"docker daemon {out.strip()} is ready")
+                return None
+            if asyncio.get_running_loop().time() >= deadline:
+                return f"the docker daemon does not answer: {_tail(out)}"
+            await asyncio.sleep(1)
+
+    async def _packages_ready(self, call: Call, manager: g.PackageManager) -> str | None:
+        """None when docker's abstract dependencies are ready, else why not."""
         await call.log("info", f"resolving docker's dependencies: {' '.join(self._deps)}")
         client = await self._client()
         request = await client.request(
             g.AbstractDepsReq(
-                kind="AbstractDepsReq", deps=[g.AbstractDepSpec(name=dep) for dep in self._deps]
+                kind="AbstractDepsReq",
+                packageManager=manager,
+                deps=[g.AbstractDepSpec(name=dep) for dep in self._deps],
             ),
             parent=call.req_id,
         )
@@ -168,16 +188,7 @@ class Docker:
                 + ", ".join(f"{d.dep} {d.state.value}: {d.message or ''}".strip() for d in s.deps)
                 for s in missing
             )
-
-        deadline = asyncio.get_running_loop().time() + self._daemon_wait
-        while True:
-            ok, out = await self._docker.info(call.report)
-            if ok:
-                await call.log("info", f"docker daemon {out.strip()} is ready")
-                return None
-            if asyncio.get_running_loop().time() >= deadline:
-                return f"the docker daemon does not answer: {_tail(out)}"
-            await asyncio.sleep(1)
+        return None
 
     # -- 3: one image --------------------------------------------------------
 

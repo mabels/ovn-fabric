@@ -122,17 +122,22 @@ export interface HostMonitoring {
   readonly ipfix?: IpfixExport;
 }
 
-/** The OS a Host runs (2026-08-23) — what the deployer needs to install
+/** The OS a Host runs (2026-08-23) — what the runtime needs to install
  * the topology's dependencies in the right package form: OVS/OVN for a
  * chassis, iproute2/iptables for a kernel router's netns, dhcpcd or
- * isc-dhcp-client for a dhcp-client app, wireguard-tools, the zerotier
- * curl installer, docker. `name` is the distro, `version` its release
- * ("24.04" for Ubuntu, "12" for Debian). Required to know HOW to
- * install; no deinstall ever happens (2026-08-23). */
+ * isc-dhcp-client for a dhcp-client app, wireguard-tools, docker. `name`
+ * is the distro, `version` its release ("24.04" for Ubuntu, "44" for
+ * Fedora), `packageManager` the one the runtime installs them with — named
+ * explicitly, never detected (2026-10-31). No deinstall ever happens. */
 export interface HostOs {
-  readonly name: "ubuntu" | "debian";
+  readonly name: "ubuntu" | "debian" | "fedora";
   readonly version: string;
+  readonly packageManager: PackageManager;
 }
+
+/** The package managers the runtime has an implementation for
+ * (fabric/services/packages.py). */
+export type PackageManager = "apt" | "dnf";
 
 export interface Host {
   readonly name: string;

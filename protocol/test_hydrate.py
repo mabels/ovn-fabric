@@ -27,7 +27,7 @@ RAW_INFRA_HOST: dict[str, Any] = {
         "connectAddress": "10.0.0.1",
         "ovnRole": "central",
         "encapIp": "10.0.0.1",
-        "os": {"name": "ubuntu", "version": "26.04"},
+        "os": {"name": "ubuntu", "version": "26.04", "packageManager": "apt"},
     },
 }
 
@@ -75,7 +75,10 @@ class HydrateInfraHostTest(unittest.TestCase):
     def test_optional_fields_default_to_none_when_absent(self) -> None:
         raw = {
             **RAW_INFRA_HOST,
-            "data": {"connectAddress": "10.0.0.1", "os": {"name": "ubuntu", "version": "26.04"}},
+            "data": {
+                "connectAddress": "10.0.0.1",
+                "os": {"name": "ubuntu", "version": "26.04", "packageManager": "apt"},
+            },
         }
         node = mod.hydrate_node(raw)
         self.assertIsNone(node.data.ovnRole)

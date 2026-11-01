@@ -8,7 +8,7 @@
 // `deno run -A fabric/schema/generate.ts`.
 
 import { type } from "arktype";
-import { IRNode } from "../../src/protocol.ts";
+import { IRNode, PackageManager } from "../../src/protocol.ts";
 
 export const VersionReq = type({
   kind: "'VersionReq'",
@@ -37,6 +37,9 @@ export const DepStatus = type({
  * seconds; without it the request waits as long as the installs take. */
 export const ResolveSystemDepsReq = type({
   kind: "'ResolveSystemDepsReq'",
+  /** The host's package manager — named by the host's config (the IR's
+   * infra.host os), never detected. */
+  packageManager: PackageManager,
   deps: "string[]",
   "timeout?": "number",
 });
@@ -76,6 +79,9 @@ export const ImageStatus = type({
 export const DockerPrepareReq = type({
   kind: "'DockerPrepareReq'",
   images: ImageSpec.array(),
+  /** To make docker's own packages present first; without it, docker
+   * must already be installed (only its daemon is waited for). */
+  "packageManager?": PackageManager,
 });
 
 /** Emitted (with the request's reqId) once docker and every image are
@@ -130,6 +136,8 @@ export const DockerRunReq = type({
   kind: "'DockerRunReq'",
   container: ContainerSpec,
   "follow?": "boolean",
+  /** As DockerPrepareReq's. */
+  "packageManager?": PackageManager,
 });
 
 export const ContainerState = type(
@@ -169,6 +177,8 @@ export const AbstractDepSpec = type({
  * made present (one ResolveSystemDepsReq for all of them). */
 export const AbstractDepsReq = type({
   kind: "'AbstractDepsReq'",
+  /** As ResolveSystemDepsReq's: picks the packages' column. */
+  packageManager: PackageManager,
   deps: AbstractDepSpec.array(),
   "timeout?": "number",
 });

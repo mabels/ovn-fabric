@@ -1314,7 +1314,6 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
     "arp",
     "ping",
     "traceroute",
-    "curl",
     "python",
     "ovn",
     "ovs",
@@ -1323,7 +1322,11 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
     "dhclient",
   ]);
   // os not set -> assume Ubuntu (2026-08-23).
-  assertEquals(hostNode.data["os"], { name: "ubuntu", version: "26.04" });
+  assertEquals(hostNode.data["os"], {
+    name: "ubuntu",
+    version: "26.04",
+    packageManager: "apt",
+  });
 });
 
 // Flow export (2026-10-10): Host.monitoring.ipfix becomes the host's

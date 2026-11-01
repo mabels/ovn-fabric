@@ -83,7 +83,7 @@ async def _runtime(
     runtime = Runtime()
     runtime.register(
         SystemDeps(
-            FakeApt(installed={"docker.io": "26"}), stamp=_stamp(0), sleep=FakeSleep()
+            [FakeApt(installed={"docker.io": "26"})], stamp=_stamp(0), sleep=FakeSleep()
         ).service(),
         AbstractDeps(runtime.client).service(),
         Docker(runtime.client, docker).service(),
@@ -118,6 +118,7 @@ def _req(follow: bool = True, **spec: Any) -> g.DockerRunReq:
         kind="DockerRunReq",
         container=g.ContainerSpec(**{"name": "t", "image": "busybox", **spec}),
         follow=follow,
+        packageManager=g.PackageManager.apt,
     )
 
 

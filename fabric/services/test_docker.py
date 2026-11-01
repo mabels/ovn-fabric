@@ -58,7 +58,7 @@ class FakeDocker:
 async def _client(apt: FakeApt, docker: FakeDocker, **options: Any) -> AsyncIterator[Peer]:
     runtime = Runtime()
     runtime.register(
-        SystemDeps(apt, stamp=_stamp(0), sleep=FakeSleep()).service(),
+        SystemDeps([apt], stamp=_stamp(0), sleep=FakeSleep()).service(),
         AbstractDeps(runtime.client).service(),
         Docker(runtime.client, docker, **options).service(),
     )
@@ -81,6 +81,7 @@ def _req(*specs: tuple[str, str | None]) -> g.DockerPrepareReq:
     return g.DockerPrepareReq(
         kind="DockerPrepareReq",
         images=[g.ImageSpec(image=image, dockerfile=dockerfile) for image, dockerfile in specs],
+        packageManager=g.PackageManager.apt,
     )
 
 

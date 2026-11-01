@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import tempfile
 import time
 import unittest
 from collections.abc import AsyncIterator, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from runtime import command
 from runtime import generated as rg
@@ -17,12 +18,17 @@ from runtime.runtime import Runtime
 from runtime.transport import connect
 
 from .. import generated as g
+from .packages import Apt
 from .sysdeps import UPDATE_EVERY, SystemDeps
 
 READY, FAILED, TIMEOUT = g.SystemDepState.ready, g.SystemDepState.failed, g.SystemDepState.timeout
 
 
 class FakeApt:
+    """A package manager of kind apt, in memory."""
+
+    name: ClassVar[str] = "apt"
+
     def __init__(self, installed: dict[str, str] | None = None, broken: Sequence[str] = ()) -> None:
         self.installed = dict(installed or {})
         self.broken = set(broken)  # packages whose install fails
@@ -35,7 +41,7 @@ class FakeApt:
     async def version(self, package: str, *, report: Report = command.nowhere) -> str | None:
         return self.installed.get(package)
 
-    async def update(self, *, report: Report = command.nowhere) -> tuple[bool, str]:
+    async def refresh(self, *, report: Report = command.nowhere) -> tuple[bool, str]:
         self.calls.append(("update",))
         report("info", "$ apt-get update")
         if self.update_fails:
@@ -73,6 +79,9 @@ class FakeApt:
     ) -> tuple[bool, str]:
         self.calls.append(("upgrade", *packages))
         return True, ""
+
+    def permanent(self, output: str) -> bool:
+        return Apt().permanent(output)
 
 
 class FakeSleep:
@@ -114,7 +123,12 @@ async def _client(sysdeps: SystemDeps) -> AsyncIterator[Peer]:
 
 
 def _req(*deps: str, timeout: float | None = None) -> g.ResolveSystemDepsReq:
-    return g.ResolveSystemDepsReq(kind="ResolveSystemDepsReq", deps=list(deps), timeout=timeout)
+    return g.ResolveSystemDepsReq(
+        kind="ResolveSystemDepsReq",
+        packageManager=g.PackageManager.apt,
+        deps=list(deps),
+        timeout=timeout,
+    )
 
 
 def _states(res: Any) -> dict[str, g.SystemDepState]:
@@ -126,7 +140,7 @@ class ResolveTest(unittest.TestCase):
     def test_an_installed_dep_is_ready_without_apt(self) -> None:
         async def run() -> None:
             apt = FakeApt(installed={"curl": "8.5.0"})
-            async with _client(SystemDeps(apt, stamp=_stamp(0), sleep=FakeSleep())) as client:
+            async with _client(SystemDeps([apt], stamp=_stamp(0), sleep=FakeSleep())) as client:
                 request = await client.request(_req("curl"))
                 seen = [msg async for msg in request]
             self.assertEqual(apt.calls, [])
@@ -141,7 +155,7 @@ class ResolveTest(unittest.TestCase):
         async def run() -> None:
             apt = FakeApt()
             stamp = _stamp(UPDATE_EVERY + 1)
-            async with _client(SystemDeps(apt, stamp=stamp, sleep=FakeSleep())) as client:
+            async with _client(SystemDeps([apt], stamp=stamp, sleep=FakeSleep())) as client:
                 res = await client.ask(_req("jq"), timeout=5)
             self.assertEqual(_states(res.body), {"jq": READY})
             self.assertIn(("install", "jq"), apt.calls)
@@ -153,7 +167,7 @@ class ResolveTest(unittest.TestCase):
     def test_fresh_lists_are_not_updated_again(self) -> None:
         async def run() -> None:
             apt = FakeApt()
-            async with _client(SystemDeps(apt, stamp=_stamp(60), sleep=FakeSleep())) as client:
+            async with _client(SystemDeps([apt], stamp=_stamp(60), sleep=FakeSleep())) as client:
                 await client.ask(_req("jq"), timeout=5)
             self.assertEqual(apt.calls, [("install", "jq")])
 
@@ -163,7 +177,7 @@ class ResolveTest(unittest.TestCase):
         async def run() -> None:
             apt = FakeApt()
             apt.gate = asyncio.Event()
-            async with _client(SystemDeps(apt, stamp=_stamp(0), sleep=FakeSleep())) as client:
+            async with _client(SystemDeps([apt], stamp=_stamp(0), sleep=FakeSleep())) as client:
                 first = await client.request(_req("curl", "jq"))
                 second = await client.request(_req("jq", "iproute2"))
                 await asyncio.sleep(0.01)
@@ -181,7 +195,7 @@ class ResolveTest(unittest.TestCase):
             apt = FakeApt()
             apt.transient = 6  # every attempt
             sleep = FakeSleep()
-            async with _client(SystemDeps(apt, stamp=_stamp(0), sleep=sleep)) as client:
+            async with _client(SystemDeps([apt], stamp=_stamp(0), sleep=sleep)) as client:
                 with self.assertLogs("fabric.sysdeps", "WARNING"):
                     res = await client.ask(_req("jq"), timeout=5)
             self.assertEqual(_states(res.body), {"jq": FAILED})
@@ -195,7 +209,7 @@ class ResolveTest(unittest.TestCase):
         async def run() -> None:
             apt = FakeApt(broken=["nope"])
             sleep = FakeSleep()
-            async with _client(SystemDeps(apt, stamp=_stamp(0), sleep=sleep)) as client:
+            async with _client(SystemDeps([apt], stamp=_stamp(0), sleep=sleep)) as client:
                 with self.assertLogs("fabric.sysdeps", "WARNING"):
                     res = await client.ask(_req("nope"), timeout=5)
             self.assertEqual(_states(res.body), {"nope": FAILED})
@@ -208,7 +222,7 @@ class ResolveTest(unittest.TestCase):
     def test_one_bad_package_only_fails_itself(self) -> None:
         async def run() -> None:
             apt = FakeApt(broken=["nope"])
-            async with _client(SystemDeps(apt, stamp=_stamp(0), sleep=FakeSleep())) as client:
+            async with _client(SystemDeps([apt], stamp=_stamp(0), sleep=FakeSleep())) as client:
                 with self.assertLogs("fabric.sysdeps", "WARNING"):
                     res = await client.ask(_req("jq", "nope", "curl"), timeout=5)
             self.assertEqual(_states(res.body), {"jq": READY, "nope": FAILED, "curl": READY})
@@ -228,7 +242,7 @@ class ResolveTest(unittest.TestCase):
         async def run() -> None:
             apt = FakeApt()
             apt.gate = asyncio.Event()
-            async with _client(SystemDeps(apt, stamp=_stamp(0), sleep=FakeSleep())) as client:
+            async with _client(SystemDeps([apt], stamp=_stamp(0), sleep=FakeSleep())) as client:
                 res = await client.ask(_req("jq", timeout=0.05), timeout=5)
                 self.assertEqual(_states(res.body), {"jq": TIMEOUT})
                 apt.gate.set()
@@ -241,7 +255,7 @@ class ResolveTest(unittest.TestCase):
     def test_a_bad_package_name_is_refused(self) -> None:
         async def run() -> None:
             apt = FakeApt()
-            async with _client(SystemDeps(apt, stamp=_stamp(0), sleep=FakeSleep())) as client:
+            async with _client(SystemDeps([apt], stamp=_stamp(0), sleep=FakeSleep())) as client:
                 with self.assertRaises(RemoteError) as caught:
                     await client.ask(_req("curl", "-o=APT::Get::Foo"), timeout=5)
             self.assertEqual(caught.exception.code, "bad-request")
@@ -255,7 +269,7 @@ class OutputTest(unittest.TestCase):
         async def run() -> None:
             apt = FakeApt()
             apt.gate = asyncio.Event()
-            async with _client(SystemDeps(apt, stamp=_stamp(0), sleep=FakeSleep())) as client:
+            async with _client(SystemDeps([apt], stamp=_stamp(0), sleep=FakeSleep())) as client:
                 first = await client.request(_req("curl", "jq"))
                 second = await client.request(_req("jq"))  # joins the same job
                 await asyncio.sleep(0.01)
@@ -283,14 +297,23 @@ class OutputTest(unittest.TestCase):
 
 
 class RefreshTest(unittest.TestCase):
+    def test_a_package_manager_without_an_implementation_is_refused(self) -> None:
+        async def run() -> None:
+            async with _client(SystemDeps([FakeApt()], stamp=_stamp(0), sleep=FakeSleep())) as c:
+                req = dataclasses.replace(_req("curl"), packageManager=g.PackageManager.dnf)
+                with self.assertRaisesRegex(RemoteError, "no package manager 'dnf'"):
+                    await c.ask(req, timeout=5)
+
+        asyncio.run(run())
+
     def test_the_regular_refresh_updates_and_upgrades_what_it_knows(self) -> None:
         async def run() -> None:
             apt = FakeApt(installed={"curl": "8.5.0"})
-            sysdeps = SystemDeps(apt, stamp=_stamp(60), sleep=FakeSleep())
+            sysdeps = SystemDeps([apt], stamp=_stamp(60), sleep=FakeSleep())
             async with _client(sysdeps) as client:
                 await client.ask(_req("curl"), timeout=5)
             apt.calls.clear()
-            await sysdeps._refresh()
+            await sysdeps._resolvers["apt"]._refresh()
             self.assertEqual(apt.calls, [("update",), ("upgrade", "curl")])
 
         asyncio.run(run())
@@ -298,7 +321,9 @@ class RefreshTest(unittest.TestCase):
     def test_nothing_requested_means_no_apt_at_all(self) -> None:
         async def run() -> None:
             apt = FakeApt()
-            async with _client(SystemDeps(apt, stamp=_stamp(UPDATE_EVERY + 1), sleep=FakeSleep())):
+            async with _client(
+                SystemDeps([apt], stamp=_stamp(UPDATE_EVERY + 1), sleep=FakeSleep())
+            ):
                 await asyncio.sleep(0.05)
             self.assertEqual(apt.calls, [])
 
@@ -308,7 +333,7 @@ class RefreshTest(unittest.TestCase):
         async def run() -> None:
             apt = FakeApt(installed={"curl": "8.5.0"})
             stale = _stamp(UPDATE_EVERY + 1)
-            async with _client(SystemDeps(apt, stamp=stale, sleep=FakeSleep())) as client:
+            async with _client(SystemDeps([apt], stamp=stale, sleep=FakeSleep())) as client:
                 await client.ask(_req("curl"), timeout=5)  # installed: no apt for the request
                 for _ in range(100):
                     if ("upgrade", "curl") in apt.calls:
@@ -325,7 +350,7 @@ class RefreshTest(unittest.TestCase):
             sleep = FakeSleep()
             with self.assertLogs("fabric.sysdeps", "WARNING"):
                 stale = _stamp(UPDATE_EVERY + 1)
-                async with _client(SystemDeps(apt, stamp=stale, sleep=sleep)) as client:
+                async with _client(SystemDeps([apt], stamp=stale, sleep=sleep)) as client:
                     await client.ask(_req("curl"), timeout=5)
                     for _ in range(200):
                         if apt.calls.count(("update",)) >= 7:

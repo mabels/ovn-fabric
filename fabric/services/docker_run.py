@@ -203,7 +203,7 @@ class DockerRun:
             if not path.is_absolute() or ".." in path.parts:
                 raise ProtocolError("bad-request", f"not an absolute file path: {file.path!r}")
 
-        problem = await self._prepare(call, spec)
+        problem = await self._prepare(call, spec, req.packageManager)
         if problem is not None:
             return await self._end(call, spec.name, g.ContainerState.failed, message=problem)
         # One start per name at a time: replace whatever runs under it, then
@@ -304,12 +304,15 @@ class DockerRun:
         await self._containers.remove(spec.name, report=call.report)
         return await self._end(call, spec.name, g.ContainerState.stopped, exit_code=code)
 
-    async def _prepare(self, call: Call, spec: g.ContainerSpec) -> str | None:
+    async def _prepare(
+        self, call: Call, spec: g.ContainerSpec, manager: g.PackageManager | None
+    ) -> str | None:
         """None when the image is present, else why not."""
         client = await self._client()
         image = g.ImageSpec(image=spec.image, dockerfile=spec.dockerfile)
         request = await client.request(
-            g.DockerPrepareReq(kind="DockerPrepareReq", images=[image]), parent=call.req_id
+            g.DockerPrepareReq(kind="DockerPrepareReq", images=[image], packageManager=manager),
+            parent=call.req_id,
         )
         async for event in request:  # relay docker prepare's progress as our own
             if isinstance(event.body, rg.LogMsg):

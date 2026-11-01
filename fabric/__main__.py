@@ -2,7 +2,7 @@
 
 python3 -m fabric serve [--host H]
 python3 -m fabric version
-python3 -m fabric resolve curl jq --timeout 300
+python3 -m fabric resolve curl traceroute --timeout 300
 python3 -m fabric abstract-deps docker ovn=ovn-central,ovn-host
 python3 -m deployer.deps py.ir --host H | python3 -m fabric abstract-deps --spec -
 python3 -m deployer.images py.ir --host H | python3 -m fabric docker-prepare --spec -
@@ -40,6 +40,7 @@ from runtime.transport import Closed, connect, dump_wire, wire_log
 from . import generated as g
 from .services import abstract_deps, apply, docker, docker_run, ir, sysdeps, version
 from .services import unit as unit_executor
+from .services.packages import MANAGERS
 
 # The runtime's logs for a request (LogMsg), shown at their own level and
 # named by their sender's component (`INFO sysdeps: …`, a container's name
@@ -206,6 +207,10 @@ async def _ask(address: str, body: object) -> object | None:
         await reader
 
 
+def _package_manager(args: argparse.Namespace) -> g.PackageManager | None:
+    return g.PackageManager(args.package_manager) if args.package_manager else None
+
+
 async def _version(args: argparse.Namespace) -> int:
     res = await _ask(args.address, g.VersionReq(kind="VersionReq"))
     if not isinstance(res, g.VersionRes):
@@ -215,7 +220,12 @@ async def _version(args: argparse.Namespace) -> int:
 
 
 async def _resolve(args: argparse.Namespace) -> int:
-    req = g.ResolveSystemDepsReq(kind="ResolveSystemDepsReq", deps=args.deps, timeout=args.timeout)
+    req = g.ResolveSystemDepsReq(
+        kind="ResolveSystemDepsReq",
+        packageManager=g.PackageManager(args.package_manager),
+        deps=args.deps,
+        timeout=args.timeout,
+    )
     res = await _ask(args.address, req)
     if not isinstance(res, g.ResolveSystemDepsRes):
         return 1
@@ -260,7 +270,12 @@ async def _abstract_deps(args: argparse.Namespace) -> int:
     if not specs:
         print("error: no dependencies (NAME[=pkg,...] or --spec FILE)", file=sys.stderr)
         return 2
-    req = g.AbstractDepsReq(kind="AbstractDepsReq", deps=specs, timeout=args.timeout)
+    req = g.AbstractDepsReq(
+        kind="AbstractDepsReq",
+        packageManager=g.PackageManager(args.package_manager),
+        deps=specs,
+        timeout=args.timeout,
+    )
     res = await _ask(args.address, req)
     if not isinstance(res, g.AbstractDepsRes):
         return 1
@@ -280,7 +295,10 @@ async def _docker_prepare(args: argparse.Namespace) -> int:
     if not specs:
         print("error: no images (IMAGE ... or --spec FILE)", file=sys.stderr)
         return 2
-    res = await _ask(args.address, g.DockerPrepareReq(kind="DockerPrepareReq", images=specs))
+    req = g.DockerPrepareReq(
+        kind="DockerPrepareReq", images=specs, packageManager=_package_manager(args)
+    )
+    res = await _ask(args.address, req)
     if not isinstance(res, g.DockerPrepareRes):
         return 1
     for status in res.images:
@@ -314,7 +332,12 @@ async def _docker_run(args: argparse.Namespace) -> int:
     spec = _container_spec(args)
     if spec is None:
         return 2
-    req = g.DockerRunReq(kind="DockerRunReq", container=spec, follow=args.follow or None)
+    req = g.DockerRunReq(
+        kind="DockerRunReq",
+        container=spec,
+        follow=args.follow or None,
+        packageManager=_package_manager(args),
+    )
     res = await _ask(args.address, req)
     if not isinstance(res, g.DockerRunRes):
         return 1
@@ -503,8 +526,14 @@ def main() -> int:
     serve.set_defaults(run=_serve)
     version_cmd = commands.add_parser("version", help="ask the runtime's version")
     version_cmd.set_defaults(run=_version)
-    resolve = commands.add_parser("resolve", help="make system dependencies (apt) present")
+    resolve = commands.add_parser("resolve", help="make system dependencies (packages) present")
     resolve.add_argument("deps", nargs="+", metavar="PACKAGE")
+    resolve.add_argument(
+        "--package-manager",
+        choices=sorted(MANAGERS),
+        required=True,
+        help="the host's package manager",
+    )
     resolve.add_argument(
         "--timeout", type=float, help="seconds to wait (default: as long as it takes)"
     )
@@ -524,6 +553,12 @@ def main() -> int:
         help="JSON [{name, systemDeps}] (- for stdin), e.g. from deployer.deps",
     )
     abstract.add_argument(
+        "--package-manager",
+        choices=sorted(MANAGERS),
+        required=True,
+        help="the host's package manager (picks the packages)",
+    )
+    abstract.add_argument(
         "--timeout", type=float, help="seconds to wait (default: as long as it takes)"
     )
     abstract.set_defaults(run=_abstract_deps)
@@ -535,6 +570,11 @@ def main() -> int:
         "--spec",
         metavar="FILE",
         help='JSON list of {"image", "dockerfile"?} (- for stdin), e.g. from deployer.images',
+    )
+    prepare.add_argument(
+        "--package-manager",
+        choices=sorted(MANAGERS),
+        help="make docker's packages present first (default: docker must be installed)",
     )
     prepare.set_defaults(run=_docker_prepare)
     run_cmd = commands.add_parser(
@@ -555,6 +595,11 @@ def main() -> int:
     run_cmd.add_argument("--name", help="the container (with --spec: which one)")
     run_cmd.add_argument("--image", help="without --spec: the image to run")
     run_cmd.add_argument("command", nargs="*", help="without --spec: the command (after --)")
+    run_cmd.add_argument(
+        "--package-manager",
+        choices=sorted(MANAGERS),
+        help="make docker's packages present first (default: docker must be installed)",
+    )
     run_cmd.set_defaults(run=_docker_run)
     ir_put = commands.add_parser(
         "ir-put", help="store an IR (under --name, else its hash); shows the stored IRs"

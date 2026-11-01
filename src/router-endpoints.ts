@@ -553,13 +553,20 @@ export function buildTunnelRouterEndpoint(
         // The container's program, baked into the image at build time
         // (one image per router) instead of passed as a `sh -c` argument:
         // join the network, wait for its device, wire it, stay alive.
+        // It is started with `docker exec -d`, so its output would go
+        // nowhere: it writes to the container's main process instead —
+        // `docker logs <container>` shows the join and the wiring.
         const ztScript = [
           "#!/bin/sh",
+          "exec >/proc/1/fd/1 2>&1",
+          'echo "zerotier-up: starting zerotier-one"',
           "/usr/sbin/zerotier-one -d /var/lib/zerotier-one",
           "for i in $(seq 1 30); do",
           "  zerotier-cli -D/var/lib/zerotier-one info >/dev/null 2>&1 && break",
           "  sleep 1",
           "done",
+          "zerotier-cli -D/var/lib/zerotier-one info",
+          `echo "zerotier-up: joining ${ztNetworkId}"`,
           `zerotier-cli -D/var/lib/zerotier-one join "${ztNetworkId}" || true`,
           'var=""',
           "for i in $(seq 1 60); do",
@@ -567,9 +574,12 @@ export function buildTunnelRouterEndpoint(
           '  [ -n "$var" ] && [ "$var" != "null" ] && break',
           "  sleep 1",
           "done",
+          'echo "zerotier-up: network device: ${var:-none after 60s}"',
+          "zerotier-cli -D/var/lib/zerotier-one listnetworks",
           'ip link set "$var" up',
           ...ztMasq,
           ...ztRouteCmds,
+          'echo "zerotier-up: wired"',
           "exec sleep infinity",
         ];
         // Written with printf, one single-quoted argument per line — works

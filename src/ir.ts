@@ -115,21 +115,16 @@ function resolveEncapIp(host: Host): string | undefined {
 // The ABSTRACT dependencies this Host needs (2026-08-23), derived from
 // what the topology puts on it — ABSTRACT names, deliberately not
 // distro package names, so the IR stays OS-agnostic: every host gets the
-// base tooling (`arp`/net-tools, `ping`, `traceroute`, `curl`,
-// `python`/python-is-python3 — the
-// everyday debugging commands, and curl is also what the zerotier
-// installer needs), an OVN-cluster host needs `ovn`+`ovs`, any kernel
-// router's netns needs `ip`+`iptables`, and the apps need their own
-// (dhclient/dhcpcd, wireguard, zerotier+jq, docker). `jq` is not
-// optional for zerotier: the generated wire script parses
-// `zerotier-cli -j listnetworks` with it to learn the mesh device name
-// (deployer/ir_common.py's _zerotier_wire_script), and without it that
-// script dies with "jq: not found" and the mesh device is never
-// configured (confirmed live, 2026-10-20). The deployer maps each
-// abstract dependency to the host OS's concrete package/install form;
-// there is deliberately NO deinstall.
+// base tooling (`arp`/net-tools, `ping`, `traceroute`,
+// `python`/python-is-python3 — the everyday debugging commands), an
+// OVN-cluster host needs `ovn`+`ovs`, any kernel router's netns needs
+// `ip`+`iptables`, and the apps need their own (dhclient/dhcpcd,
+// wireguard, docker). A zerotier app needs nothing on the host: zerotier
+// runs in its container (2026-10-31). The runtime maps each abstract
+// dependency to the host's package manager's packages; there is
+// deliberately NO deinstall.
 function hostDependencies(host: Host, network: NetworkDefinition): string[] {
-  const deps = new Set<string>(["arp", "ping", "traceroute", "curl", "python"]);
+  const deps = new Set<string>(["arp", "ping", "traceroute", "python"]);
   if (host.ovn) {
     deps.add("ovn");
     deps.add("ovs");
@@ -147,9 +142,6 @@ function hostDependencies(host: Host, network: NetworkDefinition): string[] {
             deps.add(app.style);
           } else if (app.kind === "wireguard") {
             deps.add("wireguard");
-          } else if (app.kind === "zerotier") {
-            deps.add("zerotier");
-            deps.add("jq");
           } else if (app.kind === "docker") {
             deps.add("docker");
           }
@@ -183,9 +175,10 @@ function hostToIR(
       ovnRole: host.ovn?.role.kind,
       encapIp: resolveEncapIp(host),
       // OS always resolved — when the config leaves it unset, assume
-      // Ubuntu (2026-08-23), so the deployer always knows the install
-      // form; `...host.os` lets a partial override win field by field.
-      os: { name: "ubuntu", version: "26.04", ...host.os },
+      // Ubuntu with apt (2026-08-23), so the runtime always knows the
+      // install form. A config that sets `os` names its package manager.
+      os: host.os ??
+        { name: "ubuntu", version: "26.04", packageManager: "apt" },
       dependencies: dependencies.length > 0 ? dependencies : undefined,
       // WHERE to export flows (types.ts IpfixExport -> protocol IpfixData)
       // — the per-leg WHETHER rides each ovn.ls interface instead (see

@@ -134,14 +134,14 @@ class Apply:
     async def _deps(self, call: Call, nodes: list[pt.Model], host: str) -> str | None:
         """Resolve the host's abstract dependencies; None when all are ready."""
         host_node = next(n for n in nodes if isinstance(n, pt.InfraHostNode) and n.key.host == host)
-        deps, notes = abstract_deps(host_node)
-        for note in notes:
-            await call.log("info", f"deps: {note}")
+        deps = abstract_deps(host_node)
         client = await self._client()
         request = await client.request(
             g.AbstractDepsReq(
                 kind="AbstractDepsReq",
-                deps=[g.AbstractDepSpec(name=d["name"], systemDeps=d["systemDeps"]) for d in deps],
+                # The host's config names it (the IR's infra.host os).
+                packageManager=g.PackageManager(host_node.data.os.packageManager.value),
+                deps=[g.AbstractDepSpec(name=d["name"]) for d in deps],
             ),
             parent=call.req_id,
         )

@@ -1,37 +1,39 @@
-"""The system dependency resolver: makes apt packages present and keeps
-them current.
+"""The system dependency resolver: makes packages present and keeps them
+current, through the host's package manager (packages.py: apt or dnf,
+found when the runtime starts).
 
     ResolveSystemDepsReq { deps: [...], timeout? }
       → ResolveSystemDep { dep, state }   one event per dependency, as it settles
       → ResolveSystemDepsRes { deps: [DepStatus] }
 
-All apt work goes through ONE queue drained by ONE worker, so apt never
-runs twice at a time from here (another apt on the host —
-unattended-upgrades — is waited for by apt itself: `DPkg::Lock::Timeout`).
-The queue carries two kinds of jobs:
+All package work goes through ONE queue drained by ONE worker, so the
+package manager never runs twice at a time from here (another one on the
+host — unattended-upgrades — is waited for by the manager itself). The
+queue carries two kinds of jobs:
 
-- install: the missing dependencies of a request. The package lists are
-  refreshed first when they are stale (`apt-get update`, at most every
-  UPDATE_EVERY, the time persisted in a stamp file across restarts).
-- refresh: the regular maintenance, every UPDATE_EVERY — `apt-get update`,
-  then `apt-get install --only-upgrade` of every dependency this resolver
-  has made ready (it keeps them current, as the old deployer's daily pass
-  did). Only once something was requested: with no dependency there is
-  nothing to keep current.
+- install: the missing dependencies of a request. The package index is
+  refreshed first when it is stale (at most every UPDATE_EVERY, the time
+  persisted in a stamp file across restarts).
+- refresh: the regular maintenance, every UPDATE_EVERY — refresh the
+  index, then upgrade every dependency this resolver has made ready (it
+  keeps them current, as the old deployer's daily pass did). Only once
+  something was requested: with no dependency there is nothing to keep
+  current.
 
-Whether a dependency is there is `dpkg-query`'s `install ok installed`;
-its version is reported with `ready`. Every apt command is retried with
-backoff (RETRIES attempts, 5s doubling up to 300s) — unless apt's error is
-permanent (an unknown package): that is not retried. apt refuses a whole
-install for one bad package, so a failed batch is retried package by
-package: one bad package only fails itself.
+Whether a dependency is there, and its version, is the manager's `version`;
+the version is reported with `ready`. Every package command is retried
+with backoff (RETRIES attempts, 5s doubling up to 300s) — unless the
+manager says its failure is permanent (an unknown package): that is not
+retried. A manager refuses a whole install for one bad package, so a
+failed batch is retried package by package: one bad package only fails
+itself.
 
 A dependency already queued or being installed for another request is not
 queued again: both requests wait for the same result. A request's
 `timeout` only bounds how long it waits: what has not settled by then is
-reported `timeout`, but the install is never killed (interrupting dpkg
-can leave the package database broken) — it finishes in the queue, and a
-later request finds the package installed.
+reported `timeout`, but the install is never killed (interrupting dpkg or
+rpm can leave the package database broken) — it finishes in the queue,
+and a later request finds the package installed.
 """
 
 from __future__ import annotations
@@ -43,7 +45,6 @@ import os
 import re
 import time
 from collections.abc import Awaitable, Callable, Sequence
-from typing import Protocol
 
 from runtime import command
 from runtime.command import Report
@@ -52,6 +53,7 @@ from runtime.peer import Call
 from runtime.service import Service
 
 from .. import generated as g
+from .packages import MANAGERS, PackageManager
 
 log = logging.getLogger("fabric.sysdeps")
 
@@ -62,89 +64,17 @@ BODIES = {
 }
 register_bodies(BODIES)  # clients decode these too
 
-# A Debian package name (optionally :arch). Anything else is refused: the
-# name ends up in apt's argv, and must never look like an option.
-_PACKAGE = re.compile(r"^[a-z0-9][a-z0-9+.-]+(:[a-z0-9-]+)?$")
+# A package name (Debian's may carry :arch, rpm's capitals and `_`). Anything
+# else is refused: the name ends up in the manager's argv, and must never
+# look like an option.
+_PACKAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_+.-]+(:[a-z0-9-]+)?$")
 
 UPDATE_EVERY = 24 * 60 * 60
 # After a failed refresh, try again this much later (not at once).
 RETRY_REFRESH = 60 * 60
-UPDATE_STAMP = "/var/lib/ovn-fabric/last-apt-update"
+# When the index was last refreshed, per manager ("last-apt-update").
+UPDATE_STAMP = "/var/lib/ovn-fabric/last-{manager}-update"
 RETRIES = 6
-
-
-class Apt(Protocol):
-    """What the resolver needs from the package manager. `report`: where
-    the commands and their output go (the waiting requests)."""
-
-    async def version(self, package: str, *, report: Report = command.nowhere) -> str | None:
-        """The installed version, or None when it is not installed."""
-
-    async def update(self, *, report: Report = command.nowhere) -> tuple[bool, str]: ...
-
-    async def install(
-        self, packages: Sequence[str], *, report: Report = command.nowhere
-    ) -> tuple[bool, str]: ...
-
-    async def upgrade(
-        self, packages: Sequence[str], *, report: Report = command.nowhere
-    ) -> tuple[bool, str]: ...
-
-
-class SystemApt:
-    """The host's apt/dpkg."""
-
-    _ENV = {
-        "DEBIAN_FRONTEND": "noninteractive",
-        "APT_LISTCHANGES_FRONTEND": "none",
-        "LC_ALL": "C",
-        "TERM": "dumb",
-    }
-    _OPTIONS = (
-        "-o",
-        "Dpkg::Use-Pty=0",
-        "-o",
-        "Dpkg::Progress-Fancy=0",
-        # Wait for another apt/dpkg on the host instead of failing.
-        "-o",
-        "DPkg::Lock::Timeout=600",
-    )
-
-    async def version(self, package: str, *, report: Report = command.nowhere) -> str | None:
-        ok, out = await self._run(["dpkg-query", "-W", "-f=${Status} ${Version}", package], report)
-        if not ok or not out.startswith("install ok installed"):
-            return None
-        return out.rsplit(" ", 1)[-1].strip()
-
-    async def update(self, *, report: Report = command.nowhere) -> tuple[bool, str]:
-        return await self._run(["apt-get", *self._OPTIONS, "update"], report)
-
-    async def install(
-        self, packages: Sequence[str], *, report: Report = command.nowhere
-    ) -> tuple[bool, str]:
-        return await self._run(["apt-get", *self._OPTIONS, "install", "-y", *packages], report)
-
-    async def upgrade(
-        self, packages: Sequence[str], *, report: Report = command.nowhere
-    ) -> tuple[bool, str]:
-        return await self._run(
-            ["apt-get", *self._OPTIONS, "install", "--only-upgrade", "-y", *packages], report
-        )
-
-    async def _run(self, argv: list[str], report: Report) -> tuple[bool, str]:
-        return await command.run(argv, log=log, env=self._ENV, report=report)
-
-
-# apt errors no retry can fix (unlike a held lock or a network failure).
-_PERMANENT = (
-    "Unable to locate package",
-    "has no installation candidate",
-    "is not available, but is referred to",
-)
-
-
-def _permanent(output: str) -> bool:
-    return any(marker in output for marker in _PERMANENT)
 
 
 def _tail(output: str, lines: int = 5) -> str:
@@ -162,27 +92,21 @@ class _Refresh:
 
 
 class SystemDeps:
+    """The service: one resolver per package manager, each with its own
+    queue and worker. A request goes to the one it names (the host's
+    config chose it); a manager without an implementation is refused."""
+
     def __init__(
         self,
-        apt: Apt | None = None,
+        managers: Sequence[PackageManager],
         *,
         stamp: str = UPDATE_STAMP,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
-        self._apt: Apt = apt if apt is not None else SystemApt()
-        self._stamp = stamp
-        self._sleep = sleep
-        self._queue: asyncio.Queue[_Install | _Refresh] = asyncio.Queue()
-        # Every dependency queued or being installed → its coming status.
-        self._pending: dict[str, asyncio.Future[g.DepStatus]] = {}
-        # Every dependency queued or being installed → the requests waiting
-        # on it: they get the apt output of its job.
-        self._watchers: dict[str, list[Call]] = {}
-        # Every dependency made ready: what the regular refresh upgrades.
-        self._known: set[str] = set()
-        # Set once something is known: before that there is nothing to refresh.
-        self._something_known = asyncio.Event()
-        self._last_update = _read_stamp(stamp)
+        self._resolvers = {
+            manager.name: _Resolver(manager, stamp=stamp.format(manager=manager.name), sleep=sleep)
+            for manager in managers
+        }
 
     def service(self) -> Service:
         return Service(
@@ -191,6 +115,49 @@ class SystemDeps:
             handlers={"ResolveSystemDepsReq": self.resolve},
             run=self.run,
         )
+
+    async def resolve(self, call: Call) -> object:
+        req = call.body
+        assert isinstance(req, g.ResolveSystemDepsReq)
+        resolver = self._resolvers.get(req.packageManager.value)
+        if resolver is None:
+            known = ", ".join(sorted(self._resolvers))
+            raise ProtocolError(
+                "bad-request", f"no package manager {req.packageManager.value!r} (known: {known})"
+            )
+        return await resolver.resolve(call)
+
+    async def run(self) -> None:
+        async with asyncio.TaskGroup() as tg:
+            for resolver in self._resolvers.values():
+                tg.create_task(resolver.run())
+
+
+class _Resolver:
+    """Resolving through one package manager: its queue, its worker, its
+    regular refresh."""
+
+    def __init__(
+        self,
+        packages: PackageManager,
+        *,
+        stamp: str,
+        sleep: Callable[[float], Awaitable[None]],
+    ) -> None:
+        self._packages = packages
+        self._stamp = stamp
+        self._sleep = sleep
+        self._queue: asyncio.Queue[_Install | _Refresh] = asyncio.Queue()
+        # Every dependency queued or being installed → its coming status.
+        self._pending: dict[str, asyncio.Future[g.DepStatus]] = {}
+        # Every dependency queued or being installed → the requests waiting
+        # on it: they get the package manager's output of its job.
+        self._watchers: dict[str, list[Call]] = {}
+        # Every dependency made ready: what the regular refresh upgrades.
+        self._known: set[str] = set()
+        # Set once something is known: before that there is nothing to refresh.
+        self._something_known = asyncio.Event()
+        self._last_update = _read_stamp(self._stamp)
 
     # -- the request ---------------------------------------------------------
 
@@ -207,7 +174,7 @@ class SystemDeps:
         missing: list[str] = []
         for dep in deps:
             if dep not in self._pending:
-                version = await self._apt.version(dep, report=call.report)
+                version = await self._packages.version(dep, report=call.report)
                 if version is not None:
                     settled[dep] = self._ready(dep, version)
                     await self._emit(call, settled[dep])
@@ -224,7 +191,7 @@ class SystemDeps:
 
         try:
             return await self._wait(call, req, deps, settled, waiting)
-        finally:  # done (or timed out): no more apt output for this request
+        finally:  # done (or timed out): no more package output for this request
             for dep in deps:
                 watchers = self._watchers.get(dep, [])
                 watchers[:] = [w for w in watchers if w is not call]
@@ -299,7 +266,8 @@ class SystemDeps:
                 await self._sleep(RETRY_REFRESH)
 
     async def _worker(self) -> None:
-        """The only place apt runs: one job at a time, in queue order."""
+        """The only place the package manager runs: one job at a time, in
+        queue order."""
         while True:
             job = await self._queue.get()
             try:
@@ -312,7 +280,7 @@ class SystemDeps:
                     self._fail(job.deps, "the resolver stopped")
                 raise
             except Exception as exc:  # noqa: BLE001 — a job never kills the worker
-                log.exception("apt job failed")
+                log.exception("%s job failed", self._packages.name)
                 if isinstance(job, _Install):
                     self._fail(job.deps, f"{type(exc).__name__}: {exc}")
             finally:
@@ -324,30 +292,32 @@ class SystemDeps:
         if time.time() - self._last_update > UPDATE_EVERY:
             await self._update(report)
         ok, out = await self._retry(
-            "apt-get install", lambda: self._apt.install(deps, report=report)
+            f"{self._packages.name} install", lambda: self._packages.install(deps, report=report)
         )
         outputs = {dep: (ok, out) for dep in deps}
         if not ok and len(deps) > 1:
-            # apt refuses the whole transaction for one bad package: try
+            # The manager refuses the whole transaction for one bad package: try
             # each on its own, so one only fails itself.
             log.warning("installing %s together failed; one by one", " ".join(deps))
             for dep in deps:
                 outputs[dep] = await self._retry(
-                    f"apt-get install {dep}",
-                    lambda dep=dep: self._apt.install([dep], report=report),  # type: ignore[misc]
+                    f"{self._packages.name} install {dep}",
+                    lambda dep=dep: self._packages.install([dep], report=report),  # type: ignore[misc]
                 )
         # The check after the install is reported to the waiting requests
         # too; their statuses only go out after it (below).
         results: list[g.DepStatus] = []
         for dep in deps:
-            version = await self._apt.version(dep, report=report)
+            version = await self._packages.version(dep, report=report)
             if version is not None:
                 results.append(self._ready(dep, version))
                 log.info("%s installed (%s)", dep, version)
             else:
                 dep_ok, dep_out = outputs[dep]
                 message = (
-                    _tail(dep_out) if not dep_ok else "apt-get succeeded but it is not installed"
+                    _tail(dep_out)
+                    if not dep_ok
+                    else f"{self._packages.name} install succeeded but it is not installed"
                 )
                 results.append(g.DepStatus(dep=dep, state=g.SystemDepState.failed, message=message))
                 log.warning("%s not installed: %s", dep, message)
@@ -358,7 +328,7 @@ class SystemDeps:
         known = sorted(self._known)
         if not known or not await self._update(command.nowhere):  # no one waits on it
             return
-        await self._retry("apt-get --only-upgrade", lambda: self._apt.upgrade(known))
+        await self._retry(f"{self._packages.name} upgrade", lambda: self._packages.upgrade(known))
 
     def _report_to(self, deps: list[str]) -> Report:
         """A Report for a job for `deps`: each line goes, in order, to every
@@ -372,13 +342,15 @@ class SystemDeps:
         return report
 
     async def _update(self, report: Report) -> bool:
-        ok, _ = await self._retry("apt-get update", lambda: self._apt.update(report=report))
+        ok, _ = await self._retry(
+            f"{self._packages.name} refresh", lambda: self._packages.refresh(report=report)
+        )
         if ok:
             self._last_update = time.time()
             try:
                 await asyncio.to_thread(_write_stamp, self._stamp, self._last_update)
             except OSError as exc:
-                log.warning("cannot save the apt update time to %s: %s", self._stamp, exc)
+                log.warning("cannot save the index refresh time to %s: %s", self._stamp, exc)
         return ok
 
     async def _retry(
@@ -389,7 +361,7 @@ class SystemDeps:
             ok, out = await run()
             if ok:
                 return ok, out
-            if _permanent(out):  # retrying cannot help
+            if self._packages.permanent(out):  # retrying cannot help
                 log.warning("%s failed: %s", label, _tail(out))
                 return False, out
             if attempt < RETRIES:
@@ -426,4 +398,4 @@ def _write_stamp(path: str, when: float) -> None:
 
 
 def service() -> Service:
-    return SystemDeps().service()
+    return SystemDeps(list(MANAGERS.values())).service()

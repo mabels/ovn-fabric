@@ -55,7 +55,12 @@ import { type } from "arktype";
 import { IPAddress } from "jsr:@adviser/ipaddress@0.2.11";
 
 export const InfraHostKey = type({ host: "string" });
-export const HostOs = type({ name: "string", version: "string" });
+export const PackageManager = type("'apt' | 'dnf'");
+export const HostOs = type({
+  name: "string",
+  version: "string",
+  packageManager: PackageManager,
+});
 // The host's IPFIX flow-export config (2026-10-10), resolved from
 // Host.monitoring.ipfix (types.ts, IpfixExport): the collector endpoint
 // every bridge on this host samples into. `targets` is the one required
@@ -76,8 +81,9 @@ export const InfraHostData = type({
   // 2026-08-23) — the deployer installs the dependencies in this OS's
   // package form. No deinstall ever.
   os: HostOs,
-  // The OS packages/requirements this host needs (ovs/ovn, iproute2/
-  // iptables, dhcpcd/dhclient, wireguard-tools, zerotier, docker).
+  // The ABSTRACT dependencies this host needs (ovn, ovs, ip, iptables,
+  // dhcpcd/dhclient, wireguard, docker) — the runtime maps them to its
+  // package manager's packages.
   "dependencies?": "string[]",
   // Flow export onto the collector — see IpfixData.
   "ipfix?": IpfixData,
@@ -614,8 +620,8 @@ export const KernelAppServiceData = type({
   "down?": "string[]",
   // Files written before `up` (e.g. a wg conf) — {path, content}.
   "files?": KernelAppServiceFile.array(),
-  // ABSTRACT requirements (e.g. "wireguard-tools", "zerotier-one") — the
-  // deployer maps these to the host OS's concrete packages.
+  // ABSTRACT requirements (e.g. "wireguard") — mapped to the host's
+  // package manager's packages.
   "deps?": "string[]",
 });
 export const KernelAppContainerNode = type({
@@ -807,6 +813,7 @@ export function buildJsonSchema(): Record<string, unknown> {
   // name it has in this file — the generated class carries that name.
   const shapes = refNamedShapes({
     InfraHostKey: shape(InfraHostKey),
+    PackageManager: shape(PackageManager),
     HostOs: shape(HostOs),
     IpfixData: shape(IpfixData),
     InfraHostData: shape(InfraHostData),

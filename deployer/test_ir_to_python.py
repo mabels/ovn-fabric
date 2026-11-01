@@ -353,7 +353,7 @@ NODES: list[pt.Model] = [
             connectAddress="10.0.0.1",
             ovnRole=pt.OvnRole.central,
             encapIp="10.0.0.1",
-            os=pt.HostOs(name="ubuntu", version="26.04"),
+            os=pt.HostOs(name="ubuntu", version="26.04", packageManager=pt.PackageManager.apt),
         ),
     ),
     pt.InfraHostNode(
@@ -364,7 +364,7 @@ NODES: list[pt.Model] = [
             connectAddress="10.0.0.2",
             ovnRole=pt.OvnRole.chassis,
             encapIp="10.0.0.2",
-            os=pt.HostOs(name="ubuntu", version="26.04"),
+            os=pt.HostOs(name="ubuntu", version="26.04", packageManager=pt.PackageManager.apt),
         ),
     ),
     pt.OvnLsNode(
@@ -1741,7 +1741,10 @@ class KernelRouterCreateTest(unittest.TestCase):
         self.assertEqual(
             unknown_dep.install_plan["notes"], ['unknown dependency "quantum-vpn" — skipped']
         )
-        unknown_os = with_host(dependencies=["ovs"], os=pt.HostOs(name="plan9", version="4"))
+        unknown_os = with_host(
+            dependencies=["ovs"],
+            os=pt.HostOs(name="plan9", version="4", packageManager=pt.PackageManager.apt),
+        )
         self.assertEqual(_install_packages(unknown_os), [])
         self.assertEqual(
             unknown_os.install_plan["notes"],
@@ -3307,7 +3310,7 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                 "data": {
                     "connectAddress": "10.0.0.6",
                     "ovnRole": "central",
-                    "os": {"name": "ubuntu", "version": "26.04"},
+                    "os": {"name": "ubuntu", "version": "26.04", "packageManager": "apt"},
                 },
             },
             {
