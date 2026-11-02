@@ -125,6 +125,11 @@ def _resolve(value: Any, store: Mapping[str, Any]) -> Any:
     return value
 
 
+def resolve(value: Any, store: Mapping[str, Any]) -> Any:
+    """`value` with its RuntimeRefs replaced by what `store` holds."""
+    return _resolve(value, store)
+
+
 def _display(value: Any) -> str:
     if isinstance(value, RuntimeRef):
         return f"<{value.name}>" if value.key is None else f"<{value.name}[{value.key}]>"

@@ -4,7 +4,7 @@ import dataclasses
 
 from ladops import ovs as ovs_ops
 
-from .lifecycle import (
+from ..lifecycle import (
     Command,
     CommandPrimitive,
     Primitive,

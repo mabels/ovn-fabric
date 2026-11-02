@@ -124,6 +124,19 @@ const ovsIfaceFields = {
 export const OvsIfaceData = type(ovsIfaceFields);
 export const OvsIfaceCollection = nodeType("ovs.iface", ovsIfaceFields);
 
+/** One Open_vSwitch external_ids entry (the host's own OVN settings:
+ * ovn-remote, ovn-encap-type, ovn-encap-ip, …). The bridge mappings are
+ * not one of them: they are a field of each bridge. */
+const ovsExternalIdFields = {
+  key: "string",
+  value: "string",
+} as const;
+export const OvsExternalIdData = type(ovsExternalIdFields);
+export const OvsExternalIdCollection = nodeType(
+  "ovs.external-id",
+  ovsExternalIdFields,
+);
+
 // ── OVN northbound ──────────────────────────────────────────────────
 const ovnLsFields = {
   name: "string",
@@ -202,6 +215,18 @@ const ovnAclFields = {
 export const OvnAclData = type(ovnAclFields);
 export const OvnAclCollection = nodeType("ovn.acl", ovnAclFields);
 
+/** Where an OVN database listens (its Connection rows): one node per
+ * database, the targets as `ovn-nbctl get-connection` lists them. */
+const ovnConnectionFields = {
+  db: "'nb'|'sb'",
+  targets: "string[]",
+} as const;
+export const OvnConnectionData = type(ovnConnectionFields);
+export const OvnConnectionCollection = nodeType(
+  "ovn.connection",
+  ovnConnectionFields,
+);
+
 export const IptablesAction = type(
   "'*'|'ACCEPT'|'DROP'|'REJECT'|'JUMP'|'MASQUERADE'|'SNAT'|'DNAT'|'REDIRECT'|'RETURN'|'CONTINUE'|'GOTO'",
 );
@@ -259,6 +284,7 @@ export const RawCollection = HostCollection
   .or(OvsBridgeCollection)
   .or(OvsPortCollection)
   .or(OvsIfaceCollection)
+  .or(OvsExternalIdCollection)
   .or(OvnLsCollection)
   .or(OvnLspCollection)
   .or(OvnLrCollection)
@@ -266,6 +292,7 @@ export const RawCollection = HostCollection
   .or(OvnRouteCollection)
   .or(OvnNatCollection)
   .or(OvnAclCollection)
+  .or(OvnConnectionCollection)
   .or(IptablesRuleCollection)
   .or(DockerContainerCollection);
 
@@ -284,6 +311,7 @@ export type RouteData = typeof RouteData.infer;
 export type OvsBridgeData = typeof OvsBridgeData.infer;
 export type OvsPortData = typeof OvsPortData.infer;
 export type OvsIfaceData = typeof OvsIfaceData.infer;
+export type OvsExternalIdData = typeof OvsExternalIdData.infer;
 export type OvnLsData = typeof OvnLsData.infer;
 export type OvnLspData = typeof OvnLspData.infer;
 export type OvnLrData = typeof OvnLrData.infer;
@@ -291,6 +319,7 @@ export type OvnLrpData = typeof OvnLrpData.infer;
 export type OvnRouteData = typeof OvnRouteData.infer;
 export type OvnNatData = typeof OvnNatData.infer;
 export type OvnAclData = typeof OvnAclData.infer;
+export type OvnConnectionData = typeof OvnConnectionData.infer;
 export type IptablesRuleData = typeof IptablesRuleData.infer;
 export type DockerContainerData = typeof DockerContainerData.infer;
 
@@ -314,6 +343,8 @@ export function buildRawJsonSchema(): Record<string, unknown> {
     OvsPortCollection: shape(OvsPortCollection),
     OvsIfaceData: shape(OvsIfaceData),
     OvsIfaceCollection: shape(OvsIfaceCollection),
+    OvsExternalIdData: shape(OvsExternalIdData),
+    OvsExternalIdCollection: shape(OvsExternalIdCollection),
     OvnLsData: shape(OvnLsData),
     OvnLsCollection: shape(OvnLsCollection),
     OvnLspData: shape(OvnLspData),
@@ -329,6 +360,8 @@ export function buildRawJsonSchema(): Record<string, unknown> {
     OvnNatCollection: shape(OvnNatCollection),
     OvnAclData: shape(OvnAclData),
     OvnAclCollection: shape(OvnAclCollection),
+    OvnConnectionData: shape(OvnConnectionData),
+    OvnConnectionCollection: shape(OvnConnectionCollection),
     IptablesAction: shape(IptablesAction),
     IptablesRuleFields: shape(IptablesRuleFields),
     IptablesRuleSpec: shape(IptablesRuleSpec),

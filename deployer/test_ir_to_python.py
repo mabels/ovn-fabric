@@ -42,6 +42,7 @@ from collections.abc import Collection, Sequence
 from typing import Any, cast
 from unittest import mock
 
+from fabric.lifecycle import LifecycleAction
 from protocol import AppDhcpClient, AppDocker, AppWireguard, AppZerotier
 from protocol import generated as pt
 from protocol.hydrate import hydrate_as
@@ -67,7 +68,6 @@ from .ir_common import (
     _shell_token,
     _short_suffix,
 )
-from .lifecycle import LifecycleAction
 
 mod = importlib.import_module("deployer.ir_to_python")
 

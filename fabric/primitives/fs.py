@@ -13,10 +13,10 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
-from .lifecycle import LifecycleAction, RawNodeTemplate
+from ..lifecycle import LifecycleAction, RawNodeTemplate
 
 if TYPE_CHECKING:
-    from .lifecycle import LifecycleController
+    from ..lifecycle import LifecycleController
 
 
 @dataclasses.dataclass(frozen=True)

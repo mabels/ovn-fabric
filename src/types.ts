@@ -152,10 +152,21 @@ export interface Host {
    * own setup is the operator's responsibility). */
   readonly os?: HostOs;
   readonly monitoring?: HostMonitoring;
+  /** What the runtime's reconcile leaves alone on this host — see
+   * HostReconcile. */
+  readonly reconcile?: HostReconcile;
   /** Undefined means this Host is not part of the OVN cluster at all
    * (e.g. a pure bastion/management host with no chassis role) — no
    * ovn-central/ovn-host gets installed there. See OvnHostConfig. */
   readonly ovn?: OvnHostConfig;
+}
+
+/** What the runtime's reconcile leaves alone on a host (2026-11-01):
+ * RawIR node ids, as globs (`*` any text) — e.g. `"link:*global*|host"`
+ * for the management NIC, `"addr:*global*|host|*"` for its addresses.
+ * The loopback (`lo`) is always left alone; it need not be listed. */
+export interface HostReconcile {
+  readonly exclude?: readonly string[];
 }
 
 export function sshHost(
@@ -165,6 +176,7 @@ export function sshHost(
   os?: HostOs,
   ovn?: OvnHostConfig,
   monitoring?: HostMonitoring,
+  reconcile?: HostReconcile,
 ): Host {
   return {
     name,
@@ -174,6 +186,7 @@ export function sshHost(
     ...(os ? { os } : {}),
     ...(ovn ? { ovn } : {}),
     ...(monitoring ? { monitoring } : {}),
+    ...(reconcile ? { reconcile } : {}),
   };
 }
 
@@ -182,6 +195,7 @@ export function localHost(
   os?: HostOs,
   ovn?: OvnHostConfig,
   monitoring?: HostMonitoring,
+  reconcile?: HostReconcile,
 ): Host {
   return {
     name,
@@ -191,6 +205,7 @@ export function localHost(
     ...(os ? { os } : {}),
     ...(ovn ? { ovn } : {}),
     ...(monitoring ? { monitoring } : {}),
+    ...(reconcile ? { reconcile } : {}),
   };
 }
 

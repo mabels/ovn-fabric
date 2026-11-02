@@ -211,5 +211,27 @@ class WriteTest(unittest.TestCase):
         )
 
 
+class ListLspsTest(unittest.TestCase):
+    def test_a_switch_with_one_port_reports_it(self) -> None:
+        # OVSDB reports a set of one as the value itself, not a list.
+        tables = {
+            "Logical_Switch": [
+                {"_uuid": "ls-one", "name": "home", "ports": "lsp-uuid"},
+                {"_uuid": "ls-two", "name": "bb", "ports": ["lsp-a", "lsp-b"]},
+            ],
+            "Logical_Switch_Port": [
+                {"_uuid": "lsp-uuid", "name": "lsp-home-localnet", "type": "localnet"},
+                {"_uuid": "lsp-a", "name": "a"},
+                {"_uuid": "lsp-b", "name": "b"},
+            ],
+        }
+        with mock.patch.object(mod, "list_table", side_effect=lambda _argv, t: tables[t]):
+            lsps = mod.list_lsps()
+        self.assertEqual(
+            sorted((lsp["switch"], lsp["name"]) for lsp in lsps),
+            [("bb", "a"), ("bb", "b"), ("home", "lsp-home-localnet")],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

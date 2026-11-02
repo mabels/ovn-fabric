@@ -10,7 +10,6 @@ from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
-from deployer.primitives_host import HostPrimitive
 from runtime import generated as rg
 from runtime.message import BodySpec, Msg, from_parts, header, register_bodies, to_parts
 from runtime.peer import Peer
@@ -18,6 +17,7 @@ from runtime.runtime import Runtime
 from runtime.transport import connect
 
 from .. import generated as g
+from ..primitives.host import HostPrimitive
 from ..units import _KINDS, to_operation, to_step
 from .unit import UnitExecutor, component_name
 
@@ -269,6 +269,17 @@ class ExecuteTest(unittest.TestCase):
                     res = (await _exec(client, _unit(own), CREATE, commandTimeout=60))[-1].body
                     self.assertEqual(res.state, FAILED)
                     self.assertIn("timed out after 0.2s: sleep 0.5", res.message)
+
+        asyncio.run(run())
+
+    def test_skipped_steps_do_not_run(self) -> None:
+        async def run() -> None:
+            log = Path(tempfile.mkdtemp()) / "log"
+            unit = _unit(_logged(log, "a", "-a"), _logged(log, "b", "-b"))
+            async with _client() as client:
+                res = (await _exec(client, unit, CREATE, skip=[0]))[-1].body
+            self.assertEqual(res.state, DONE)
+            self.assertEqual(log.read_text().split(), ["b"])  # step 0 is already there
 
         asyncio.run(run())
 

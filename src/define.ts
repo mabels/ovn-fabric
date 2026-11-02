@@ -45,6 +45,7 @@ import {
   type HostAddress,
   type HostMonitoring,
   type HostOs,
+  type HostReconcile,
   type KernelRouter,
   type KernelRouterSide,
   localHost,
@@ -384,8 +385,11 @@ export class NetworkBuilder implements RouterEndpointContext {
     os?: HostOs,
     ovn?: OvnHostConfig,
     monitoring?: HostMonitoring,
+    reconcile?: HostReconcile,
   ): Host {
-    return this.registerHost(sshHost(name, address, user, os, ovn, monitoring));
+    return this.registerHost(
+      sshHost(name, address, user, os, ovn, monitoring, reconcile),
+    );
   }
 
   /** Declare the generator's own host — no SSH needed. */
@@ -394,8 +398,9 @@ export class NetworkBuilder implements RouterEndpointContext {
     os?: HostOs,
     ovn?: OvnHostConfig,
     monitoring?: HostMonitoring,
+    reconcile?: HostReconcile,
   ): Host {
-    return this.registerHost(localHost(name, os, ovn, monitoring));
+    return this.registerHost(localHost(name, os, ovn, monitoring, reconcile));
   }
 
   /** Cluster-wide OVN settings (NB_Global) — see OvnClusterOptions,

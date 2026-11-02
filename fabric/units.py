@@ -21,7 +21,8 @@ import json
 from collections.abc import Callable
 from typing import Any
 
-from deployer.lifecycle import (
+from . import generated as g
+from .lifecycle import (
     CaptureOperation,
     Command,
     CommandPrimitive,
@@ -32,9 +33,7 @@ from deployer.lifecycle import (
     SymlinkNetnsOperation,
     WriteFileOperation,
 )
-from deployer.primitives_fs import ChmodPrimitive, DirectoryPrimitive, RemovePathPrimitive
-
-from . import generated as g
+from .primitives.fs import ChmodPrimitive, DirectoryPrimitive, RemovePathPrimitive
 
 
 def _arg(arg: g.Arg) -> Any:

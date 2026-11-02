@@ -6,7 +6,7 @@ from typing import Any, cast
 
 from ladops import ovn as ovn_ops
 
-from .lifecycle import (
+from ..lifecycle import (
     Command,
     CommandPrimitive,
     LifecycleController,
@@ -420,6 +420,13 @@ class OVNNbCtlNat(CommandPrimitive):
     def key(self) -> str:
         return f"ovn.nat:{self.router}|{self.type}|{self.external_ip}|{self.logical_ip}"
 
+    @property
+    def _deletes_by(self) -> str:
+        """What `lr-nat-del` finds the NAT by: an snat by its logical IP, a
+        dnat/dnat_and_snat by its external IP. (The external IP for an snat
+        matches nothing — and the delete still succeeds, leaving it behind.)"""
+        return self.logical_ip if self.type == "snat" else self.external_ip
+
     def as_primitive(self) -> Primitive:
         create: list[Command] = []
         if self.reset:
@@ -459,8 +466,8 @@ class OVNNbCtlNat(CommandPrimitive):
             create_cmds=tuple(create),
             delete_cmds=(
                 Command(
-                    f"nat:{self.router}/{self.external_ip} (delete)",
-                    tuple(ovn_ops.lr_nat_del_argv(self.router, self.type, self.external_ip)),
+                    f"nat:{self.router}/{self._deletes_by} (delete)",
+                    tuple(ovn_ops.lr_nat_del_argv(self.router, self.type, self._deletes_by)),
                 ),
             ),
             probe=_find_probe(

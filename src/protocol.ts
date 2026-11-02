@@ -73,6 +73,9 @@ export const IpfixData = type({
   "cacheActiveTimeout?": "number",
   "cacheMaxFlows?": "number",
 });
+// RawIR node id globs the reconcile leaves alone (types.ts HostReconcile);
+// the loopback always, without being listed.
+export const HostReconcile = type({ "exclude?": "string[]" });
 export const InfraHostData = type({
   connectAddress: "string",
   "ovnRole?": "'central'|'chassis'",
@@ -87,6 +90,8 @@ export const InfraHostData = type({
   "dependencies?": "string[]",
   // Flow export onto the collector — see IpfixData.
   "ipfix?": IpfixData,
+  // What the runtime's reconcile leaves alone — see HostReconcile.
+  "reconcile?": HostReconcile,
 });
 export const InfraHostNode = type({
   id: "string",
@@ -815,6 +820,7 @@ export function buildJsonSchema(): Record<string, unknown> {
     InfraHostKey: shape(InfraHostKey),
     PackageManager: shape(PackageManager),
     HostOs: shape(HostOs),
+    HostReconcile: shape(HostReconcile),
     IpfixData: shape(IpfixData),
     InfraHostData: shape(InfraHostData),
     WireguardPeerConfig: shape(WireguardPeerConfig),

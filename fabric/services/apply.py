@@ -32,9 +32,12 @@ the requester as they come.
 from __future__ import annotations
 
 import asyncio
+import collections
+import json
 import logging
 import socket
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from deployer.deps import abstract_deps
 from protocol import generated as pt
@@ -45,9 +48,27 @@ from runtime.peer import Call, Peer, RemoteError
 from runtime.service import Service
 
 from .. import generated as g
-from ..plan import PlanError, plan_units
+from .. import observed
+from ..desired import (
+    Reconciled,
+    StepState,
+    choose,
+    compare,
+    desired_rawir,
+    missing_nodes,
+    step_state,
+)
+from ..exclude import DEFAULT_EXCLUDE, exclude_nodes
+from ..lifecycle import LifecycleAction, resolve
+from ..plan import PlanError, plan_operations, plan_units
 
 log = logging.getLogger("fabric.apply")
+
+# The IR store's name for the IR deployed on this host (create sets it).
+DEPLOYED = "deployed"
+
+# run's choice for a unit (see Apply._run).
+Choose = Callable[[g.Unit, dict[str, Any]], Awaitable[list[int] | None]]
 
 BODIES = {
     "IrApplyReq": BodySpec(g.IrApplyReq, "request"),
@@ -105,6 +126,11 @@ class Apply:
                 "bad-request",
                 f"{host} is not a host of {info.hash} (its hosts: {', '.join(info.hosts) or '-'})",
             )
+        if req.action is g.ApplyAction.run and req.dryRun:
+            return await self._run_dry(call, req, info, ir, host)
+        if req.action is g.ApplyAction.run:
+            async with self._lock:
+                return await self._converge(call, req, info, ir, host)
         if self._lock.locked():
             await call.log("info", "another apply runs: waiting for it")
         async with self._lock:
@@ -127,6 +153,8 @@ class Apply:
                     await call.log("warn", problem)
                     return self._result(info.hash, req, host, g.IrApplyOutcome.failed, [])
             results = await self._run(call, plan if creating else plan[::-1], req, host)
+            if not req.dryRun and (creating or not req.keepDeployed):
+                await self._mark_deployed(call, ir, info.hash, creating)
             failed = any(r.state is g.ApplyState.failed for r in results)
             outcome = g.IrApplyOutcome.failed if failed else g.IrApplyOutcome.done
             return self._result(info.hash, req, host, outcome, results)
@@ -158,30 +186,54 @@ class Apply:
         return f"dependencies not ready: {', '.join(missing)}" if missing else None
 
     async def _run(
-        self, call: Call, units: list[g.Unit], req: g.IrApplyReq, host: str
+        self,
+        call: Call,
+        units: list[g.Unit],
+        req: g.IrApplyReq,
+        host: str,
+        choose: Choose | None = None,
     ) -> list[g.ApplyUnit]:
+        """Run `units` through the unit executor. create and delete run every
+        step, unconditionally (a create fails on what is already there, a
+        delete removes best effort). `choose` is run's: asked right before
+        each unit, with the values known by then — which steps to skip, or
+        None to leave the unit alone."""
         client = await self._client()
         store: list[g.UnitValue] = []
         results: list[g.ApplyUnit] = []
         failed = Failed()
         for unit in units:
-            if req.action is g.ApplyAction.create and failed.blocks(unit):
+            if req.action is not g.ApplyAction.delete and failed.blocks(unit):
                 skipped = g.ApplyUnit(
                     name=unit.name, state=g.ApplyState.skipped, message=failed.why(unit)
                 )
                 results.append(skipped)
                 await self._progress(call, skipped)
                 continue
+            skip: list[int] = []
+            if choose is not None:
+                values = {value.name: json.loads(value.json) for value in store}
+                chosen = await choose(unit, values)
+                if chosen is None:
+                    left = g.ApplyUnit(name=unit.name, state=g.ApplyState.skipped)
+                    results.append(left)
+                    await self._progress(call, left)
+                    continue
+                skip = chosen
             await self._progress(call, g.ApplyUnit(name=unit.name, state=g.ApplyState.running))
             request = await client.request(
                 g.UnitExecReq(
                     kind="UnitExecReq",
                     unit=unit,
-                    action=req.action,
+                    # run converges by creating what is missing
+                    action=(
+                        g.ApplyAction.create if req.action is g.ApplyAction.run else req.action
+                    ),
                     inputs=store,
                     host=host,
                     dryRun=req.dryRun,
                     commandTimeout=req.commandTimeout,
+                    skip=skip or None,
                 ),
                 parent=call.req_id,
             )
@@ -230,6 +282,245 @@ class Apply:
             units=units,
         )
 
+    async def _mark_deployed(
+        self, call: Call, ir: g.IrCollection, digest: str, creating: bool
+    ) -> None:
+        """The IR store's name DEPLOYED points to the IR on this host: set
+        once a create ran its units (what is on the host belongs to it, even
+        where a unit failed), dropped once that IR is deleted again — unless
+        the delete asks to keep it (keepDeployed)."""
+        client = await self._client()
+        if creating:
+            await client.ask(
+                g.IrPutReq(kind="IrPutReq", name=DEPLOYED, ir=ir), timeout=None, parent=call.req_id
+            )
+            return
+        try:
+            deployed, _ = await self._resolve(call, DEPLOYED)
+        except ProtocolError:
+            return  # nothing deployed
+        if deployed.hash == digest:
+            await client.ask(
+                g.IrDeleteReq(kind="IrDeleteReq", ref=DEPLOYED), timeout=None, parent=call.req_id
+            )
+
+    async def _converge(
+        self, call: Call, req: g.IrApplyReq, info: g.IrInfo, ir: g.IrCollection, host: str
+    ) -> g.IrApplyRes:
+        """run: bring the host to its IR, unit by unit in plan order. Right
+        before a unit runs, its steps are checked against the live RawIR
+        (their learned footprint, with the values captured so far) and
+        `choose` decides: run all of it, only its missing steps, only its
+        reads — or leave it alone (fabric/desired.py). Nothing is removed
+        yet."""
+        if host != self.host:
+            raise ProtocolError("bad-request", f"run needs the live RawIR: only on {self.host}")
+        nodes = hydrate_nodes(plain(ir.collection))  # type: ignore[arg-type]
+        try:
+            plan = plan_units(nodes, host)
+            operations = plan_operations(nodes, host)
+        except PlanError as exc:
+            raise ProtocolError("bad-ir", str(exc)) from None
+        try:
+            live = await asyncio.to_thread(observed.snapshot)
+        except Exception as exc:  # noqa: BLE001 — without the live view, change nothing
+            raise ProtocolError("failed", f"cannot collect the live RawIR: {exc}") from None
+        host_node = next(n for n in nodes if isinstance(n, pt.InfraHostNode) and n.key.host == host)
+        exclude = [*DEFAULT_EXCLUDE, *_exclude_of(host_node)]
+        graph = Reconciled.of(
+            exclude_nodes(live, exclude)[0], desired_rawir(operations, exclude).nodes
+        )
+        by_unit: dict[str, list[Any]] = collections.defaultdict(list)
+        for unit_name, operation in operations:
+            by_unit[unit_name].append(operation)
+        # The resolved steps a unit created, that have a footprint.
+        ran_of: dict[str, list[Any]] = {}
+        choices: collections.Counter[str] = collections.Counter()
+
+        async def choose_unit(unit: g.Unit, values: dict[str, Any]) -> list[int] | None:
+            steps = [resolve(operation, values) for operation in by_unit[unit.name]]
+            checked = [step_state(step, live, exclude) for step in steps]
+            choice = choose([state for state, _ in checked])
+            choices[choice.why] += 1
+            states = ", ".join(
+                f"{type(step).__name__} {state.value}"
+                for step, (state, _) in zip(steps, checked, strict=True)
+            )
+            level = "info" if choice.run else "debug"
+            verdict = "runs" if choice.run else "left alone"
+            await call.log(level, f"{unit.name}: {verdict} — {choice.why} ({states})")
+            for _state, differ in checked:
+                for node_id, fields in differ.items():
+                    await call.log(
+                        "warn", f"{node_id}: present, but differs in {', '.join(fields)}"
+                    )
+            if not choice.run:
+                return None
+            ran_of[unit.name] = [
+                step
+                for i, (step, (state, _)) in enumerate(zip(steps, checked, strict=True))
+                if i not in choice.skip and state is StepState.missing
+            ]
+            return choice.skip
+
+        await call.log("info", f"run {info.hash} on {host}: {len(plan)} units")
+        results = await self._run(call, plan, req, host, choose=choose_unit)
+        for result in results:  # what run did, into the reconciled graph
+            for step in ran_of.get(result.name, []):
+                if result.state is g.ApplyState.done:
+                    graph.applied(step)
+                else:
+                    graph.failed(step)
+        await call.log(
+            "info",
+            "units: " + ", ".join(f"{why} {n}" for why, n in sorted(choices.items())),
+        )
+        counts = graph.counts()
+        await call.log(
+            "info",
+            f"reconciled graph: {len(graph.nodes)} nodes — present {counts['present']}, "
+            f"applied {counts['applied']}, missing {counts['missing']}, "
+            f"observed {counts['observed']} (no desired node: left, no deleter yet)",
+        )
+        for node_id, state in sorted(graph.state.items()):
+            await call.log("debug", f"{state.value}: {node_id}")
+        failed = any(r.state is g.ApplyState.failed for r in results)
+        outcome = g.IrApplyOutcome.failed if failed else g.IrApplyOutcome.done
+        return self._result(info.hash, req, host, outcome, results)
+
+    async def _run_dry(
+        self, call: Call, req: g.IrApplyReq, info: g.IrInfo, ir: g.IrCollection, host: str
+    ) -> g.IrApplyRes:
+        """run, as a dry run: what the IR is in RawIR on this host (the
+        desired side of a reconcile), and what cannot be predicted yet."""
+        if not req.dryRun:
+            raise ProtocolError("bad-request", "run applies nothing yet: use it with --dry-run")
+        nodes = hydrate_nodes(plain(ir.collection))  # type: ignore[arg-type]
+        host_node = next(n for n in nodes if isinstance(n, pt.InfraHostNode) and n.key.host == host)
+        exclude = _exclude_of(host_node)
+        try:
+            desired = desired_rawir(plan_operations(nodes, host), exclude)
+        except PlanError as exc:
+            raise ProtocolError("bad-ir", str(exc)) from None
+        kinds = collections.Counter(node["kind"] for node in desired.nodes.values())
+        await call.log(
+            "info",
+            f"run {info.hash} on {host} (dry run): {len(desired.nodes)} RawIR nodes — "
+            + ", ".join(f"{kind} {n}" for kind, n in sorted(kinds.items())),
+        )
+        await call.log(
+            "info",
+            f"excluded {desired.excluded} nodes ({', '.join([*DEFAULT_EXCLUDE, *exclude])}); "
+            f"changes on {len(desired.changes)} nodes no primitive adds",
+        )
+        if desired.not_learned:
+            await call.log(
+                "warn",
+                "not learned yet (primate): "
+                + ", ".join(f"{name} ×{n}" for name, n in desired.not_learned.most_common()),
+            )
+            await call.log(
+                "info",
+                "  because of: "
+                + ", ".join(f"{why} ×{n}" for why, n in desired.not_learned_why.most_common()),
+            )
+        if desired.runtime_values:
+            await call.log(
+                "info", f"{len(desired.runtime_values)} with a value known only at run time"
+            )
+        if desired.not_rawir:
+            await call.log(
+                "info",
+                "no RawIR: " + ", ".join(f"{k} ×{n}" for k, n in desired.not_rawir.most_common()),
+            )
+        for node_id, unit in desired.conflicts:
+            await call.log("warn", f"{node_id}: added differently again by {unit}")
+        live = await self._compare(call, desired.nodes, [*DEFAULT_EXCLUDE, *exclude])
+        if live is not None:
+            await self._would_create(call, nodes, host, live, [*DEFAULT_EXCLUDE, *exclude])
+        return self._result(info.hash, req, host, g.IrApplyOutcome.done, [])
+
+    async def _would_create(
+        self,
+        call: Call,
+        nodes: list[pt.Model],
+        host: str,
+        live: dict[str, dict[str, Any]],
+        exclude: list[str],
+    ) -> None:
+        """What run would do now, per unit (as _converge chooses). Steps with
+        a value only known at run time cannot be checked here: they count as
+        unknown (run checks them once the values are captured)."""
+        operations = plan_operations(nodes, host)
+        by_unit: dict[str, list[Any]] = collections.defaultdict(list)
+        for unit_name, operation in operations:
+            by_unit[unit_name].append(operation)
+        choices: collections.Counter[str] = collections.Counter()
+        for unit in plan_units(nodes, host):
+            steps = by_unit[unit.name]
+            states = [step_state(step, live, exclude)[0] for step in steps]
+            choice = choose(states)
+            choices[choice.why] += 1
+            verdict = "would run" if choice.run else "left alone"
+            await call.log("info", f"{unit.name}: {verdict} — {choice.why}")
+            for step, state in zip(steps, states, strict=True):
+                await call.log("debug", f"{unit.name}:   {type(step).__name__} {state.value}")
+                if state in (StepState.partial, StepState.missing):
+                    level = "info" if state is StepState.partial else "debug"
+                    for node_id in missing_nodes(step, live, exclude):
+                        await call.log(level, f"{unit.name}:   missing {node_id}")
+            for index, step in enumerate(steps):
+                if choice.run and index not in choice.skip:
+                    commands = "; ".join(step.describe(LifecycleAction.CREATE))
+                    await call.log("debug", f"{unit.name}: would run: {commands}")
+        await call.log(
+            "info",
+            "units: " + ", ".join(f"{why} {n}" for why, n in sorted(choices.items())),
+        )
+
+    async def _compare(
+        self, call: Call, desired: dict[str, dict[str, Any]], exclude: list[str]
+    ) -> dict[str, dict[str, Any]] | None:
+        """The live RawIR (same exclude) against the desired: per kind, what
+        is applied, to apply, only observed, or differs — ids at debug.
+        Returns the live RawIR as collected (None when it cannot be)."""
+        try:
+            collected = await asyncio.to_thread(observed.snapshot)
+        except Exception as exc:  # noqa: BLE001 — a report, not an apply: say why, go on
+            await call.log("warn", f"cannot collect the live RawIR: {type(exc).__name__}: {exc}")
+            return None
+        live, excluded = exclude_nodes(collected, exclude)
+        result = compare(desired, live)
+        await call.log(
+            "info",
+            f"live: {len(live)} RawIR nodes ({excluded} excluded) — applied {len(result.applied)}, "
+            f"to apply {len(result.to_apply)}, only observed {len(result.only_observed)}, "
+            f"differ {len(result.differ)}",
+        )
+        kinds = sorted({n["kind"] for n in [*desired.values(), *live.values()]})
+        for kind in kinds:
+
+            def count(ids: list[str]) -> int:
+                return sum(
+                    1 for i in ids if (desired.get(i) or live.get(i) or {}).get("kind") == kind
+                )
+
+            await call.log(
+                "info",
+                f"  {kind}: applied {count(result.applied)}, to apply {count(result.to_apply)}, "
+                f"only observed {count(result.only_observed)}, differ {count(list(result.differ))}",
+            )
+        for label, ids in (
+            ("to apply", result.to_apply),
+            ("only observed", result.only_observed),
+            ("applied", result.applied),
+        ):
+            for node_id in ids:
+                await call.log("debug", f"{label}: {node_id}")
+        for node_id, fields in result.differ.items():
+            await call.log("debug", f"differ: {node_id}: {', '.join(fields)}")
+        return collected
+
     async def _resolve(self, call: Call, ref: str) -> tuple[g.IrInfo, g.IrCollection]:
         """The stored IR `ref` names (a hash or a name): its info and nodes."""
         client = await self._client()
@@ -241,6 +532,12 @@ class Apply:
             raise ProtocolError(exc.code, exc.message) from None
         assert isinstance(res.body, g.IrGetRes)
         return res.body.info, res.body.ir
+
+
+def _exclude_of(host_node: pt.InfraHostNode) -> list[str]:
+    """The host's own exclude patterns (topology: Host.reconcile.exclude)."""
+    reconcile = host_node.data.reconcile
+    return list(reconcile.exclude or []) if reconcile is not None else []
 
 
 def service(client: Callable[[], Awaitable[Peer]], host: str | None = None) -> Service:

@@ -10,8 +10,8 @@ from pathlib import Path
 from typing import cast
 from unittest import mock
 
-from deployer.context import Ctx, Options
-from deployer.lifecycle import (
+from fabric.context import Ctx, Options
+from fabric.lifecycle import (
     Command,
     LifecycleAction,
     LifecycleController,

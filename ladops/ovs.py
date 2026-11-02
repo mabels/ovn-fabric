@@ -80,6 +80,13 @@ def list_bridge_mappings() -> dict[str, str]:
     return mappings
 
 
+def list_external_ids() -> dict[str, str]:
+    """Open_vSwitch.external_ids: the host's own settings (ovn-remote,
+    ovn-encap-ip, the bridge mappings, …)."""
+    rows = list_table(_VSCTL, "Open_vSwitch")
+    return dict(rows[0].get("external_ids", {})) if rows else {}
+
+
 def list_interfaces() -> list[JsonObject]:
     return [
         {

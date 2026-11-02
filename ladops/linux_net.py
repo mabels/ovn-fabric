@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shlex
 import subprocess
 from typing import Any
@@ -33,12 +34,20 @@ from .netns import run as run_in_netns
 
 def _run_ip_json(args: list[str], netns: str | None, pid: int | None = None) -> Any:
     if pid is not None:
-        out = subprocess.run(
+        done = subprocess.run(
             ["nsenter", "-t", str(pid), "-n", "--", "ip", "-j", *args],
-            check=True,
             capture_output=True,
             text=True,
-        ).stdout
+        )
+        if done.returncode != 0:
+            # A container ended since it was listed: its namespace is gone,
+            # and with it everything in it.
+            if not os.path.exists(f"/proc/{pid}"):
+                return []
+            raise subprocess.CalledProcessError(
+                done.returncode, done.args, output=done.stdout, stderr=done.stderr
+            )
+        out = done.stdout
     else:
         out = run_in_netns(["ip", "-j", *args], netns).stdout
     return json.loads(out)

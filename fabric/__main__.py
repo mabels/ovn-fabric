@@ -351,6 +351,14 @@ async def _docker_run(args: argparse.Namespace) -> int:
 def _read_ir(path: str) -> g.IrCollection | None:
     """The IR at `path` (- for stdin): its node list (generate-ir's output)
     or an IrCollection — validated here, before it is sent."""
+    if path == "-" and sys.stdin.isatty():
+        # Nothing piped in: waiting for a terminal to type JSON only looks hung.
+        print(
+            "error: no IR: give a stored one (its hash or name, e.g. `deployed`), "
+            "or pipe one in (< ir.json)",
+            file=sys.stderr,
+        )
+        return None
     try:
         raw = json.loads(sys.stdin.read() if path == "-" else Path(path).read_text())
     except OSError as exc:
@@ -394,9 +402,14 @@ async def _ir_put(args: argparse.Namespace) -> int:
 
 async def _ir_apply(args: argparse.Namespace) -> int:
     """Apply a stored IR — or store one first (--put FILE, or from stdin
-    when no REF is given) and apply that."""
+    when no REF is given) and apply that. `run` and `delete` without REF
+    and with nothing piped in: the IR that is deployed (the store's name
+    `deployed`, set by create)."""
     ref = args.ref
     put = args.put
+    piped = not sys.stdin.isatty()
+    if args.action in ("run", "delete") and ref is None and put is None and not piped:
+        ref = "deployed"
     if ref == "-" or (ref is None and put is None):
         ref, put = None, "-"  # the IR comes on stdin
     if put is not None:
@@ -418,6 +431,7 @@ async def _ir_apply(args: argparse.Namespace) -> int:
         host=args.host,
         dryRun=args.dry_run or None,
         commandTimeout=args.command_timeout,
+        keepDeployed=args.keep_deployed or None,
     )
     res = await _ask(args.address, req)
     if not isinstance(res, g.IrApplyRes):
@@ -454,7 +468,7 @@ async def _ir_delete(args: argparse.Namespace) -> int:
 
 
 # What the runtime and its services need on a host (their imports).
-BUNDLE_PACKAGES = ("fabric", "runtime", "deployer", "protocol", "ladops")
+BUNDLE_PACKAGES = ("fabric", "runtime", "deployer", "protocol", "ladops", "raw_reconciler")
 
 
 async def _bundle(args: argparse.Namespace) -> int:
@@ -616,14 +630,18 @@ def main() -> int:
     ir_delete.add_argument("ref", help="its name, or the hash of one stored without a name")
     ir_delete.set_defaults(run=_ir_delete)
     ir_apply = commands.add_parser(
-        "ir-apply", help="apply a stored IR on the runtime's host (create, or delete rewound)"
+        "ir-apply",
+        help="apply a stored IR on the runtime's host (create, delete rewound, or run "
+        "— converge to the deployed IR: create what is missing, of the primitives "
+        "reconciled so far; --dry-run: the comparison and what it would do)",
     )
     ir_apply.add_argument("action", choices=[a.value for a in g.ApplyAction])
     ir_apply.add_argument(
         "ref",
         nargs="?",
-        help="a stored IR: its hash or name; none (or -): the IR comes on stdin, "
-        "is stored, then applied",
+        help="a stored IR: its hash or name; none: the IR on stdin (-: stdin always), "
+        "stored, then applied — for run and delete with nothing piped in: the deployed "
+        "one (`deployed`)",
     )
     ir_apply.add_argument(
         "--put", metavar="FILE", help="store this IR first (- for stdin), then apply it"
@@ -631,6 +649,11 @@ def main() -> int:
     ir_apply.add_argument("--name", help="with --put: store it under this name")
     ir_apply.add_argument("--host", help="which of the IR's hosts (default: the runtime's)")
     ir_apply.add_argument("--dry-run", action="store_true", help="describe, run nothing")
+    ir_apply.add_argument(
+        "--keep-deployed",
+        action="store_true",
+        help="delete: keep the name `deployed` on the deleted IR (default: drop it)",
+    )
     ir_apply.add_argument(
         "--command-timeout",
         type=float,

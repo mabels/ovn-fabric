@@ -286,7 +286,10 @@ export const IrDeleteRes = type({
 
 /** What applying does: create what the IR declares, or delete it (rewound).
  * Later: 'reconcile' (diff against what is there). */
-export const ApplyAction = type("'create' | 'delete'");
+/** create and delete as declared; run converges the host to the IR that is
+ * deployed: it creates what is missing from the live RawIR — for the
+ * primitives that are reconciled so far — and leaves the rest alone. */
+export const ApplyAction = type("'create' | 'delete' | 'run'");
 
 /** Apply a stored IR on this host. */
 export const IrApplyReq = type({
@@ -302,6 +305,9 @@ export const IrApplyReq = type({
   /** Seconds one command may run before it is killed and its unit has
    * failed (a command may set its own); 0: no limit. Default: 300. */
   "commandTimeout?": "number",
+  /** delete: keep the store's name `deployed` pointing to the deleted IR
+   * (by default a delete of the deployed IR drops the name). */
+  "keepDeployed?": "boolean",
 });
 
 export const ApplyState = type(
@@ -449,6 +455,9 @@ export const UnitExecReq = type({
   "dryRun?": "boolean",
   /** As IrApplyReq's. */
   "commandTimeout?": "number",
+  /** Steps (by index) not to run: their object is already there — apply
+   * found their predicted RawIR in the live RawIR (fabric/desired.py). */
+  "skip?": "number.integer[]",
 });
 
 export const UnitExecRes = type({

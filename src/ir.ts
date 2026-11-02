@@ -192,6 +192,9 @@ function hostToIR(
           cacheMaxFlows: ipfix.cacheMaxFlows,
         }
         : undefined,
+      reconcile: host.reconcile?.exclude
+        ? { exclude: [...host.reconcile.exclude] }
+        : undefined,
     },
   };
 }

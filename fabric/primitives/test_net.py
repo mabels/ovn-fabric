@@ -4,9 +4,9 @@ import asyncio
 import unittest
 from collections.abc import Sequence
 
-from deployer.context import Ctx
-from deployer.lifecycle import LifecycleAction, LifecycleController, Operation
-from deployer.primitives_host import HostPrimitive
+from fabric.context import Ctx
+from fabric.lifecycle import LifecycleAction, LifecycleController, Operation
+from fabric.primitives.host import HostPrimitive
 
 
 class FakeJob:
@@ -81,12 +81,7 @@ class NetnsPrimitiveTest(unittest.TestCase):
             await _now(lc, netns.set_sysctl("net.ipv4.ip_forward", "1"))
             await _now(
                 lc,
-                netns.add_rule(
-                    "iptables",
-                    "nat",
-                    "POSTROUTING",
-                    ("-o", "veth-krn", "-j", "MASQUERADE"),
-                ),
+                netns.add_masq("ipv4", "veth-krn"),
             )
 
             for node in (
@@ -282,18 +277,120 @@ class NetnsPrimitiveTest(unittest.TestCase):
         # caller's error, not something create papers over.
         async def run() -> None:
             netns = HostPrimitive("h").netns("ns-router")
-            rule = netns.add_rule("iptables", "filter", "INPUT", ("-j", "ACCEPT"))
-            prefix = ("ip", "netns", "exec", "ns-router", "iptables", "-t", "filter")
-            for action, flag in ((LifecycleAction.CREATE, "-A"), (LifecycleAction.DELETE, "-D")):
+            # A default covers both families; delete removes in reverse.
+            rule = netns.add_default("input", "allow")
+            prefix = ("ip", "netns", "exec", "ns-router")
+            for action, flag, binaries in (
+                (LifecycleAction.CREATE, "-A", ("iptables", "ip6tables")),
+                (LifecycleAction.DELETE, "-D", ("ip6tables", "iptables")),
+            ):
                 job = FakeJob()
                 lc = LifecycleController(Ctx(), job, action, "h")
                 await _now(lc, rule)
                 self.assertEqual(
                     [command[1] for command in job.commands],
-                    [(*prefix, flag, "INPUT", "-j", "ACCEPT")],
+                    [
+                        (*prefix, binary, "-t", "filter", flag, "INPUT", "-j", "ACCEPT")
+                        for binary in binaries
+                    ],
                 )
 
         asyncio.run(run())
+
+    def test_each_named_rule_says_what_it_is(self) -> None:
+        netns = HostPrimitive("h").netns("ns-x")
+        cases = [
+            (
+                netns.add_stateful_accept("ipv6", "forward"),
+                (
+                    "ip6tables",
+                    "-t",
+                    "filter",
+                    "-A",
+                    "FORWARD",
+                    "-m",
+                    "conntrack",
+                    "--ctstate",
+                    "ESTABLISHED,RELATED",
+                    "-j",
+                    "ACCEPT",
+                ),
+            ),
+            (
+                netns.add_masq("ipv4", "wg0"),
+                ("iptables", "-t", "nat", "-A", "POSTROUTING", "-o", "wg0", "-j", "MASQUERADE"),
+            ),
+            (
+                netns.add_filter(
+                    "ipv4",
+                    "input",
+                    "allow",
+                    sources=["10.0.0.0/8"],
+                    exclude_sources=["10.9.0.0/16"],
+                    protocol="tcp",
+                    ports=[(8000, 8100)],
+                ),
+                (
+                    "iptables",
+                    "-t",
+                    "filter",
+                    "-A",
+                    "INPUT",
+                    "-s",
+                    "10.0.0.0/8",
+                    "!",
+                    "-s",
+                    "10.9.0.0/16",
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    "8000:8100",
+                    "-j",
+                    "ACCEPT",
+                ),
+            ),
+        ]
+        for rule, argv in cases:
+            with self.subTest(rule=type(rule).__name__):
+                self.assertEqual(
+                    rule.as_primitive().create_cmds[0].argv, ("ip", "netns", "exec", "ns-x", *argv)
+                )
+
+    def test_a_filter_rule_is_its_whole_cross_product(self) -> None:
+        rule = (
+            HostPrimitive("h")
+            .netns("ns-x")
+            .add_filter(
+                "ipv6",
+                "forward",
+                "deny",
+                sources=["fd00::/8", "fc00::/8"],
+                protocol="udp",
+                ports=[(53, 53), (5000, 5010)],
+            )
+        )
+        primitive = rule.as_primitive()
+        self.assertEqual(
+            [c.argv[4:] for c in primitive.create_cmds],
+            [
+                ("ip6tables", "-t", "filter", "-A", "FORWARD", "-s", source, "-p", "udp",
+                 "--dport", port, "-j", "DROP")
+                for source in ("fd00::/8", "fc00::/8")
+                for port in ("53", "5000:5010")
+            ],
+        )  # fmt: skip
+        self.assertEqual(len(primitive.nodes), 4)
+        self.assertEqual(
+            [c.argv[4:] for c in primitive.delete_cmds],
+            [
+                tuple("-D" if a == "-A" else a for a in c.argv[4:])
+                for c in reversed(primitive.create_cmds)
+            ],
+        )
+
+    def test_ports_need_tcp_or_udp(self) -> None:
+        with self.assertRaises(ValueError):
+            HostPrimitive("h").netns("ns-x").add_filter("ipv4", "input", "allow", ports=[(22, 22)])
 
 
 if __name__ == "__main__":

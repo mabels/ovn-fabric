@@ -10,6 +10,7 @@ from ladops.linux_net import list_addrs, list_links_detail, list_routes
 from ladops.netns import list_netns
 from ladops.ovn import (
     list_acls,
+    list_connections,
     list_logical_routers,
     list_logical_switches,
     list_lrps,
@@ -17,7 +18,7 @@ from ladops.ovn import (
     list_nats,
     list_static_routes,
 )
-from ladops.ovs import list_bridge_mappings, list_bridge_ports
+from ladops.ovs import list_bridge_mappings, list_bridge_ports, list_external_ids
 from protocol import raw_generated as raw
 from protocol.hydrate import hydrate_as
 
@@ -117,6 +118,11 @@ def _addr_nodes(
     return nodes
 
 
+# `ip route` names a default route "default" in both families; RawIR
+# names it as the deployer does.
+_DEFAULT = {"ipv4": "0.0.0.0/0", "ipv6": "::/0"}
+
+
 def _route_nodes(
     spaces: list[tuple[str, str | None, int | None]],
 ) -> list[dict[str, Any]]:
@@ -124,9 +130,12 @@ def _route_nodes(
     for ns, netns, pid in spaces:
         for family in ("-4", "-6"):
             for route in list_routes(netns, family, pid):
+                prefix = (
+                    _DEFAULT[route["family"]] if route["prefix"] == "default" else route["prefix"]
+                )
                 id_ = (
                     f"route:{ns}|{route['family']}|{route.get('table') or 'main'}|"
-                    f"{route['prefix']}|{route['dev']}|{route['nexthop']}|"
+                    f"{prefix}|{route['dev']}|{route['nexthop']}|"
                     f"{route.get('metric')}"
                 )
                 nodes.append(
@@ -136,7 +145,7 @@ def _route_nodes(
                         "collection": {
                             "netnsRef": f"netns:{ns}",
                             "family": route["family"],
-                            "prefix": route["prefix"],
+                            "prefix": prefix,
                             "devRef": _link_id(ns, route["dev"]),
                             "via": route["nexthop"],
                             "metric": route.get("metric"),
@@ -157,9 +166,20 @@ def _iptables_nodes(
         # discovery until the same pid path exists in ladops.iptables.
         if pid is not None:
             continue
+        seen: dict[str, int] = {}
         for rule in list_rules(netns):
             family = "ipv4" if rule["family"] == "ip" else "ipv6"
-            id_ = f"iptables:{ns}|{family}|{rule['table']}|{rule['chain']}|" f"{rule['order']}"
+            # By content — what it matches and what it does — so a rule is
+            # found wherever it sits in its chain (its position: `handle`);
+            # the same rule twice gets "#2".
+            matches = ",".join(f"{key}={value}" for key, value in sorted(rule["fields"].items()))
+            id_ = (
+                f"iptables:{ns}|{family}|{rule['table']}|{rule['chain']}|"
+                f"{matches}|{rule['action']}"
+            )
+            seen[id_] = seen.get(id_, 0) + 1
+            if seen[id_] > 1:
+                id_ += f"#{seen[id_]}"
             nodes.append(
                 {
                     "id": id_,
@@ -202,7 +222,17 @@ def _ovs_nodes() -> list[dict[str, Any]]:
     mappings = list_bridge_mappings()
     rows = list_bridge_ports()
     bridges = sorted({row["bridge"] for row in rows})
-    nodes: list[dict[str, Any]] = []
+    # The host's own settings; the bridge mappings are a field of each
+    # bridge instead (below).
+    nodes: list[dict[str, Any]] = [
+        {
+            "id": f"ovs.external-id:{key}",
+            "kind": "ovs.external-id",
+            "collection": {"key": key, "value": value},
+        }
+        for key, value in sorted(list_external_ids().items())
+        if key != "ovn-bridge-mappings"
+    ]
     for bridge in bridges:
         port_names = sorted({row["port"] for row in rows if row["bridge"] == bridge})
         nodes.append(
@@ -343,7 +373,13 @@ def _ovn_nodes() -> list[dict[str, Any]]:
     for nat in list_nats():
         nodes.append(
             {
-                "id": f"ovn.nat:{nat['router']}|{nat['uuid']}",
+                # Keyed by what it is, not its UUID (new on every create):
+                # the same key the NAT primitive declares, so it can be
+                # predicted (fabric/rawir_learned.py, ADR 0008).
+                "id": (
+                    f"ovn.nat:{nat['router']}|{nat['type']}|{nat['externalIp']}|"
+                    f"{nat['logicalIp']}"
+                ),
                 "kind": "ovn.nat",
                 "collection": {
                     "routerRef": f"ovn.lr:{nat['router']}",
@@ -356,13 +392,22 @@ def _ovn_nodes() -> list[dict[str, Any]]:
                 },
             }
         )
+    for db in ("nb", "sb"):
+        targets = list_connections(db)
+        if targets:  # a database that does not listen has no node
+            nodes.append(
+                {
+                    "id": f"ovn.connection:{db}",
+                    "kind": "ovn.connection",
+                    "collection": {"db": db, "targets": targets},
+                }
+            )
     for acl in list_acls():
-        # A catch-all ACL (match "1") carries no condition of its own and
-        # no metadata; it is the deployer's implicit stateful/default
-        # helper, not a semantic raw fact. Drop it from the graph.
-        if acl["match"].strip() == "1" and not acl.get("external_ids"):
-            continue
-        acl_id = f"ovn.acl:{acl['switch']}|{acl['uuid']}"
+        # By content, like the ACL primitive's key (see the NAT above).
+        acl_id = (
+            f"ovn.acl:{acl['switch']}|{acl['direction']}|{acl['priority']}|"
+            f"{acl['match']}|{acl['action']}"
+        )
         nodes.append(
             {
                 "id": acl_id,

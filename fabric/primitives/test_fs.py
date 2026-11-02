@@ -7,9 +7,9 @@ import unittest
 from collections.abc import Sequence
 from pathlib import Path
 
-from deployer.context import Ctx
-from deployer.lifecycle import LifecycleAction, LifecycleController, Operation
-from deployer.primitives_host import HostPrimitive
+from fabric.context import Ctx
+from fabric.lifecycle import LifecycleAction, LifecycleController, Operation
+from fabric.primitives.host import HostPrimitive
 
 
 class FakeJob:

@@ -4,12 +4,13 @@ import dataclasses
 import ipaddress
 import shlex
 from collections.abc import Sequence
+from typing import ClassVar
 
 from ladops import linux_net as linux_net_ops
 from ladops import netns as netns_ops
 from ladops import ovs as ovs_ops
 
-from .lifecycle import (
+from ..lifecycle import (
     Command,
     CommandPrimitive,
     Primitive,
@@ -330,49 +331,182 @@ class DhclientPrimitive(CommandPrimitive):
         )
 
 
+# A security group's vocabulary (the IR's) -> iptables'.
+_CHAIN = {"input": "INPUT", "output": "OUTPUT", "forward": "FORWARD"}
+_TARGET = {"allow": "ACCEPT", "deny": "DROP", "reject": "REJECT"}
+_BINARY = {"ipv4": "iptables", "ipv6": "ip6tables"}
+
+# One iptables line: (binary, table, chain, args).
+Line = tuple[str, str, str, tuple[str, ...]]
+
+
 @dataclasses.dataclass(frozen=True)
-class IptablesRule(CommandPrimitive):
-    """One iptables/ip6tables rule inside a netns."""
+class FirewallRule(CommandPrimitive):
+    """Base of the security-group rules inside a netns. Each one is a rule
+    of the IR's security group (`security.group`) — with its field names
+    and values (direction input/output/forward, action allow/deny/reject,
+    lists of sources, ports …) — and becomes the iptables/ip6tables lines
+    that implement it: create appends them (`-A`), delete removes them
+    (`-D`, in reverse). The translation into iptables' vocabulary lives
+    here, once. Not a primitive of its own."""
 
     host: str
     netns: str
-    binary: str
-    table: str
-    chain: str
-    args: tuple[str, ...] = ()
+
+    # The NetnsPrimitive method that builds it (the old generator renders
+    # a rule back into that call).
+    builder: ClassVar[str] = ""
+
+    @property
+    def key(self) -> str:
+        raise NotImplementedError
+
+    def lines(self) -> list[Line]:
+        raise NotImplementedError
+
+    def _argv(self, verb: str, line: Line) -> tuple[str, ...]:
+        binary, table, chain, args = line
+        return _prefix(self.netns, [binary, "-t", table, verb, chain, *args])
+
+    def as_primitive(self) -> Primitive:
+        lines = self.lines()
+        return Primitive(
+            key=self.key,
+            nodes=tuple(
+                RawNodeTemplate(
+                    id=f"iptables.rule:{self.netns}|{binary}|{table}|{chain}|{' '.join(args)}",
+                    kind="iptables.rule",
+                    fields={
+                        "netnsRef": f"netns:{self.netns}",
+                        "binary": binary,
+                        "table": table,
+                        "chain": chain,
+                        "args": list(args),
+                    },
+                )
+                for binary, table, chain, args in lines
+            ),
+            create_cmds=tuple(
+                Command(f"{self.host}:{line[0]} {line[2]}", self._argv("-A", line))
+                for line in lines
+            ),
+            delete_cmds=tuple(
+                Command(f"{self.host}:{line[0]} {line[2]} (delete)", self._argv("-D", line))
+                for line in reversed(lines)
+            ),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class FilterRule(FirewallRule):
+    """A security group's filter rule: `action` for traffic in `direction`
+    that matches — from any of `sources` (but none of `exclude_sources`),
+    to any of `destinations`, with `protocol`, to any of `ports`
+    ((from, to), tcp/udp only); an empty list matches anything. One line
+    per source × destination × port."""
+
+    family: str  # "ipv4" | "ipv6"
+    direction: str  # "input" | "output" | "forward"
+    action: str  # "allow" | "deny" | "reject"
+    sources: tuple[str, ...] = ()
+    exclude_sources: tuple[str, ...] = ()
+    destinations: tuple[str, ...] = ()
+    protocol: str | None = None
+    ports: tuple[tuple[int, int], ...] = ()
+    builder: ClassVar[str] = "add_filter"
+
+    def __post_init__(self) -> None:
+        if self.ports and self.protocol not in ("tcp", "udp"):
+            raise ValueError(f"filter rule in {self.netns}: ports require tcp/udp")
 
     @property
     def key(self) -> str:
         return (
-            f"iptables.rule:{self.netns}|{self.binary}|{self.table}|"
-            f"{self.chain}|{' '.join(self.args)}"
+            f"firewall.filter:{self.netns}|{self.family}|{self.direction}|{self.action}|"
+            f"{','.join(self.sources)}|{','.join(self.exclude_sources)}|"
+            f"{','.join(self.destinations)}|{self.protocol or ''}|"
+            f"{','.join(f'{a}-{b}' for a, b in self.ports)}"
         )
 
-    def _argv(self, verb: str) -> tuple[str, ...]:
-        argv = [self.binary, "-t", self.table, verb, self.chain, *self.args]
-        return _prefix(self.netns, argv)
+    def lines(self) -> list[Line]:
+        out: list[Line] = []
+        for source in self.sources or (None,):
+            for destination in self.destinations or (None,):
+                for port in self.ports or (None,):
+                    args: list[str] = []
+                    if source is not None:
+                        args += ["-s", source]
+                    for excluded in self.exclude_sources:
+                        args += ["!", "-s", excluded]
+                    if destination is not None:
+                        args += ["-d", destination]
+                    if self.protocol is not None:
+                        args += ["-p", self.protocol]
+                    if port is not None:
+                        first, last = port
+                        args += ["--dport", str(first) if first == last else f"{first}:{last}"]
+                    args += ["-j", _TARGET[self.action]]
+                    out.append(
+                        (_BINARY[self.family], "filter", _CHAIN[self.direction], tuple(args))
+                    )
+        return out
 
-    def as_primitive(self) -> Primitive:
-        return Primitive(
-            key=self.key,
-            nodes=(
-                RawNodeTemplate(
-                    id=self.key,
-                    kind="iptables.rule",
-                    fields={
-                        "netnsRef": f"netns:{self.netns}",
-                        "binary": self.binary,
-                        "table": self.table,
-                        "chain": self.chain,
-                        "args": list(self.args),
-                    },
-                ),
-            ),
-            create_cmds=(Command(f"{self.host}:{self.binary} {self.chain}", self._argv("-A")),),
-            delete_cmds=(
-                Command(f"{self.host}:{self.binary} {self.chain} (delete)", self._argv("-D")),
-            ),
-        )
+
+@dataclasses.dataclass(frozen=True)
+class MasqRule(FirewallRule):
+    """A security group's masq rule, applied where it is used: masquerade
+    what leaves through `out_dev`."""
+
+    family: str
+    out_dev: str
+    builder: ClassVar[str] = "add_masq"
+
+    @property
+    def key(self) -> str:
+        return f"firewall.masq:{self.netns}|{self.family}|{self.out_dev}"
+
+    def lines(self) -> list[Line]:
+        args = ("-o", self.out_dev, "-j", "MASQUERADE")
+        return [(_BINARY[self.family], "nat", "POSTROUTING", args)]
+
+
+@dataclasses.dataclass(frozen=True)
+class DefaultRule(FirewallRule):
+    """A security group's default for one direction: `action` for what no
+    rule decided — the last line of the chain, for both families."""
+
+    direction: str
+    action: str
+    builder: ClassVar[str] = "add_default"
+
+    @property
+    def key(self) -> str:
+        return f"firewall.default:{self.netns}|{self.direction}|{self.action}"
+
+    def lines(self) -> list[Line]:
+        return [
+            (binary, "filter", _CHAIN[self.direction], ("-j", _TARGET[self.action]))
+            for binary in ("iptables", "ip6tables")
+        ]
+
+
+@dataclasses.dataclass(frozen=True)
+class StatefulAccept(FirewallRule):
+    """What makes a direction's filter rules stateful: accept what belongs
+    to a connection already accepted (the replies). No rule of the IR —
+    derived for every family and direction that has filter rules."""
+
+    family: str
+    direction: str
+    builder: ClassVar[str] = "add_stateful_accept"
+
+    @property
+    def key(self) -> str:
+        return f"firewall.stateful:{self.netns}|{self.family}|{self.direction}"
+
+    def lines(self) -> list[Line]:
+        args = ("-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
+        return [(_BINARY[self.family], "filter", _CHAIN[self.direction], args)]
 
 
 @dataclasses.dataclass(frozen=True)

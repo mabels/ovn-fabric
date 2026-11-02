@@ -5,13 +5,13 @@ import unittest
 from collections.abc import Callable
 
 from deployer.ir_common import Emitter
-from deployer.primitives_host import HostPrimitive
 from deployer.test_ir_to_python import NODES
 from protocol.hydrate import hydrate_nodes
 from runtime.test_message import IR_SAMPLE
 
 from . import generated as g
 from .plan import PlanEmitter, PlanError, plan_units
+from .primitives.host import HostPrimitive
 from .units import to_operation
 
 HOST = HostPrimitive("h")

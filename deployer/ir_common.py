@@ -88,14 +88,9 @@ import shlex
 from collections.abc import Sequence
 from typing import Any, Protocol
 
-from ladops import linux_net as linux_net_ops
-from ladops import netns as netns_ops
-from ladops import ovn as ovn_ops
-from protocol import KernelApp
-from protocol import generated as pt
-
-from .primitives_host import HostPrimitive, NetnsPrimitive
-from .primitives_ovn import (
+from fabric.primitives.host import HostPrimitive, NetnsPrimitive
+from fabric.primitives.net import FirewallRule
+from fabric.primitives.ovn import (
     OVNNbCtlAcl,
     OVNNbCtlLr,
     OVNNbCtlLrp,
@@ -104,6 +99,11 @@ from .primitives_ovn import (
     OVNNbCtlNat,
     OVNNbCtlRoute,
 )
+from ladops import linux_net as linux_net_ops
+from ladops import netns as netns_ops
+from ladops import ovn as ovn_ops
+from protocol import KernelApp
+from protocol import generated as pt
 
 Action = str  # "create" | "delete"
 
@@ -1020,23 +1020,20 @@ def _security_groups_from_refs(
 # the netns, and `ip netns delete` (the kernel router's own delete path
 # in the kernel router job) destroys the whole netns, its rules included —
 # nothing left to tear down separately.
-def _emit_iptables(
+def _emit_rule(
     emit: Emitter,
     netns_primitive: NetnsPrimitive | None,
     netns_var: str | None,
-    netns: str,
-    binary: str,
-    table: str,
-    chain: str,
-    args: Sequence[str],
+    rule: FirewallRule,
 ) -> None:
     if netns_primitive is not None:
-        emit.ovn(
-            netns_primitive.add_rule(binary, table, chain, tuple(args)),
-            parent=netns_var,
-        )
+        emit.ovn(rule, parent=netns_var)
         return
-    emit.sh(netns_ops.netns_exec_argv([binary, "-t", table, "-A", chain, *args], netns))
+    for command in rule.as_primitive().create_cmds:
+        emit.sh(list(command.argv))
+
+
+_FAMILY = {pt.Family.ipv4: "ipv4", pt.Family.ipv6: "ipv6"}
 
 
 def _emit_security_group_rules(
@@ -1048,47 +1045,25 @@ def _emit_security_group_rules(
     netns_var: str | None = None,
 ) -> None:
     group_unit = emit.unit("security group", f"{group.key.name} in {netns} on {dev}")
+    # Builds the rules (its host only names their commands).
+    rules = netns_primitive or NetnsPrimitive(host="", name=netns)
     # Every filter rule is stateful: allow replies first, per family for
-    # every chain the group actually uses.
-    chains: dict[str, set[str]] = {"iptables": set(), "ip6tables": set()}
-    for rule in group.data.rules:
-        if rule.kind == "filter":
-            chains["iptables" if rule.family == pt.Family.ipv4 else "ip6tables"].add(
-                {
-                    pt.Direction.input: "INPUT",
-                    pt.Direction.output: "OUTPUT",
-                    pt.Direction.forward: "FORWARD",
-                }[rule.direction]
-            )
-    for iptables, used in chains.items():
-        for chain in sorted(used):
-            _emit_iptables(
-                group_unit,
-                netns_primitive,
-                netns_var,
-                netns,
-                iptables,
-                "filter",
-                chain,
-                ("-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT"),
-            )
-    action_map = {
-        pt.Action.allow: "ACCEPT",
-        pt.Action.deny: "DROP",
-        pt.Action.reject: "REJECT",
-    }
+    # every direction the group actually uses.
+    stateful = sorted(
+        {
+            (_FAMILY[rule.family], rule.direction.value)
+            for rule in group.data.rules
+            if rule.kind == "filter"
+        }
+    )
+    for family, direction in stateful:
+        _emit_rule(
+            group_unit, netns_primitive, netns_var, rules.add_stateful_accept(family, direction)
+        )
     for rule in group.data.rules:
         if rule.kind == "masq":
-            iptables = "iptables" if rule.family == pt.Family.ipv4 else "ip6tables"
-            _emit_iptables(
-                group_unit,
-                netns_primitive,
-                netns_var,
-                netns,
-                iptables,
-                "nat",
-                "POSTROUTING",
-                ("-o", dev, "-j", "MASQUERADE"),
+            _emit_rule(
+                group_unit, netns_primitive, netns_var, rules.add_masq(_FAMILY[rule.family], dev)
             )
             continue
         if rule.kind != "filter":
@@ -1096,70 +1071,31 @@ def _emit_security_group_rules(
                 f"{group.key.name}: rule kind {rule.kind!r} is not a kernel "
                 "rule; a kernel reference may not carry it"
             )
-        iptables = "iptables" if rule.family == pt.Family.ipv4 else "ip6tables"
-        chain = {
-            pt.Direction.input: "INPUT",
-            pt.Direction.output: "OUTPUT",
-            pt.Direction.forward: "FORWARD",
-        }[rule.direction]
-        proto = rule.protocol.value if rule.protocol is not None else None
-        ports: list[pt.Port | None] = list(rule.ports) if rule.ports else [None]
-        sources: list[str | None] = list(rule.sources) if rule.sources else [None]
-        destinations: list[str | None] = list(rule.destinations) if rule.destinations else [None]
-        for source in sources:
-            for destination in destinations:
-                for port in ports:
-                    argv = [iptables, "-A", chain]
-                    if source is not None:
-                        argv += ["-s", source]
-                    for excluded in rule.excludeSources or []:
-                        argv += ["!", "-s", excluded]
-                    if destination is not None:
-                        argv += ["-d", destination]
-                    if proto is not None:
-                        argv += ["-p", proto]
-                    if port is not None:
-                        if proto not in ("tcp", "udp"):
-                            raise ValueError(f"{group.key.name}: ports require tcp/udp")
-                        argv += [
-                            "--dport",
-                            (
-                                str(port.from_)
-                                if port.from_ == port.to
-                                else f"{port.from_}:{port.to}"
-                            ),
-                        ]
-                    argv += ["-j", action_map[rule.action]]
-                    _emit_iptables(
-                        group_unit,
-                        netns_primitive,
-                        netns_var,
-                        netns,
-                        iptables,
-                        "filter",
-                        chain,
-                        tuple(argv[3:]),
-                    )
+        _emit_rule(
+            group_unit,
+            netns_primitive,
+            netns_var,
+            rules.add_filter(
+                _FAMILY[rule.family],
+                rule.direction.value,
+                rule.action.value,
+                sources=rule.sources or (),
+                exclude_sources=rule.excludeSources or (),
+                destinations=rule.destinations or (),
+                protocol=rule.protocol.value if rule.protocol is not None else None,
+                ports=[(port.from_, port.to) for port in rule.ports or ()],
+            ),
+        )
     default = group.data.default
     if default is not None:
-        for direction, chain in (
-            ("input", "INPUT"),
-            ("output", "OUTPUT"),
-            ("forward", "FORWARD"),
-        ):
+        for direction in ("input", "output", "forward"):
             action = getattr(default, direction, None)
-            if action is None:
-                continue
-            for iptables in ("iptables", "ip6tables"):
-                _emit_iptables(
+            if action is not None:
+                _emit_rule(
                     group_unit,
                     netns_primitive,
                     netns_var,
-                    netns,
-                    iptables,
-                    "filter",
-                    chain,
-                    ("-j", action_map[action]),
+                    rules.add_default(direction, action.value),
                 )
 
 
@@ -1484,14 +1420,8 @@ def _emit_kernel_app_rules(
                 parent=netns_var,
             )
             for family in _masq_families(list(app.securityGroups), nodes):
-                iptables = "iptables" if family == "ipv4" else "ip6tables"
                 app_unit.ovn(
-                    netns_primitive.add_rule(
-                        iptables,
-                        "nat",
-                        "POSTROUTING",
-                        ("-o", app.ifaceName, "-j", "MASQUERADE"),
-                    ),
+                    netns_primitive.add_masq(family, app.ifaceName),
                     parent=netns_var,
                 )
         elif app.kind == "zerotier":

@@ -4,7 +4,7 @@ import dataclasses
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any
 
-from .lifecycle import (
+from ..lifecycle import (
     Command,
     CommandPrimitive,
     LifecycleController,
@@ -13,22 +13,25 @@ from .lifecycle import (
 )
 
 if TYPE_CHECKING:
-    from .primitives_docker import DockerImage, DockerPrimitive, DockerPull
+    from .docker import DockerImage, DockerPrimitive, DockerPull
 
-from .primitives_fs import ChmodPrimitive, DirectoryPrimitive, RemovePathPrimitive
-from .primitives_net import (
+from .fs import ChmodPrimitive, DirectoryPrimitive, RemovePathPrimitive
+from .net import (
     AddrPrimitive,
+    DefaultRule,
     DhclientPrimitive,
+    FilterRule,
     IpRulePrimitive,
-    IptablesRule,
     LinkMovePrimitive,
+    MasqRule,
     NetnsLinkPrimitive,
     RoutePrimitive,
+    StatefulAccept,
     SysctlFilePrimitive,
     SysctlPrimitive,
     WireguardPrimitive,
 )
-from .primitives_ovn import (
+from .ovn import (
     OVNNbCtlAcl,
     OVNNbCtlConnection,
     OVNNbCtlLr,
@@ -39,7 +42,7 @@ from .primitives_ovn import (
     OVNNbCtlRoute,
     OVNSbCtlConnection,
 )
-from .primitives_ovs import (
+from .ovs import (
     OVSAfxdpPort,
     OVSBridge,
     OVSExternalId,
@@ -115,7 +118,7 @@ class HostPrimitive(CommandPrimitive):
         run_flags: Sequence[str] = (),
         remove_existing: bool = True,
     ) -> "DockerPrimitive":
-        from .primitives_docker import DockerPrimitive
+        from .docker import DockerPrimitive
 
         return DockerPrimitive(
             host=self.name,
@@ -131,12 +134,12 @@ class HostPrimitive(CommandPrimitive):
         )
 
     def docker_image(self, image: str, dockerfile: str, context: str) -> "DockerImage":
-        from .primitives_docker import DockerImage
+        from .docker import DockerImage
 
         return DockerImage(self.name, image, dockerfile, context)
 
     def docker_pull(self, image: str) -> "DockerPull":
-        from .primitives_docker import DockerPull
+        from .docker import DockerPull
 
         return DockerPull(self.name, image)
 
@@ -480,23 +483,48 @@ class NetnsPrimitive(CommandPrimitive):
             raise ValueError("a sysctl needs a named netns")
         return SysctlPrimitive(host=self.host, netns=self.name, key=key, value=value)
 
-    def add_rule(
-        self,
-        binary: str,
-        table: str,
-        chain: str,
-        args: Sequence[str] = (),
-    ) -> IptablesRule:
+    def _rule_netns(self) -> str:
         if self.name is None:
             raise ValueError("an iptables rule needs a named netns")
-        return IptablesRule(
-            host=self.host,
-            netns=self.name,
-            binary=binary,
-            table=table,
-            chain=chain,
-            args=tuple(args),
+        return self.name
+
+    def add_filter(
+        self,
+        family: str,
+        direction: str,
+        action: str,
+        *,
+        sources: Sequence[str] = (),
+        exclude_sources: Sequence[str] = (),
+        destinations: Sequence[str] = (),
+        protocol: str | None = None,
+        ports: Sequence[tuple[int, int]] = (),
+    ) -> FilterRule:
+        """A security group's filter rule (the IR's: direction, action, …)."""
+        return FilterRule(
+            self.host,
+            self._rule_netns(),
+            family,
+            direction,
+            action,
+            sources=tuple(sources),
+            exclude_sources=tuple(exclude_sources),
+            destinations=tuple(destinations),
+            protocol=protocol,
+            ports=tuple(ports),
         )
+
+    def add_masq(self, family: str, out_dev: str) -> MasqRule:
+        """A security group's masq rule, out through `out_dev`."""
+        return MasqRule(self.host, self._rule_netns(), family, out_dev)
+
+    def add_default(self, direction: str, action: str) -> DefaultRule:
+        """A security group's default for `direction`, both families."""
+        return DefaultRule(self.host, self._rule_netns(), direction, action)
+
+    def add_stateful_accept(self, family: str, direction: str) -> StatefulAccept:
+        """The replies of accepted connections, in `direction`."""
+        return StatefulAccept(self.host, self._rule_netns(), family, direction)
 
 
 async def _link_probe(lc: LifecycleController) -> dict[str, Any] | None:

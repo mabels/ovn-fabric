@@ -83,7 +83,7 @@ def list_logical_routers() -> list[JsonObject]:
 def list_lsps() -> list[JsonObject]:
     switch_by_port_uuid: dict[str, str] = {}
     for switch in list_table(_NBCTL, "Logical_Switch"):
-        for port_uuid in switch["ports"]:
+        for port_uuid in _as_list(switch.get("ports")):
             switch_by_port_uuid[port_uuid] = switch["name"]
     return [
         {
@@ -372,6 +372,13 @@ def lsp_del_argv(lsp: str) -> list[str]:
 # pattern), confirmed live against the 3-container multi-chassis test
 # (ADR 0003): the central chassis exposes ptcp:6641 (NB)/ptcp:6642 (SB)
 # so every other chassis's ovn-controller can reach the shared DBs.
+
+
+def list_connections(db: str) -> list[str]:
+    """Where the `db` ("nb"/"sb") database listens: its Connection rows'
+    targets ("ptcp:6641:0.0.0.0"), sorted."""
+    argv = _NBCTL if db == "nb" else _SBCTL
+    return sorted(str(row["target"]) for row in list_table(argv, "Connection"))
 
 
 def nb_set_connection_argv(target: str = "ptcp:6641:0.0.0.0") -> list[str]:

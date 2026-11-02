@@ -4,9 +4,9 @@ import asyncio
 import unittest
 from collections.abc import Sequence
 
-from deployer.context import Ctx
-from deployer.lifecycle import LifecycleAction, LifecycleController, Operation
-from deployer.primitives_ovn import (
+from fabric.context import Ctx
+from fabric.lifecycle import LifecycleAction, LifecycleController, Operation
+from fabric.primitives.ovn import (
     OVNNbCtlAcl,
     OVNNbCtlConnection,
     OVNNbCtlLr,
@@ -189,6 +189,12 @@ class OvnnPrimitiveTest(unittest.TestCase):
             self.assertEqual(node["gatewayChassis"], ["chassis-uuid"])
 
         asyncio.run(run())
+
+    def test_an_snat_is_deleted_by_its_logical_ip_a_dnat_by_its_external_ip(self) -> None:
+        snat = OVNNbCtlNat("r", "snat", "203.0.113.1", "10.0.0.0/24")
+        dnat = OVNNbCtlNat("r", "dnat", "203.0.113.1", "10.0.0.5")
+        self.assertEqual(snat.as_primitive().delete_cmds[0].argv[-3:], ("r", "snat", "10.0.0.0/24"))
+        self.assertEqual(dnat.as_primitive().delete_cmds[0].argv[-3:], ("r", "dnat", "203.0.113.1"))
 
     def test_route_nat_and_acl_use_semantic_keys(self) -> None:
         async def run() -> None:

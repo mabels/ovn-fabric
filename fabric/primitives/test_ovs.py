@@ -4,10 +4,10 @@ import asyncio
 import unittest
 from collections.abc import Sequence
 
-from deployer.context import Ctx
-from deployer.lifecycle import LifecycleAction, LifecycleController, Operation
-from deployer.primitives_host import HostPrimitive
-from deployer.primitives_ovs import OVSBridge, OVSExternalId, OVSMapping, OVSPort
+from fabric.context import Ctx
+from fabric.lifecycle import LifecycleAction, LifecycleController, Operation
+from fabric.primitives.host import HostPrimitive
+from fabric.primitives.ovs import OVSBridge, OVSExternalId, OVSMapping, OVSPort
 
 
 class FakeJob:

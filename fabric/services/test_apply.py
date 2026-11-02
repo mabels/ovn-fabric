@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import json
 import tempfile
 import unittest
 from collections.abc import AsyncIterator
-from typing import Any
+from typing import Any, cast
 from unittest import mock
 
+from deployer.test_ir_to_python import NODES
 from protocol.hydrate import hydrate_nodes
 from runtime import generated as rg
-from runtime.message import Msg
+from runtime.message import Msg, plain
 from runtime.peer import Call, Peer, RemoteError
 from runtime.runtime import Runtime
 from runtime.service import Service
@@ -19,7 +21,8 @@ from runtime.test_message import IR_SAMPLE
 from runtime.transport import connect
 
 from .. import generated as g
-from ..plan import plan_units
+from ..desired import desired_rawir
+from ..plan import plan_operations, plan_units
 from . import abstract_deps, unit
 from .apply import Apply
 from .ir import IrStore
@@ -35,6 +38,7 @@ class Fakes:
 
     def __init__(self, fail: str | None = None, deps_fail: bool = False) -> None:
         self.calls: list[tuple[str, Any]] = []
+        self.skips: dict[str, list[int]] = {}  # unit -> the steps it was told to skip
         self.fail, self.deps_fail = fail, deps_fail
 
     async def deps(self, call: Call) -> object:
@@ -49,6 +53,7 @@ class Fakes:
         req = call.body
         inputs = {v.name: json.loads(v.json) for v in req.inputs or []}
         self.calls.append((req.unit.name, (req.action.value, inputs, req.dryRun)))
+        self.skips[req.unit.name] = list(req.skip or [])
         await call.log("info", f"{req.action.value} unit: {req.unit.name}")
         failed = req.unit.name == self.fail
         outputs = {**inputs, f"seen-{len(self.calls)}": req.unit.name}
@@ -246,6 +251,158 @@ class ApplyTest(unittest.TestCase):
                     self.assertIsNone(second._final)  # it waits
                 final = await second.wait(timeout=5)
                 self.assertEqual(final.body.state, g.IrApplyOutcome.done)
+
+        asyncio.run(run())
+
+
+class DeployedTest(unittest.TestCase):
+    """The store's name `deployed`: the IR on this host."""
+
+    def test_create_names_it_deployed_and_its_delete_drops_the_name(self) -> None:
+        async def run() -> None:
+            async with _client(Fakes()) as (client, _apply_service):
+                await _run(client, _apply("create"))
+                got = await client.ask(g.IrGetReq(kind="IrGetReq", ref="deployed"), timeout=5)
+                draft = await client.ask(g.IrGetReq(kind="IrGetReq", ref="draft"), timeout=5)
+                self.assertEqual(got.body.info.hash, draft.body.info.hash)
+                await _run(client, _apply("delete"))
+                with self.assertRaises(RemoteError):
+                    await client.ask(g.IrGetReq(kind="IrGetReq", ref="deployed"), timeout=5)
+                # the IR itself stays: its own name still points to it
+                await client.ask(g.IrGetReq(kind="IrGetReq", ref="draft"), timeout=5)
+
+        asyncio.run(run())
+
+    def test_a_delete_with_keep_deployed_keeps_the_name(self) -> None:
+        async def run() -> None:
+            async with _client(Fakes()) as (client, _apply_service):
+                await _run(client, _apply("create"))
+                deployed = await client.ask(g.IrGetReq(kind="IrGetReq", ref="deployed"), timeout=5)
+                await _run(client, dataclasses.replace(_apply("delete"), keepDeployed=True))
+                kept = await client.ask(g.IrGetReq(kind="IrGetReq", ref="deployed"), timeout=5)
+                self.assertEqual(kept.body.info.hash, deployed.body.info.hash)
+
+        asyncio.run(run())
+
+    def test_a_dry_run_deploys_nothing(self) -> None:
+        async def run() -> None:
+            async with _client(Fakes()) as (client, _apply_service):
+                await _run(client, _apply("create", dry=True))
+                with self.assertRaises(RemoteError):
+                    await client.ask(g.IrGetReq(kind="IrGetReq", ref="deployed"), timeout=5)
+
+        asyncio.run(run())
+
+    def test_run_dry_run_reports_the_deployed_ir_in_rawir(self) -> None:
+        async def run() -> None:
+            live = {"ovn.ls:elsewhere": {"id": "ovn.ls:elsewhere", "kind": "ovn.ls"}}
+            async with _client(Fakes()) as (client, _apply_service):
+                await _run(client, _apply("create"))
+                with mock.patch("fabric.observed.snapshot", return_value=live):
+                    res, seen = await _run(client, _apply("run", ref="deployed", dry=True))
+                self.assertEqual(res.state, g.IrApplyOutcome.done)
+                self.assertEqual(res.units, [])
+                logs = [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
+                self.assertTrue(any("RawIR nodes" in line for line in logs), logs)
+                self.assertTrue(any(line.startswith("excluded ") for line in logs), logs)
+                self.assertTrue(any("only observed 1" in line for line in logs), logs)
+
+        asyncio.run(run())
+
+
+CENTRAL = "central-1"
+LS_BACKBONE = {
+    "id": "ovn.ls:backbone",
+    "kind": "ovn.ls",
+    "name": "backbone",
+    "externalIds": {},
+    "portRefs": [],
+}
+
+
+def _central_ir() -> list[dict[str, Any]]:
+    """The deployer fixtures' IR (it has logical switches), as plain JSON."""
+    return [cast(dict[str, Any], plain(node)) for node in NODES]
+
+
+class RunTest(unittest.TestCase):
+    """run: per unit, from the live RawIR — run what is gone, leave what is
+    there (fabric/desired.py's choose)."""
+
+    def _run_on(self, live: dict[str, dict[str, Any]]) -> tuple[Fakes, g.IrApplyRes, list[str]]:
+        async def run() -> tuple[Fakes, g.IrApplyRes, list[str]]:
+            fakes = Fakes()
+            async with _client(fakes, host=CENTRAL) as (client, _apply_service):
+                await client.ask(_put("central", _central_ir()), timeout=5)
+                with mock.patch("fabric.observed.snapshot", return_value=live):
+                    res, seen = await _run(client, _apply("run", ref="central"))
+            logs = [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
+            return fakes, res, logs
+
+        return asyncio.run(run())
+
+    @staticmethod
+    def _all_there() -> dict[str, dict[str, Any]]:
+        """The fixtures' desired RawIR — plus the router port whose chassis
+        is only known at run time (desired_rawir cannot predict it)."""
+        live = desired_rawir(plan_operations(NODES, CENTRAL)).nodes
+        port = "ovn.lrp:router-home|lrp-router-home-left"
+        live[port] = {"id": port, "kind": "ovn.lrp"}
+        return live
+
+    def test_what_is_there_is_left_alone_only_reads_run(self) -> None:
+        live = self._all_there()
+        fakes, res, logs = self._run_on(live)
+        self.assertEqual(res.state, g.IrApplyOutcome.done)
+        ran = [name for name, _ in fakes.calls]
+        self.assertIn("chassis id: chassis-1 (resolved on this host)", ran)  # a read
+        self.assertNotIn("logical switch: backbone", ran)
+        self.assertNotIn("root namespace: central-1", ran)
+        self.assertNotIn("router port: lrp-router-home-left (home)", ran)
+        self.assertTrue(any(line.startswith("units: ") for line in logs), logs)
+
+    def test_a_unit_that_is_gone_runs_completely(self) -> None:
+        live = self._all_there()
+        del live["ovn.ls:backbone"]
+        fakes, res, logs = self._run_on(live)
+        self.assertEqual(res.state, g.IrApplyOutcome.done)
+        ran = dict(fakes.calls)
+        self.assertEqual(ran["logical switch: backbone"][0], "create")  # run creates
+        self.assertEqual(fakes.skips["logical switch: backbone"], [])  # all of it
+        self.assertNotIn("logical switch: home", ran)
+        graph = next(line for line in logs if line.startswith("reconciled graph:"))
+        self.assertIn("applied 1, missing 0", graph)
+
+    def test_create_and_delete_are_unconditional(self) -> None:
+        # Only run looks at the live RawIR: create and delete run every
+        # step, also where everything is there (or gone) already.
+        for action in ("create", "delete"):
+            with self.subTest(action=action):
+
+                async def run(action: str = action) -> Fakes:
+                    fakes = Fakes()
+                    async with _client(fakes, host=CENTRAL) as (client, _apply_service):
+                        await client.ask(_put("central", _central_ir()), timeout=5)
+                        with mock.patch(
+                            "fabric.observed.snapshot", return_value=self._all_there()
+                        ) as snapshot:
+                            await _run(client, _apply(action, ref="central"))
+                        self.assertFalse(snapshot.called)
+                    return fakes
+
+                fakes = asyncio.run(run())
+                self.assertIn("logical switch: backbone", fakes.skips)
+                self.assertTrue(all(skip == [] for skip in fakes.skips.values()))
+
+    def test_without_the_live_view_run_changes_nothing(self) -> None:
+        async def run() -> None:
+            fakes = Fakes()
+            async with _client(fakes, host=CENTRAL) as (client, _apply_service):
+                await client.ask(_put("central", _central_ir()), timeout=5)
+                with mock.patch("fabric.observed.snapshot", side_effect=OSError("no ip")):
+                    with self.assertRaisesRegex(RemoteError, "cannot collect the live RawIR"):
+                        await client.ask(_apply("run", ref="central"), timeout=5)
+            self.assertEqual(fakes.calls, [])
 
         asyncio.run(run())
 

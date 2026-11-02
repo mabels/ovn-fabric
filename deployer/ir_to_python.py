@@ -37,11 +37,45 @@
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import re
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from fabric.primitives.docker import DockerImage, DockerPrimitive, DockerPull
+from fabric.primitives.fs import ChmodPrimitive, DirectoryPrimitive, RemovePathPrimitive
+from fabric.primitives.host import LinkPrimitive, NetnsPrimitive, VlanPrimitive
+from fabric.primitives.net import (
+    AddrPrimitive,
+    DhclientPrimitive,
+    FirewallRule,
+    IpRulePrimitive,
+    NetnsLinkPrimitive,
+    RoutePrimitive,
+    SysctlFilePrimitive,
+    SysctlPrimitive,
+    WireguardPrimitive,
+)
+from fabric.primitives.ovn import (
+    OVNNbCtlAcl,
+    OVNNbCtlConnection,
+    OVNNbCtlLr,
+    OVNNbCtlLrp,
+    OVNNbCtlLs,
+    OVNNbCtlLsp,
+    OVNNbCtlNat,
+    OVNNbCtlRoute,
+    OVNSbCtlConnection,
+)
+from fabric.primitives.ovs import (
+    OVSAfxdpPort,
+    OVSBridge,
+    OVSExternalId,
+    OVSIpfix,
+    OVSMapping,
+    OVSPort,
+)
 from protocol import generated as pt
 
 from .ir_common import (
@@ -62,39 +96,6 @@ from .ir_common import (
     _netns_name,
     _python_token,
     _service_faces,
-)
-from .primitives_docker import DockerImage, DockerPrimitive, DockerPull
-from .primitives_fs import ChmodPrimitive, DirectoryPrimitive, RemovePathPrimitive
-from .primitives_host import LinkPrimitive, NetnsPrimitive, VlanPrimitive
-from .primitives_net import (
-    AddrPrimitive,
-    DhclientPrimitive,
-    IpRulePrimitive,
-    IptablesRule,
-    NetnsLinkPrimitive,
-    RoutePrimitive,
-    SysctlFilePrimitive,
-    SysctlPrimitive,
-    WireguardPrimitive,
-)
-from .primitives_ovn import (
-    OVNNbCtlAcl,
-    OVNNbCtlConnection,
-    OVNNbCtlLr,
-    OVNNbCtlLrp,
-    OVNNbCtlLs,
-    OVNNbCtlLsp,
-    OVNNbCtlNat,
-    OVNNbCtlRoute,
-    OVNSbCtlConnection,
-)
-from .primitives_ovs import (
-    OVSAfxdpPort,
-    OVSBridge,
-    OVSExternalId,
-    OVSIpfix,
-    OVSMapping,
-    OVSPort,
 )
 
 
@@ -153,16 +154,23 @@ def _ovn_method_call(primitive: object) -> str:
         return f"set_sysctl({primitive.key!r}, {primitive.value!r})"
     if isinstance(primitive, SysctlFilePrimitive):
         return f"set_sysctl_file({primitive.path!r}, {primitive.value!r})"
-    if isinstance(primitive, IptablesRule):
-        return (
-            f"add_rule({primitive.binary!r}, {primitive.table!r}, "
-            f"{primitive.chain!r}, {primitive.args!r})"
-        )
+    if isinstance(primitive, FirewallRule):
+        return _rule_call(primitive)
     if isinstance(primitive, WireguardPrimitive):
         return f"wireguard({primitive.iface!r}, {primitive.conf_path!r})"
     if isinstance(primitive, DhclientPrimitive):
         return f"dhclient({primitive.dev!r}, {primitive.lease!r})"
     raise TypeError(f"{primitive!r} cannot be attached to a parent")
+
+
+def _rule_call(rule: FirewallRule) -> str:
+    """A named iptables rule as its NetnsPrimitive builder call."""
+    args = ", ".join(
+        f"{f.name}={getattr(rule, f.name)!r}"
+        for f in dataclasses.fields(rule)
+        if f.name not in ("host", "netns")
+    )
+    return f"{rule.builder}({args})"
 
 
 def _ovn_call(primitive: object) -> str:
@@ -292,11 +300,8 @@ def _ovn_call(primitive: object) -> str:
         )
     if isinstance(primitive, SysctlPrimitive):
         return f"netns({primitive.netns!r}).set_sysctl(" f"{primitive.key!r}, {primitive.value!r})"
-    if isinstance(primitive, IptablesRule):
-        return (
-            f"netns({primitive.netns!r}).add_rule({primitive.binary!r}, "
-            f"{primitive.table!r}, {primitive.chain!r}, {primitive.args!r})"
-        )
+    if isinstance(primitive, FirewallRule):
+        return f"netns({primitive.netns!r}).{_rule_call(primitive)}"
     if isinstance(primitive, WireguardPrimitive):
         return f"netns({primitive.netns!r}).wireguard({primitive.iface!r}, {primitive.conf_path!r})"
     raise TypeError(f"unknown OVN primitive {primitive!r}")
@@ -504,8 +509,8 @@ _GENERATED_RUNTIME = r"""#!/usr/bin/env python3
 
 from __future__ import annotations
 
-from deployer.context import Ctx, Options
-from deployer.lifecycle import (
+from fabric.context import Ctx, Options
+from fabric.lifecycle import (
     DaemonReloadOperation as DaemonReload,
     InstallSelfOperation as InstallSelf,
     LifecycleAction,
@@ -516,7 +521,7 @@ from deployer.lifecycle import (
     SystemdUnitOperation as SystemdUnit,
     WriteFileOperation as WriteFile,
 )
-from deployer.primitives_host import HostPrimitive
+from fabric.primitives.host import HostPrimitive
 from deployer.dependency import (
     APT_UPDATE_STAMP,
     INSTALL_INTERVAL,

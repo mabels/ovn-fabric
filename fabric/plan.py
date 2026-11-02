@@ -50,15 +50,15 @@ from deployer.ir_common import (
     _service_faces,
     unit_name,
 )
-from deployer.lifecycle import (
+from protocol import generated as pt
+
+from . import generated as g
+from .lifecycle import (
     CaptureOperation,
     RuntimeRef,
     SymlinkNetnsOperation,
     WriteFileOperation,
 )
-from protocol import generated as pt
-
-from . import generated as g
 from .units import to_step
 
 
@@ -74,6 +74,9 @@ class _Plan:
     units: list[g.Unit] = dataclasses.field(default_factory=list)
     values: dict[str, Any] = dataclasses.field(default_factory=dict)  # `emit.py("x = 1")`
     refs: dict[str, RuntimeRef] = dataclasses.field(default_factory=dict)  # capture -> ref
+    # Every unit's operations as the typed objects they were declared as —
+    # what a step is serialized from, and what fabric/rawir_learned knows.
+    operations: list[tuple[str, Any]] = dataclasses.field(default_factory=list)
 
 
 class PlanEmitter(Emitter):
@@ -105,7 +108,8 @@ class PlanEmitter(Emitter):
         return None
 
     def _add(self, operation: Any) -> None:
-        step = to_step(self._resolve(operation))
+        resolved = self._resolve(operation)
+        step = to_step(resolved)
         if self._unit is None:
             raise PlanError(f"{self.label}: {_what(step)} is declared outside any unit")
         newest = self.plan.units[-1]
@@ -115,6 +119,7 @@ class PlanEmitter(Emitter):
                 "give it a unit of its own"
             )
         self._unit.steps.append(step)
+        self.plan.operations.append((self._unit.name, resolved))
 
     # -- what the declarations call ----------------------------------------------
 
@@ -219,28 +224,40 @@ def _what(step: g.UnitStepSpec) -> str:
     return f"a {step.kind} step"
 
 
-def _scope(scope: str, declare: Callable[[Emitter], None]) -> list[g.Unit]:
+def _scope(scope: str, declare: Callable[[Emitter], None]) -> _Plan:
     emit = PlanEmitter(scope)
     declare(emit)
-    return emit.units
+    return emit.plan
 
 
 def plan_units(nodes: Sequence[pt.Model], host: str) -> list[g.Unit]:
     """The units of work `nodes` (an IR) make on `host`, in create order."""
+    return [unit for plan in _plans(nodes, host) for unit in plan.units]
+
+
+def plan_operations(nodes: Sequence[pt.Model], host: str) -> list[tuple[str, Any]]:
+    """The same plan as (unit name, operation) — the typed objects (an
+    AddrPrimitive, an OVSBridge, …) its units are serialized from."""
+    return [entry for plan in _plans(nodes, host) for entry in plan.operations]
+
+
+def _plans(nodes: Sequence[pt.Model], host: str) -> list[_Plan]:
     all_nodes = list(nodes)
     host_node = next(
         (n for n in all_nodes if isinstance(n, pt.InfraHostNode) and n.key.host == host), None
     )
     if host_node is None:
         raise PlanError(f"{host} is not a host of this IR")
-    units = _scope("configure", functools.partial(_emit_host_configure, host_node, all_nodes))
+    plans = [_scope("configure", functools.partial(_emit_host_configure, host_node, all_nodes))]
     if host_node.data.ovnRole == pt.OvnRole.central:
-        units += _scope("cluster", functools.partial(_emit_cluster_body, all_nodes))
+        plans.append(_scope("cluster", functools.partial(_emit_cluster_body, all_nodes)))
     for owner in _kernel_router_owners(host_node.id, all_nodes):
         name = owner.key.name
-        units += _scope(
-            name,
-            functools.partial(_emit_kernel_router_owner, owner, _netns_name(name), all_nodes),
+        plans.append(
+            _scope(
+                name,
+                functools.partial(_emit_kernel_router_owner, owner, _netns_name(name), all_nodes),
+            )
         )
     for node in all_nodes:
         if node.kind not in ("kernel.app.container", "kernel.app.service"):
@@ -249,10 +266,10 @@ def plan_units(nodes: Sequence[pt.Model], host: str) -> list[g.Unit]:
             continue
         name = node.key.name
         faces = _service_faces(name, host, all_nodes)
-        units += _scope(name, functools.partial(_emit_service_up, node, faces))
+        plans.append(_scope(name, functools.partial(_emit_service_up, node, faces)))
     names: set[str] = set()
-    for unit in units:
+    for unit in (unit for plan in plans for unit in plan.units):
         if unit.name in names:
             raise PlanError(f"two units are named {unit.name!r}")
         names.add(unit.name)
-    return units
+    return plans

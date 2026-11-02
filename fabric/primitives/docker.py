@@ -3,13 +3,13 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Sequence
 
-from .lifecycle import (
+from ..lifecycle import (
     Command,
     CommandPrimitive,
     Primitive,
     RawNodeTemplate,
 )
-from .primitives_host import NetnsPrimitive
+from .host import NetnsPrimitive
 
 # A build or pull may take long (a slow link, a big image) — but not forever.
 IMAGE_TIMEOUT = 1800.0

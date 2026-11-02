@@ -27,14 +27,14 @@ import re
 import shlex
 import socket
 
-from deployer.context import Ctx, Options
-from deployer.lifecycle import LifecycleAction, LifecycleController
 from runtime import command
 from runtime.message import BodySpec, register_bodies
 from runtime.peer import Call
 from runtime.service import Service
 
 from .. import generated as g
+from ..context import Ctx, Options
+from ..lifecycle import LifecycleAction, LifecycleController
 from ..units import to_operation
 
 log = logging.getLogger("fabric.unit")
@@ -146,7 +146,10 @@ class UnitExecutor:
             req.host or self.host,
             name=unit.name,
         )
-        for step in unit.steps:
+        skip = set(req.skip or [])
+        for index, step in enumerate(unit.steps):
+            if index in skip:
+                continue  # already there (apply found it in the live RawIR)
             await lc.run(to_operation(step, lc.graph.host))
         await call.log("info", f"{req.action.value} ({len(unit.steps)} steps)")
 

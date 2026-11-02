@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import importlib
+import subprocess
 import unittest
 from unittest import mock
 
@@ -294,6 +295,22 @@ class VethArgvTest(unittest.TestCase):
                 "00:00:0a:63:00:02",
             ],
         )
+
+
+class VanishedContainerTest(unittest.TestCase):
+    def test_a_container_that_ended_since_it_was_listed_has_nothing(self) -> None:
+        failed = subprocess.CompletedProcess(["nsenter"], 1, "", "nsenter: No such process")
+        with (
+            mock.patch.object(mod.subprocess, "run", return_value=failed),
+            mock.patch.object(mod.os.path, "exists", return_value=False),
+        ):
+            self.assertEqual(mod._run_ip_json(["link", "show"], None, pid=4242), [])
+        with (
+            mock.patch.object(mod.subprocess, "run", return_value=failed),
+            mock.patch.object(mod.os.path, "exists", return_value=True),
+            self.assertRaises(subprocess.CalledProcessError),
+        ):
+            mod._run_ip_json(["link", "show"], None, pid=4242)
 
 
 if __name__ == "__main__":
