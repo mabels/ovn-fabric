@@ -149,6 +149,7 @@ class HostPrimitive(CommandPrimitive):
         volumes: Sequence[tuple[str, str]] = (),
         run_flags: Sequence[str] = (),
         remove_existing: bool = True,
+        files: str = "",
     ) -> "DockerPrimitive":
         from .docker import DockerPrimitive
 
@@ -163,6 +164,7 @@ class HostPrimitive(CommandPrimitive):
             volumes=tuple(volumes),
             run_flags=tuple(run_flags),
             remove_existing=remove_existing,
+            files=files,
         )
 
     def docker_image(
@@ -484,7 +486,8 @@ class NetnsPrimitive(CommandPrimitive):
             dst=dst,
             dev=dev,
             via=via,
-            metric=metric,
+            # A metric is a whole number to the kernel; the IR's JSON may say 400.0.
+            metric=int(metric) if metric is not None else None,
             table=table,
             family=family,
         )

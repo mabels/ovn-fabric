@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import io
+import os
 import tempfile
 import unittest
 from collections.abc import Sequence
@@ -17,6 +18,7 @@ from fabric.lifecycle import (
     LifecycleController,
     Primitive,
     RawNodeTemplate,
+    SymlinkNetnsOperation,
     WriteFileOperation,
 )
 
@@ -321,6 +323,26 @@ class LifecycleTest(unittest.TestCase):
             await delete.execute()
 
         asyncio.run(run())
+
+
+class SymlinkNetnsTest(unittest.TestCase):
+    def test_a_link_to_a_process_that_is_gone_is_made_anew(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            old = Path(tmp) / "c"
+            old.symlink_to("/proc/999999/ns/net")
+            operation = SymlinkNetnsOperation("c", os.getpid())
+
+            async def run() -> None:
+                with (
+                    mock.patch.object(SymlinkNetnsOperation, "path", old),
+                    mock.patch.object(
+                        SymlinkNetnsOperation, "_running", mock.AsyncMock(return_value=True)
+                    ),
+                ):
+                    await operation.create(mock.Mock())
+
+            asyncio.run(run())
+            self.assertEqual(os.readlink(old), f"/proc/{os.getpid()}/ns/net")
 
 
 if __name__ == "__main__":

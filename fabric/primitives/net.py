@@ -254,6 +254,10 @@ class SysctlFilePrimitive(CommandPrimitive):
     """Write one /proc/sys file inside a netns. Needed for iface names
     containing dots, which `sysctl` cannot address."""
 
+    # Set on a link when the link comes: it has no RawIR of its own, and the
+    # link may have moved on (lent to a container), so it follows its unit.
+    follows_unit: ClassVar[bool] = True
+
     host: str
     netns: str
     path: str

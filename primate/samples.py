@@ -34,7 +34,7 @@ be marked is given per sample:
   generated function ignores the field; learn checks it left no trace;
 - `keep`: for a primitive that sets one of the host's global settings
   (the bridge mappings, where a database listens) — saves the host's
-  value and returns what restores it after the sample.
+  value, clears it for the sample, and returns what restores it after.
 
 Two runs use different markers, so what a field becomes in RawIR can be
 told apart from what the system fills in.
@@ -280,6 +280,10 @@ def _bridge_with_port(host: HostPrimitive, m: Mapping[str, Any]) -> list[Any]:
 
 def _keep_mappings() -> Callable[[], None]:
     saved = list_external_ids().get("ovn-bridge-mappings")
+    if saved:  # cleared: the sample must see what setting it does
+        system.run(
+            ["ovs-vsctl", "remove", "open_vswitch", ".", "external-ids", "ovn-bridge-mappings"]
+        )
 
     def restore() -> None:
         if saved:
@@ -299,6 +303,8 @@ def _keep_mappings() -> Callable[[], None]:
 def _keep_connection(db: str) -> Keep:
     def keep() -> Callable[[], None]:
         saved = list_connections(db)
+        if saved:  # cleared: the sample must see what setting it does
+            system.run([f"ovn-{db}ctl", "del-connection"])
 
         def restore() -> None:
             if saved:
@@ -448,6 +454,7 @@ SAMPLES = [
             "volumes": (),
             "run_flags": (),
             "remove_existing": True,
+            "files": "",
         },
     ),
     Sample(OVSBridge, fixed={"datapath": None, "fail_mode": "standalone"}),
@@ -494,6 +501,22 @@ SAMPLES = [
         kinds={"networks_1": "cidr6"},
         setup=_router,
         variant="gateway",
+    ),
+    # A port without addresses (an L2 attachment), with or without a chassis.
+    Sample(
+        OVNNbCtlLrp,
+        maps=RA_CONFIGS,
+        shape={"networks": 0},
+        setup=_router,
+        variant="no_networks_gateway",
+    ),
+    Sample(
+        OVNNbCtlLrp,
+        fixed={"gateway_chassis": None},
+        maps=RA_CONFIGS,
+        shape={"networks": 0},
+        setup=_router,
+        variant="no_networks",
     ),
     Sample(
         OVNNbCtlLrp,

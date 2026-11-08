@@ -152,6 +152,23 @@ class OwnersTest(unittest.TestCase):
         for node_id in ("netns:ours", "netns:docker:ours", "link:ours|zt0"):
             self.assertEqual(owner[node_id], "docker", node_id)  # inside a container
 
+    def test_a_physical_nic_is_the_host_s_with_what_is_on_it(self) -> None:
+        nodes = self._discovered()
+        for node in nodes.values():
+            node["owner"] = "ovn-fabric"
+        nic = f"link:{G}|nic0"
+        nodes[nic] = {
+            "id": nic,
+            "kind": "link",
+            "ifname": "nic0",
+            "linkKind": "physical",
+            "owner": "ovn-fabric",
+        }
+        addr = f"addr:{G}|nic0|10.0.0.1/24"
+        nodes[addr] = {"id": addr, "kind": "addr", "linkRef": nic, "owner": "ovn-fabric"}
+        owners._physical(nodes)
+        self.assertEqual((nodes[nic]["owner"], nodes[addr]["owner"]), ("host", "host"))
+
     def test_the_host_s_interfaces_not_what_is_stacked_on_them(self) -> None:
         nodes = self._discovered()
         owners.mark_host(nodes, ["host", "lo"], parents=["ovnkern"])

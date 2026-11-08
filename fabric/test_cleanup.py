@@ -44,6 +44,41 @@ class CleanupTest(unittest.TestCase):
         left = cleanup.leftovers(nodes, {NETNS["id"]})
         self.assertEqual([n["kind"] for n in left], ["iptables.rule", "route", "link"])
 
+    def test_they_go_in_the_reverse_of_a_create(self) -> None:
+        self.assertEqual(set(cleanup.CREATE_ORDER), set(cleanup.DELETERS))
+        kinds = (
+            "netns",
+            "ovs.bridge",
+            "link",
+            "ovs.port",
+            "ovn.ls",
+            "ovn.lr",
+            "ovn.lrp",
+            "ovn.lsp",
+            "ovn.route",
+            "addr",
+            "route",
+            "iptables.rule",
+            "docker.container",
+        )
+        nodes = {kind: {"id": kind, "kind": kind, "name": "x"} for kind in kinds}
+        removed = [node["kind"] for node in cleanup.leftovers(nodes, set())]
+        self.assertEqual(removed, list(reversed(kinds)))
+
+    def test_within_a_kind_the_reverse_of_how_they_were_found(self) -> None:
+        nodes = {i: {"id": i, "kind": "route"} for i in ("first", "second", "third")}
+        left = cleanup.leftovers(nodes, set())
+        self.assertEqual([n["id"] for n in left], ["third", "second", "first"])
+
+    def test_a_bridge_s_own_link_goes_with_the_bridge(self) -> None:
+        nodes = {
+            "ovs.bridge:br": {"id": "ovs.bridge:br", "kind": "ovs.bridge", "name": "br"},
+            "link:*global*|br": {"id": "link:*global*|br", "kind": "link", "ifname": "br"},
+            "link:*global*|v": {"id": "link:*global*|v", "kind": "link", "ifname": "v"},
+        }
+        left = [n["id"] for n in cleanup.leftovers(nodes, set())]
+        self.assertEqual(left, ["link:*global*|v", "ovs.bridge:br"])
+
     def test_each_kind_is_removed_by_its_command(self) -> None:
         netns = ["ip", "netns", "exec", "ns"]
         self.assertEqual(

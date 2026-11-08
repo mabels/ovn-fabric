@@ -173,9 +173,12 @@ _SHOW: dict[str, Callable[[Msg[Any], Hidden], None]] = {
 }
 
 
-async def _ask(address: str, body: object) -> object | None:
+async def _ask(
+    address: str, body: object, on_request: Callable[[str], None] | None = None
+) -> object | None:
     """Send one request; show everything carrying its reqId as it comes;
-    return the final response's body (None when it never arrived)."""
+    return the final response's body (None when it never arrived).
+    `on_request` gets its reqId once it is sent."""
     try:
         conn = await connect(address)
     except Closed as exc:
@@ -190,6 +193,8 @@ async def _ask(address: str, body: object) -> object | None:
     hidden: Hidden = []
     try:
         request = await peer.request(body)
+        if on_request is not None:
+            on_request(request.req_id)
         async for msg in request:
             show = _SHOW.get(msg.kind)
             if show is not None:
@@ -434,8 +439,12 @@ async def _ir_apply(args: argparse.Namespace) -> int:
         keepDeployed=args.keep_deployed or None,
         noCleanup=args.no_cleanup or None,
     )
-    res = await _ask(args.address, req)
+    # Its last line says how to find it: journalctl -u ovn-fabric --grep <req>.
+    req_ids: list[str] = []
+    res = await _ask(args.address, req, req_ids.append)
     if not isinstance(res, g.IrApplyRes):
+        if req_ids:
+            print(f"req={req_ids[0]} ir={ref}", file=sys.stderr)
         return 1
     print(
         f"{res.action.value} {res.hash} on {res.host}: {res.state.value} ({len(res.units)} units)"
@@ -443,6 +452,7 @@ async def _ir_apply(args: argparse.Namespace) -> int:
     for unit in res.units:
         note = f" — {unit.message}" if unit.message else ""
         print(f"  {unit.name}: {unit.state.value}{note}")
+    print(f"req={req_ids[0]} ir={res.hash}")
     return 0 if res.state is g.IrApplyOutcome.done else 1
 
 

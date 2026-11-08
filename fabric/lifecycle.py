@@ -359,7 +359,8 @@ SETTLE = 0.5
 
 @dataclasses.dataclass(frozen=True)
 class SymlinkNetnsOperation:
-    """`/var/run/netns/<container>` -> `/proc/<pid>/ns/net`."""
+    """`/var/run/netns/<container>` -> `/proc/<pid>/ns/net`, of the process
+    running now — so safe to run again."""
 
     # Its kind as a unit step (fabric/units.py; the schema's `kind`).
     step_kind: ClassVar[str] = "SymlinkNetns"
@@ -392,6 +393,9 @@ class SymlinkNetnsOperation:
                 "a container without a long-running command ends at once"
             )
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        # Always to the process running now: a link of a container that was
+        # restarted points at a process that is gone.
+        _unlink(self.path)
         self.path.symlink_to(Path(f"/proc/{self.pid}/ns/net"))
 
     async def _running(self) -> bool:

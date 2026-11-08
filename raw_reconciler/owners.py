@@ -15,7 +15,8 @@ those nodes are never touched:
   the ids it sets itself;
 - ovn-controller: the integration bridge with its ports, the patch ports.
 
-The host's own interfaces are known from its config only — `mark_host`,
+Physical NICs are the host's too. Its other own interfaces are known from
+its config only — `mark_host`,
 called by the runtime (the topology's hostInterfaces, the IR's physical
 parents) and by primate (the loopback).
 
@@ -233,9 +234,23 @@ def _ovn_controller(nodes: Nodes) -> None:
     mark(nodes, "ovn-controller", others=owned)
 
 
+def _physical(nodes: Nodes) -> None:
+    """A physical NIC: nothing we could have made, used by the IR or not."""
+    mark(
+        nodes,
+        "host",
+        links=[
+            node_id
+            for node_id, node in nodes.items()
+            if node["kind"] == "link" and node.get("linkKind") == "physical"
+        ],
+    )
+
+
 # Asked in this order: the first owner found keeps a node.
 DISCOVER: dict[str, Callable[[Nodes], None]] = {
     "kernel": _kernel,
+    "host": _physical,
     "ovn-controller": _ovn_controller,
     "openvswitch": _openvswitch,
     "docker": _docker,

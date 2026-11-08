@@ -275,6 +275,27 @@ class ExecuteTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_every_line_goes_to_the_journal_whatever_a_client_shows(self) -> None:
+        async def run() -> None:
+            log = Path(tempfile.mkdtemp()) / "log"
+            async with _client() as client:
+                request = await client.request(
+                    g.UnitExecReq(
+                        kind="UnitExecReq", unit=_unit(_logged(log, "a", "-a")), action=CREATE
+                    ),
+                    parent="the-run",
+                )
+                async for _msg in request:
+                    pass
+                lines.append(f"req={request.req_id} parent=the-run")
+
+        lines: list[str] = []
+        with self.assertLogs("fabric.journal", "DEBUG") as logs:
+            asyncio.run(run())
+        text = "\n".join(record.getMessage() for record in logs.records)
+        self.assertIn(lines[0], text)
+        self.assertIn(" debug test_unit: $ sh -c", text)  # a command, at debug
+
     def test_skipped_steps_do_not_run(self) -> None:
         async def run() -> None:
             log = Path(tempfile.mkdtemp()) / "log"
@@ -340,6 +361,30 @@ class DecideTest(unittest.TestCase):
             [(d.index, d.decision.value) for d in res.decisions],
             [(0, "skip"), (1, "replace"), (2, "apply")],
         )
+
+
+class AfreshFailureTest(unittest.TestCase):
+    def test_a_container_started_for_a_unit_that_fails_is_removed_again(self) -> None:
+        async def run(log: Path) -> list[str]:
+            container = _logged(log, "up", "down")
+            container.decide = g.DockerContainerDecide(
+                kind="docker.container", name="c", image="i", spec="s"
+            )
+            broken = g.PrimitiveStep(
+                kind="Primitive", key="b", nodes=[], create=[_cmd("false")], delete=[]
+            )
+
+            async def fresh(spec: Any, decided: decide.Decided, lc: Any) -> decide.Decision:
+                return decide.Decision.apply
+
+            with mock.patch.dict(decide.DECIDERS, {"docker.container": fresh}):
+                async with _client() as client:
+                    res = (await _exec(client, _unit(container, broken), CREATE, decide=True))[-1]
+            self.assertEqual(res.body.state, FAILED)
+            return log.read_text().split()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(asyncio.run(run(Path(tmp) / "log")), ["up", "down"])
 
 
 class WireguardDeciderTest(unittest.TestCase):

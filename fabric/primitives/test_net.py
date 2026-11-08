@@ -269,6 +269,10 @@ class NetnsPrimitiveTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_a_route_s_metric_is_a_whole_number(self) -> None:
+        route = HostPrimitive("h").netns("ns").add_route("10.0.0.0/8", "eth0", "10.0.0.1", 400.0)
+        self.assertEqual(str(route.metric), "400")
+
     def test_moving_a_link_needs_two_named_namespaces(self) -> None:
         host = HostPrimitive("h")
         with self.assertRaises(ValueError):

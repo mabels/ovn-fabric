@@ -35,7 +35,7 @@ from runtime.service import Service
 
 from .. import generated as g
 from ..context import Ctx, Options
-from ..decide import STARTS_AFRESH, Decided, Decision, Replaced, decide
+from ..decide import STARTS_AFRESH, Decided, Decision, Replaced, decide, undo
 from ..lifecycle import LifecycleAction, LifecycleController, Primitive
 from ..units import to_operation
 
@@ -152,6 +152,7 @@ class UnitExecutor:
         decided = Decided()
         decisions: list[g.StepDecision] = []
         afresh = False  # a step started afresh what the later ones build on
+        started: Primitive | None = None  # the container it started
         for index, step in enumerate(unit.steps):
             if index in skip and not afresh:
                 continue  # already there (apply found it in the live RawIR)
@@ -168,6 +169,7 @@ class UnitExecutor:
                 await call.log("info", f"{primitive.key}: {decision.value}")
                 if spec.kind in STARTS_AFRESH and decision is not Decision.skip:
                     afresh = True
+                    started = cast(Primitive, operation)
                 if decision is Decision.skip:
                     continue
                 if decision is Decision.replace:
@@ -187,6 +189,10 @@ class UnitExecutor:
                 state, message = g.IrApplyOutcome.failed, str(exc)
                 log.warning("%s: %s", unit.name, message)
                 await call.log("warn", message)
+                # Half set up: the next run must start it afresh, not find
+                # it running and leave it.
+                if started is not None:
+                    await undo(started, lc)
         return g.UnitExecRes(
             kind="UnitExecRes",
             unit=unit.name,

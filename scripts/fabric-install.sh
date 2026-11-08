@@ -52,6 +52,9 @@ RestartSec=5
 # More grace than the runtime gives the containers it stops (10s each).
 TimeoutStopSec=60
 KillMode=mixed
+# A run logs every line to the journal: thousands, in seconds.
+LogRateLimitIntervalSec=30s
+LogRateLimitBurst=100000
 
 [Install]
 WantedBy=multi-user.target

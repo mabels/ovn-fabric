@@ -51,6 +51,7 @@ from runtime.service import Service
 
 from .. import cleanup, observed
 from .. import generated as g
+from ..decide import STARTS_AFRESH
 from ..desired import (
     Reconciled,
     StepState,
@@ -388,8 +389,8 @@ class Apply:
             values_of["latest"] = values
             steps = [resolve(operation, values) for operation in by_unit[unit.name]]
             checked = [
-                ((StepState.read, {}) if decides else step_state(step, live, later[unit.name]))
-                for step, decides in zip(steps, _self_deciding(unit), strict=True)
+                ((decider, {}) if decider is not None else step_state(step, live, later[unit.name]))
+                for step, decider in zip(steps, _deciders(unit), strict=True)
             ]
             choice = choose([state for state, _ in checked])
             choices[choice.why] += 1
@@ -573,8 +574,8 @@ class Apply:
                 continue
             steps = by_unit[unit.name]
             states = [
-                StepState.read if decides else step_state(step, live, consumed)[0]
-                for step, decides in zip(steps, _self_deciding(unit), strict=True)
+                decider if decider is not None else step_state(step, live, consumed)[0]
+                for step, decider in zip(steps, _deciders(unit), strict=True)
             ]
             choice = choose(states)
             choices[choice.why] += 1
@@ -670,10 +671,19 @@ class Apply:
         return res.body.info, res.body.ir
 
 
-def _self_deciding(unit: g.Unit) -> list[bool]:
-    """Per step: it has its own decider (fabric/decide.py) — the executor
-    decides it from its live state; for run's check it is like a read."""
-    return [step.kind == "Primitive" and step.decide is not None for step in unit.steps]
+def _deciders(unit: g.Unit) -> list[StepState | None]:
+    """Per step: that it decides itself on the host (fabric/decide.py), and
+    whether it may start afresh what later steps build on; None: run's check
+    of its footprint tells."""
+    out: list[StepState | None] = []
+    for step in unit.steps:
+        spec = step.decide if step.kind == "Primitive" else None
+        if spec is None:
+            out.append(None)
+        else:
+            afresh = spec.kind in STARTS_AFRESH
+            out.append(StepState.starts_afresh if afresh else StepState.decides)
+    return out
 
 
 # Where an operation names an interface of the host it uses but does not

@@ -147,6 +147,7 @@ def docker(
     volumes: tuple[tuple[str, str], ...],
     run_flags: tuple[str, ...],
     remove_existing: bool,
+    files: str,
 ) -> Footprint:
     """DockerPrimitive (learned with markers only)."""
     del (
@@ -160,6 +161,7 @@ def docker(
         volumes,
         run_flags,
         remove_existing,
+        files,
     )  # not in RawIR
     return {
         "added": {},
@@ -879,7 +881,15 @@ def ovn_nb_ctl_connection(*, key: str) -> Footprint:
     if key != "ovn.nb.connection":
         raise NotLearned(f"OVNNbCtlConnection.key={key!r}: learned only with 'ovn.nb.connection'")
     return {
-        "added": {},
+        "added": {
+            "ovn.connection:nb": {
+                "db": "nb",
+                "id": "ovn.connection:nb",
+                "kind": "ovn.connection",
+                "owner": "ovn-fabric",
+                "targets": ["ptcp:6641:0.0.0.0"],
+            }
+        },
         "changed": {},
         "removed": [],
     }
@@ -1092,6 +1102,76 @@ def ovn_nb_ctl_lrp_gateway(
                 "mac": mac,
                 "name": name,
                 "networks": [networks_0, networks_1],
+                "owner": "ovn-fabric",
+                "routerRef": f"ovn.lr:{router}",
+            }
+        },
+        "changed": {
+            f"ovn.lr:{router}": {"portRefs": {"added": [f"ovn.lrp:{router}|{name}"], "removed": []}}
+        },
+        "removed": [],
+    }
+
+
+def ovn_nb_ctl_lrp_no_networks(
+    *,
+    router: str,
+    name: str,
+    mac: str,
+    networks: tuple[str, ...],
+    gateway_chassis: Any,
+    ipv6_ra_configs: tuple[tuple[str, str], ...],
+) -> Footprint:
+    """OVNNbCtlLrp (learned with {'gateway_chassis': None})."""
+    if gateway_chassis is not None:
+        raise NotLearned(f"OVNNbCtlLrp.gateway_chassis={gateway_chassis!r}: learned only with None")
+    if len(networks) != 0:
+        raise NotLearned(f"OVNNbCtlLrp.networks: {len(networks)} elements, learned only with 0")
+    return {
+        "added": {
+            f"ovn.lrp:{router}|{name}": {
+                "externalIds": {},
+                "gatewayChassis": [],
+                "id": f"ovn.lrp:{router}|{name}",
+                "ipv6RaConfigs": dict(ipv6_ra_configs),
+                "kind": "ovn.lrp",
+                "mac": mac,
+                "name": name,
+                "networks": [],
+                "owner": "ovn-fabric",
+                "routerRef": f"ovn.lr:{router}",
+            }
+        },
+        "changed": {
+            f"ovn.lr:{router}": {"portRefs": {"added": [f"ovn.lrp:{router}|{name}"], "removed": []}}
+        },
+        "removed": [],
+    }
+
+
+def ovn_nb_ctl_lrp_no_networks_gateway(
+    *,
+    router: str,
+    name: str,
+    mac: str,
+    networks: tuple[str, ...],
+    gateway_chassis: Any,
+    ipv6_ra_configs: tuple[tuple[str, str], ...],
+) -> Footprint:
+    """OVNNbCtlLrp (learned with markers only)."""
+    if len(networks) != 0:
+        raise NotLearned(f"OVNNbCtlLrp.networks: {len(networks)} elements, learned only with 0")
+    del gateway_chassis  # not in RawIR
+    return {
+        "added": {
+            f"ovn.lrp:{router}|{name}": {
+                "externalIds": {},
+                "id": f"ovn.lrp:{router}|{name}",
+                "ipv6RaConfigs": dict(ipv6_ra_configs),
+                "kind": "ovn.lrp",
+                "mac": mac,
+                "name": name,
+                "networks": [],
                 "owner": "ovn-fabric",
                 "routerRef": f"ovn.lr:{router}",
             }
@@ -1374,7 +1454,15 @@ def ovn_sb_ctl_connection(*, key: str) -> Footprint:
     if key != "ovn.sb.connection":
         raise NotLearned(f"OVNSbCtlConnection.key={key!r}: learned only with 'ovn.sb.connection'")
     return {
-        "added": {},
+        "added": {
+            "ovn.connection:sb": {
+                "db": "sb",
+                "id": "ovn.connection:sb",
+                "kind": "ovn.connection",
+                "owner": "ovn-fabric",
+                "targets": ["ptcp:6642:0.0.0.0"],
+            }
+        },
         "changed": {},
         "removed": [],
     }
@@ -2046,6 +2134,8 @@ _BY_CLASS: dict[str, tuple[Callable[..., Footprint], ...]] = {
         ovn_nb_ctl_lrp,
         ovn_nb_ctl_lrp_dual,
         ovn_nb_ctl_lrp_gateway,
+        ovn_nb_ctl_lrp_no_networks,
+        ovn_nb_ctl_lrp_no_networks_gateway,
     ),
     "OVNNbCtlLs": (ovn_nb_ctl_ls,),
     "OVNNbCtlLsp": (

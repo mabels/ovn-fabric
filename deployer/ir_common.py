@@ -89,6 +89,7 @@ from collections.abc import Sequence
 from typing import Any, Protocol
 
 from fabric.decide import Decide
+from fabric.primitives.docker import DockerPrimitive, files_hash
 from fabric.primitives.host import HostPrimitive, NetnsPrimitive
 from fabric.primitives.net import FirewallRule
 from fabric.primitives.ovn import (
@@ -1196,18 +1197,10 @@ def _wg_conf_lines(app: pt.WireguardApp) -> list[str]:
 @dataclasses.dataclass
 class _SideContext:
     """The facts a kernel router SIDE carries into its apps — the target
-    netns, the side's real interface `dev`, the transit veth's netns leg
-    (left side) and its addressing, plus the side's own static addressing
-    and security group (masq)."""
+    netns and the side's real interface `dev`."""
 
     netns: str
     dev: str
-    transit_leg: str | None
-    groups: list[pt.SecurityGroupNode]
-    ipaddrs: list[str]
-    routes: list[pt.KernelRouterRoute]
-    transit_ipaddrs: list[str]
-    transit_routes: list[pt.KernelRouterRoute]
 
 
 def _emit_kernel_app_rules(
@@ -1261,118 +1254,6 @@ def _emit_kernel_app_rules(
             # (eth0), the other into the router netns with `router_ip`;
             # the container's default route is via the router.
             container = app.name or f"{router}-docker"
-            # A docker that OWNS the router's interfaces ("container IS the
-            # router" mode, dhcpcd-in-docker) carries NO veth addressing in
-            # the IR — that structural fact (no `ip`) is how the TS side
-            # says "own the interfaces", so this is decided here, not by a
-            # TS concept name (2026-08-31).
-            if app.ip is None:
-                app_unit = emit.unit(
-                    "kernel app", f"docker (owns the interfaces) ({container}) on {dev} in {netns}"
-                )
-                # Its image, then the container: run, inject the legs,
-                # address them, start the app.
-                image = app.image or f"ovn-fabric-{container}"
-                volumes = [
-                    {"host": volume.host, "container": volume.container}
-                    for volume in (app.volumes or [])
-                ]
-                identity = (
-                    {"public": app.identity.public, "secret": app.identity.secret}
-                    if app.identity
-                    else None
-                )
-                dockerfile = _docker_dockerfile(app.build) if app.build else None
-                _emit_image(
-                    host, image, dockerfile, f"/var/lib/ovn-fabric/build/{container}", app_unit
-                )
-                # The app owns its volume directories: DELETE removes them
-                # with whatever the app wrote into them.
-                for volume in volumes:
-                    app_unit.ovn(host.state_dir(volume["host"]))
-                if identity is not None:
-                    state_dir = next(
-                        (
-                            volume["host"]
-                            for volume in volumes
-                            if volume["container"] == "/var/lib/zerotier-one"
-                        ),
-                        None,
-                    )
-                    if state_dir is not None:
-                        public = f"{state_dir}/identity.public"
-                        secret = f"{state_dir}/identity.secret"
-                        app_unit.append(public, identity["public"])
-                        app_unit.append(secret, identity["secret"])
-                        app_unit.ovn(host.chmod(public, "644"))
-                        app_unit.ovn(host.chmod(secret, "600"))
-                docker = host.docker(
-                    container,
-                    image,
-                    command=("sleep", "infinity"),
-                    privileged=True,
-                    volumes=tuple((volume["host"], volume["container"]) for volume in volumes),
-                    run_flags=tuple(app.run or ()),
-                )
-                container_var = app_unit.local(container)
-                # Running from its image with what it should run with: run
-                # leaves it; else it is restarted (fabric/decide.py).
-                app_unit.ovn(docker, bind=container_var, decide=Decide.docker_container)
-                pid_var = app_unit.local(f"{container}-pid")
-                app_unit.capture(
-                    pid_var,
-                    ["/usr/bin/docker", "inspect", "-f", "{{.State.Pid}}", container],
-                )
-                app_unit.netns_symlink(repr(container), pid_var)
-                container_ns = docker.get_netns()
-                container_ns_var = app_unit.local(f"{container}-netns")
-                app_unit.ovn(container_ns, bind=container_ns_var)
-                # The router's legs are lent to the container — it IS the
-                # router now; their rewind moves them back, so the router's
-                # own delete finds them.
-                router_ns = host.netns(netns)
-                for leg in (ctx.transit_leg, dev):
-                    if leg:
-                        app_unit.ovn(
-                            router_ns.move_link(leg, container_ns), parent=container_ns_var
-                        )
-                # A sysctl is set every run: no undo, the same value again.
-                app_unit.ovn(
-                    container_ns.set_sysctl("net.ipv4.ip_forward", "1"),
-                    parent=container_ns_var,
-                    decide=Decide.always,
-                )
-                app_unit.ovn(
-                    container_ns.set_sysctl("net.ipv6.conf.all.forwarding", "1"),
-                    parent=container_ns_var,
-                    decide=Decide.always,
-                )
-                if ctx.transit_leg:
-                    _apply_side_network(
-                        [],
-                        ctx.transit_ipaddrs,
-                        ctx.transit_routes,
-                        container,
-                        ctx.transit_leg,
-                        app_unit,
-                        container_ns,
-                        container_ns_var,
-                    )
-                _apply_side_network(
-                    ctx.groups,
-                    ctx.ipaddrs,
-                    ctx.routes,
-                    container,
-                    dev,
-                    app_unit,
-                    container_ns,
-                    container_ns_var,
-                )
-                app_unit.ovn(
-                    docker.exec_detached([*(app.cmd or ["sh"]), dev]),
-                    decide=Decide.docker_exec,  # with its container (re)started
-                )
-                continue
             # Else: the client mode — one veth injected into the router netns
             # (CNI/Multus-style interface injection — the same primitive
             # a k8s pod + Multus uses, 2026-08-23). `--network host`
@@ -1524,27 +1405,29 @@ def _emit_kernel_router_owner(
     is the same declaration rewound (the netns' moved-in links are deleted
     from inside the netns before the netns itself). See the module doc
     block above for the netns/side semantics."""
-    # The transit veth's netns-side leg (the router's mesh uplink, on the
-    # LEFT side) plus its static addressing — handed to container-owning
-    # apps (dhcpcd-in-docker) so the container becomes the router and
-    # carries this leg and its addresses too (2026-08-31).
-    transit_leg = None
-    transit_ipaddrs: list[str] = []
-    transit_routes: list[pt.KernelRouterRoute] = []
     host = HostPrimitive(owner.data.host.removeprefix("host:"))
-    kernel_netns = host.netns(netns)
     kernel_var = emit.local("kernel")
     netns_var = emit.local(netns)
-    for side_node in _kernel_router_sides(owner.key.name, nodes):
-        if side_node.key.side == pt.Side.left:
-            iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
-            if iface is not None and iface.kind == "veth":
-                transit_leg = f"veth-krn-{iface.shortName}"
-            transit_ipaddrs = list(side_node.data.ipaddrs or [])
-            transit_routes = list(side_node.data.routes or [])
     netns_unit = emit.unit("kernel router", owner.key.name, key=owner.id)
     netns_unit.ovn(host.rootNs(), bind=kernel_var)
-    netns_unit.ovn(kernel_netns, bind=netns_var)
+    # A router whose container owns its interfaces has no netns of its own:
+    # the container's is it. All of it is one unit: a restart of the
+    # container makes everything in its netns again.
+    owning = _owning_app(owner, nodes)
+    docker = None
+    if owning is None:
+        kernel_netns = host.netns(netns)
+        netns_unit.ovn(kernel_netns, bind=netns_var)
+    else:
+        docker = _start_owning_container(owning[0], owning[1], host, netns_unit)
+        netns = owning[1]
+        kernel_netns = docker.get_netns()
+        netns_unit.ovn(kernel_netns, bind=netns_var)
+        # A sysctl is set every run: no undo, the same value again.
+        for key in ("net.ipv4.ip_forward", "net.ipv6.conf.all.forwarding"):
+            netns_unit.ovn(
+                kernel_netns.set_sysctl(key, "1"), parent=netns_var, decide=Decide.always
+            )
     for side_node in _kernel_router_sides(owner.key.name, nodes):
         iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
         if iface is not None and iface.kind not in _BINDABLE_IFACE_KINDS:
@@ -1565,7 +1448,11 @@ def _emit_kernel_router_owner(
             dev = f"veth-krn-{iface.shortName}"
         else:
             dev = _iface_real_name(iface) if iface is not None else _dummy_name(_side(side_node))
-        side_unit = emit.unit("kernel router side", f"{owner.key.name} ({_side(side_node).value})")
+        side_unit = (
+            netns_unit
+            if docker is not None
+            else emit.unit("kernel router side", f"{owner.key.name} ({_side(side_node).value})")
+        )
         if iface is not None:
             if iface.kind == "vlan":
                 side_unit.ovn(
@@ -1614,7 +1501,6 @@ def _emit_kernel_router_owner(
             side_unit.ovn(
                 kernel_netns.set_sysctl_file(f"/proc/sys/net/ipv6/conf/{dev}/accept_ra", "2"),
                 parent=netns_var,
-                decide=Decide.always,  # set every run: no undo, the same value again
             )
         # The side's static addressing + security-group (masq) rules,
         # applied inside the netns — SAME code as the dhcpcd-in-docker
@@ -1639,9 +1525,10 @@ def _emit_kernel_router_owner(
         # netns on this interface — started after the interface is up
         # and bound, so the DHCP client can immediately acquire a
         # lease on a ready device.
-        if side_node.data.apps:
+        apps = [a for a in side_node.data.apps or [] if owning is None or a is not owning[0]]
+        if apps:
             _emit_kernel_app_rules(
-                side_node.data.apps,
+                apps,
                 owner.key.name,
                 host,
                 netns_var,
@@ -1649,20 +1536,90 @@ def _emit_kernel_router_owner(
                 _SideContext(
                     netns=netns,
                     dev=dev,
-                    transit_leg=transit_leg,
-                    groups=_security_groups_from_refs(
-                        list(side_node.data.securityGroups or []),
-                        nodes,
-                        pt.Render.kernel,
-                        f"kernel router {owner.key.name}",
-                    ),
-                    ipaddrs=list(side_node.data.ipaddrs or []),
-                    routes=list(side_node.data.routes or []),
-                    transit_ipaddrs=transit_ipaddrs,
-                    transit_routes=transit_routes,
                 ),
                 nodes,
             )
+    # Its app starts once its interfaces are there, and with its container.
+    if docker is not None and owning is not None:
+        netns_unit.ovn(
+            docker.exec_detached([*(owning[0].cmd or ["sh"]), owning[2]]),
+            decide=Decide.docker_exec,
+        )
+
+
+def _owning_app(
+    owner: pt.KernelRouterNode, nodes: list[pt.Model]
+) -> tuple[pt.DockerApp, str, str] | None:
+    """The docker app that OWNS the router's interfaces ("the container IS the
+    router", dhcpcd-in-docker): (app, its container, its side's device). It
+    carries NO veth addressing in the IR — that structural fact (no `ip`) is
+    how the TS side says so, not a concept name (2026-08-31)."""
+    for side_node in _kernel_router_sides(owner.key.name, nodes):
+        for app in side_node.data.apps or []:
+            if app.kind == "docker" and app.ip is None:
+                iface = side_node.data.ifaces[0].iface if side_node.data.ifaces else None
+                if iface is None:
+                    dev = _dummy_name(_side(side_node))
+                elif iface.kind == "veth":
+                    dev = f"veth-krn-{iface.shortName}"
+                else:
+                    dev = _iface_real_name(iface)
+                return app, app.name or f"{owner.key.name}-docker", dev
+    return None
+
+
+def _start_owning_container(
+    app: pt.DockerApp, container: str, host: HostPrimitive, unit: Emitter
+) -> DockerPrimitive:
+    """Its image, state and container, up to its named netns: the router's
+    interfaces are made right there (the same way as a workload's NICs)."""
+    image = app.image or f"ovn-fabric-{container}"
+    volumes = [
+        {"host": volume.host, "container": volume.container} for volume in (app.volumes or [])
+    ]
+    identity = (
+        {"public": app.identity.public, "secret": app.identity.secret} if app.identity else None
+    )
+    dockerfile = _docker_dockerfile(app.build) if app.build else None
+    _emit_image(host, image, dockerfile, f"/var/lib/ovn-fabric/build/{container}", unit)
+    # The app owns its volume directories: DELETE removes them with whatever
+    # the app wrote into them.
+    for volume in volumes:
+        unit.ovn(host.state_dir(volume["host"]))
+    if identity is not None:
+        state_dir = next(
+            (
+                volume["host"]
+                for volume in volumes
+                if volume["container"] == "/var/lib/zerotier-one"
+            ),
+            None,
+        )
+        if state_dir is not None:
+            public = f"{state_dir}/identity.public"
+            secret = f"{state_dir}/identity.secret"
+            unit.append(public, identity["public"])
+            unit.append(secret, identity["secret"])
+            unit.ovn(host.chmod(public, "644"))
+            unit.ovn(host.chmod(secret, "600"))
+    docker = host.docker(
+        container,
+        image,
+        command=("sleep", "infinity"),
+        privileged=True,
+        volumes=tuple((volume["host"], volume["container"]) for volume in volumes),
+        run_flags=tuple(app.run or ()),
+        # A changed identity needs a restart: the daemon read it.
+        files=files_hash(*(identity.values() if identity else ())),
+    )
+    # Running from its image with what it should run with: run leaves it;
+    # else it is restarted, and the unit's later steps run again
+    # (fabric/decide.py).
+    unit.ovn(docker, bind=unit.local(container), decide=Decide.docker_container)
+    pid_var = unit.local(f"{container}-pid")
+    unit.capture(pid_var, ["/usr/bin/docker", "inspect", "-f", "{{.State.Pid}}", container])
+    unit.netns_symlink(repr(container), pid_var)
+    return docker
 
 
 def _kernel_router_script(router: str, up_lines: list[str], down_lines: list[str]) -> str:
@@ -2371,6 +2328,13 @@ def _emit_service_body(
         environment=env,
         volumes=mounts,
         run_flags=tuple(run_flags),
+        # A changed file needs a restart: the service read it.
+        files=files_hash(
+            *(
+                "\n".join(content) if isinstance(content, list) else content
+                for _path, _container_path, content in file_mounts
+            )
+        ),
     )
     docker_var = emit.local(container)
     emit.ovn(docker, bind=docker_var, decide=Decide.docker_container)

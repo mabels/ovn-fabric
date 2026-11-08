@@ -25,6 +25,11 @@ def _hash(*parts: str) -> str:
     return hashlib.sha256(json.dumps(parts).encode()).hexdigest()
 
 
+def files_hash(*contents: str) -> str:
+    """What a container's `files` says about the files it gets."""
+    return _hash(*contents)
+
+
 @dataclasses.dataclass(frozen=True)
 class DockerImage(CommandPrimitive):
     """A locally built image. The Dockerfile and the build context are
@@ -126,6 +131,9 @@ class DockerPrimitive(CommandPrimitive):
     volumes: tuple[tuple[str, str], ...] = ()
     run_flags: tuple[str, ...] = ()
     remove_existing: bool = True
+    # A hash of the files it gets through its volumes (written by its unit):
+    # part of its spec, so that a changed file restarts it.
+    files: str = ""
 
     @property
     def key(self) -> str:
@@ -143,8 +151,8 @@ class DockerPrimitive(CommandPrimitive):
 
     @property
     def spec(self) -> str:
-        """A hash of everything it is run with: its label."""
-        return _hash(*self._run_argv(labelled=False))
+        """A hash of everything it is run with, its files too: its label."""
+        return _hash(*self._run_argv(labelled=False), self.files)
 
     def _run_argv(self, labelled: bool = True) -> tuple[str, ...]:
         argv = ["/usr/bin/docker", "run", "-d"]

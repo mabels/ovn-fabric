@@ -134,6 +134,8 @@ def compare(desired: dict[str, dict[str, Any]], observed: dict[str, dict[str, An
     system fills in differently every time (VOLATILE) are not compared."""
     volatile = {field for fields in VOLATILE.values() for field in fields}
     volatile |= {f"iptables.rule.{field}" for field in ("handle", "nftHandle")}  # its place
+    # A route's table is in its id already (the system says "1000", a footprint 1000).
+    volatile.add("route.table")
     out = Comparison()
     for node_id in sorted(set(desired) | set(observed)):
         want, have = desired.get(node_id), observed.get(node_id)
@@ -146,7 +148,9 @@ def compare(desired: dict[str, dict[str, Any]], observed: dict[str, dict[str, An
             fields = sorted(
                 field
                 for field in set(want) | set(have)
-                if f"{kind}.{field}" not in volatile and want.get(field) != have.get(field)
+                if field != "owner"  # who it belongs to now: no difference in what it is
+                and f"{kind}.{field}" not in volatile
+                and want.get(field) != have.get(field)
             )
             if fields:
                 out.differ[node_id] = fields
@@ -215,12 +219,16 @@ class StepState(enum.Enum):
     missing = "missing"  # learned: none of its nodes is live
     partial = "partial"  # learned: some of its nodes are live
     read = "read"  # safe to run every time: a capture, a file, no commands at all
+    follows = "follows"  # no RawIR of its own: runs when its unit has work to do
+    decides = "decides"  # decides itself on the host (fabric/decide.py)
+    starts_afresh = "starts-afresh"  # … and may start what later steps build on
     unknown = "unknown"  # not learned, a run-time value, or no RawIR (files, …)
 
 
 # Steps that are safe to run again and again: a capture reads; a file is
-# written over, a directory made if missing, a mode set again.
-_REPEATABLE = ("Capture", "WriteFile", "Directory", "Chmod")
+# written over, a directory made if missing, a mode set again, a container's
+# netns link made to its process of now.
+_REPEATABLE = ("Capture", "WriteFile", "Directory", "Chmod", "SymlinkNetns")
 
 
 def step_state(
@@ -239,6 +247,8 @@ def step_state(
     kind = getattr(operation, "step_kind", None)
     if kind in _REPEATABLE or _no_commands(operation):
         return StepState.read, {}
+    if getattr(operation, "follows_unit", False):
+        return StepState.follows, {}
     if kind != "Primitive" or _has_runtime_value(operation):
         return StepState.unknown, {}
     try:
@@ -400,6 +410,23 @@ class Choice:
     unchecked: bool = False
 
 
+_LEARNED = (StepState.present, StepState.missing, StepState.partial)
+
+
+def _choose_with_decider(
+    states: Sequence[StepState], learned: list[int], unknown: list[int]
+) -> Choice:
+    """A unit with a step that decides itself is always sent. What is there
+    is skipped, what is missing runs — a network change does not restart a
+    container. What cannot be checked runs only with a unit that is gone
+    altogether; after a step that starts afresh the executor runs it anyway
+    (fabric/services/unit.py)."""
+    there = [i for i in learned if states[i] is not StepState.missing]
+    gone = bool(learned) and not there and StepState.starts_afresh not in states
+    skip = there if gone else sorted({*there, *unknown})
+    return Choice(True, skip, "decides itself" if not gone else "not there: all of it")
+
+
 def choose(states: Sequence[StepState]) -> Choice:
     """run's choice for a unit, from its steps' states. The learned steps
     tell whether the unit is there:
@@ -414,11 +441,18 @@ def choose(states: Sequence[StepState]) -> Choice:
 
     Without a learned step nothing can be told: such a unit is left alone,
     unless it only reads."""
-    learned = [i for i, s in enumerate(states) if s not in (StepState.read, StepState.unknown)]
+    # A step that follows its unit runs when something of the unit is missing,
+    # and otherwise counts as there.
+    work = any(s in (StepState.missing, StepState.partial) for s in states)
+    follow = StepState.read if work else StepState.present
+    states = [follow if s is StepState.follows else s for s in states]
+    learned = [i for i, s in enumerate(states) if s in _LEARNED]
     reads = [i for i, s in enumerate(states) if s is StepState.read]
     unknown = [i for i, s in enumerate(states) if s is StepState.unknown]
     present = [i for i in learned if states[i] is StepState.present]
     every = range(len(states))
+    if any(s in (StepState.decides, StepState.starts_afresh) for s in states):
+        return _choose_with_decider(states, learned, unknown)
     if any(states[i] is StepState.partial for i in learned):
         return Choice(False, [], "a step is partly there", unchecked=True)
     if not learned:

@@ -555,7 +555,13 @@ def _image_nodes() -> list[Any]:
                             cmd=["/sbin/dhcpcd"],
                             build=pt.DockerBuild(from_="alpine:latest", packages=["dhcpcd"]),
                         ),
-                        AppDocker(kind="docker", image="ubuntu", name="kernel-0-tool"),
+                        AppDocker(
+                            kind="docker",
+                            image="ubuntu",
+                            name="kernel-0-tool",
+                            ip="172.30.0.2/30",
+                            routerIp="172.30.0.1/30",
+                        ),
                     ],
                 ),
             )
@@ -1484,10 +1490,20 @@ class KernelRouterCreateTest(unittest.TestCase):
             up,
         )
         self.assertIn("symlink 'kernel-0-dhcpcd' kernel_0_dhcpcd_pid", up)
-        # The router's legs are lent to the container (moved back on delete).
+        # The container's netns IS the router's: no netns of its own, its
+        # interfaces are made right there, once the container runs.
+        self.assertNotIn("ns-kernel-0", up)
         for leg in ("veth-krn-9adb1d", "eth0.2280"):
-            self.assertIn(f"ip netns exec ns-kernel-0 ip link set {leg} netns kernel-0-dhcpcd", up)
+            self.assertIn(f"ip link set {leg} netns kernel-0-dhcpcd", up)
             self.assertIn(f"ip netns exec kernel-0-dhcpcd ip link set {leg} up", up)
+            self.assertLess(
+                up.index("symlink 'kernel-0-dhcpcd'"), up.index(f"ip link set {leg} netns")
+            )
+        self.assertIn(
+            "ip netns exec kernel-0-dhcpcd sh -c "
+            "'echo 2 > /proc/sys/net/ipv6/conf/eth0.2280/accept_ra'",
+            up,
+        )
         self.assertIn("ip netns exec kernel-0-dhcpcd sysctl -w net.ipv4.ip_forward=1", up)
         self.assertIn(
             "ip netns exec kernel-0-dhcpcd ip addr add 10.12.80.14/28 dev veth-krn-9adb1d",

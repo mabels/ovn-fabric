@@ -122,6 +122,8 @@ class PlatformImpl implements Platform {
     this.#ingressService = {
       name: `cp-${name}-ingress`,
       image: "busybox",
+      // Stays up, so that its NICs have a namespace to go into.
+      cmd: ["sleep", "infinity"],
       endpointRefs: [],
     };
   }

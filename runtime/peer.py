@@ -24,6 +24,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any
 
 from . import generated as g
+from . import journal
 from .forward import Outbox
 from .message import Msg, ProtocolError, decode, encode, header, new_req_id
 from .transport import Closed, Connection
@@ -72,6 +73,9 @@ class Call:
         self._outbox.put(self._log(level, line, None))
 
     def _log(self, level: str, message: str, component: str | None) -> g.LogMsg:
+        journal.record(
+            self.req_id, self.msg.header.parentReqId, component or self.component, level, message
+        )
         return g.LogMsg(
             kind="LogMsg",
             level=g.LogLevel(level),

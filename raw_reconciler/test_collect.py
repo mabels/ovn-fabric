@@ -30,6 +30,12 @@ class RouteNodesTest(unittest.TestCase):
         self.assertIn("route:ns-x|ipv4|main|10.9.0.0/16|eth0|eth0|None", ids)
 
 
+class EnterableTest(unittest.TestCase):
+    def test_a_link_of_a_container_that_is_gone_is_left_out(self) -> None:
+        with mock.patch.object(collect.os.path, "exists", side_effect=lambda p: "alive" in p):
+            self.assertEqual(collect._enterable(["alive", "gone"]), ["alive"])
+
+
 class IptablesNodesTest(unittest.TestCase):
     def test_a_rule_is_keyed_by_what_it_matches_and_does(self) -> None:
         rule = {"family": "ip", "table": "nat", "chain": "POSTROUTING", "action": "MASQUERADE"}

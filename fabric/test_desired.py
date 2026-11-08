@@ -141,6 +141,47 @@ class ChooseTest(unittest.TestCase):
         self.assertFalse(choose([]).run)
 
 
+D, A = StepState.decides, StepState.starts_afresh
+
+
+F = StepState.follows
+
+
+class FollowsTest(unittest.TestCase):
+    def test_it_runs_when_its_unit_has_work_and_not_when_all_is_there(self) -> None:
+        self.assertEqual(choose([M, F, M]), Choice(True, [], "not there: all of it"))
+        self.assertEqual(choose([P, F, M]).skip, [0])  # a route missing: the link gets it too
+        self.assertEqual(choose([P, F, P]), Choice(False, [], "there"))
+        # the unit is there, its reads run: it does not
+        self.assertEqual(choose([P, F, R]).skip, [0, 1])
+        self.assertEqual(choose([D, P, F]).skip, [1, 2])  # with a decider too
+
+    def test_its_step_says_so(self) -> None:
+        sysctl = HOST.netns("ns-x").set_sysctl_file("/proc/sys/x", "2")
+        self.assertEqual(step_state(sysctl, {})[0], StepState.follows)
+
+
+class ChooseWithDeciderTest(unittest.TestCase):
+    def test_a_workload_without_learned_steps_is_sent_its_symlink_waits(self) -> None:
+        # image, container, capture, symlink: the executor runs the symlink
+        # only when the container starts afresh
+        self.assertEqual(choose([D, A, R, U]).run, True)
+        self.assertEqual(choose([D, A, R, U]).skip, [3])
+        self.assertFalse(choose([D, A, R, U]).unchecked)
+
+    def test_a_network_change_does_not_touch_the_container(self) -> None:
+        # container, the symlink, an address there, an address missing
+        choice = choose([A, U, P, M])
+        self.assertEqual((choice.run, choice.skip), (True, [1, 2]))
+
+    def test_a_unit_that_is_gone_runs_completely_unless_a_container_decides(self) -> None:
+        self.assertEqual(choose([D, U, M]).skip, [])  # a sysctl, a link, an address
+        self.assertEqual(choose([A, U, M]).skip, [1])  # with its container: when it starts
+
+    def test_what_is_there_with_a_decider_is_skipped_partly_too(self) -> None:
+        self.assertEqual(choose([D, P, X]).skip, [1, 2])
+
+
 class StepStateTest(unittest.TestCase):
     def test_states_from_the_live_rawir(self) -> None:
         switch = OVNNbCtlLs("a")

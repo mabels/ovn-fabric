@@ -1,6 +1,6 @@
 """The leftovers of a run: what the first look at the host found to be ours
 (`owner` ovn-fabric) and no step of the plan fulfilled. They are removed at
-the end of a run, as one unit of work, dependents first.
+the end of a run, as one unit of work, in reverse — as a delete rewinds.
 
 Which nodes those are is decided by crossing out (fabric/desired.py); if
 this removes what should stay, the crossing out is wrong — there is no
@@ -110,8 +110,7 @@ def _nothing(node: Node) -> list[list[str]]:
     return []  # it goes with another node (an OVS interface with its port)
 
 
-# Per kind, what removes a node — in the order they are removed: what
-# depends on another kind first.
+# Per kind, what removes a node.
 DELETERS: dict[str, Callable[[Node], list[list[str]]]] = {
     "iptables.rule": _iptables,
     "route": _route,
@@ -133,15 +132,41 @@ DELETERS: dict[str, Callable[[Node], list[list[str]]]] = {
     "netns": _netns,
 }
 
-_ORDER = {kind: index for index, kind in enumerate(DELETERS)}
+# The order a create builds them in (fabric/plan.py) — leftovers are removed
+# in reverse, as a delete rewinds its plan.
+CREATE_ORDER = (
+    "netns",
+    "ovs.external-id",
+    "ovn.connection",
+    "ovs.bridge",
+    "link",
+    "ovs.port",
+    "ovs.iface",
+    "ovn.ls",
+    "ovn.lr",
+    "ovn.lrp",
+    "ovn.lsp",
+    "ovn.route",
+    "ovn.nat",
+    "ovn.acl",
+    "addr",
+    "route",
+    "iptables.rule",
+    "docker.container",
+)
+
+_ORDER = {kind: index for index, kind in enumerate(CREATE_ORDER)}
 
 
 def leftovers(nodes: Mapping[str, Node], fulfilled: set[str]) -> list[Node]:
-    """The nodes not fulfilled, in the order they are removed."""
+    """The nodes not fulfilled, in the order they are removed: the reverse
+    of a create, by kind; within a kind the reverse of how they were found.
+    A bridge's own link goes with the bridge."""
     left = [node for node_id, node in nodes.items() if node_id not in fulfilled]
-    return sorted(
-        left, key=lambda node: (_ORDER.get(str(node["kind"]), len(_ORDER)), str(node["id"]))
-    )
+    bridges = {f"link:{GLOBAL}|{node['name']}" for node in left if node["kind"] == "ovs.bridge"}
+    created = [node for node in left if node["id"] not in bridges]
+    created.sort(key=lambda node: _ORDER[str(node["kind"])])  # stable: found order
+    return created[::-1]
 
 
 def unit(nodes: list[Node]) -> g.Unit:

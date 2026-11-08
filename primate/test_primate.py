@@ -10,7 +10,7 @@ from fabric.primitives.ovn import OVNNbCtlLs, OVNNbCtlLsp
 from fabric.primitives.ovs import OVSBridge, OVSMapping
 
 from . import __main__ as primate_main
-from . import discover, learn, module, system
+from . import discover, learn, module, samples, system
 from .samples import Sample
 
 
@@ -252,6 +252,16 @@ class ModuleTest(unittest.TestCase):
 
 
 class KeepTest(unittest.TestCase):
+    def test_a_setting_is_cleared_for_the_sample_and_comes_back(self) -> None:
+        with (
+            mock.patch.object(samples, "list_connections", return_value=["ptcp:6641:0.0.0.0"]),
+            mock.patch.object(system, "run") as run,
+        ):
+            restore = samples._keep_connection("nb")()
+            run.assert_called_once_with(["ovn-nbctl", "del-connection"])
+            restore()
+        run.assert_called_with(["ovn-nbctl", "set-connection", "ptcp:6641:0.0.0.0"])
+
     def test_a_global_setting_is_restored_also_when_the_sample_fails(self) -> None:
         calls: list[str] = []
 

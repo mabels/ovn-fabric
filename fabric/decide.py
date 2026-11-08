@@ -218,6 +218,12 @@ async def decide(spec: Any, decided: Decided, lc: LifecycleController) -> Decisi
     return await DECIDERS[spec.kind](spec, decided, lc)
 
 
+async def undo(primitive: Primitive, lc: LifecycleController) -> None:
+    """A primitive's delete, best effort, in a create."""
+    for command in primitive.delete_cmds:
+        await lc.run_cmd(command.label, command.argv, optional=True, timeout=command.timeout)
+
+
 @dataclasses.dataclass(frozen=True)
 class Replaced:
     """A step decided `replace`: its undo (best effort), then its create."""
@@ -229,8 +235,7 @@ class Replaced:
         return self.primitive.key
 
     async def create(self, lc: LifecycleController) -> None:
-        for command in self.primitive.delete_cmds:
-            await lc.run_cmd(command.label, command.argv, optional=True, timeout=command.timeout)
+        await undo(self.primitive, lc)
         await self.primitive.create(lc)
 
     async def delete(self, lc: LifecycleController) -> None:

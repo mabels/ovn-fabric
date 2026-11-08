@@ -6,6 +6,7 @@ from collections.abc import Sequence
 
 from fabric.context import Ctx
 from fabric.lifecycle import LifecycleAction, LifecycleController, Operation
+from fabric.primitives.docker import files_hash
 from fabric.primitives.host import HostPrimitive
 
 
@@ -157,6 +158,16 @@ class DockerPrimitiveTest(unittest.TestCase):
             )
 
         asyncio.run(run())
+
+
+class SpecTest(unittest.TestCase):
+    def test_a_changed_file_changes_the_spec_the_run_arguments_stay(self) -> None:
+        host = HostPrimitive("h")
+        one = host.docker("c", "img", files=files_hash("identity-1"))
+        other = host.docker("c", "img", files=files_hash("identity-2"))
+        self.assertNotEqual(one.spec, other.spec)
+        self.assertEqual(one, host.docker("c", "img", files=files_hash("identity-1")))
+        self.assertNotIn("identity-1", " ".join(one._run_argv()))
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import socket
 from datetime import datetime, timezone
 from typing import Any
@@ -490,8 +491,14 @@ def _wire(nodes: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return nodes
 
 
+def _enterable(names: list[str]) -> list[str]:
+    """Without the netns links of containers that are gone: there is no
+    namespace behind them to read (the next run makes the link anew)."""
+    return [name for name in names if os.path.exists(f"/var/run/netns/{name}")]
+
+
 def collect(host: str | None = None) -> raw.RawSnapshot:
-    netns_names = list_netns()
+    netns_names = _enterable(list_netns())
     containers = [c for c in list_containers() if c["pid"] > 0]
     spaces: list[tuple[str, str | None, int | None]] = [
         (_ns(netns), netns, None) for netns in [None, *netns_names]

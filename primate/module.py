@@ -188,7 +188,7 @@ def render(templates: dict[str, Any], source: str) -> str:
                 f"    if len({field}) != {count}:",
                 f'        raise NotLearned(f"{template["class"]}.{field}: {{len({field})}} '
                 f'elements, learned only with {count}")',
-                f"    ({names},) = {field}",
+                *([f"    ({names},) = {field}"] if count else []),
             ]
         for field, keys in pairs.items():
             names = ", ".join(f"{field}_{i}" for i in range(len(keys)))

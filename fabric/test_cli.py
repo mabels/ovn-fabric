@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import argparse
 import asyncio
 import contextlib
 import io
 import logging
 import tempfile
 import unittest
+from typing import Any
+from unittest import mock
 
 from runtime import generated as rg
 from runtime import logconfig
@@ -103,6 +106,53 @@ class ShowTableTest(unittest.TestCase):
             with self.subTest(kind=kind):
                 part = getattr(g, kind, None) or getattr(rg, kind, None)
                 self.assertIsNotNone(part, f"{kind} is no message part")
+
+
+class IrApplyLastLineTest(unittest.TestCase):
+    def _run(self, res: object) -> tuple[int, str, str]:
+        async def ask(_address: str, _body: object, on_request: Any = None) -> object:
+            if on_request is not None:
+                on_request("req-1")
+            return res
+
+        args = argparse.Namespace(
+            address="x",
+            action="run",
+            ref="deployed",
+            put=None,
+            name=None,
+            host=None,
+            dry_run=False,
+            command_timeout=None,
+            keep_deployed=False,
+            no_cleanup=False,
+        )
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            mock.patch.object(cli, "_ask", ask),
+            contextlib.redirect_stdout(out),
+            contextlib.redirect_stderr(err),
+        ):
+            code = asyncio.run(cli._ir_apply(args))
+        return code, out.getvalue(), err.getvalue()
+
+    def test_the_last_line_names_the_request_and_the_ir(self) -> None:
+        res = g.IrApplyRes(
+            kind="IrApplyRes",
+            hash="sha256:abc",
+            action=g.ApplyAction.run,
+            host="h",
+            state=g.IrApplyOutcome.done,
+            units=[],
+        )
+        code, out, _err = self._run(res)
+        self.assertEqual(code, 0)
+        self.assertEqual(out.splitlines()[-1], "req=req-1 ir=sha256:abc")
+
+    def test_without_a_result_it_names_what_was_asked(self) -> None:
+        code, out, err = self._run(None)
+        self.assertEqual((code, out), (1, ""))
+        self.assertEqual(err.splitlines()[-1], "req=req-1 ir=deployed")
 
 
 if __name__ == "__main__":
