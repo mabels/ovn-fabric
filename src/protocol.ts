@@ -449,6 +449,20 @@ export const DockerApp = type({
     public: "string",
     secret: "string",
   }),
+  // Files on the host the app reads when it starts. With `content`: written.
+  // Without: made if missing and kept (the app writes into it itself).
+  "stateFiles?": type({
+    path: "string",
+    "content?": "string",
+  }).array(),
+  // Its masq rules go out of `tunnel.iface`.
+  "securityGroups?": SecurityGroupRef.array(),
+  // A device the app makes itself: wired from the host through the
+  // container's netns, nothing of it is done inside the image.
+  "tunnel?": type({
+    iface: "string",
+    routes: "string[]",
+  }),
 });
 // The CONFIG-side `kernel.app.docker` service kind (types.ts's
 // RouterEndpointService): a docker container the kernel host runs. `image`

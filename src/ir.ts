@@ -453,7 +453,8 @@ function kernelRouterSideToIR(
       // deployer turns each into its `ip netns exec` service script,
       // and stops/releases it on delete.
       apps: router[side].apps?.map((app) => {
-        const withRefs = app.kind === "wireguard" || app.kind === "zerotier"
+        const withRefs = app.kind === "wireguard" || app.kind === "zerotier" ||
+            (app.kind === "docker" && app.securityGroups)
           ? {
             ...app,
             securityGroups: (app.securityGroups ?? []).map((g) => ({

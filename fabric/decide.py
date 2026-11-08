@@ -192,10 +192,17 @@ async def _decide_docker_container(
 async def _decide_docker_exec(
     spec: g.DockerExecDecide, decided: Decided, lc: LifecycleController
 ) -> Decision:
-    """Started with its container: when that one was (re)started."""
+    """Started with its container: when that one is (re)started below, or
+    when nothing but the process holding it open (PID 1) runs in it — it
+    was restarted behind our back, or the app ended."""
     container = decided.by_key.get(f"docker.container:{spec.container}")
-    fresh = container in (Decision.apply, Decision.replace)
-    return Decision.apply if fresh else Decision.skip
+    if container in (Decision.apply, Decision.replace):
+        return Decision.apply
+    top = await lc.capture_cmd(
+        f"{spec.container} app (running?)", [_DOCKER, "top", spec.container], optional=True
+    )
+    processes = top.splitlines()[1:]  # below the header
+    return Decision.skip if len(processes) > 1 else Decision.apply
 
 
 DECIDERS: dict[str, Decider] = {

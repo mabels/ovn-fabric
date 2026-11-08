@@ -467,13 +467,21 @@ class DockerDeciderTest(unittest.TestCase):
 
     def test_an_exec_runs_with_its_container_started(self) -> None:
         exec_ = g.DockerExecDecide(kind="docker.exec", container="c")
+        running = _Probe({"top": "UID PID\nroot 1\nroot 2"})
         for container, expected in (
             (decide.Decision.apply, decide.Decision.apply),
             (decide.Decision.replace, decide.Decision.apply),
             (decide.Decision.skip, decide.Decision.skip),
         ):
-            got = _decided(exec_, _Probe({}), {"docker.container:c": container})
+            got = _decided(exec_, running, {"docker.container:c": container})
             self.assertEqual(got, expected)
+
+    def test_an_exec_runs_again_when_only_pid_1_is_left(self) -> None:
+        # `docker restart`, or the app ended: the container looks the same.
+        exec_ = g.DockerExecDecide(kind="docker.exec", container="c")
+        alone = _Probe({"top": "UID PID\nroot 1"})
+        kept = {"docker.container:c": decide.Decision.skip}
+        self.assertEqual(_decided(exec_, alone, kept), decide.Decision.apply)
 
     def test_a_fresh_container_runs_the_unit_s_later_steps_again(self) -> None:
         async def run(log: Path) -> list[str]:

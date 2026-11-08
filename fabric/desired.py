@@ -417,12 +417,14 @@ def _choose_with_decider(
     states: Sequence[StepState], learned: list[int], unknown: list[int]
 ) -> Choice:
     """A unit with a step that decides itself is always sent. What is there
-    is skipped, what is missing runs — a network change does not restart a
-    container. What cannot be checked runs only with a unit that is gone
-    altogether; after a step that starts afresh the executor runs it anyway
-    (fabric/services/unit.py)."""
-    there = [i for i in learned if states[i] is not StepState.missing]
-    gone = bool(learned) and not there and StepState.starts_afresh not in states
+    is skipped, what is missing or only partly there runs (a veth whose dead
+    OVS port is left: skipped, the steps on it would fail) — a network change
+    does not restart a container. What cannot be checked runs only with a
+    unit that is gone altogether; after a step that starts afresh the
+    executor runs it anyway (fabric/services/unit.py)."""
+    there = [i for i in learned if states[i] is StepState.present]
+    untouched = not any(states[i] is StepState.partial for i in learned)
+    gone = bool(learned) and not there and untouched and StepState.starts_afresh not in states
     skip = there if gone else sorted({*there, *unknown})
     return Choice(True, skip, "decides itself" if not gone else "not there: all of it")
 

@@ -1,15 +1,18 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import unittest
 from collections.abc import Callable
 
 from deployer.ir_common import Emitter
 from deployer.test_ir_to_python import NODES
+from protocol import generated as pt
 from protocol.hydrate import hydrate_nodes
 from runtime.test_message import IR_SAMPLE
 
 from . import generated as g
+from .lifecycle import LifecycleAction
 from .plan import PlanEmitter, PlanError, plan_units
 from .primitives.host import HostPrimitive
 from .units import to_operation
@@ -97,6 +100,62 @@ class PlanTest(unittest.TestCase):
     def test_an_unknown_host(self) -> None:
         with self.assertRaises(PlanError):
             plan_units(NODES, "nowhere")
+
+    def test_an_app_s_own_device_is_wired_from_the_host_around_its_start(self) -> None:
+        state = "/var/lib/z"
+        app = pt.DockerApp(
+            kind="docker",
+            image="img",
+            name="c",
+            cmd=["/up"],
+            volumes=[pt.Volume(host=state, container="/z")],
+            stateFiles=[
+                pt.StateFile(path=f"{state}/devicemap", content="n=zt0\n"),
+                pt.StateFile(path=f"{state}/networks.d/n.conf"),
+            ],
+            securityGroups=[pt.SecurityGroupRef(render=pt.Render.kernel, name="sg")],
+            tunnel=pt.Tunnel(iface="zt0", routes=["192.168.0.0/16"]),
+        )
+        group = pt.SecurityGroupNode(
+            id="securitygroup:sg",
+            kind="security.group",
+            key=pt.SecurityGroupKey(name="sg"),
+            data=pt.SecurityGroupData(
+                rules=[pt.SecurityGroupRule2(family=pt.Family.ipv4, kind="masq")]
+            ),
+        )
+        nodes = [
+            group,
+            *[
+                (
+                    dataclasses.replace(n, data=dataclasses.replace(n.data, apps=[app]))
+                    if n.kind == "kernel.router" and n.key.side == pt.Side.right
+                    else n
+                )
+                for n in NODES
+            ],
+        ]
+        unit = next(
+            u for u in plan_units(nodes, "chassis-1") if u.name == "kernel router: kernel-0"
+        )
+        lines = [
+            line
+            for step in unit.steps
+            for line in to_operation(step, "chassis-1").describe(LifecycleAction.CREATE)
+        ]
+        joined = "\n".join(lines)
+
+        def at(text: str) -> int:
+            return next(i for i, line in enumerate(lines) if text in line)
+
+        self.assertLess(at("devicemap"), at("docker run"))
+        self.assertLess(at("touch"), at("docker run"))
+        self.assertLess(at("MASQUERADE"), at("docker exec"))
+        self.assertLess(at("docker exec"), at("ip link set dev zt0 up"))
+        self.assertLess(at("ip link set dev zt0 up"), at("192.168.0.0/16"))
+        for line in (at("MASQUERADE"), at("ip link set dev zt0 up"), at("192.168.0.0/16")):
+            self.assertIn("ip netns exec c", lines[line])  # from the host, not in the image
+        self.assertNotIn("docker exec -d c iptables", joined)
 
 
 def _plan(declare: Callable[[Emitter], None]) -> list[g.Unit]:

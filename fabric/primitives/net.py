@@ -159,6 +159,42 @@ class RoutePrimitive(CommandPrimitive):
 
 
 @dataclasses.dataclass(frozen=True)
+class LinkUpPrimitive(CommandPrimitive):
+    """Waits for a device an app makes itself, and brings it up. With the
+    host's `ip`, in the netns: the app's image need not have it. Goes with
+    the app, so DELETE does nothing."""
+
+    host: str
+    netns: str
+    dev: str
+    seconds: int = 60
+
+    @property
+    def key(self) -> str:
+        return f"link.up:{self.netns}|{self.dev}"
+
+    def as_primitive(self) -> Primitive:
+        dev = shlex.quote(self.dev)
+        wait = (
+            f"for i in $(seq 1 {self.seconds}); do"
+            f" ip link set dev {dev} up 2>/dev/null && exit 0; sleep 1;"
+            f" done; echo {dev}: no such device after {self.seconds}s >&2; exit 1"
+        )
+        return Primitive(
+            key=self.key,
+            nodes=(),
+            create_cmds=(
+                Command(
+                    f"{self.host}:wait for {self.dev} in {self.netns}",
+                    _prefix(self.netns, ("sh", "-c", wait)),
+                    timeout=self.seconds + 30,
+                ),
+            ),
+            delete_cmds=(),
+        )
+
+
+@dataclasses.dataclass(frozen=True)
 class SysctlPrimitive(CommandPrimitive):
     """One netns-local sysctl value."""
 

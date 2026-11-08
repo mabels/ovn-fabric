@@ -1170,13 +1170,15 @@ Deno.test("tunnelRouterEndpoint: zerotier is a docker app with its state volume"
     return { routers: [r1] };
   });
   const nodes = toIR(network);
-  // The netns wire script gets the via-less supernet to egress the tunnel.
+  // The via-less supernet egresses the tunnel: wired from the host.
   const right = node(nodes, "kernelrouter:router-zerotier|side:right").data as {
     apps?: Array<{
       kind: string;
       cmd?: string[];
       build?: { dockerfile?: string };
       volumes?: Array<{ host: string; container: string }>;
+      stateFiles?: Array<{ path: string; content?: string }>;
+      tunnel?: { iface: string; routes: string[] };
     }>;
   };
   const app = right.apps?.find((a) => a.kind === "docker");
@@ -1186,12 +1188,21 @@ Deno.test("tunnelRouterEndpoint: zerotier is a docker app with its state volume"
   );
   // The program is baked into the image; the app only runs it.
   assertEquals(app?.cmd, ["/usr/local/bin/zerotier-up"]);
-  assertEquals(
-    app?.build?.dockerfile?.includes(
-      `'ip route add 192.168.0.0/16 dev "$var"'`,
-    ),
-    true,
-  );
+  assertEquals(app?.tunnel, { iface: "zt0", routes: ["192.168.0.0/16"] });
+  assertEquals(app?.stateFiles, [
+    {
+      path: "/var/lib/ovn-fabric/router-zerotier/zerotier/devicemap",
+      content: "02cfbec15c2319ff=zt0\n",
+    },
+    {
+      path:
+        "/var/lib/ovn-fabric/router-zerotier/zerotier/networks.d/02cfbec15c2319ff.conf",
+    },
+  ]);
+  // Nothing of the network is done inside the image.
+  for (const tool of ["iptables", "ip route", "iproute2", "jq"]) {
+    assertEquals(app?.build?.dockerfile?.includes(tool), false, tool);
+  }
   assertEquals(
     app?.build?.dockerfile?.includes("> /usr/local/bin/zerotier-up"),
     true,

@@ -1540,11 +1540,25 @@ def _emit_kernel_router_owner(
                 nodes,
             )
     # Its app starts once its interfaces are there, and with its container.
+    # A device the app makes itself is wired from here, not in its image:
+    # its masq needs only the name; a route needs the device.
     if docker is not None and owning is not None:
+        app = owning[0]
+        if app.tunnel is not None:
+            for family in _masq_families(list(app.securityGroups or []), nodes):
+                netns_unit.ovn(kernel_netns.add_masq(family, app.tunnel.iface), parent=netns_var)
         netns_unit.ovn(
-            docker.exec_detached([*(owning[0].cmd or ["sh"]), owning[2]]),
+            docker.exec_detached([*(app.cmd or ["sh"]), owning[2]]),
             decide=Decide.docker_exec,
         )
+        if app.tunnel is not None:
+            netns_unit.ovn(
+                kernel_netns.wait_link_up(app.tunnel.iface),
+                parent=netns_var,
+                decide=Decide.always,
+            )
+            for dst in app.tunnel.routes:
+                netns_unit.ovn(kernel_netns.add_route(dst, app.tunnel.iface), parent=netns_var)
 
 
 def _owning_app(
@@ -1602,6 +1616,16 @@ def _start_owning_container(
             unit.append(secret, identity["secret"])
             unit.ovn(host.chmod(public, "644"))
             unit.ovn(host.chmod(secret, "600"))
+    state_files = list(app.stateFiles or [])
+    for state_file in state_files:
+        directory = posixpath.dirname(state_file.path)
+        if directory not in {volume["host"] for volume in volumes}:
+            unit.ovn(host.state_dir(directory))
+        if state_file.content is not None:
+            unit.append(state_file.path, state_file.content)
+        else:
+            # The app writes into it: not written over, whatever a run finds.
+            unit.ovn(host.touch(state_file.path), decide=Decide.always)
     docker = host.docker(
         container,
         image,
@@ -1609,8 +1633,11 @@ def _start_owning_container(
         privileged=True,
         volumes=tuple((volume["host"], volume["container"]) for volume in volumes),
         run_flags=tuple(app.run or ()),
-        # A changed identity needs a restart: the daemon read it.
-        files=files_hash(*(identity.values() if identity else ())),
+        # A changed identity or state file needs a restart: the daemon read it.
+        files=files_hash(
+            *(identity.values() if identity else ()),
+            *(f"{f.path}={f.content}" for f in state_files),
+        ),
     )
     # Running from its image with what it should run with: run leaves it;
     # else it is restarted, and the unit's later steps run again

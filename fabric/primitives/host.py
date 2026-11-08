@@ -15,7 +15,7 @@ from ..lifecycle import (
 if TYPE_CHECKING:
     from .docker import DockerImage, DockerPrimitive, DockerPull
 
-from .fs import ChmodPrimitive, DirectoryPrimitive, RemovePathPrimitive
+from .fs import ChmodPrimitive, DirectoryPrimitive, RemovePathPrimitive, TouchPrimitive
 from .net import (
     AddrPrimitive,
     DefaultRule,
@@ -23,6 +23,7 @@ from .net import (
     FilterRule,
     IpRulePrimitive,
     LinkMovePrimitive,
+    LinkUpPrimitive,
     MasqRule,
     NetnsLinkPrimitive,
     RoutePrimitive,
@@ -191,6 +192,10 @@ class HostPrimitive(CommandPrimitive):
         """A directory this deployer owns with its content (see
         DirectoryPrimitive)."""
         return DirectoryPrimitive(self.name, path, owned=True)
+
+    def touch(self, path: str) -> TouchPrimitive:
+        """A file made if missing, what is in it kept."""
+        return TouchPrimitive(self.name, path)
 
     def chmod(self, path: str, mode: str) -> ChmodPrimitive:
         return ChmodPrimitive(self.name, path, mode)
@@ -517,6 +522,12 @@ class NetnsPrimitive(CommandPrimitive):
         if self.name is None or to.name is None:
             raise ValueError("moving a link needs two named namespaces")
         return LinkMovePrimitive(host=self.host, netns=self.name, name=name, to=to.name)
+
+    def wait_link_up(self, dev: str) -> LinkUpPrimitive:
+        """Wait for a device an app makes itself, and bring it up."""
+        if self.name is None:
+            raise ValueError("an app's device needs a named netns")
+        return LinkUpPrimitive(host=self.host, netns=self.name, dev=dev)
 
     def set_sysctl(self, key: str, value: str) -> SysctlPrimitive:
         if self.name is None:

@@ -13,7 +13,7 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
-from ..lifecycle import LifecycleAction, RawNodeTemplate
+from ..lifecycle import Command, CommandPrimitive, LifecycleAction, Primitive, RawNodeTemplate
 
 if TYPE_CHECKING:
     from ..lifecycle import LifecycleController
@@ -61,6 +61,28 @@ class DirectoryPrimitive:
         if self.owned:
             return [f"rm -rf {self.path}"]
         return [f"rmdir -p {self.path}"]
+
+
+@dataclasses.dataclass(frozen=True)
+class TouchPrimitive(CommandPrimitive):
+    """A file made if missing, what is in it kept (an app writes into it).
+    A command, unlike the others here: as a Primitive step it can be
+    decided. DELETE leaves it, to the directory that holds it."""
+
+    host: str
+    path: str
+
+    @property
+    def key(self) -> str:
+        return f"fs.touch:{self.path}"
+
+    def as_primitive(self) -> Primitive:
+        return Primitive(
+            key=self.key,
+            nodes=(),
+            create_cmds=(Command(f"touch {self.path}", ("touch", self.path)),),
+            delete_cmds=(),
+        )
 
 
 @dataclasses.dataclass(frozen=True)

@@ -477,6 +477,9 @@ export function buildKernelRouterEndpoint(
  * — a tunnel router anchors one domain from its LEFT (the tunnel's
  * default) and participates in another from its RIGHT (e.g.
  * Voda-defaultRoute on the backbone side). */
+// A zerotier tunnel's device: the container's netns holds only this one.
+const ZEROTIER_IFACE = "zt0";
+
 export function buildTunnelRouterEndpoint(
   ctx: RouterEndpointContext,
   input: Omit<TunnelRouterEndpoint, "kind">,
@@ -542,46 +545,21 @@ export function buildTunnelRouterEndpoint(
         const ztRoutes = (routes ?? [])
           .filter((route) => !route.via)
           .map((route) => route.dst.to_string());
-        const ztMasq = masq.map((family) =>
-          family === "ipv4"
-            ? 'iptables -t nat -A POSTROUTING -o "$var" -j MASQUERADE'
-            : 'ip6tables -t nat -A POSTROUTING -o "$var" -j MASQUERADE'
-        );
-        const ztRouteCmds = ztRoutes.map((dst) =>
-          `ip route add ${dst} dev "$var"`
-        );
-        // The container's program, baked into the image at build time
-        // (one image per router) instead of passed as a `sh -c` argument:
-        // join the network, wait for its device, wire it, stay alive.
+        // The container's program, baked into the image at build time (one
+        // image per router): only the daemon, in the foreground, so that it
+        // is gone from the container when it ends (a run starts it again).
+        // What it joins and how its device is named is in its state files;
+        // its device is wired from the host (DockerApp's `tunnel`) — the
+        // image need not have `ip` or `iptables`.
         // It is started with `docker exec -d`, so its output would go
         // nowhere: it writes to the container's main process instead —
-        // `docker logs <container>` shows the join and the wiring.
+        // `docker logs <container>` shows it.
         const ztScript = [
           "#!/bin/sh",
           "exec >/proc/1/fd/1 2>&1",
-          'echo "zerotier-up: starting zerotier-one"',
-          "/usr/sbin/zerotier-one -d /var/lib/zerotier-one",
-          "for i in $(seq 1 30); do",
-          "  zerotier-cli -D/var/lib/zerotier-one info >/dev/null 2>&1 && break",
-          "  sleep 1",
-          "done",
-          "zerotier-cli -D/var/lib/zerotier-one info",
-          `echo "zerotier-up: joining ${ztNetworkId}"`,
-          `zerotier-cli -D/var/lib/zerotier-one join "${ztNetworkId}" || true`,
-          'var=""',
-          "for i in $(seq 1 60); do",
-          `  var=$(zerotier-cli -D/var/lib/zerotier-one -j listnetworks | jq -r '.[] | select(.nwid=="${ztNetworkId}") | .portDeviceName')`,
-          '  [ -n "$var" ] && [ "$var" != "null" ] && break',
-          "  sleep 1",
-          "done",
-          'echo "zerotier-up: network device: ${var:-none after 60s}"',
-          "zerotier-cli -D/var/lib/zerotier-one listnetworks",
-          'ip link set "$var" up',
-          ...ztMasq,
-          ...ztRouteCmds,
-          'echo "zerotier-up: wired"',
-          "exec sleep infinity",
+          "exec /usr/sbin/zerotier-one /var/lib/zerotier-one",
         ];
+        const ztState = `/var/lib/ovn-fabric/${routerName}/zerotier`;
         // Written with printf, one single-quoted argument per line — works
         // with every docker builder (a Dockerfile heredoc needs BuildKit).
         const ztScriptLines = ztScript
@@ -590,7 +568,7 @@ export function buildTunnelRouterEndpoint(
         const dockerfile = `
 FROM ubuntu:24.04
 RUN apt-get update && apt-get install -y --no-install-recommends \\
-      ca-certificates curl jq iproute2 iptables iputils-ping traceroute \\
+      ca-certificates curl \\
  && curl -fsSL https://install.zerotier.com | bash \\
  && rm -rf /var/lib/apt/lists/*
 RUN mkdir -p /var/lib/zerotier-one
@@ -608,12 +586,24 @@ ${ztScriptLines} \\
           build: { from: "ubuntu:24.04", dockerfile },
           volumes: [
             {
-              host: `/var/lib/ovn-fabric/${routerName}/zerotier`,
+              host: ztState,
               container: "/var/lib/zerotier-one",
             },
           ],
           run: ["--dns", "1.1.1.1"],
           identity: workload.identity,
+          stateFiles: [
+            // ZeroTier names its device from this file, else by itself.
+            {
+              path: `${ztState}/devicemap`,
+              content: `${ztNetworkId}=${ZEROTIER_IFACE}\n`,
+            },
+            // The network's file there is what joins it. The daemon keeps
+            // the network's config in it: kept when there.
+            { path: `${ztState}/networks.d/${ztNetworkId}.conf` },
+          ],
+          securityGroups: masqGroup ? [masqGroup] : [],
+          tunnel: { iface: ZEROTIER_IFACE, routes: ztRoutes },
         };
       })(),
   ];

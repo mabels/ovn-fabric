@@ -565,6 +565,22 @@ export type KernelApp =
       readonly public: string;
       readonly secret: string;
     };
+    /** Files on the host the app reads when it starts (in a volume). With
+     * `content`: written. Without: made if missing and kept — the app
+     * writes into it itself. */
+    readonly stateFiles?: readonly {
+      readonly path: string;
+      readonly content?: string;
+    }[];
+    /** Security groups whose `masq` rules apply out `tunnel.iface`. */
+    readonly securityGroups?: readonly SecurityGroupRef<"kernel">[];
+    /** A device the app makes itself, under a name it is told (not in the
+     * image: the image need not have `ip` or `iptables`). The deployer waits
+     * for it and wires it from the host, through the container's netns. */
+    readonly tunnel?: {
+      readonly iface: string;
+      readonly routes: readonly string[];
+    };
   };
 
 // ── Router: connects exactly two collision domains ──────────────────

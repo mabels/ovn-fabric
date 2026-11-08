@@ -178,8 +178,10 @@ class ChooseWithDeciderTest(unittest.TestCase):
         self.assertEqual(choose([D, U, M]).skip, [])  # a sysctl, a link, an address
         self.assertEqual(choose([A, U, M]).skip, [1])  # with its container: when it starts
 
-    def test_what_is_there_with_a_decider_is_skipped_partly_too(self) -> None:
-        self.assertEqual(choose([D, P, X]).skip, [1, 2])
+    def test_a_step_partly_there_with_a_decider_runs(self) -> None:
+        # A veth with its dead OVS port left: the addresses on it need it.
+        self.assertEqual(choose([D, P, X, M]).skip, [1])
+        self.assertEqual(choose([A, U, X, M]).skip, [1])  # a partial is not a gone unit either
 
 
 class StepStateTest(unittest.TestCase):
