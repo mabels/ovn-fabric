@@ -192,9 +192,13 @@ function hostToIR(
           cacheMaxFlows: ipfix.cacheMaxFlows,
         }
         : undefined,
-      reconcile: host.reconcile?.exclude
-        ? { exclude: [...host.reconcile.exclude] }
-        : undefined,
+      // The host's own interfaces the reconcile leaves alone — the
+      // loopback always (every netns has one), then the topology's.
+      reconcile: {
+        hostInterfaces: [
+          ...new Set(["lo", ...(host.reconcile?.hostInterfaces ?? [])]),
+        ],
+      },
     },
   };
 }

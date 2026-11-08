@@ -101,9 +101,12 @@ def _load_primitive(step: g.PrimitiveStep, host: str) -> Operation:
     )
 
 
-def _dump_primitive(operation: Primitive | CommandPrimitive) -> g.PrimitiveStep:
+def _dump_primitive(
+    operation: Primitive | CommandPrimitive, decide: g.StepDecide | None = None
+) -> g.PrimitiveStep:
     primitive = operation.as_primitive()
     return g.PrimitiveStep(
+        decide=decide,
         kind="Primitive",
         key=primitive.key,
         nodes=[
@@ -210,10 +213,16 @@ def to_operation(step: g.UnitStepSpec, host: str = "") -> Operation:
     return kind.load(step, host)
 
 
-def to_step(operation: object) -> g.UnitStepSpec:
-    """The serialized step for a lifecycle operation a unit may contain."""
+def to_step(operation: object, decide: g.StepDecide | None = None) -> g.UnitStepSpec:
+    """The serialized step for a lifecycle operation a unit may contain;
+    `decide`: who decides it in a run (fabric/decide.py) — a primitive's
+    only."""
     step_kind = getattr(operation, "step_kind", None)
     kind = _KINDS.get(step_kind) if isinstance(step_kind, str) else None
     if kind is None:
         raise TypeError(f"{type(operation).__name__} cannot be part of a unit (no step kind)")
-    return kind.dump(operation)
+    if decide is None:
+        return kind.dump(operation)
+    if step_kind != "Primitive":
+        raise TypeError(f"a {step_kind} step decides nothing (only a primitive does)")
+    return _dump_primitive(operation, decide)  # type: ignore[arg-type]

@@ -28,6 +28,7 @@ RAW_INFRA_HOST: dict[str, Any] = {
         "ovnRole": "central",
         "encapIp": "10.0.0.1",
         "os": {"name": "ubuntu", "version": "26.04", "packageManager": "apt"},
+        "reconcile": {"hostInterfaces": ["lo"]},
     },
 }
 
@@ -78,6 +79,7 @@ class HydrateInfraHostTest(unittest.TestCase):
             "data": {
                 "connectAddress": "10.0.0.1",
                 "os": {"name": "ubuntu", "version": "26.04", "packageManager": "apt"},
+                "reconcile": {"hostInterfaces": ["lo"]},
             },
         }
         node = mod.hydrate_node(raw)

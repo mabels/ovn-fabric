@@ -23,8 +23,8 @@ from runtime.transport import connect
 from .. import generated as g
 from ..desired import desired_rawir
 from ..plan import plan_operations, plan_units
-from . import abstract_deps, unit
-from .apply import Apply
+from . import abstract_deps, apply, unit
+from .apply import Apply, Failed
 from .ir import IrStore
 from .test_ir import _put
 
@@ -95,6 +95,12 @@ async def _client(fakes: Fakes, host: str = HOST) -> AsyncIterator[tuple[Peer, A
         await reader
         stop.set()
         await server
+
+
+def _owned(live: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Live nodes as the collector hands them: each with its owner (ours,
+    unless a fixture says else)."""
+    return {node_id: {"owner": "ovn-fabric", **node} for node_id, node in live.items()}
 
 
 def _apply(
@@ -295,16 +301,20 @@ class DeployedTest(unittest.TestCase):
 
     def test_run_dry_run_reports_the_deployed_ir_in_rawir(self) -> None:
         async def run() -> None:
-            live = {"ovn.ls:elsewhere": {"id": "ovn.ls:elsewhere", "kind": "ovn.ls"}}
+            live = {
+                "ovn.ls:elsewhere": {"id": "ovn.ls:elsewhere", "kind": "ovn.ls"},
+                "link:*global*|docker0": {"id": "x", "kind": "link", "owner": "docker"},
+            }
             async with _client(Fakes()) as (client, _apply_service):
                 await _run(client, _apply("create"))
-                with mock.patch("fabric.observed.snapshot", return_value=live):
+                with mock.patch("fabric.observed.snapshot", return_value=_owned(live)):
                     res, seen = await _run(client, _apply("run", ref="deployed", dry=True))
                 self.assertEqual(res.state, g.IrApplyOutcome.done)
                 self.assertEqual(res.units, [])
                 logs = [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
                 self.assertTrue(any("RawIR nodes" in line for line in logs), logs)
-                self.assertTrue(any(line.startswith("excluded ") for line in logs), logs)
+                # someone else's: counted, not compared
+                self.assertIn("left alone, someone else's: docker 1", logs)
                 self.assertTrue(any("only observed 1" in line for line in logs), logs)
 
         asyncio.run(run())
@@ -325,6 +335,22 @@ def _central_ir() -> list[dict[str, Any]]:
     return [cast(dict[str, Any], plain(node)) for node in NODES]
 
 
+class FailedTest(unittest.TestCase):
+    def _unit(self, name: str, scope: str) -> g.Unit:
+        return g.Unit(name=name, kind="x", scope=scope, steps=[])
+
+    def test_an_unchecked_unit_holds_back_its_scope_not_the_foundation(self) -> None:
+        failed = Failed()
+        failed.hold(self._unit("workload: w", "w"))
+        failed.hold(self._unit("root namespace: h", "configure"))
+        self.assertTrue(failed.blocks(self._unit("NIC: n", "w")))
+        self.assertEqual(
+            failed.why(self._unit("NIC: n", "w")), "needs workload: w, which run cannot check"
+        )
+        self.assertFalse(failed.blocks(self._unit("workload: other", "other")))
+        self.assertFalse(failed.blocks(self._unit("logical switch: s", "cluster")))
+
+
 class RunTest(unittest.TestCase):
     """run: per unit, from the live RawIR — run what is gone, leave what is
     there (fabric/desired.py's choose)."""
@@ -334,7 +360,7 @@ class RunTest(unittest.TestCase):
             fakes = Fakes()
             async with _client(fakes, host=CENTRAL) as (client, _apply_service):
                 await client.ask(_put("central", _central_ir()), timeout=5)
-                with mock.patch("fabric.observed.snapshot", return_value=live):
+                with mock.patch("fabric.observed.snapshot", return_value=_owned(live)):
                     res, seen = await _run(client, _apply("run", ref="central"))
             logs = [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
             return fakes, res, logs
@@ -357,7 +383,8 @@ class RunTest(unittest.TestCase):
         ran = [name for name, _ in fakes.calls]
         self.assertIn("chassis id: chassis-1 (resolved on this host)", ran)  # a read
         self.assertNotIn("logical switch: backbone", ran)
-        self.assertNotIn("root namespace: central-1", ran)
+        # the root netns runs nothing: as a read, it does no harm
+        self.assertIn("root namespace: central-1", ran)
         self.assertNotIn("router port: lrp-router-home-left (home)", ran)
         self.assertTrue(any(line.startswith("units: ") for line in logs), logs)
 
@@ -373,6 +400,54 @@ class RunTest(unittest.TestCase):
         graph = next(line for line in logs if line.startswith("reconciled graph:"))
         self.assertIn("applied 1, missing 0", graph)
 
+    def _cleaned(
+        self, fail: str | None = None, **req: Any
+    ) -> tuple[Fakes, g.IrApplyRes, list[str]]:
+        leftover = {"id": "ovn.ls:gone", "kind": "ovn.ls", "name": "gone"}
+        live = {**self._all_there(), "ovn.ls:gone": leftover}
+
+        async def run() -> tuple[Fakes, g.IrApplyRes, list[str]]:
+            fakes = Fakes(fail=fail)
+            async with _client(fakes, host=CENTRAL) as (client, _apply_service):
+                await client.ask(_put("central", _central_ir()), timeout=5)
+                with mock.patch("fabric.observed.snapshot", return_value=_owned(live)):
+                    res, seen = await _run(
+                        client, dataclasses.replace(_apply("run", ref="central"), **req)
+                    )
+            return fakes, res, [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
+
+        return asyncio.run(run())
+
+    def test_leftovers_are_removed_at_the_end_by_default(self) -> None:
+        fakes, res, logs = self._cleaned()
+        self.assertEqual(res.state, g.IrApplyOutcome.done)
+        self.assertEqual(fakes.calls[-1][0], "cleanup: leftovers")
+        self.assertEqual(fakes.calls[-1][1][0], "delete")
+        self.assertIn("cleanup: remove ovn.ls:gone", logs)
+        self.assertNotIn("cleanup: remove ovn.ls:backbone", logs)  # fulfilled by a step
+
+    def test_a_run_names_its_ir_deployed(self) -> None:
+        async def run() -> None:
+            async with _client(Fakes(), host=CENTRAL) as (client, _apply_service):
+                put = await client.ask(_put("central", _central_ir()), timeout=5)
+                with mock.patch("fabric.observed.snapshot", return_value=_owned({})):
+                    await _run(client, _apply("run", ref="central"))
+                got = await client.ask(g.IrGetReq(kind="IrGetReq", ref="deployed"), timeout=5)
+                self.assertEqual(got.body.info.hash, put.body.hash)
+
+        asyncio.run(run())
+
+    def test_no_cleanup_keeps_them(self) -> None:
+        fakes, _res, logs = self._cleaned(noCleanup=True)
+        self.assertNotIn("cleanup: leftovers", [name for name, _ in fakes.calls])
+        self.assertIn("leftovers kept (--no-cleanup)", logs)
+
+    def test_a_failed_unit_keeps_them(self) -> None:
+        fakes, res, logs = self._cleaned(fail="chassis id: chassis-1 (resolved on this host)")
+        self.assertEqual(res.state, g.IrApplyOutcome.failed)
+        self.assertNotIn("cleanup: leftovers", [name for name, _ in fakes.calls])
+        self.assertIn("a unit failed: leftovers are not removed", logs)
+
     def test_create_and_delete_are_unconditional(self) -> None:
         # Only run looks at the live RawIR: create and delete run every
         # step, also where everything is there (or gone) already.
@@ -384,7 +459,7 @@ class RunTest(unittest.TestCase):
                     async with _client(fakes, host=CENTRAL) as (client, _apply_service):
                         await client.ask(_put("central", _central_ir()), timeout=5)
                         with mock.patch(
-                            "fabric.observed.snapshot", return_value=self._all_there()
+                            "fabric.observed.snapshot", return_value=_owned(self._all_there())
                         ) as snapshot:
                             await _run(client, _apply(action, ref="central"))
                         self.assertFalse(snapshot.called)
@@ -402,7 +477,26 @@ class RunTest(unittest.TestCase):
                 with mock.patch("fabric.observed.snapshot", side_effect=OSError("no ip")):
                     with self.assertRaisesRegex(RemoteError, "cannot collect the live RawIR"):
                         await client.ask(_apply("run", ref="central"), timeout=5)
-            self.assertEqual(fakes.calls, [])
+            self.assertEqual([c[0] for c in fakes.calls], ["deps"])  # no unit ran
+
+        asyncio.run(run())
+
+    def test_run_resolves_the_dependencies_first(self) -> None:
+        async def run() -> None:
+            fakes = Fakes(deps_fail=True)
+            async with _client(fakes, host=CENTRAL) as (client, _apply_service):
+                await client.ask(_put("central", _central_ir()), timeout=5)
+                with (
+                    mock.patch("fabric.observed.snapshot", return_value={}) as snapshot,
+                    # the fixtures' host declares none: give it one
+                    mock.patch.object(
+                        apply, "abstract_deps", return_value=[{"name": "ovn-central"}]
+                    ),
+                ):
+                    res, _seen = await _run(client, _apply("run", ref="central"))
+            self.assertEqual((res.state, res.units), (g.IrApplyOutcome.failed, []))
+            self.assertEqual([c[0] for c in fakes.calls], ["deps"])
+            self.assertFalse(snapshot.called)  # not ready: nothing collected either
 
         asyncio.run(run())
 

@@ -22,6 +22,8 @@ from ladops.ovs import list_bridge_mappings, list_bridge_ports, list_external_id
 from protocol import raw_generated as raw
 from protocol.hydrate import hydrate_as
 
+from .owners import discover
+
 GLOBAL_NETNS = "*global*"
 
 
@@ -112,6 +114,7 @@ def _addr_nodes(
                         "family": addr["family"],
                         "address": addr["addr"].split("/")[0],
                         "prefixlen": int(addr["addr"].split("/")[1]),
+                        "dynamic": True if addr.get("dynamic") else None,
                     },
                 }
             )
@@ -192,8 +195,10 @@ def _iptables_nodes(
                         "rule": {
                             "fields": rule["fields"],
                             "action": rule["action"],
+                            "target": rule.get("target"),
                         },
                         "handle": rule["order"],
+                        "nftHandle": rule.get("nftHandle"),
                     },
                 }
             )
@@ -203,7 +208,8 @@ def _iptables_nodes(
 def _docker_nodes(containers: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         {
-            "id": f"docker.container:{container['containerId']}",
+            # By name, as the deployer names it (the id is docker's, random).
+            "id": f"docker.container:{container['name']}",
             "kind": "docker.container",
             "collection": {
                 "containerId": container["containerId"],
@@ -512,6 +518,8 @@ def collect(host: str | None = None) -> raw.RawSnapshot:
         node.update(node.pop("collection", {}))
     _wire_references(nodes)
     wired = _wire(nodes)
+    # Whose each node is: ours, unless docker/OVS/OVN/the kernel say theirs.
+    discover({node["id"]: node for node in wired})
     if host is not None:
         for node in wired:
             node["host"] = host

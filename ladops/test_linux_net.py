@@ -112,8 +112,13 @@ class ListTest(unittest.TestCase):
         self.assertEqual(
             addrs,
             [
-                {"addr": "192.168.129.20/24", "interface": "ens19", "family": "ipv4"},
-                {"addr": "fe80::1/64", "interface": "ens19", "family": "ipv6"},
+                {
+                    "addr": "192.168.129.20/24",
+                    "interface": "ens19",
+                    "family": "ipv4",
+                    "dynamic": False,
+                },
+                {"addr": "fe80::1/64", "interface": "ens19", "family": "ipv6", "dynamic": False},
             ],
         )
 

@@ -73,9 +73,9 @@ export const IpfixData = type({
   "cacheActiveTimeout?": "number",
   "cacheMaxFlows?": "number",
 });
-// RawIR node id globs the reconcile leaves alone (types.ts HostReconcile);
-// the loopback always, without being listed.
-export const HostReconcile = type({ "exclude?": "string[]" });
+// The host's own interfaces the reconcile leaves alone, with what is on
+// them (types.ts HostReconcile) — the loopback always among them.
+export const HostReconcile = type({ hostInterfaces: "string[]" });
 export const InfraHostData = type({
   connectAddress: "string",
   "ovnRole?": "'central'|'chassis'",
@@ -91,7 +91,7 @@ export const InfraHostData = type({
   // Flow export onto the collector — see IpfixData.
   "ipfix?": IpfixData,
   // What the runtime's reconcile leaves alone — see HostReconcile.
-  "reconcile?": HostReconcile,
+  reconcile: HostReconcile,
 });
 export const InfraHostNode = type({
   id: "string",

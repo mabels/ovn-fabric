@@ -162,7 +162,14 @@ def list_addrs(netns: str | None, pid: int | None = None) -> list[JsonObject]:
         for a in entry.get("addr_info", []):
             addr = f"{a['local']}/{a['prefixlen']}"
             out.append(
-                {"addr": addr, "interface": ifname, "family": "ipv6" if ":" in addr else "ipv4"}
+                {
+                    "addr": addr,
+                    "interface": ifname,
+                    "family": "ipv6" if ":" in addr else "ipv4",
+                    # SLAAC or link-local: the kernel's, nobody configured it
+                    "dynamic": bool(a.get("dynamic"))
+                    or str(a.get("protocol", "")).startswith("kernel"),
+                }
             )
     return out
 

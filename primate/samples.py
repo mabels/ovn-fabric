@@ -26,6 +26,12 @@ be marked is given per sample:
   not fit (`networks_1`: an IPv6 CIDR);
 - `variant`: a name for one more shape of a class (a route with a
   gateway); the generated library tries a class's shapes in order;
+- `maps`: a (key, value) tuple field RawIR holds as it is, whatever its
+  keys — field -> (the node's field, the sample's value); the generated
+  function passes it on (a router port's RA configs);
+- `free`: fields that leave no trace in RawIR (a container's command,
+  its environment) — the sample runs with the given value, the
+  generated function ignores the field; learn checks it left no trace;
 - `keep`: for a primitive that sets one of the host's global settings
   (the bridge mappings, where a database listens) — saves the host's
   value and returns what restores it after the sample.
@@ -43,10 +49,13 @@ import secrets
 from collections.abc import Callable, Mapping
 from typing import Any
 
+from fabric.lifecycle import Primitive
+from fabric.primitives.docker import DockerPrimitive, DockerPull
 from fabric.primitives.host import HostPrimitive, LinkPrimitive, NetnsPrimitive, VlanPrimitive
 from fabric.primitives.net import (
     AddrPrimitive,
     IpRulePrimitive,
+    LinkMovePrimitive,
     MasqRule,
     NetnsLinkPrimitive,
     RoutePrimitive,
@@ -100,7 +109,7 @@ MARKER_KIND: dict[str, str] = {
     **dict.fromkeys(("dst", "prefix"), "net"),
     **dict.fromkeys(("via", "nexthop", "external_ip"), "ip"),
     "mac": "mac",
-    **dict.fromkeys(("vlan_id", "table", "priority", "tag", "n_rxq"), "int"),
+    **dict.fromkeys(("vlan_id", "table", "priority", "tag", "n_rxq", "metric"), "int"),
 }
 
 # Fields that are no part of the object (only the commands' labels).
@@ -121,6 +130,8 @@ class Sample:
     each: Mapping[str, str] = dataclasses.field(default_factory=dict)
     kinds: Mapping[str, str] = dataclasses.field(default_factory=dict)
     variant: str = ""
+    free: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+    maps: Mapping[str, tuple[str, Any]] = dataclasses.field(default_factory=dict)
     keep: Keep | None = None
 
     @property
@@ -137,7 +148,10 @@ class Sample:
         return [
             field.name
             for field in dataclasses.fields(self.primitive)
-            if field.name not in CONTEXT and field.name not in self.fixed
+            if field.name not in CONTEXT
+            and field.name not in self.fixed
+            and field.name not in self.free
+            and field.name not in self.maps
         ]
 
     def element_names(self, field: str) -> list[str]:
@@ -172,6 +186,8 @@ def _marker(kind: str, index: int, run: int) -> Any:
         return f"fd6{run}:{17 + index:x}::/{64 - run * 8}"
     if kind == "ip6":
         return f"fd7{run}:{17 + index:x}::{0x29 + run * 0x20:x}"
+    if kind == "image":  # a real one: it is pulled
+        return ("busybox:latest", "alpine:latest")[run]
     if kind == "mac":
         return f"02:5e:0{run}:{index:02x}:{secrets.token_hex(1)}:{secrets.token_hex(1)}"
     if kind == "int":
@@ -220,7 +236,8 @@ def build(sample: Sample, host: str, values: Mapping[str, Any]) -> tuple[list[An
             fields[field] = tuple((key, values[n]) for key, n in zip(keys, names, strict=True))
         else:
             fields[field] = values[field]
-    primitive = sample.primitive(**fields, **sample.fixed)
+    mapped = {field: value for field, (_node_field, value) in sample.maps.items()}
+    primitive = sample.primitive(**fields, **sample.fixed, **sample.free, **mapped)
     return sample.setup(HostPrimitive(host), values), primitive
 
 
@@ -292,6 +309,30 @@ def _keep_connection(db: str) -> Keep:
     return keep
 
 
+def _two_netns_and_link(host: HostPrimitive, m: Mapping[str, Any]) -> list[Any]:
+    netns = host.netns(m["netns"])
+    return [netns, host.netns(m["to"]), netns.add_if(m["name"], kind="dummy", up=True)]
+
+
+@dataclasses.dataclass(frozen=True)
+class _Pulled:
+    """An image the sample needs there: pulled, and left there afterwards
+    (a workload of the host may use it — DockerPull's delete removes it)."""
+
+    pull: DockerPull
+
+    def as_primitive(self) -> Primitive:
+        return dataclasses.replace(self.pull.as_primitive(), delete_cmds=())
+
+
+def _image(host: HostPrimitive, m: Mapping[str, Any]) -> list[Any]:
+    return [_Pulled(host.docker_pull(m["image"]))]
+
+
+def _netns_and_bridge(host: HostPrimitive, m: Mapping[str, Any]) -> list[Any]:
+    return [host.netns(m["netns"]), host.ovs_bridge(m["bridge"])]
+
+
 def _root_parent(host: HostPrimitive, m: Mapping[str, Any]) -> list[Any]:
     return [host.rootNs().add_if(m["parent"], kind="dummy", up=True)]
 
@@ -309,6 +350,7 @@ def _switch(host: HostPrimitive, m: Mapping[str, Any]) -> list[Any]:
 
 
 NO_PAIRS: tuple[tuple[str, str], ...] = ()
+RA_CONFIGS = {"ipv6_ra_configs": ("ipv6RaConfigs", (("address_mode", "slaac"),))}
 
 SAMPLES = [
     Sample(NetnsPrimitive, fixed={"owned": True}),
@@ -357,12 +399,57 @@ SAMPLES = [
         setup=_netns_dev_and_gateway,
         variant="via_v6",
     ),
+    # A workload NIC's routes: with a metric, in its own table (and again
+    # in main for the default), per family.
+    *(
+        Sample(
+            RoutePrimitive,
+            fixed={"family": family, **({} if table else {"table": None})},
+            kinds=kinds,
+            setup=_netns_dev_and_gateway,
+            variant=f"metric{'_table' if table else ''}{'_v6' if family == 6 else ''}",
+        )
+        for family, kinds in ((4, {}), (6, {"dst": "net6", "via": "ip6"}))
+        for table in (True, False)
+    ),
+    # A veth: one leg in the netns, the other one in the root netns and
+    # in an OVS bridge (a kernel router side, a workload NIC).
+    Sample(
+        NetnsLinkPrimitive,
+        fixed={"kind": "veth", "rename_to": None, "parent": None, "vlan_id": None},
+        setup=_netns_and_bridge,
+        variant="veth",
+    ),
+    # … renamed in the netns (a workload NIC: eth1 in the container).
+    Sample(
+        NetnsLinkPrimitive,
+        fixed={"kind": "veth", "parent": None, "vlan_id": None},
+        setup=_netns_and_bridge,
+        variant="veth_renamed",
+    ),
     Sample(IpRulePrimitive, fixed={"family": 4}, setup=_netns),
+    Sample(LinkMovePrimitive, setup=_two_netns_and_link),
     *(
         Sample(MasqRule, fixed={"family": family}, setup=_netns, variant=family)
         for family in ("ipv4", "ipv6")
     ),
     Sample(SysctlPrimitive, fixed={"key": "net.ipv4.ip_forward", "value": "1"}, setup=_netns),
+    # A container that stays up; what it runs and with which settings is no
+    # part of RawIR.
+    Sample(
+        DockerPrimitive,
+        setup=_image,
+        kinds={"image": "image"},
+        free={
+            "command": ("sleep", "3600"),
+            "privileged": False,
+            "network": "none",
+            "environment": (),
+            "volumes": (),
+            "run_flags": (),
+            "remove_existing": True,
+        },
+    ),
     Sample(OVSBridge, fixed={"datapath": None, "fail_mode": "standalone"}),
     Sample(OVSPort, fixed={"tag": None, "trunks": ()}, setup=_bridge_and_link),
     # The mappings are ONE global setting: the host's is kept and restored.
@@ -395,13 +482,14 @@ SAMPLES = [
     ),
     Sample(
         OVNNbCtlLrp,
-        fixed={"gateway_chassis": None, "ipv6_ra_configs": NO_PAIRS},
+        fixed={"gateway_chassis": None},
+        maps=RA_CONFIGS,
         shape={"networks": 1},
         setup=_router,
     ),
     Sample(
         OVNNbCtlLrp,
-        fixed={"ipv6_ra_configs": NO_PAIRS},
+        maps=RA_CONFIGS,
         shape={"networks": 2},
         kinds={"networks_1": "cidr6"},
         setup=_router,
@@ -409,7 +497,8 @@ SAMPLES = [
     ),
     Sample(
         OVNNbCtlLrp,
-        fixed={"gateway_chassis": None, "ipv6_ra_configs": NO_PAIRS},
+        fixed={"gateway_chassis": None},
+        maps=RA_CONFIGS,
         shape={"networks": 2},
         kinds={"networks_1": "cidr6"},
         setup=_router,

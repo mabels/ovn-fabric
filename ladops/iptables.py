@@ -54,6 +54,17 @@ def _format_right(right: Any) -> str:
     return str(right)
 
 
+def _jump_target(expr: list[JsonObject]) -> str | None:
+    """The chain a rule jumps (or goes) to — nft's own `jump`/`goto`
+    verdict, or an iptables `-j CHAIN` translated as one."""
+    for item in expr:
+        for verdict in ("jump", "goto"):
+            target = item.get(verdict)
+            if isinstance(target, dict) and isinstance(target.get("target"), str):
+                return str(target["target"])
+    return None
+
+
 def _parse_rule_expr(expr: list[JsonObject]) -> tuple[dict[str, str], str]:
     # A dimension with no real match present is omitted, not filled with
     # a "*" sentinel — "*" would be one more magic string a real value
@@ -115,6 +126,7 @@ def list_rules(netns: str | None) -> list[JsonObject]:
         table = rule["table"]
         chain = rule["chain"]
         fields, action = _parse_rule_expr(rule.get("expr", []))
+        target = _jump_target(rule.get("expr", []))
         counter_key = (family, table, chain)
         idx = order_counters.get(counter_key, 0)
         order_counters[counter_key] = idx + 1
@@ -125,7 +137,9 @@ def list_rules(netns: str | None) -> list[JsonObject]:
                 "chain": chain,
                 "fields": fields,
                 "action": action,
+                "target": target,
                 "order": f"{idx:03d}",
+                "nftHandle": rule.get("handle"),
             }
         )
     return rules

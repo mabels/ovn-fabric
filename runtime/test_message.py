@@ -38,6 +38,7 @@ IR_SAMPLE: list[dict[str, Any]] = [
             "ovnRole": "central",
             "encapIp": "192.168.128.31",
             "os": {"name": "ubuntu", "version": "26.04", "packageManager": "apt"},
+            "reconcile": {"hostInterfaces": ["lo"]},
             "dependencies": [
                 "arp",
                 "ping",

@@ -161,28 +161,33 @@ export interface Host {
   readonly ovn?: OvnHostConfig;
 }
 
-/** What the runtime's reconcile leaves alone on a host (2026-11-01):
- * RawIR node ids, as globs (`*` any text) — e.g. `"link:*global*|host"`
- * for the management NIC, `"addr:*global*|host|*"` for its addresses.
- * The loopback (`lo`) is always left alone; it need not be listed. */
+/** What the runtime's reconcile leaves alone on a host: the host's own
+ * interfaces — e.g. `["host", "lo"]` for the management NIC and the
+ * loopback (in every netns) — with what is on them (addresses, routes).
+ * Interfaces of docker, OVS and OVN, and the physical parents the
+ * topology names (a VLAN's parent), are known without being listed. */
 export interface HostReconcile {
-  readonly exclude?: readonly string[];
+  readonly hostInterfaces?: readonly string[];
 }
 
-export function sshHost(
-  name: string,
-  address: HostAddress,
-  user: string,
-  os?: HostOs,
-  ovn?: OvnHostConfig,
-  monitoring?: HostMonitoring,
-  reconcile?: HostReconcile,
-): Host {
+/** A host of the network: where its parts run. */
+export interface HostSpec {
+  readonly name: string;
+  readonly os?: HostOs;
+  readonly ovn?: OvnHostConfig;
+  readonly monitoring?: HostMonitoring;
+  readonly reconcile?: HostReconcile;
+}
+
+/** A host reached over SSH, as `user`. */
+export interface SshHostSpec extends HostSpec {
+  readonly address: HostAddress;
+  readonly user: string;
+}
+
+function hostParts(spec: HostSpec) {
+  const { os, ovn, monitoring, reconcile } = spec;
   return {
-    name,
-    address,
-    connectAddress: primaryHostAddress(address),
-    access: { method: "ssh", user },
     ...(os ? { os } : {}),
     ...(ovn ? { ovn } : {}),
     ...(monitoring ? { monitoring } : {}),
@@ -190,22 +195,23 @@ export function sshHost(
   };
 }
 
-export function localHost(
-  name: string,
-  os?: HostOs,
-  ovn?: OvnHostConfig,
-  monitoring?: HostMonitoring,
-  reconcile?: HostReconcile,
-): Host {
+export function sshHost(spec: SshHostSpec): Host {
   return {
-    name,
+    name: spec.name,
+    address: spec.address,
+    connectAddress: primaryHostAddress(spec.address),
+    access: { method: "ssh", user: spec.user },
+    ...hostParts(spec),
+  };
+}
+
+export function localHost(spec: HostSpec): Host {
+  return {
+    name: spec.name,
     address: { fqdn: "localhost" },
     connectAddress: "127.0.0.1",
     access: { method: "local" },
-    ...(os ? { os } : {}),
-    ...(ovn ? { ovn } : {}),
-    ...(monitoring ? { monitoring } : {}),
-    ...(reconcile ? { reconcile } : {}),
+    ...hostParts(spec),
   };
 }
 

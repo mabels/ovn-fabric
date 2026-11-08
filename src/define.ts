@@ -42,15 +42,11 @@ import {
   type DnsProvider,
   type DnsProviderSpec,
   type Host,
-  type HostAddress,
-  type HostMonitoring,
-  type HostOs,
-  type HostReconcile,
+  type HostSpec,
   type KernelRouter,
   type KernelRouterSide,
   localHost,
   type OvnClusterOptions,
-  type OvnHostConfig,
   type OvnRouterEndpoint,
   type OvnRouterEndpointSpec,
   type OvnRouterOptions,
@@ -74,6 +70,7 @@ import {
   type SecurityGroupTemplate,
   type Service,
   sshHost,
+  type SshHostSpec,
 } from "./types.ts";
 
 // Re-export the pieces split out of this file, so configs and mod.ts keep
@@ -378,29 +375,13 @@ export class NetworkBuilder implements RouterEndpointContext {
   }
 
   /** Declare a host reachable via SSH. Returns a handle for reuse. */
-  sshHost(
-    name: string,
-    address: HostAddress,
-    user: string,
-    os?: HostOs,
-    ovn?: OvnHostConfig,
-    monitoring?: HostMonitoring,
-    reconcile?: HostReconcile,
-  ): Host {
-    return this.registerHost(
-      sshHost(name, address, user, os, ovn, monitoring, reconcile),
-    );
+  sshHost(spec: SshHostSpec): Host {
+    return this.registerHost(sshHost(spec));
   }
 
   /** Declare the generator's own host — no SSH needed. */
-  localHost(
-    name: string,
-    os?: HostOs,
-    ovn?: OvnHostConfig,
-    monitoring?: HostMonitoring,
-    reconcile?: HostReconcile,
-  ): Host {
-    return this.registerHost(localHost(name, os, ovn, monitoring, reconcile));
+  localHost(spec: HostSpec): Host {
+    return this.registerHost(localHost(spec));
   }
 
   /** Cluster-wide OVN settings (NB_Global) — see OvnClusterOptions,

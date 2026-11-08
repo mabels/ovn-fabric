@@ -71,6 +71,8 @@ def _learn(samples: list[Sample], host: str) -> dict[str, Any]:
             first = _observe(sample, 0, host)
             second = _observe(sample, 1, host)
             out[sample.name] = {**head, **learn.template(first, second)}
+            learn.no_trace(sample.free, out[sample.name])
+            learn.pass_on(sample.maps, out[sample.name])
             for node_id in out[sample.name]["leftover"]:
                 log.warning("%s: delete left %s behind", sample.name, node_id)
         except (learn.Unexplained, system.CommandFailed) as exc:

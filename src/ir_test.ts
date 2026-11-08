@@ -116,7 +116,7 @@ function networkWithBoundDomain(domainName: string) {
   return defineNetwork("test-net", (net) => {
     const domain = net.collisionDomain(domainName);
     const other = net.collisionDomain(`${domainName}-other`);
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const r1 = net.defineOvnRouter(`router-${domainName}`, (router) => {
       return {
         routingDomains: [],
@@ -176,7 +176,7 @@ Deno.test("collisionDomainToIR: long domain name falls back to a short determini
 // deployer's _emit_iface_bindings_create attaches the actual devices).
 Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls carries the veth", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
       return {
@@ -276,7 +276,7 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
 
 Deno.test("collisionDomain: host-only domain emits a bridge with its ports", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const wan = net.collisionDomain("wan", { host });
     wan.addInterface({
       kind: "vlan",
@@ -308,7 +308,7 @@ Deno.test("collisionDomain: host-only domain emits a bridge with its ports", () 
 
 Deno.test("collisionDomain: auto-registers every ovnRouterEndpoint port", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const segment = net.collisionDomain("segment");
     net.defineOvnRouter("router-a", (router) => ({
       routingDomains: [],
@@ -337,7 +337,7 @@ Deno.test("collisionDomain: auto-registers every ovnRouterEndpoint port", () => 
 
 Deno.test("kernelRouterSideToIR: shared WAN VLAN becomes a bridge with veth ports", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const define = (name: string, wan: string, transit: string) =>
       net.defineOvnRouter(name, (router) => ({
         routingDomains: [],
@@ -402,7 +402,7 @@ Deno.test("kernelRouterSideToIR: shared WAN VLAN becomes a bridge with veth port
 
 Deno.test("iface resolution: a VLAN on an xdp parent carries the resolved AF_XDP settings", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const home = net.collisionDomain("home");
     const xdp = {
       kind: "xdp",
@@ -450,7 +450,7 @@ Deno.test("iface resolution: a VLAN on an xdp parent carries the resolved AF_XDP
 
 Deno.test("iface resolution: a bare xdp iface defaults to best-effort/1; an explicit physical parent stays physical", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-xdp-defaults", (router) => ({
       routingDomains: [],
@@ -518,7 +518,7 @@ Deno.test("iface resolution: a bare xdp iface defaults to best-effort/1; an expl
 // router made it ARP for its WAN gateway out the transit veth).
 Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes via the kernel router", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const backbone = net.collisionDomain("backbone");
     const domain = net.routingDomain("test-domain");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
@@ -612,7 +612,7 @@ Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes 
 // them), and the side attaches the explicitly-declared group instead.
 Deno.test("kernelRouterEndpoint: explicit security group wins, masq services are ignored", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const backbone = net.collisionDomain("backbone");
     const out = net.securityGroup("wan-out", (g) => g.masq("ipv4"));
     const r1 = net.defineOvnRouter("router-wan", (router) => {
@@ -673,7 +673,7 @@ Deno.test("kernelRouterEndpoint: unregistered security group is rejected", () =>
   let threw = false;
   try {
     defineNetwork("test-net", (net) => {
-      const host = net.localHost("chassis-1");
+      const host = net.localHost({ name: "chassis-1" });
       const backbone = net.collisionDomain("backbone");
       const r1 = net.defineOvnRouter("router-wan", (router) => {
         return {
@@ -743,7 +743,7 @@ Deno.test("securityGroup builder: accumulates rules, registers once, rejects dup
 // group shortcut — and never reach the OVN endpoint's RA handling.
 Deno.test("kernelRouterEndpoint: kernel.app services resolve to app descriptors on the right side", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
       return {
@@ -812,7 +812,7 @@ Deno.test("kernelRouterEndpoint: kernel.app services resolve to app descriptors 
 // IR (`ve-<hash>`).
 Deno.test("kernelRouterEndpoint: kernel.app.docker resolves router-prefixed name and veth addressing", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
       return {
@@ -873,7 +873,7 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker resolves router-prefixed name
 // (10.200.<fnv1a32(routerName) % 256>.2/24) so the config stays concise.
 Deno.test("kernelRouterEndpoint: kernel.app.docker without ip gets a deterministic default slot", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
       return {
@@ -925,7 +925,7 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker without ip gets a determinist
 // `build` section is carried through (2026-08-31).
 Deno.test("kernelRouterEndpoint: builder function + buildAppDocker, image defaults to router name", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
       return {
@@ -983,7 +983,7 @@ Deno.test("kernelRouterEndpoint: builder function + buildAppDocker, image defaul
 // pattern).
 Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's default in its own domain", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const backbone = net.collisionDomain("backbone");
     const neighborRoute = net.routingDomain("Neighbor-defaultRoute");
     const vodaRoute = net.routingDomain("Voda-defaultRoute");
@@ -1129,7 +1129,7 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
 // routes, which target the upstream veth (2026-08-30).
 Deno.test("tunnelRouterEndpoint: zerotier is a docker app with its state volume", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const backbone = net.collisionDomain("backbone");
     const zt = net.routingDomain("Zerotier-route");
     const r1 = net.defineOvnRouter("router-zerotier", (router) => {
@@ -1226,7 +1226,7 @@ Deno.test("tunnelRouterEndpoint: zerotier is a docker app with its state volume"
 // directory.
 Deno.test("tunnelRouterEndpoint: zerotier state directory is derived from the router name", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-zt", (router) => {
       return {
@@ -1271,11 +1271,10 @@ Deno.test("tunnelRouterEndpoint: zerotier state directory is derived from the ro
 // maps each abstract dep to the distro's package form (2026-08-23).
 Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost(
-      "chassis-1",
-      undefined,
-      { role: { kind: "chassis" } },
-    );
+    const host = net.localHost({
+      name: "chassis-1",
+      ovn: { role: { kind: "chassis" } },
+    });
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-wan", (router) => {
       return {
@@ -1335,12 +1334,11 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
 // sampled) — only reported when OFF; absent means inherit.
 Deno.test("hostToIR: monitoring.ipfix becomes host data.ipfix", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost(
-      "chassis-1",
-      undefined,
-      { role: { kind: "chassis" } },
-      { ipfix: { target: "192.168.129.88:4739", sampling: 512 } },
-    );
+    const host = net.localHost({
+      name: "chassis-1",
+      ovn: { role: { kind: "chassis" } },
+      monitoring: { ipfix: { target: "192.168.129.88:4739", sampling: 512 } },
+    });
     const domain = net.collisionDomain("home");
     const backbone = net.collisionDomain("backbone");
     const r1 = net.defineOvnRouter("router-1", (router) => ({
@@ -1376,7 +1374,7 @@ Deno.test("hostToIR: monitoring.ipfix becomes host data.ipfix", () => {
 
 Deno.test("collisionDomainToIR: flow:false rides the leg's bridge iface", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const sampled = net.collisionDomain("sampled");
     const quiet = net.collisionDomain("quiet");
     const r1 = net.defineOvnRouter("router-1", (router) => ({
@@ -1412,7 +1410,7 @@ Deno.test("collisionDomainToIR: flow:false rides the leg's bridge iface", () => 
 // builder-function form (2026-09-08, array 2026-09-16).
 Deno.test("defineOvnRouter object form: declarative OvnRouterSpec resolves endpoints", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
     const d = net.routingDomain("Route-D");
@@ -1456,7 +1454,7 @@ Deno.test("defineOvnRouter object form: declarative OvnRouterSpec resolves endpo
 // kernel.container node with a FACE (NIC) on that endpoint's segment.
 Deno.test("net.service + ep.attachTo -> kernel.service node + endpoint serviceRef", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
     const dns = net.service("dns", {
@@ -1529,7 +1527,7 @@ Deno.test("net.service + ep.attachTo -> kernel.service node + endpoint serviceRe
 // management-v2 over a control-plane fallback.
 Deno.test("route metrics: domain, attachment and per-route precedence", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
     const domain = net.routingDomain("Dom", {
@@ -1613,7 +1611,7 @@ Deno.test("route metrics: domain, attachment and per-route precedence", () => {
 // lowest (most preferred), each subsequent +100 (2026-09-19).
 Deno.test("route metrics fall back to execution order (first NIC lowest)", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
     const domain = net.routingDomain("Dom", {
@@ -1669,7 +1667,7 @@ Deno.test("route metrics fall back to execution order (first NIC lowest)", () =>
 // attachment.resolver wins (2026-09-19).
 Deno.test("resolver: control-plane attachments inherit the platform resolver", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const controlPlane = net.collisionDomain("control-plane");
     const bb = net.collisionDomain("bb");
     const app = net.service("app", { image: "x" });
@@ -1723,7 +1721,7 @@ Deno.test("resolver: control-plane attachments inherit the platform resolver", (
 // Service while keeping its platform semantics (allocation + resolver).
 Deno.test('platform: role "dns" replaces the built-in service and supplies the resolver', () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const controlPlane = net.collisionDomain("control-plane");
     const bb = net.collisionDomain("bb");
     const app = net.service("app", { image: "x" });
@@ -1782,7 +1780,7 @@ Deno.test("platform: two services cannot claim the same role", () => {
   assertThrows(
     () =>
       defineNetwork("test-net", (net) => {
-        const host = net.localHost("chassis-1");
+        const host = net.localHost({ name: "chassis-1" });
         const controlPlane = net.collisionDomain("control-plane");
         const dnsA = net.service("dns-a", { image: "a" });
         const dnsB = net.service("dns-b", { image: "b" });
@@ -1809,7 +1807,7 @@ Deno.test("platform: a claimed role conflicts with explicit platformServices con
   assertThrows(
     () =>
       defineNetwork("test-net", (net) => {
-        const host = net.localHost("chassis-1");
+        const host = net.localHost({ name: "chassis-1" });
         const controlPlane = net.collisionDomain("control-plane");
         const dns = net.service("my-dns", { image: "x" });
         net.createPlatform("plat", {
@@ -1832,7 +1830,7 @@ Deno.test("platform: a claimed role conflicts with explicit platformServices con
 // An explicit controlPlane.resolver overrides the CoreDNS default.
 Deno.test("resolver: controlPlane.resolver overrides the CoreDNS default", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const controlPlane = net.collisionDomain("control-plane");
     const bb = net.collisionDomain("bb");
     const app = net.service("app", { image: "x" });
@@ -1871,7 +1869,7 @@ Deno.test("resolver: controlPlane.resolver overrides the CoreDNS default", () =>
 // An attachment's own resolver wins over the control-plane default.
 Deno.test("resolver: attachment resolver is emitted for a plain segment NIC", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
     const svc = net.service("svc", { image: "x" });
@@ -1916,7 +1914,7 @@ Deno.test("resolver: attachment resolver is emitted for a plain segment NIC", ()
 Deno.test("attached service route via must be on the endpoint's segment", () => {
   const build = (via: string) =>
     defineNetwork("test-net", (net) => {
-      const host = net.localHost("chassis-1");
+      const host = net.localHost({ name: "chassis-1" });
       const a = net.collisionDomain("seg-a");
       const b = net.collisionDomain("seg-b");
       const dns = net.service("dns", { image: "x" });
@@ -1960,7 +1958,7 @@ Deno.test("attached service route via must be on the endpoint's segment", () => 
 // control-plane endpoint references BOTH.
 Deno.test("multiple services attached across endpoints -> one service node each", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const seg128 = net.collisionDomain("home-v2");
     const seg129 = net.collisionDomain("management-v2");
     const cp = net.collisionDomain("control-plane");
@@ -2078,7 +2076,7 @@ Deno.test("multiple services attached across endpoints -> one service node each"
 // endpoint's l2Segment/ipaddrs/routes per service.
 Deno.test("endpoint builder injects `endpoint` into every service entry", () => {
   const network = defineNetwork("t", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
     return {
@@ -2125,7 +2123,7 @@ Deno.test("endpoint builder injects `endpoint` into every service entry", () => 
 Deno.test("attachTo records endpointRefs on the service", () => {
   let dns!: Service;
   defineNetwork("t", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
     const cp = net.collisionDomain("control-plane");
@@ -2212,7 +2210,7 @@ Deno.test("deriveEndpointName: stable, role- and domain-sensitive, explicit name
 
 Deno.test("defineOvnRouter: each endpoint gets its own derived name", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
     return {
@@ -2251,7 +2249,7 @@ Deno.test("defineOvnRouter: each endpoint gets its own derived name", () => {
 
 Deno.test("defineOvnRouter: an explicit name overrides the derived name", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
     return {
@@ -2285,7 +2283,7 @@ Deno.test("defineOvnRouter: two endpoints with the same explicit name are reject
   assertThrows(
     () =>
       defineNetwork("test-net", (net) => {
-        const host = net.localHost("chassis-1");
+        const host = net.localHost({ name: "chassis-1" });
         const a = net.collisionDomain("seg-a");
         const b = net.collisionDomain("seg-b");
         return {
@@ -2320,7 +2318,7 @@ Deno.test("defineOvnRouter: one explicit endpoint name across two routers is rej
   assertThrows(
     () =>
       defineNetwork("test-net", (net) => {
-        const host = net.localHost("chassis-1");
+        const host = net.localHost({ name: "chassis-1" });
         const a = net.collisionDomain("seg-a");
         const b = net.collisionDomain("seg-b");
         const c = net.collisionDomain("seg-c");
@@ -2370,7 +2368,7 @@ Deno.test("defineOvnRouter: one explicit endpoint name across two routers is rej
 // segments inherits that, next-hopped at the segment's gateway.
 Deno.test("routingDomain: calculated routes reach a workload via its segment gateway", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const seg = net.collisionDomain("seg-a");
     const bseg = net.collisionDomain("seg-b");
     const bb = net.collisionDomain("bb");
@@ -2443,7 +2441,7 @@ Deno.test("routingDomain: calculated routes reach a workload via its segment gat
 
 Deno.test("routingDomain: explicit routes replace the calculated set", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const seg = net.collisionDomain("seg-a");
     const bb = net.collisionDomain("bb");
     const d = net.routingDomain("D", {
@@ -2494,7 +2492,7 @@ Deno.test("routingDomain: explicit routes replace the calculated set", () => {
 
 Deno.test("routingDomain: a dst the attachment is on-link for is skipped", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const seg = net.collisionDomain("seg-a");
     const bb = net.collisionDomain("bb");
     const d = net.routingDomain("D", {
@@ -2543,7 +2541,7 @@ Deno.test("routingDomain: a dst the attachment is on-link for is skipped", () =>
 
 Deno.test("workload routes: a prefix reached from two NICs stays on both (per-NIC tables)", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const segA = net.collisionDomain("seg-a");
     const segB = net.collisionDomain("seg-b");
     // Both domains distribute the same destination — e.g. ControlPlane-Route
@@ -2609,7 +2607,7 @@ Deno.test("workload routes: a prefix reached from two NICs stays on both (per-NI
 
 Deno.test("ovn masq services resolve to SNAT rows on the logical router", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const cp = net.collisionDomain("cp");
     const bb = net.collisionDomain("bb");
     net.defineOvnRouter("router-x", (router) => ({
@@ -2663,7 +2661,7 @@ Deno.test("ovn masq services resolve to SNAT rows on the logical router", () => 
 Deno.test("platform: dnsProvider is a plain object, unique by name", () => {
   let provider: DnsProvider | undefined;
   defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     provider = net.dnsProvider("cloudflare", {
       kind: "cloudflare",
       token: "cf-token",
@@ -2684,7 +2682,7 @@ Deno.test("service: accepts a builder object or a callback that returns one", ()
   let plain: Service | undefined;
   let returned: Service | undefined;
   defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     plain = net.service("plain", {
       image: "img-a",
       cmd: "sh -c true",
@@ -2705,7 +2703,7 @@ Deno.test("service: accepts a builder object or a callback that returns one", ()
 Deno.test("platform: createPlatform is a dummy carrying ingressService + publish", () => {
   let platform: Platform | undefined;
   defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const controlPlane = net.collisionDomain("control-plane");
     platform = net.createPlatform("mam-hh-platform", {
       controlPlane: { collisionDomain: controlPlane, hosts: [host] },
@@ -2726,7 +2724,7 @@ Deno.test("platform: createPlatform is a dummy carrying ingressService + publish
 Deno.test("platform: attachTo(ingressService) injects endpoint + service into publish", () => {
   let platform: Platform | undefined;
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const management = net.collisionDomain("management-v2");
     const bb = net.collisionDomain("bb");
     const controlPlane = net.collisionDomain("control-plane");
@@ -2804,7 +2802,7 @@ Deno.test("deriveEndpointName: stable, role- and domain-sensitive, explicit name
 
 Deno.test("defineOvnRouter: each endpoint gets its own derived name", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
     return {
@@ -2843,7 +2841,7 @@ Deno.test("defineOvnRouter: each endpoint gets its own derived name", () => {
 
 Deno.test("defineOvnRouter: an explicit name overrides the derived name", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const a = net.collisionDomain("seg-a");
     const b = net.collisionDomain("seg-b");
     return {
@@ -2877,7 +2875,7 @@ Deno.test("defineOvnRouter: two endpoints with the same explicit name are reject
   assertThrows(
     () =>
       defineNetwork("test-net", (net) => {
-        const host = net.localHost("chassis-1");
+        const host = net.localHost({ name: "chassis-1" });
         const a = net.collisionDomain("seg-a");
         const b = net.collisionDomain("seg-b");
         return {
@@ -2912,7 +2910,7 @@ Deno.test("defineOvnRouter: one explicit endpoint name across two routers is rej
   assertThrows(
     () =>
       defineNetwork("test-net", (net) => {
-        const host = net.localHost("chassis-1");
+        const host = net.localHost({ name: "chassis-1" });
         const a = net.collisionDomain("seg-a");
         const b = net.collisionDomain("seg-b");
         const c = net.collisionDomain("seg-c");
@@ -2962,7 +2960,7 @@ Deno.test("defineOvnRouter: one explicit endpoint name across two routers is rej
 // segments inherits that, next-hopped at the segment's gateway.
 Deno.test("routingDomain: calculated routes reach a workload via its segment gateway", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const seg = net.collisionDomain("seg-a");
     const bseg = net.collisionDomain("seg-b");
     const bb = net.collisionDomain("bb");
@@ -3035,7 +3033,7 @@ Deno.test("routingDomain: calculated routes reach a workload via its segment gat
 
 Deno.test("routingDomain: explicit routes replace the calculated set", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const seg = net.collisionDomain("seg-a");
     const bb = net.collisionDomain("bb");
     const d = net.routingDomain("D", {
@@ -3086,7 +3084,7 @@ Deno.test("routingDomain: explicit routes replace the calculated set", () => {
 
 Deno.test("routingDomain: a dst the attachment is on-link for is skipped", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const seg = net.collisionDomain("seg-a");
     const bb = net.collisionDomain("bb");
     const d = net.routingDomain("D", {
@@ -3135,7 +3133,7 @@ Deno.test("routingDomain: a dst the attachment is on-link for is skipped", () =>
 
 Deno.test("workload routes: a prefix reached from two NICs stays on both (per-NIC tables)", () => {
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const segA = net.collisionDomain("seg-a");
     const segB = net.collisionDomain("seg-b");
     // Both domains distribute the same destination — e.g. ControlPlane-Route
@@ -3203,7 +3201,7 @@ Deno.test("workload routes: a prefix reached from two NICs stays on both (per-NI
 Deno.test("platform: dnsProvider is a plain object, unique by name", () => {
   let provider: DnsProvider | undefined;
   defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     provider = net.dnsProvider("cloudflare", {
       kind: "cloudflare",
       token: "cf-token",
@@ -3223,7 +3221,7 @@ Deno.test("platform: dnsProvider is a plain object, unique by name", () => {
 Deno.test("platform: createPlatform is a dummy carrying ingressService + publish", () => {
   let platform: Platform | undefined;
   defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const controlPlane = net.collisionDomain("control-plane");
     platform = net.createPlatform("mam-hh-platform", {
       controlPlane: { collisionDomain: controlPlane, hosts: [host] },
@@ -3244,7 +3242,7 @@ Deno.test("platform: createPlatform is a dummy carrying ingressService + publish
 Deno.test("platform: attachTo(ingressService) injects endpoint + service into publish", () => {
   let platform: Platform | undefined;
   const network = defineNetwork("test-net", (net) => {
-    const host = net.localHost("chassis-1");
+    const host = net.localHost({ name: "chassis-1" });
     const management = net.collisionDomain("management-v2");
     const bb = net.collisionDomain("bb");
     const controlPlane = net.collisionDomain("control-plane");

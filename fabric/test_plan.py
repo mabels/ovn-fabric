@@ -44,11 +44,12 @@ class PlanTest(unittest.TestCase):
                 "kernel router: kernel-0",
                 "kernel router side: kernel-0 (left)",
                 "kernel router side: kernel-0 (right)",
+                "boot: reconcile",
             ],
         )
         self.assertEqual(
             [u.kind for u in units][5:],
-            ["kernel router", "kernel router side", "kernel router side"],
+            ["kernel router", "kernel router side", "kernel router side", "boot"],
         )
 
     def test_the_chassis_id_is_a_ref_until_it_runs(self) -> None:
@@ -61,7 +62,7 @@ class PlanTest(unittest.TestCase):
 
     def test_a_workload_is_its_container_then_its_nics(self) -> None:
         units = plan_units(hydrate_nodes(IR_SAMPLE), "net-test-hh-b")
-        workload = units[-1]
+        workload = units[-2]  # the last one is the boot's
         self.assertEqual(workload.name, "workload: cp-mam-hh-platform-platform.dns")
         kinds = [s.kind for s in workload.steps]
         self.assertIn("Capture", kinds)  # the container's PID …
@@ -150,6 +151,28 @@ class UnitBoundaryTest(unittest.TestCase):
             bridge.ovn(HOST.ovs_bridge("br-a"))
 
         self.assertEqual([u.name for u in _plan(declare)], ["bridge: br-a"])
+
+
+class BootTest(unittest.TestCase):
+    def test_every_host_comes_back_at_boot_as_the_plan_s_last_unit(self) -> None:
+        for host in ("central-1", "chassis-1"):
+            unit = plan_units(NODES, host)[-1]
+            self.assertEqual((unit.name, unit.scope), ("boot: reconcile", "boot"))
+            kinds = [step.kind for step in unit.steps]
+            self.assertEqual(kinds, ["WriteFile", "Chmod", "WriteFile", "Primitive"])
+            script, _mode, service, enable = unit.steps
+            self.assertIn("ir-apply run deployed --no-cleanup", script.content)  # type: ignore[union-attr]
+            self.assertIn("grep -q '\"deployed\"'", script.content)  # type: ignore[union-attr]
+            self.assertEqual(
+                service.path, "/etc/systemd/system/ovn-fabric-reconcile.service"  # type: ignore[union-attr]
+            )
+            self.assertIn("WantedBy=multi-user.target", service.content)  # type: ignore[union-attr]
+            # enabled every run; a delete disables it again
+            self.assertEqual(enable.decide.kind, "always")  # type: ignore[union-attr]
+            self.assertEqual(
+                [c.argv for c in enable.delete],  # type: ignore[union-attr]
+                [["systemctl", "disable", "--quiet", "ovn-fabric-reconcile.service"]],
+            )
 
 
 if __name__ == "__main__":

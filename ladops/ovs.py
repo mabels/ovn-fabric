@@ -37,7 +37,8 @@ def _uuids(value: object) -> list[str]:
 
 
 def list_bridge_ports() -> list[JsonObject]:
-    """Every OVS bridge port, joined to its bridge and interface facts."""
+    """Every OVS bridge port that works, joined to its bridge and
+    interface facts (a port whose device is gone is left out)."""
     iface_by_uuid = {row["_uuid"]: row for row in list_table(_VSCTL, "Interface")}
     bridge_by_port_uuid: dict[str, str] = {}
     for bridge in list_table(_VSCTL, "Bridge"):
@@ -50,7 +51,10 @@ def list_bridge_ports() -> list[JsonObject]:
             continue
         for iface_uuid in _uuids(port["interfaces"]):
             iface = iface_by_uuid.get(iface_uuid)
-            if iface is None:
+            # ofport -1: OVS keeps the record of a device that is gone (a
+            # veth after a reboot) — no working port; its bridge's own
+            # internal port always has one.
+            if iface is None or iface.get("ofport") == -1:
                 continue
             result.append(
                 {
@@ -85,6 +89,27 @@ def list_external_ids() -> dict[str, str]:
     ovn-encap-ip, the bridge mappings, …)."""
     rows = list_table(_VSCTL, "Open_vSwitch")
     return dict(rows[0].get("external_ids", {})) if rows else {}
+
+
+def list_datapath() -> dict[str, list[str]]:
+    """The kernel datapath of OVS (`ovs-dpctl show`): its own devices
+    (`ovs-system`) and its tunnel ports (`genev_sys_6081`) — devices OVS
+    makes itself. Empty when OVS is not there."""
+    try:
+        out = run_in_netns(["ovs-dpctl", "show"], None).stdout
+    except Exception:  # noqa: BLE001 — no OVS (or no datapath): nothing of its own
+        return {"datapaths": [], "tunnels": []}
+    datapaths: list[str] = []
+    tunnels: list[str] = []
+    for line in out.splitlines():
+        if line.endswith(":") and "@" in line and not line.startswith(" "):
+            datapaths.append(line.rstrip(":").split("@", 1)[1])
+        port = line.strip()
+        if port.startswith("port ") and ": " in port:
+            name, _, kind = port.split(": ", 1)[1].partition(" (")
+            if kind.split(":")[0].rstrip(")") in ("geneve", "vxlan", "gre", "stt"):
+                tunnels.append(name)
+    return {"datapaths": datapaths, "tunnels": tunnels}
 
 
 def list_interfaces() -> list[JsonObject]:
@@ -200,7 +225,9 @@ def add_afxdp_port_argv(
 
 
 def add_port_argv(bridge: str, port: str) -> list[str]:
-    return [*_VSCTL, "add-port", bridge, port]
+    # --may-exist: OVS keeps a port's record when its device is gone (a
+    # veth after a reboot); adding the device again re-attaches it.
+    return [*_VSCTL, "--may-exist", "add-port", bridge, port]
 
 
 def del_port_argv(bridge: str, port: str) -> list[str]:

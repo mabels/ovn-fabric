@@ -76,6 +76,33 @@ class LearnTest(unittest.TestCase):
         with self.assertRaises(learn.Unexplained):
             learn.template(sample, broken)  # the sample's own node in one run only
 
+    def test_a_parameter_only_in_what_it_takes_away_is_kept(self) -> None:
+        template = {
+            "class": "LinkMovePrimitive",
+            "params": {"host": "str", "netns": "str", "name": "str", "to": "str"},
+            "fixed": {},
+            "added": {"link:{to}|{name}": {"ifname": "{name}"}},
+            "changed": {},
+            "removed": ["link:{netns}|{name}"],
+            "volatile": [],
+            "leftover": [],
+        }
+        namespace: dict[str, Any] = {}
+        exec(
+            compile(module.render({"link_move": template}, "a test"), "generated", "exec"),
+            namespace,
+        )
+        footprint = namespace["link_move"](host="h", netns="a", name="eth0", to="b")
+        self.assertEqual(footprint["removed"], ["link:a|eth0"])
+
+    def test_what_it_takes_away_is_recorded(self) -> None:
+        before = {"link:pma0aaaaaa|pma1bbbbbb": {"ifname": "pma1bbbbbb"}, "netns:x": {}}
+        after = {"link:pma2cccccc|pma1bbbbbb": {"ifname": "pma1bbbbbb"}}
+        markers = {"netns": "pma0aaaaaa", "name": "pma1bbbbbb", "to": "pma2cccccc"}
+        seen = learn.observe(before, after, before, markers)
+        self.assertEqual(seen["removed"], ["link:{netns}|{name}"])  # netns:x: not its own
+        self.assertEqual(set(seen["added"]), {"link:{to}|{name}"})
+
     def test_delete_that_does_not_undo_is_reported(self) -> None:
         before, after, _ = _addr_snapshots("pma0aaaaaa", "pma1bbbbbb", "10.251.18.33/27", 7)
         seen = learn.observe(before, after, after, {"netns": "pma0aaaaaa"})
@@ -176,7 +203,11 @@ class ModuleTest(unittest.TestCase):
         rawir, not_learned = namespace["rawir"], namespace["NotLearned"]
         self.assertEqual(
             rawir(OVNNbCtlLsp("ls", "p", "localnet", ("unknown",), (("network_name", "phys"),))),
-            {"added": {"ovn.lsp:ls|p": {"options": {"network_name": "phys"}}}, "changed": {}},
+            {
+                "added": {"ovn.lsp:ls|p": {"options": {"network_name": "phys"}}},
+                "changed": {},
+                "removed": [],
+            },
         )
         self.assertIn(
             "ovn.lsp:ls|p", rawir(OVNNbCtlLsp("ls", "p", addresses=("unknown",)))["added"]

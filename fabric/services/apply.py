@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import dataclasses
 import json
 import logging
 import socket
@@ -42,33 +43,46 @@ from typing import Any
 from deployer.deps import abstract_deps
 from protocol import generated as pt
 from protocol.hydrate import hydrate_nodes
+from raw_reconciler.owners import OVN_FABRIC, mark_host, ours
 from runtime import generated as rg
 from runtime.message import BodySpec, ProtocolError, plain, register_bodies
 from runtime.peer import Call, Peer, RemoteError
 from runtime.service import Service
 
+from .. import cleanup, observed
 from .. import generated as g
-from .. import observed
 from ..desired import (
     Reconciled,
     StepState,
     choose,
     compare,
+    consumed_later,
+    crossed_out,
     desired_rawir,
     missing_nodes,
     step_state,
 )
-from ..exclude import DEFAULT_EXCLUDE, exclude_nodes
 from ..lifecycle import LifecycleAction, resolve
 from ..plan import PlanError, plan_operations, plan_units
 
 log = logging.getLogger("fabric.apply")
 
-# The IR store's name for the IR deployed on this host (create sets it).
+# The IR store's name for the IR deployed on this host: the last one a create
+# or a run was fed (refs.json points it to that IR's hash).
 DEPLOYED = "deployed"
 
-# run's choice for a unit (see Apply._run).
-Choose = Callable[[g.Unit, dict[str, Any]], Awaitable[list[int] | None]]
+
+@dataclasses.dataclass(frozen=True)
+class Pick:
+    """run's choice for a unit (see Apply._run): the steps to skip, or
+    None to leave it alone; `hold`: left alone unchecked — the units after
+    it in its scope wait (Failed.hold)."""
+
+    skip: list[int] | None
+    hold: bool = False
+
+
+Choose = Callable[[g.Unit, dict[str, Any]], Awaitable[Pick]]
 
 BODIES = {
     "IrApplyReq": BodySpec(g.IrApplyReq, "request"),
@@ -91,6 +105,7 @@ class Failed:
     def __init__(self) -> None:
         self._foundation: str | None = None  # the failed foundation unit
         self._scopes: dict[str, str] = {}  # failed scope -> its failed unit
+        self._held: dict[str, str] = {}  # scope -> the unit run cannot check
 
     def add(self, unit: g.Unit) -> None:
         scope = unit.scope or ""
@@ -99,11 +114,22 @@ class Failed:
         else:
             self._scopes.setdefault(scope, unit.name)
 
+    def hold(self, unit: g.Unit) -> None:
+        """run left `unit` alone, unable to tell whether it is there: the
+        units after it in its scope (a workload's NICs) wait — not in the
+        foundation, where everything else would wait too."""
+        scope = unit.scope or ""
+        if scope and scope not in FOUNDATION:
+            self._held.setdefault(scope, unit.name)
+
     def blocks(self, unit: g.Unit) -> bool:
-        return self._foundation is not None or (unit.scope or "") in self._scopes
+        scope = unit.scope or ""
+        return self._foundation is not None or scope in self._scopes or scope in self._held
 
     def why(self, unit: g.Unit) -> str:
         failed = self._foundation or self._scopes.get(unit.scope or "")
+        if failed is None:
+            return f"needs {self._held[unit.scope or '']}, which run cannot check"
         return f"needs {failed}, which failed"
 
 
@@ -128,11 +154,11 @@ class Apply:
             )
         if req.action is g.ApplyAction.run and req.dryRun:
             return await self._run_dry(call, req, info, ir, host)
+        if self._lock.locked():
+            await call.log("info", "another apply runs: waiting for it")
         if req.action is g.ApplyAction.run:
             async with self._lock:
                 return await self._converge(call, req, info, ir, host)
-        if self._lock.locked():
-            await call.log("info", "another apply runs: waiting for it")
         async with self._lock:
             mode = " (dry run)" if req.dryRun else ""
             # The deployer's declarations take the IR as its own types.
@@ -214,12 +240,14 @@ class Apply:
             if choose is not None:
                 values = {value.name: json.loads(value.json) for value in store}
                 chosen = await choose(unit, values)
-                if chosen is None:
+                if chosen.skip is None:
+                    if chosen.hold:
+                        failed.hold(unit)
                     left = g.ApplyUnit(name=unit.name, state=g.ApplyState.skipped)
                     results.append(left)
                     await self._progress(call, left)
                     continue
-                skip = chosen
+                skip = chosen.skip
             await self._progress(call, g.ApplyUnit(name=unit.name, state=g.ApplyState.running))
             request = await client.request(
                 g.UnitExecReq(
@@ -234,6 +262,8 @@ class Apply:
                     dryRun=req.dryRun,
                     commandTimeout=req.commandTimeout,
                     skip=skip or None,
+                    # run: steps with their own decider are decided there
+                    decide=True if req.action is g.ApplyAction.run else None,
                 ),
                 parent=call.req_id,
             )
@@ -286,7 +316,7 @@ class Apply:
         self, call: Call, ir: g.IrCollection, digest: str, creating: bool
     ) -> None:
         """The IR store's name DEPLOYED points to the IR on this host: set
-        once a create ran its units (what is on the host belongs to it, even
+        once a create or a run ran its units (what is on the host belongs to it, even
         where a unit failed), dropped once that IR is deleted again — unless
         the delete asks to keep it (keepDeployed)."""
         client = await self._client()
@@ -307,15 +337,23 @@ class Apply:
     async def _converge(
         self, call: Call, req: g.IrApplyReq, info: g.IrInfo, ir: g.IrCollection, host: str
     ) -> g.IrApplyRes:
-        """run: bring the host to its IR, unit by unit in plan order. Right
+        """run: bring the host to its IR — its dependencies first, then unit
+        by unit in plan order. Right
         before a unit runs, its steps are checked against the live RawIR
         (their learned footprint, with the values captured so far) and
         `choose` decides: run all of it, only its missing steps, only its
-        reads — or leave it alone (fabric/desired.py). Nothing is removed
-        yet."""
+        reads — or leave it alone (fabric/desired.py). At the end, what the
+        first look found to be ours and no step fulfilled is removed, unless
+        a unit failed or noCleanup asks to keep it."""
         if host != self.host:
             raise ProtocolError("bad-request", f"run needs the live RawIR: only on {self.host}")
         nodes = hydrate_nodes(plain(ir.collection))  # type: ignore[arg-type]
+        # First the host's dependencies (as create): the tools the live
+        # RawIR is collected with, and the services the plan needs.
+        problem = await self._deps(call, nodes, host)
+        if problem is not None:
+            await call.log("warn", problem)
+            return self._result(info.hash, req, host, g.IrApplyOutcome.failed, [])
         try:
             plan = plan_units(nodes, host)
             operations = plan_operations(nodes, host)
@@ -326,20 +364,33 @@ class Apply:
         except Exception as exc:  # noqa: BLE001 — without the live view, change nothing
             raise ProtocolError("failed", f"cannot collect the live RawIR: {exc}") from None
         host_node = next(n for n in nodes if isinstance(n, pt.InfraHostNode) and n.key.host == host)
-        exclude = [*DEFAULT_EXCLUDE, *_exclude_of(host_node)]
-        graph = Reconciled.of(
-            exclude_nodes(live, exclude)[0], desired_rawir(operations, exclude).nodes
-        )
+        _mark_host(live, host_node, operations)
+        graph = Reconciled.of(ours(live), desired_rawir(operations).nodes)
         by_unit: dict[str, list[Any]] = collections.defaultdict(list)
         for unit_name, operation in operations:
             by_unit[unit_name].append(operation)
+        # What later units take away (a link moved into a container).
+        later = dict(
+            zip(
+                (unit.name for unit in plan),
+                consumed_later([by_unit[unit.name] for unit in plan], live),
+                strict=True,
+            )
+        )
         # The resolved steps a unit created, that have a footprint.
         ran_of: dict[str, list[Any]] = {}
         choices: collections.Counter[str] = collections.Counter()
 
-        async def choose_unit(unit: g.Unit, values: dict[str, Any]) -> list[int] | None:
+        # The values captured so far: what the steps resolve with at the end.
+        values_of: dict[str, dict[str, Any]] = {"latest": {}}
+
+        async def choose_unit(unit: g.Unit, values: dict[str, Any]) -> Pick:
+            values_of["latest"] = values
             steps = [resolve(operation, values) for operation in by_unit[unit.name]]
-            checked = [step_state(step, live, exclude) for step in steps]
+            checked = [
+                ((StepState.read, {}) if decides else step_state(step, live, later[unit.name]))
+                for step, decides in zip(steps, _self_deciding(unit), strict=True)
+            ]
             choice = choose([state for state, _ in checked])
             choices[choice.why] += 1
             states = ", ".join(
@@ -355,13 +406,13 @@ class Apply:
                         "warn", f"{node_id}: present, but differs in {', '.join(fields)}"
                     )
             if not choice.run:
-                return None
+                return Pick(None, hold=choice.unchecked)
             ran_of[unit.name] = [
                 step
                 for i, (step, (state, _)) in enumerate(zip(steps, checked, strict=True))
                 if i not in choice.skip and state is StepState.missing
             ]
-            return choice.skip
+            return Pick(choice.skip)
 
         await call.log("info", f"run {info.hash} on {host}: {len(plan)} units")
         results = await self._run(call, plan, req, host, choose=choose_unit)
@@ -375,18 +426,79 @@ class Apply:
             "info",
             "units: " + ", ".join(f"{why} {n}" for why, n in sorted(choices.items())),
         )
+        # What is on the host belongs to this IR now.
+        await self._mark_deployed(call, ir, info.hash, True)
         counts = graph.counts()
         await call.log(
             "info",
             f"reconciled graph: {len(graph.nodes)} nodes — present {counts['present']}, "
             f"applied {counts['applied']}, missing {counts['missing']}, "
-            f"observed {counts['observed']} (no desired node: left, no deleter yet)",
+            f"observed {counts['observed']}",
         )
         for node_id, state in sorted(graph.state.items()):
             await call.log("debug", f"{state.value}: {node_id}")
         failed = any(r.state is g.ApplyState.failed for r in results)
+        if failed:
+            await call.log("warn", "a unit failed: leftovers are not removed")
+        elif req.noCleanup:
+            await call.log("info", "leftovers kept (--no-cleanup)")
+        else:
+            final = values_of["latest"]
+            steps = [resolve(operation, final) for _unit, operation in operations]
+            results.append(await self._cleanup(call, req, host, live, steps))
+        failed = any(r.state is g.ApplyState.failed for r in results)
         outcome = g.IrApplyOutcome.failed if failed else g.IrApplyOutcome.done
         return self._result(info.hash, req, host, outcome, results)
+
+    async def _cleanup(
+        self,
+        call: Call,
+        req: g.IrApplyReq,
+        host: str,
+        live: dict[str, dict[str, Any]],
+        steps: list[Any],
+    ) -> g.ApplyUnit:
+        """The end of a run: what the first look found to be ours and no
+        step fulfilled is removed (fabric/cleanup.py)."""
+        left = await self._leftovers(call, live, steps)
+        name = "cleanup: leftovers"
+        await self._progress(call, g.ApplyUnit(name=name, state=g.ApplyState.running))
+        client = await self._client()
+        res = await client.ask(
+            g.UnitExecReq(
+                kind="UnitExecReq",
+                unit=cleanup.unit(left),
+                action=g.ApplyAction.delete,
+                host=host,
+                commandTimeout=req.commandTimeout,
+            ),
+            timeout=None,
+            parent=call.req_id,
+        )
+        assert isinstance(res.body, g.UnitExecRes)
+        done = res.body.state is g.IrApplyOutcome.done
+        result = g.ApplyUnit(
+            name=name,
+            state=g.ApplyState.done if done else g.ApplyState.failed,
+            operations=len(left),
+            message=res.body.message,
+        )
+        await self._progress(call, result)
+        return result
+
+    @staticmethod
+    async def _leftovers(
+        call: Call, live: dict[str, dict[str, Any]], steps: list[Any]
+    ) -> list[Any]:
+        """The nodes of ours in the first look no step fulfils, logged."""
+        fulfilled, untranslated = crossed_out(steps, live)
+        if untranslated:
+            await call.log("warn", "no RawIR for these steps: " + ", ".join(untranslated))
+        left = cleanup.leftovers(ours(live), fulfilled)
+        await call.log("info", f"cleanup: {len(left)} leftovers")
+        for node in left:
+            await call.log("info", f"cleanup: remove {node['id']}")
+        return left
 
     async def _run_dry(
         self, call: Call, req: g.IrApplyReq, info: g.IrInfo, ir: g.IrCollection, host: str
@@ -397,9 +509,9 @@ class Apply:
             raise ProtocolError("bad-request", "run applies nothing yet: use it with --dry-run")
         nodes = hydrate_nodes(plain(ir.collection))  # type: ignore[arg-type]
         host_node = next(n for n in nodes if isinstance(n, pt.InfraHostNode) and n.key.host == host)
-        exclude = _exclude_of(host_node)
         try:
-            desired = desired_rawir(plan_operations(nodes, host), exclude)
+            operations = plan_operations(nodes, host)
+            desired = desired_rawir(operations)
         except PlanError as exc:
             raise ProtocolError("bad-ir", str(exc)) from None
         kinds = collections.Counter(node["kind"] for node in desired.nodes.values())
@@ -408,11 +520,7 @@ class Apply:
             f"run {info.hash} on {host} (dry run): {len(desired.nodes)} RawIR nodes — "
             + ", ".join(f"{kind} {n}" for kind, n in sorted(kinds.items())),
         )
-        await call.log(
-            "info",
-            f"excluded {desired.excluded} nodes ({', '.join([*DEFAULT_EXCLUDE, *exclude])}); "
-            f"changes on {len(desired.changes)} nodes no primitive adds",
-        )
+        await call.log("info", f"changes on {len(desired.changes)} nodes no primitive adds")
         if desired.not_learned:
             await call.log(
                 "warn",
@@ -435,9 +543,9 @@ class Apply:
             )
         for node_id, unit in desired.conflicts:
             await call.log("warn", f"{node_id}: added differently again by {unit}")
-        live = await self._compare(call, desired.nodes, [*DEFAULT_EXCLUDE, *exclude])
+        live = await self._compare(call, desired.nodes, host_node, operations)
         if live is not None:
-            await self._would_create(call, nodes, host, live, [*DEFAULT_EXCLUDE, *exclude])
+            await self._would_create(call, nodes, host, live)
         return self._result(info.hash, req, host, g.IrApplyOutcome.done, [])
 
     async def _would_create(
@@ -446,7 +554,6 @@ class Apply:
         nodes: list[pt.Model],
         host: str,
         live: dict[str, dict[str, Any]],
-        exclude: list[str],
     ) -> None:
         """What run would do now, per unit (as _converge chooses). Steps with
         a value only known at run time cannot be checked here: they count as
@@ -456,18 +563,30 @@ class Apply:
         for unit_name, operation in operations:
             by_unit[unit_name].append(operation)
         choices: collections.Counter[str] = collections.Counter()
-        for unit in plan_units(nodes, host):
+        units = plan_units(nodes, host)
+        later = consumed_later([by_unit[unit.name] for unit in units], live)
+        held = Failed()
+        for unit, consumed in zip(units, later, strict=True):
+            if held.blocks(unit):
+                choices["waits for a unit run cannot check"] += 1
+                await call.log("info", f"{unit.name}: would wait — {held.why(unit)}")
+                continue
             steps = by_unit[unit.name]
-            states = [step_state(step, live, exclude)[0] for step in steps]
+            states = [
+                StepState.read if decides else step_state(step, live, consumed)[0]
+                for step, decides in zip(steps, _self_deciding(unit), strict=True)
+            ]
             choice = choose(states)
             choices[choice.why] += 1
+            if choice.unchecked:
+                held.hold(unit)
             verdict = "would run" if choice.run else "left alone"
             await call.log("info", f"{unit.name}: {verdict} — {choice.why}")
             for step, state in zip(steps, states, strict=True):
                 await call.log("debug", f"{unit.name}:   {type(step).__name__} {state.value}")
                 if state in (StepState.partial, StepState.missing):
                     level = "info" if state is StepState.partial else "debug"
-                    for node_id in missing_nodes(step, live, exclude):
+                    for node_id in missing_nodes(step, live):
                         await call.log(level, f"{unit.name}:   missing {node_id}")
             for index, step in enumerate(steps):
                 if choice.run and index not in choice.skip:
@@ -477,23 +596,40 @@ class Apply:
             "info",
             "units: " + ", ".join(f"{why} {n}" for why, n in sorted(choices.items())),
         )
+        # With no values captured yet; what a step's node ids hold does not
+        # depend on them.
+        await self._leftovers(call, live, [resolve(op, {}) for _unit, op in operations])
 
     async def _compare(
-        self, call: Call, desired: dict[str, dict[str, Any]], exclude: list[str]
+        self,
+        call: Call,
+        desired: dict[str, dict[str, Any]],
+        host_node: pt.InfraHostNode,
+        operations: list[tuple[str, Any]],
     ) -> dict[str, dict[str, Any]] | None:
-        """The live RawIR (same exclude) against the desired: per kind, what
-        is applied, to apply, only observed, or differs — ids at debug.
-        Returns the live RawIR as collected (None when it cannot be)."""
+        """The live RawIR — ours of it — against the desired: per kind, what
+        is applied, to apply, only observed, or differs — ids at debug; how
+        many nodes are someone else's, by owner. Returns the live RawIR as
+        collected, owners marked (None when it cannot be collected)."""
         try:
             collected = await asyncio.to_thread(observed.snapshot)
         except Exception as exc:  # noqa: BLE001 — a report, not an apply: say why, go on
             await call.log("warn", f"cannot collect the live RawIR: {type(exc).__name__}: {exc}")
             return None
-        live, excluded = exclude_nodes(collected, exclude)
+        _mark_host(collected, host_node, operations)
+        live = ours(collected)
+        others = collections.Counter(
+            node["owner"] for node in collected.values() if node["owner"] != OVN_FABRIC
+        )
+        await call.log(
+            "info",
+            "left alone, someone else's: "
+            + ", ".join(f"{owner} {n}" for owner, n in sorted(others.items())),
+        )
         result = compare(desired, live)
         await call.log(
             "info",
-            f"live: {len(live)} RawIR nodes ({excluded} excluded) — applied {len(result.applied)}, "
+            f"live: {len(live)} RawIR nodes of ours — applied {len(result.applied)}, "
             f"to apply {len(result.to_apply)}, only observed {len(result.only_observed)}, "
             f"differ {len(result.differ)}",
         )
@@ -534,10 +670,34 @@ class Apply:
         return res.body.info, res.body.ir
 
 
-def _exclude_of(host_node: pt.InfraHostNode) -> list[str]:
-    """The host's own exclude patterns (topology: Host.reconcile.exclude)."""
-    reconcile = host_node.data.reconcile
-    return list(reconcile.exclude or []) if reconcile is not None else []
+def _self_deciding(unit: g.Unit) -> list[bool]:
+    """Per step: it has its own decider (fabric/decide.py) — the executor
+    decides it from its live state; for run's check it is like a read."""
+    return [step.kind == "Primitive" and step.decide is not None for step in unit.steps]
+
+
+# Where an operation names an interface of the host it uses but does not
+# create (a VLAN's NIC, the AF_XDP NIC): class name -> its fields.
+_PARENTS: dict[str, tuple[str, ...]] = {
+    "VlanPrimitive": ("parent",),
+    "NetnsLinkPrimitive": ("parent",),
+    "OVSAfxdpPort": ("port",),
+}
+
+
+def _mark_host(
+    live: dict[str, dict[str, Any]], host_node: pt.InfraHostNode, operations: list[tuple[str, Any]]
+) -> None:
+    """The host's own in the live RawIR: its interfaces (topology:
+    Host.reconcile — the loopback among them, in every netns) and the
+    physical parents the plan uses, with what is on them."""
+    parents = {
+        value
+        for _unit, operation in operations
+        for field in _PARENTS.get(type(operation).__name__, ())
+        if isinstance(value := getattr(operation, field, None), str)
+    }
+    mark_host(live, host_node.data.reconcile.hostInterfaces, parents)
 
 
 def service(client: Callable[[], Awaitable[Peer]], host: str | None = None) -> Service:

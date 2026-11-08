@@ -12,10 +12,18 @@ import { refNamedShapes, shape } from "./protocol.ts";
 
 export const GLOBAL_NETNS = "*global*";
 
+/** Whose a node is: `ovn-fabric` — ours (what a run fulfils, or else
+ * cleans up); any other — found to belong to someone else (by asking
+ * docker, OVS, OVN, or from the host's config): never touched. */
+export const Owner = type(
+  "'ovn-fabric'|'host'|'kernel'|'docker'|'openvswitch'|'ovn-controller'",
+);
+
 const base = {
   id: "string",
   host: "string",
   time: "string",
+  owner: Owner,
 } as const;
 
 function nodeType<K extends string, F extends Record<string, unknown>>(
@@ -73,6 +81,8 @@ const addrFields = {
   address: "string",
   prefixlen: "number.integer",
   "scope?": "string",
+  /** Assigned by the kernel (SLAAC, link-local), not configured. */
+  "dynamic?": "boolean",
 } as const;
 export const AddrData = type(addrFields);
 export const AddrCollection = nodeType("addr", addrFields);
@@ -242,6 +252,8 @@ export const IptablesRuleFields = type({
 const iptablesRuleFields = {
   action: IptablesAction,
   fields: IptablesRuleFields,
+  /** The chain a JUMP/GOTO goes to. */
+  "target?": "string",
 } as const;
 export const IptablesRuleSpec = type(iptablesRuleFields);
 
@@ -253,6 +265,8 @@ const iptablesFields = {
   rule: IptablesRuleSpec,
   "comment?": "string",
   "handle?": "string",
+  /** nft's handle of the rule: how it is deleted exactly. */
+  "nftHandle?": "number.integer",
 } as const;
 export const IptablesRuleData = type(iptablesFields);
 export const IptablesRuleCollection = nodeType(
@@ -303,6 +317,7 @@ export const RawSnapshot = type({
 });
 
 export type RawSnapshot = typeof RawSnapshot.infer;
+export type Owner = typeof Owner.infer;
 export type RawCollection = typeof RawCollection.infer;
 export type NetnsData = typeof NetnsData.infer;
 export type LinkData = typeof LinkData.infer;
@@ -326,6 +341,7 @@ export type DockerContainerData = typeof DockerContainerData.infer;
 // ── JSON Schema for the Python codegen ──────────────────────────────
 export function buildRawJsonSchema(): Record<string, unknown> {
   const shapes = refNamedShapes({
+    Owner: shape(Owner),
     HostData: shape(HostData),
     HostCollection: shape(HostCollection),
     NetnsData: shape(NetnsData),

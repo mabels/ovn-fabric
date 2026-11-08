@@ -88,6 +88,7 @@ import shlex
 from collections.abc import Sequence
 from typing import Any, Protocol
 
+from fabric.decide import Decide
 from fabric.primitives.host import HostPrimitive, NetnsPrimitive
 from fabric.primitives.net import FirewallRule
 from fabric.primitives.ovn import (
@@ -211,10 +212,12 @@ class Emitter:
         *,
         bind: str | None = None,
         parent: str | None = None,
+        decide: Decide = Decide.footprint,
     ) -> None:
         """A typed OVN northbound object. `bind` runs it and keeps the
         result in a local variable; `parent` attaches it to an already
-        bound object (`router.add_route(...)`)."""
+        bound object (`router.add_route(...)`). `decide`: who decides in a
+        run whether it is applied, skipped or replaced (fabric/decide.py)."""
         raise NotImplementedError
 
     def assign(self, primitive: Any, var: str) -> None:
@@ -1312,7 +1315,9 @@ def _emit_kernel_app_rules(
                     run_flags=tuple(app.run or ()),
                 )
                 container_var = app_unit.local(container)
-                app_unit.ovn(docker, bind=container_var)
+                # Running from its image with what it should run with: run
+                # leaves it; else it is restarted (fabric/decide.py).
+                app_unit.ovn(docker, bind=container_var, decide=Decide.docker_container)
                 pid_var = app_unit.local(f"{container}-pid")
                 app_unit.capture(
                     pid_var,
@@ -1331,12 +1336,16 @@ def _emit_kernel_app_rules(
                         app_unit.ovn(
                             router_ns.move_link(leg, container_ns), parent=container_ns_var
                         )
+                # A sysctl is set every run: no undo, the same value again.
                 app_unit.ovn(
-                    container_ns.set_sysctl("net.ipv4.ip_forward", "1"), parent=container_ns_var
+                    container_ns.set_sysctl("net.ipv4.ip_forward", "1"),
+                    parent=container_ns_var,
+                    decide=Decide.always,
                 )
                 app_unit.ovn(
                     container_ns.set_sysctl("net.ipv6.conf.all.forwarding", "1"),
                     parent=container_ns_var,
+                    decide=Decide.always,
                 )
                 if ctx.transit_leg:
                     _apply_side_network(
@@ -1359,7 +1368,10 @@ def _emit_kernel_app_rules(
                     container_ns,
                     container_ns_var,
                 )
-                app_unit.ovn(docker.exec_detached([*(app.cmd or ["sh"]), dev]))
+                app_unit.ovn(
+                    docker.exec_detached([*(app.cmd or ["sh"]), dev]),
+                    decide=Decide.docker_exec,  # with its container (re)started
+                )
                 continue
             # Else: the client mode — one veth injected into the router netns
             # (CNI/Multus-style interface injection — the same primitive
@@ -1410,14 +1422,18 @@ def _emit_kernel_app_rules(
                     f"kernel app wireguard on {dev} in {netns}: missing ifaceName/config"
                 )
             conf_path = f"/etc/wireguard/{app.ifaceName}.conf"
+            conf = "\n".join(_wg_conf_lines(app))
             app_unit = emit.unit("kernel app", f"wireguard ({app.ifaceName}) in {netns}")
             app_unit.ovn(host.make_dir("/etc/wireguard"))
-            app_unit.append(conf_path, "\n".join(_wg_conf_lines(app)))
+            app_unit.append(conf_path, conf)
             app_unit.ovn(host.chmod(conf_path, "600"))
             netns_primitive = host.netns(netns)
+            # Up with the config it should have: run leaves it; with another
+            # one it brings it down and up again (fabric/decide.py).
             app_unit.ovn(
-                netns_primitive.wireguard(app.ifaceName, conf_path),
+                netns_primitive.wireguard(app.ifaceName, conf_path, conf),
                 parent=netns_var,
+                decide=Decide.wireguard,
             )
             for family in _masq_families(list(app.securityGroups), nodes):
                 app_unit.ovn(
@@ -1598,6 +1614,7 @@ def _emit_kernel_router_owner(
             side_unit.ovn(
                 kernel_netns.set_sysctl_file(f"/proc/sys/net/ipv6/conf/{dev}/accept_ra", "2"),
                 parent=netns_var,
+                decide=Decide.always,  # set every run: no undo, the same value again
             )
         # The side's static addressing + security-group (masq) rules,
         # applied inside the netns — SAME code as the dhcpcd-in-docker
@@ -1913,12 +1930,15 @@ def _emit_image(
     """A container's image: built from its Dockerfile (context dir,
     Dockerfile, build) or pulled from the registry."""
     if dockerfile is None:
-        emit.ovn(host.docker_pull(image))
+        # Pulled while run decides: its container compares with it.
+        emit.ovn(host.docker_pull(image), decide=Decide.docker_pull)
         return
     dockerfile_path = f"{build_dir}/Dockerfile"
     emit.ovn(host.make_dir(build_dir))
     emit.append(dockerfile_path, dockerfile)
-    emit.ovn(host.docker_image(image, dockerfile_path, build_dir))
+    # Built anew only when its Dockerfile changed (its label).
+    spec = hashlib.sha256(dockerfile.encode()).hexdigest()
+    emit.ovn(host.docker_image(image, dockerfile_path, build_dir, spec), decide=Decide.docker_image)
 
 
 def _emit_fabric_unit(host_node: pt.InfraHostNode, emit: Emitter) -> None:
@@ -2353,7 +2373,7 @@ def _emit_service_body(
         run_flags=tuple(run_flags),
     )
     docker_var = emit.local(container)
-    emit.ovn(docker, bind=docker_var)
+    emit.ovn(docker, bind=docker_var, decide=Decide.docker_container)
     # The capture name is per container: the store is shared by every
     # controller of the run, and services run concurrently.
     pid_var = emit.local(f"{container}-pid")

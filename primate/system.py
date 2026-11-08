@@ -14,7 +14,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from fabric import observed
-from fabric.exclude import DEFAULT_EXCLUDE, exclude_nodes
+from raw_reconciler.owners import mark_host, ours
 
 from .learn import Snapshot
 
@@ -56,7 +56,9 @@ def delete(primitives: Sequence[Any]) -> None:
 
 
 def snapshot() -> Snapshot:
-    """The live RawIR, by node id, without the collection metadata and
-    without what the kernel makes by itself (DEFAULT_EXCLUDE) — the same
-    view the runtime compares against."""
-    return exclude_nodes(observed.snapshot(), DEFAULT_EXCLUDE)[0]
+    """The live RawIR, by node id, without the collection metadata — of it
+    what is ovn-fabric's: the view the runtime compares against. Not ours:
+    what docker, OVS, OVN, the kernel own, and the loopback (the host's)."""
+    nodes = observed.snapshot()
+    mark_host(nodes, ["lo"])
+    return ours(nodes)

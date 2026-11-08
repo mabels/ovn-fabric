@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, ClassVar
 
 from ..lifecycle import (
     Command,
@@ -62,6 +62,38 @@ def _prefix(netns: str | None, argv: Sequence[str]) -> tuple[str, ...]:
     if netns is None:
         return tuple(argv)
     return ("ip", "netns", "exec", netns, *argv)
+
+
+@dataclasses.dataclass(frozen=True)
+class SystemdEnabled(CommandPrimitive):
+    """A systemd unit started at boot: enabled, not started now. Its file is
+    written by its own step."""
+
+    host: str
+    unit: str
+    # It leaves nothing in RawIR, by nature.
+    no_rawir: ClassVar[bool] = True
+
+    @property
+    def key(self) -> str:
+        return f"systemd:{self.unit}"
+
+    def as_primitive(self) -> Primitive:
+        return Primitive(
+            key=self.key,
+            nodes=(),
+            create_cmds=(
+                Command(f"{self.unit} (reload)", ("systemctl", "daemon-reload")),
+                Command(f"{self.unit} (enable)", ("systemctl", "enable", "--quiet", self.unit)),
+            ),
+            delete_cmds=(
+                Command(
+                    f"{self.unit} (disable)",
+                    ("systemctl", "disable", "--quiet", self.unit),
+                    optional=True,
+                ),
+            ),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -133,15 +165,20 @@ class HostPrimitive(CommandPrimitive):
             remove_existing=remove_existing,
         )
 
-    def docker_image(self, image: str, dockerfile: str, context: str) -> "DockerImage":
+    def docker_image(
+        self, image: str, dockerfile: str, context: str, spec: str = ""
+    ) -> "DockerImage":
         from .docker import DockerImage
 
-        return DockerImage(self.name, image, dockerfile, context)
+        return DockerImage(self.name, image, dockerfile, context, spec)
 
     def docker_pull(self, image: str) -> "DockerPull":
         from .docker import DockerPull
 
         return DockerPull(self.name, image)
+
+    def systemd_enabled(self, unit: str) -> SystemdEnabled:
+        return SystemdEnabled(self.name, unit)
 
     # -- OVS / host bindings --------------------------------------------
 
@@ -462,10 +499,10 @@ class NetnsPrimitive(CommandPrimitive):
             raise ValueError("dhclient needs a named netns")
         return DhclientPrimitive(self.host, self.name, dev, lease)
 
-    def wireguard(self, iface: str, conf_path: str) -> WireguardPrimitive:
+    def wireguard(self, iface: str, conf_path: str, conf: str = "") -> WireguardPrimitive:
         if self.name is None:
             raise ValueError("wireguard needs a named netns")
-        return WireguardPrimitive(self.host, self.name, iface, conf_path)
+        return WireguardPrimitive(self.host, self.name, iface, conf_path, conf)
 
     def add_ip_rule(self, source: str, table: int, family: int = 4) -> IpRulePrimitive:
         return IpRulePrimitive(

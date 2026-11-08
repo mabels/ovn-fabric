@@ -308,6 +308,9 @@ export const IrApplyReq = type({
   /** delete: keep the store's name `deployed` pointing to the deleted IR
    * (by default a delete of the deployed IR drops the name). */
   "keepDeployed?": "boolean",
+  /** run: keep what is ours on the host but no step of the IR fulfilled
+   * (by default it is removed once every unit is done). */
+  "noCleanup?": "boolean",
 });
 
 export const ApplyState = type(
@@ -369,12 +372,58 @@ export const StepCommand = type({
 /** What a step creates in the object graph (ADR 0006); `fields` is JSON. */
 export const RawNode = type({ id: "string", kind: "string", fields: "string" });
 
+/** Who decides, in a run, whether a step is applied, skipped or replaced.
+ * Without one: its footprint against the RawIR graph (fabric/desired.py),
+ * decided by apply before the unit. The others are decided by the unit
+ * executor right before the step, from the step's own live state
+ * (fabric/decide.py) — the generator picks one per primitive. */
+export const AlwaysDecide = type({
+  /** Applied every run (a sysctl, an image build: no undo, idempotent). */
+  kind: "'always'",
+});
+export const WireguardDecide = type({
+  kind: "'wireguard'",
+  netns: "string",
+  iface: "string",
+  confPath: "string",
+  /** sha256 (hex) of the config it brings up, as the file is written —
+   * compared with the file on the host (the config holds its key). */
+  confSha256: "string",
+});
+export const DockerContainerDecide = type({
+  kind: "'docker.container'",
+  name: "string",
+  image: "string",
+  /** A hash of everything it is run with — set as the container's label. */
+  spec: "string",
+});
+export const DockerImageDecide = type({
+  kind: "'docker.image'",
+  image: "string",
+  /** A hash of what it is built from — set as the image's label. */
+  spec: "string",
+});
+export const DockerPullDecide = type({
+  /** Pulled while deciding (the container's decider compares with it). */
+  kind: "'docker.pull'",
+  image: "string",
+});
+export const DockerExecDecide = type({
+  kind: "'docker.exec'",
+  /** Applied when this container was applied or replaced in the unit. */
+  container: "string",
+});
+export const StepDecide = AlwaysDecide.or(WireguardDecide).or(
+  DockerContainerDecide,
+).or(DockerImageDecide).or(DockerPullDecide).or(DockerExecDecide);
+
 export const PrimitiveStep = type({
   kind: "'Primitive'",
   key: "string",
   nodes: RawNode.array(),
   create: StepCommand.array(),
   delete: StepCommand.array(),
+  "decide?": StepDecide,
 });
 
 export const WriteFileStep = type({
@@ -458,6 +507,17 @@ export const UnitExecReq = type({
   /** Steps (by index) not to run: their object is already there — apply
    * found their predicted RawIR in the live RawIR (fabric/desired.py). */
   "skip?": "number.integer[]",
+  /** run: steps with their own `decide` are decided here, right before
+   * they run (create applies every step). */
+  "decide?": "boolean",
+});
+
+export const Decision = type("'skip'|'apply'|'replace'");
+
+/** What the executor decided for a step with its own `decide`. */
+export const StepDecision = type({
+  index: "number.integer",
+  decision: Decision,
 });
 
 export const UnitExecRes = type({
@@ -467,4 +527,5 @@ export const UnitExecRes = type({
   "message?": "string",
   /** Every value known after the unit (inputs and its own captures). */
   outputs: UnitValue.array(),
+  "decisions?": StepDecision.array(),
 });

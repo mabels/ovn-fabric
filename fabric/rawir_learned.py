@@ -3,7 +3,8 @@
 What each primitive (fabric/primitives) does to RawIR, learned on a real
 system (ADR 0008): `rawir(primitive)` for a primitive object, or the function
 of its class with its fields. A footprint is the nodes the primitive
-adds and the fields it changes on nodes that were there."""
+adds, the fields it changes on nodes that were there, and the nodes it
+takes away."""
 
 from __future__ import annotations
 
@@ -13,7 +14,8 @@ import re
 from collections.abc import Callable
 from typing import Any
 
-Footprint = dict[str, Any]  # {'added': {id: node}, 'changed': {id: {field: change}}}
+# {'added': {id: node}, 'changed': {id: {field: change}}, 'removed': [id]}
+Footprint = dict[str, Any]
 
 
 class NotLearned(ValueError):
@@ -62,50 +64,16 @@ def addr(*, host: str, netns: str | None, link: str, addr: str) -> Footprint:
         "added": {
             f"addr:{netns}|{link}|{addr}": {
                 "address": _ip(addr),
+                "dynamic": None,
                 "family": "ipv4",
                 "id": f"addr:{netns}|{link}|{addr}",
                 "kind": "addr",
                 "linkRef": f"link:{netns}|{link}",
                 "netnsRef": f"netns:{netns}",
+                "owner": "ovn-fabric",
                 "prefixlen": _len(addr),
                 "scope": None,
-            },
-            f"route:{netns}|ipv4|local|{_ip(addr)}|{link}|{link}|None": {
-                "devRef": f"link:{netns}|{link}",
-                "family": "ipv4",
-                "id": f"route:{netns}|ipv4|local|{_ip(addr)}|{link}|{link}|None",
-                "kind": "route",
-                "metric": None,
-                "netnsRef": f"netns:{netns}",
-                "prefix": _ip(addr),
-                "protocol": "kernel",
-                "table": "local",
-                "via": link,
-            },
-            f"route:{netns}|ipv4|local|{_broadcast(addr)}|{link}|{link}|None": {
-                "devRef": f"link:{netns}|{link}",
-                "family": "ipv4",
-                "id": f"route:{netns}|ipv4|local|{_broadcast(addr)}|{link}|{link}|None",
-                "kind": "route",
-                "metric": None,
-                "netnsRef": f"netns:{netns}",
-                "prefix": _broadcast(addr),
-                "protocol": "kernel",
-                "table": "local",
-                "via": link,
-            },
-            f"route:{netns}|ipv4|main|{_net(addr)}|{link}|{link}|None": {
-                "devRef": f"link:{netns}|{link}",
-                "family": "ipv4",
-                "id": f"route:{netns}|ipv4|main|{_net(addr)}|{link}|{link}|None",
-                "kind": "route",
-                "metric": None,
-                "netnsRef": f"netns:{netns}",
-                "prefix": _net(addr),
-                "protocol": "kernel",
-                "table": "main",
-                "via": link,
-            },
+            }
         },
         "changed": {
             f"link:{netns}|{link}": {
@@ -122,6 +90,7 @@ def addr(*, host: str, netns: str | None, link: str, addr: str) -> Footprint:
                 }
             },
         },
+        "removed": [],
     }
 
 
@@ -136,50 +105,16 @@ def addr_v6(*, host: str, netns: str | None, link: str, addr: str) -> Footprint:
         "added": {
             f"addr:{netns}|{link}|{addr}": {
                 "address": _ip(addr),
+                "dynamic": None,
                 "family": "ipv6",
                 "id": f"addr:{netns}|{link}|{addr}",
                 "kind": "addr",
                 "linkRef": f"link:{netns}|{link}",
                 "netnsRef": f"netns:{netns}",
+                "owner": "ovn-fabric",
                 "prefixlen": _len(addr),
                 "scope": None,
-            },
-            f"route:{netns}|ipv6|local|{_ip(addr)}|{link}|{link}|0": {
-                "devRef": f"link:{netns}|{link}",
-                "family": "ipv6",
-                "id": f"route:{netns}|ipv6|local|{_ip(addr)}|{link}|{link}|0",
-                "kind": "route",
-                "metric": 0,
-                "netnsRef": f"netns:{netns}",
-                "prefix": _ip(addr),
-                "protocol": "kernel",
-                "table": "local",
-                "via": link,
-            },
-            f"route:{netns}|ipv6|local|{_netaddr(addr)}|{link}|{link}|0": {
-                "devRef": f"link:{netns}|{link}",
-                "family": "ipv6",
-                "id": f"route:{netns}|ipv6|local|{_netaddr(addr)}|{link}|{link}|0",
-                "kind": "route",
-                "metric": 0,
-                "netnsRef": f"netns:{netns}",
-                "prefix": _netaddr(addr),
-                "protocol": "kernel",
-                "table": "local",
-                "via": link,
-            },
-            f"route:{netns}|ipv6|main|{_net(addr)}|{link}|{link}|256": {
-                "devRef": f"link:{netns}|{link}",
-                "family": "ipv6",
-                "id": f"route:{netns}|ipv6|main|{_net(addr)}|{link}|{link}|256",
-                "kind": "route",
-                "metric": 256,
-                "netnsRef": f"netns:{netns}",
-                "prefix": _net(addr),
-                "protocol": "kernel",
-                "table": "main",
-                "via": link,
-            },
+            }
         },
         "changed": {
             f"link:{netns}|{link}": {
@@ -196,6 +131,40 @@ def addr_v6(*, host: str, netns: str | None, link: str, addr: str) -> Footprint:
                 }
             },
         },
+        "removed": [],
+    }
+
+
+def docker(
+    *,
+    host: str,
+    name: str,
+    image: str,
+    command: tuple[str, ...],
+    privileged: bool,
+    network: str,
+    environment: tuple[tuple[str, str], ...],
+    volumes: tuple[tuple[str, str], ...],
+    run_flags: tuple[str, ...],
+    remove_existing: bool,
+) -> Footprint:
+    """DockerPrimitive (learned with markers only)."""
+    del (
+        host,
+        name,
+        image,
+        command,
+        privileged,
+        network,
+        environment,
+        volumes,
+        run_flags,
+        remove_existing,
+    )  # not in RawIR
+    return {
+        "added": {},
+        "changed": {},
+        "removed": [],
     }
 
 
@@ -211,6 +180,7 @@ def ip_rule(*, host: str, netns: str | None, source: str, table: int, family: in
     return {
         "added": {},
         "changed": {},
+        "removed": [],
     }
 
 
@@ -239,7 +209,6 @@ def link(
     return {
         "added": {
             f"link:*global*|{name}": {
-                "addrRefs": [],
                 "adminUp": True,
                 "id": f"link:*global*|{name}",
                 "ifname": name,
@@ -250,30 +219,38 @@ def link(
                 "mtu": 1500,
                 "netnsRef": "netns:*global*",
                 "operState": "UNKNOWN",
+                "owner": "ovn-fabric",
                 "peerRefs": [],
-            },
-            f"route:*global*|ipv6|local|ff00::/8|{name}|{name}|256": {
-                "devRef": f"link:*global*|{name}",
-                "family": "ipv6",
-                "id": f"route:*global*|ipv6|local|ff00::/8|{name}|{name}|256",
-                "kind": "route",
-                "metric": 256,
-                "netnsRef": "netns:*global*",
-                "prefix": "ff00::/8",
-                "protocol": "kernel",
-                "table": "local",
-                "via": name,
-            },
-        },
-        "changed": {
-            "netns:*global*": {
-                "linkRefs": {"added": [f"link:*global*|{name}"], "removed": []},
-                "routeRefs": {
-                    "added": [f"route:*global*|ipv6|local|ff00::/8|{name}|{name}|256"],
-                    "removed": [],
-                },
             }
         },
+        "changed": {},
+        "removed": [],
+    }
+
+
+def link_move(*, host: str, netns: str, name: str, to: str) -> Footprint:
+    """LinkMovePrimitive (learned with markers only)."""
+    del host  # not in RawIR
+    return {
+        "added": {
+            f"link:{to}|{name}": {
+                "adminUp": True,
+                "id": f"link:{to}|{name}",
+                "ifindex": 2,
+                "ifname": name,
+                "kind": "link",
+                "linkKind": "other",
+                "linkRef": None,
+                "masterRef": None,
+                "mtu": 1500,
+                "netnsRef": f"netns:{to}",
+                "operState": "UNKNOWN",
+                "owner": "ovn-fabric",
+                "peerRefs": [],
+            }
+        },
+        "changed": {},
+        "removed": [f"link:{netns}|{name}"],
     }
 
 
@@ -292,6 +269,8 @@ def masq_rule_ipv4(*, host: str, netns: str, family: str, out_dev: str) -> Footp
                 "id": f"iptables:{netns}|ipv4|nat|POSTROUTING|oif={out_dev}|MASQUERADE",
                 "kind": "iptables.rule",
                 "netnsRef": f"netns:{netns}",
+                "nftHandle": 2,
+                "owner": "ovn-fabric",
                 "rule": {
                     "action": "MASQUERADE",
                     "fields": {
@@ -303,6 +282,7 @@ def masq_rule_ipv4(*, host: str, netns: str, family: str, out_dev: str) -> Footp
                         "sport": None,
                         "src": None,
                     },
+                    "target": None,
                 },
                 "table": "nat",
             }
@@ -315,6 +295,7 @@ def masq_rule_ipv4(*, host: str, netns: str, family: str, out_dev: str) -> Footp
                 }
             }
         },
+        "removed": [],
     }
 
 
@@ -333,6 +314,8 @@ def masq_rule_ipv6(*, host: str, netns: str, family: str, out_dev: str) -> Footp
                 "id": f"iptables:{netns}|ipv6|nat|POSTROUTING|oif={out_dev}|MASQUERADE",
                 "kind": "iptables.rule",
                 "netnsRef": f"netns:{netns}",
+                "nftHandle": 2,
+                "owner": "ovn-fabric",
                 "rule": {
                     "action": "MASQUERADE",
                     "fields": {
@@ -344,6 +327,7 @@ def masq_rule_ipv6(*, host: str, netns: str, family: str, out_dev: str) -> Footp
                         "sport": None,
                         "src": None,
                     },
+                    "target": None,
                 },
                 "table": "nat",
             }
@@ -356,6 +340,7 @@ def masq_rule_ipv6(*, host: str, netns: str, family: str, out_dev: str) -> Footp
                 }
             }
         },
+        "removed": [],
     }
 
 
@@ -371,14 +356,21 @@ def netns(*, host: str, name: str | None, owned: bool) -> Footprint:
             f"netns:{name}": {
                 "id": f"netns:{name}",
                 "kind": "netns",
-                "linkRefs": [],
+                "linkRefs": [f"link:{name}|lo"],
                 "name": name,
-                "routeRefs": [],
+                "owner": "ovn-fabric",
+                "routeRefs": [
+                    f"route:{name}|ipv4|local|127.0.0.0/8|lo|lo|None",
+                    f"route:{name}|ipv4|local|127.0.0.1|lo|lo|None",
+                    f"route:{name}|ipv4|local|127.255.255.255|lo|lo|None",
+                    f"route:{name}|ipv6|local|::1|lo|lo|0",
+                ],
                 "ruleRefs": [],
                 "scope": "isolated",
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -414,7 +406,6 @@ def netns_link(
     return {
         "added": {
             f"link:{netns}|{name}": {
-                "addrRefs": [],
                 "adminUp": True,
                 "id": f"link:{netns}|{name}",
                 "ifname": name,
@@ -425,30 +416,216 @@ def netns_link(
                 "mtu": 1500,
                 "netnsRef": f"netns:{netns}",
                 "operState": "UNKNOWN",
+                "owner": "ovn-fabric",
+                "peerRefs": [],
+            }
+        },
+        "changed": {},
+        "removed": [],
+    }
+
+
+def netns_link_veth(
+    *,
+    host: str,
+    netns: str,
+    name: str,
+    kind: str,
+    rename_to: str | None,
+    parent: str | None,
+    vlan_id: int | None,
+    mac: str | None,
+    root_leg: str | None,
+    bridge: str | None,
+) -> Footprint:
+    """NetnsLinkPrimitive (learned with {'kind': 'veth', 'rename_to': None, 'parent': None, 'vlan_id': None})."""
+    if kind != "veth":
+        raise NotLearned(f"NetnsLinkPrimitive.kind={kind!r}: learned only with 'veth'")
+    if rename_to is not None:
+        raise NotLearned(f"NetnsLinkPrimitive.rename_to={rename_to!r}: learned only with None")
+    if parent is not None:
+        raise NotLearned(f"NetnsLinkPrimitive.parent={parent!r}: learned only with None")
+    if vlan_id is not None:
+        raise NotLearned(f"NetnsLinkPrimitive.vlan_id={vlan_id!r}: learned only with None")
+    if mac is None:
+        raise NotLearned("NetnsLinkPrimitive.mac=None: learned only with a value")
+    if root_leg is None:
+        raise NotLearned("NetnsLinkPrimitive.root_leg=None: learned only with a value")
+    if bridge is None:
+        raise NotLearned("NetnsLinkPrimitive.bridge=None: learned only with a value")
+    del host  # not in RawIR
+    return {
+        "added": {
+            f"link:*global*|{root_leg}": {
+                "adminUp": True,
+                "id": f"link:*global*|{root_leg}",
+                "ifname": root_leg,
+                "kind": "link",
+                "linkKind": "veth",
+                "linkRef": None,
+                "masterRef": "link:*global*|ovs-system",
+                "mtu": 1500,
+                "netnsRef": "netns:*global*",
+                "operState": "UP",
+                "owner": "ovn-fabric",
                 "peerRefs": [],
             },
-            f"route:{netns}|ipv6|local|ff00::/8|{name}|{name}|256": {
-                "devRef": f"link:{netns}|{name}",
-                "family": "ipv6",
-                "id": f"route:{netns}|ipv6|local|ff00::/8|{name}|{name}|256",
-                "kind": "route",
-                "metric": 256,
+            f"link:{netns}|{name}": {
+                "adminUp": True,
+                "id": f"link:{netns}|{name}",
+                "ifname": name,
+                "kind": "link",
+                "linkKind": "veth",
+                "linkRef": None,
+                "mac": mac,
+                "masterRef": None,
+                "mtu": 1500,
                 "netnsRef": f"netns:{netns}",
-                "prefix": "ff00::/8",
-                "protocol": "kernel",
-                "table": "local",
-                "via": name,
+                "operState": "UP",
+                "owner": "ovn-fabric",
+                "peerRefs": [],
+            },
+            f"ovs.iface:{root_leg}": {
+                "externalIds": {},
+                "id": f"ovs.iface:{root_leg}",
+                "kind": "ovs.iface",
+                "name": root_leg,
+                "netnsRef": "netns:*global*",
+                "options": {},
+                "owner": "ovn-fabric",
+                "portRef": f"ovs.port:{root_leg}",
+                "type": "",
+            },
+            f"ovs.port:{root_leg}": {
+                "bridgeRef": f"ovs.bridge:{bridge}",
+                "externalIds": {},
+                "id": f"ovs.port:{root_leg}",
+                "ifaceRefs": [f"ovs.iface:{root_leg}"],
+                "kind": "ovs.port",
+                "name": root_leg,
+                "owner": "ovn-fabric",
+                "tag": None,
+                "trunks": [],
             },
         },
         "changed": {
             f"netns:{netns}": {
                 "linkRefs": {"added": [f"link:{netns}|{name}"], "removed": []},
                 "routeRefs": {
-                    "added": [f"route:{netns}|ipv6|local|ff00::/8|{name}|{name}|256"],
+                    "added": [
+                        f"route:{netns}|ipv6|main|fe80::/64|{name}|{name}|256",
+                        f"route:{netns}|ipv6|local|ff00::/8|{name}|{name}|256",
+                    ],
                     "removed": [],
                 },
-            }
+            },
+            f"ovs.bridge:{bridge}": {
+                "portRefs": {"added": [f"ovs.port:{root_leg}"], "removed": []}
+            },
         },
+        "removed": [],
+    }
+
+
+def netns_link_veth_renamed(
+    *,
+    host: str,
+    netns: str,
+    name: str,
+    kind: str,
+    rename_to: str | None,
+    parent: str | None,
+    vlan_id: int | None,
+    mac: str | None,
+    root_leg: str | None,
+    bridge: str | None,
+) -> Footprint:
+    """NetnsLinkPrimitive (learned with {'kind': 'veth', 'parent': None, 'vlan_id': None})."""
+    if kind != "veth":
+        raise NotLearned(f"NetnsLinkPrimitive.kind={kind!r}: learned only with 'veth'")
+    if parent is not None:
+        raise NotLearned(f"NetnsLinkPrimitive.parent={parent!r}: learned only with None")
+    if vlan_id is not None:
+        raise NotLearned(f"NetnsLinkPrimitive.vlan_id={vlan_id!r}: learned only with None")
+    if rename_to is None:
+        raise NotLearned("NetnsLinkPrimitive.rename_to=None: learned only with a value")
+    if mac is None:
+        raise NotLearned("NetnsLinkPrimitive.mac=None: learned only with a value")
+    if root_leg is None:
+        raise NotLearned("NetnsLinkPrimitive.root_leg=None: learned only with a value")
+    if bridge is None:
+        raise NotLearned("NetnsLinkPrimitive.bridge=None: learned only with a value")
+    del host, name  # not in RawIR
+    return {
+        "added": {
+            f"link:*global*|{root_leg}": {
+                "adminUp": True,
+                "id": f"link:*global*|{root_leg}",
+                "ifname": root_leg,
+                "kind": "link",
+                "linkKind": "veth",
+                "linkRef": None,
+                "masterRef": "link:*global*|ovs-system",
+                "mtu": 1500,
+                "netnsRef": "netns:*global*",
+                "operState": "UP",
+                "owner": "ovn-fabric",
+                "peerRefs": [],
+            },
+            f"link:{netns}|{rename_to}": {
+                "adminUp": True,
+                "id": f"link:{netns}|{rename_to}",
+                "ifname": rename_to,
+                "kind": "link",
+                "linkKind": "veth",
+                "linkRef": None,
+                "mac": mac,
+                "masterRef": None,
+                "mtu": 1500,
+                "netnsRef": f"netns:{netns}",
+                "operState": "UP",
+                "owner": "ovn-fabric",
+                "peerRefs": [],
+            },
+            f"ovs.iface:{root_leg}": {
+                "externalIds": {},
+                "id": f"ovs.iface:{root_leg}",
+                "kind": "ovs.iface",
+                "name": root_leg,
+                "netnsRef": "netns:*global*",
+                "options": {},
+                "owner": "ovn-fabric",
+                "portRef": f"ovs.port:{root_leg}",
+                "type": "",
+            },
+            f"ovs.port:{root_leg}": {
+                "bridgeRef": f"ovs.bridge:{bridge}",
+                "externalIds": {},
+                "id": f"ovs.port:{root_leg}",
+                "ifaceRefs": [f"ovs.iface:{root_leg}"],
+                "kind": "ovs.port",
+                "name": root_leg,
+                "owner": "ovn-fabric",
+                "tag": None,
+                "trunks": [],
+            },
+        },
+        "changed": {
+            f"netns:{netns}": {
+                "linkRefs": {"added": [f"link:{netns}|{rename_to}"], "removed": []},
+                "routeRefs": {
+                    "added": [
+                        f"route:{netns}|ipv6|main|fe80::/64|{rename_to}|{rename_to}|256",
+                        f"route:{netns}|ipv6|local|ff00::/8|{rename_to}|{rename_to}|256",
+                    ],
+                    "removed": [],
+                },
+            },
+            f"ovs.bridge:{bridge}": {
+                "portRefs": {"added": [f"ovs.port:{root_leg}"], "removed": []}
+            },
+        },
+        "removed": [],
     }
 
 
@@ -471,11 +648,13 @@ def ovn_nb_ctl_acl(
                 "id": f"ovn.acl:{switch}|to-lport|{priority}|ip4|allow",
                 "kind": "ovn.acl",
                 "match": "ip4",
+                "owner": "ovn-fabric",
                 "priority": priority,
                 "switchRef": f"ovn.ls:{switch}",
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -496,11 +675,13 @@ def ovn_nb_ctl_acl_from_allow(
                 "id": f"ovn.acl:{switch}|from-lport|{priority}|{match}|allow",
                 "kind": "ovn.acl",
                 "match": match,
+                "owner": "ovn-fabric",
                 "priority": priority,
                 "switchRef": f"ovn.ls:{switch}",
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -521,11 +702,13 @@ def ovn_nb_ctl_acl_from_allow_related(
                 "id": f"ovn.acl:{switch}|from-lport|{priority}|{match}|allow-related",
                 "kind": "ovn.acl",
                 "match": match,
+                "owner": "ovn-fabric",
                 "priority": priority,
                 "switchRef": f"ovn.ls:{switch}",
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -546,11 +729,13 @@ def ovn_nb_ctl_acl_from_drop(
                 "id": f"ovn.acl:{switch}|from-lport|{priority}|{match}|drop",
                 "kind": "ovn.acl",
                 "match": match,
+                "owner": "ovn-fabric",
                 "priority": priority,
                 "switchRef": f"ovn.ls:{switch}",
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -571,11 +756,13 @@ def ovn_nb_ctl_acl_from_reject(
                 "id": f"ovn.acl:{switch}|from-lport|{priority}|{match}|reject",
                 "kind": "ovn.acl",
                 "match": match,
+                "owner": "ovn-fabric",
                 "priority": priority,
                 "switchRef": f"ovn.ls:{switch}",
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -596,11 +783,13 @@ def ovn_nb_ctl_acl_to_allow(
                 "id": f"ovn.acl:{switch}|to-lport|{priority}|{match}|allow",
                 "kind": "ovn.acl",
                 "match": match,
+                "owner": "ovn-fabric",
                 "priority": priority,
                 "switchRef": f"ovn.ls:{switch}",
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -621,11 +810,13 @@ def ovn_nb_ctl_acl_to_allow_related(
                 "id": f"ovn.acl:{switch}|to-lport|{priority}|{match}|allow-related",
                 "kind": "ovn.acl",
                 "match": match,
+                "owner": "ovn-fabric",
                 "priority": priority,
                 "switchRef": f"ovn.ls:{switch}",
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -646,11 +837,13 @@ def ovn_nb_ctl_acl_to_drop(
                 "id": f"ovn.acl:{switch}|to-lport|{priority}|{match}|drop",
                 "kind": "ovn.acl",
                 "match": match,
+                "owner": "ovn-fabric",
                 "priority": priority,
                 "switchRef": f"ovn.ls:{switch}",
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -671,11 +864,13 @@ def ovn_nb_ctl_acl_to_reject(
                 "id": f"ovn.acl:{switch}|to-lport|{priority}|{match}|reject",
                 "kind": "ovn.acl",
                 "match": match,
+                "owner": "ovn-fabric",
                 "priority": priority,
                 "switchRef": f"ovn.ls:{switch}",
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -686,6 +881,7 @@ def ovn_nb_ctl_connection(*, key: str) -> Footprint:
     return {
         "added": {},
         "changed": {},
+        "removed": [],
     }
 
 
@@ -707,11 +903,13 @@ def ovn_nb_ctl_lr(
                 "name": name,
                 "natRefs": [],
                 "options": {},
+                "owner": "ovn-fabric",
                 "portRefs": [],
                 "routeRefs": [],
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -736,11 +934,13 @@ def ovn_nb_ctl_lr_aged(
                 "name": name,
                 "natRefs": [],
                 "options": {"mac_binding_age_threshold": options_0},
+                "owner": "ovn-fabric",
                 "portRefs": [],
                 "routeRefs": [],
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -768,11 +968,13 @@ def ovn_nb_ctl_lr_aged_groups(
                 "name": name,
                 "natRefs": [],
                 "options": {"mac_binding_age_threshold": options_0},
+                "owner": "ovn-fabric",
                 "portRefs": [],
                 "routeRefs": [],
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -785,11 +987,9 @@ def ovn_nb_ctl_lrp(
     gateway_chassis: Any,
     ipv6_ra_configs: tuple[tuple[str, str], ...],
 ) -> Footprint:
-    """OVNNbCtlLrp (learned with {'gateway_chassis': None, 'ipv6_ra_configs': ()})."""
+    """OVNNbCtlLrp (learned with {'gateway_chassis': None})."""
     if gateway_chassis is not None:
         raise NotLearned(f"OVNNbCtlLrp.gateway_chassis={gateway_chassis!r}: learned only with None")
-    if ipv6_ra_configs != ():
-        raise NotLearned(f"OVNNbCtlLrp.ipv6_ra_configs={ipv6_ra_configs!r}: learned only with ()")
     if len(networks) != 1:
         raise NotLearned(f"OVNNbCtlLrp.networks: {len(networks)} elements, learned only with 1")
     (networks_0,) = networks
@@ -801,17 +1001,19 @@ def ovn_nb_ctl_lrp(
                 "externalIds": {},
                 "gatewayChassis": [],
                 "id": f"ovn.lrp:{router}|{name}",
-                "ipv6RaConfigs": {},
+                "ipv6RaConfigs": dict(ipv6_ra_configs),
                 "kind": "ovn.lrp",
                 "mac": mac,
                 "name": name,
                 "networks": [networks_0],
+                "owner": "ovn-fabric",
                 "routerRef": f"ovn.lr:{router}",
             }
         },
         "changed": {
             f"ovn.lr:{router}": {"portRefs": {"added": [f"ovn.lrp:{router}|{name}"], "removed": []}}
         },
+        "removed": [],
     }
 
 
@@ -824,11 +1026,9 @@ def ovn_nb_ctl_lrp_dual(
     gateway_chassis: Any,
     ipv6_ra_configs: tuple[tuple[str, str], ...],
 ) -> Footprint:
-    """OVNNbCtlLrp (learned with {'gateway_chassis': None, 'ipv6_ra_configs': ()})."""
+    """OVNNbCtlLrp (learned with {'gateway_chassis': None})."""
     if gateway_chassis is not None:
         raise NotLearned(f"OVNNbCtlLrp.gateway_chassis={gateway_chassis!r}: learned only with None")
-    if ipv6_ra_configs != ():
-        raise NotLearned(f"OVNNbCtlLrp.ipv6_ra_configs={ipv6_ra_configs!r}: learned only with ()")
     if len(networks) != 2:
         raise NotLearned(f"OVNNbCtlLrp.networks: {len(networks)} elements, learned only with 2")
     (
@@ -845,17 +1045,19 @@ def ovn_nb_ctl_lrp_dual(
                 "externalIds": {},
                 "gatewayChassis": [],
                 "id": f"ovn.lrp:{router}|{name}",
-                "ipv6RaConfigs": {},
+                "ipv6RaConfigs": dict(ipv6_ra_configs),
                 "kind": "ovn.lrp",
                 "mac": mac,
                 "name": name,
                 "networks": [networks_0, networks_1],
+                "owner": "ovn-fabric",
                 "routerRef": f"ovn.lr:{router}",
             }
         },
         "changed": {
             f"ovn.lr:{router}": {"portRefs": {"added": [f"ovn.lrp:{router}|{name}"], "removed": []}}
         },
+        "removed": [],
     }
 
 
@@ -868,9 +1070,7 @@ def ovn_nb_ctl_lrp_gateway(
     gateway_chassis: Any,
     ipv6_ra_configs: tuple[tuple[str, str], ...],
 ) -> Footprint:
-    """OVNNbCtlLrp (learned with {'ipv6_ra_configs': ()})."""
-    if ipv6_ra_configs != ():
-        raise NotLearned(f"OVNNbCtlLrp.ipv6_ra_configs={ipv6_ra_configs!r}: learned only with ()")
+    """OVNNbCtlLrp (learned with markers only)."""
     if len(networks) != 2:
         raise NotLearned(f"OVNNbCtlLrp.networks: {len(networks)} elements, learned only with 2")
     (
@@ -887,17 +1087,19 @@ def ovn_nb_ctl_lrp_gateway(
             f"ovn.lrp:{router}|{name}": {
                 "externalIds": {},
                 "id": f"ovn.lrp:{router}|{name}",
-                "ipv6RaConfigs": {},
+                "ipv6RaConfigs": dict(ipv6_ra_configs),
                 "kind": "ovn.lrp",
                 "mac": mac,
                 "name": name,
                 "networks": [networks_0, networks_1],
+                "owner": "ovn-fabric",
                 "routerRef": f"ovn.lr:{router}",
             }
         },
         "changed": {
             f"ovn.lr:{router}": {"portRefs": {"added": [f"ovn.lrp:{router}|{name}"], "removed": []}}
         },
+        "removed": [],
     }
 
 
@@ -910,10 +1112,12 @@ def ovn_nb_ctl_ls(*, name: str) -> Footprint:
                 "id": f"ovn.ls:{name}",
                 "kind": "ovn.ls",
                 "name": name,
+                "owner": "ovn-fabric",
                 "portRefs": [],
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -941,6 +1145,7 @@ def ovn_nb_ctl_lsp(
                 "kind": "ovn.lsp",
                 "name": name,
                 "options": {},
+                "owner": "ovn-fabric",
                 "switchRef": f"ovn.ls:{switch}",
                 "type": "",
             }
@@ -948,6 +1153,7 @@ def ovn_nb_ctl_lsp(
         "changed": {
             f"ovn.ls:{switch}": {"portRefs": {"added": [f"ovn.lsp:{switch}|{name}"], "removed": []}}
         },
+        "removed": [],
     }
 
 
@@ -978,6 +1184,7 @@ def ovn_nb_ctl_lsp_localnet(
                 "kind": "ovn.lsp",
                 "name": name,
                 "options": {"network_name": options_0},
+                "owner": "ovn-fabric",
                 "switchRef": f"ovn.ls:{switch}",
                 "type": "localnet",
             }
@@ -985,6 +1192,7 @@ def ovn_nb_ctl_lsp_localnet(
         "changed": {
             f"ovn.ls:{switch}": {"portRefs": {"added": [f"ovn.lsp:{switch}|{name}"], "removed": []}}
         },
+        "removed": [],
     }
 
 
@@ -1015,6 +1223,7 @@ def ovn_nb_ctl_lsp_router(
                 "kind": "ovn.lsp",
                 "name": name,
                 "options": {"router-port": options_0},
+                "owner": "ovn-fabric",
                 "switchRef": f"ovn.ls:{switch}",
                 "type": "router",
             }
@@ -1022,6 +1231,7 @@ def ovn_nb_ctl_lsp_router(
         "changed": {
             f"ovn.ls:{switch}": {"portRefs": {"added": [f"ovn.lsp:{switch}|{name}"], "removed": []}}
         },
+        "removed": [],
     }
 
 
@@ -1047,6 +1257,7 @@ def ovn_nb_ctl_nat(
                 "kind": "ovn.nat",
                 "logicalIp": _net(logical_ip),
                 "logicalPort": None,
+                "owner": "ovn-fabric",
                 "routerRef": f"ovn.lr:{router}",
                 "type": "snat",
             }
@@ -1059,6 +1270,7 @@ def ovn_nb_ctl_nat(
                 }
             }
         },
+        "removed": [],
     }
 
 
@@ -1084,6 +1296,7 @@ def ovn_nb_ctl_nat_v6(
                 "kind": "ovn.nat",
                 "logicalIp": _net(logical_ip),
                 "logicalPort": None,
+                "owner": "ovn-fabric",
                 "routerRef": f"ovn.lr:{router}",
                 "type": "snat",
             }
@@ -1096,6 +1309,7 @@ def ovn_nb_ctl_nat_v6(
                 }
             }
         },
+        "removed": [],
     }
 
 
@@ -1112,6 +1326,7 @@ def ovn_nb_ctl_route(*, router: str, prefix: str, nexthop: str) -> Footprint:
                 "id": f"ovn.route:{router}|{prefix}|{nexthop}",
                 "kind": "ovn.route",
                 "nexthop": nexthop,
+                "owner": "ovn-fabric",
                 "policy": None,
                 "prefix": prefix,
                 "routerRef": f"ovn.lr:{router}",
@@ -1122,6 +1337,7 @@ def ovn_nb_ctl_route(*, router: str, prefix: str, nexthop: str) -> Footprint:
                 "routeRefs": {"added": [f"ovn.route:{router}|{prefix}|{nexthop}"], "removed": []}
             }
         },
+        "removed": [],
     }
 
 
@@ -1138,6 +1354,7 @@ def ovn_nb_ctl_route_v6(*, router: str, prefix: str, nexthop: str) -> Footprint:
                 "id": f"ovn.route:{router}|{prefix}|{nexthop}",
                 "kind": "ovn.route",
                 "nexthop": nexthop,
+                "owner": "ovn-fabric",
                 "policy": None,
                 "prefix": prefix,
                 "routerRef": f"ovn.lr:{router}",
@@ -1148,6 +1365,7 @@ def ovn_nb_ctl_route_v6(*, router: str, prefix: str, nexthop: str) -> Footprint:
                 "routeRefs": {"added": [f"ovn.route:{router}|{prefix}|{nexthop}"], "removed": []}
             }
         },
+        "removed": [],
     }
 
 
@@ -1158,6 +1376,7 @@ def ovn_sb_ctl_connection(*, key: str) -> Footprint:
     return {
         "added": {},
         "changed": {},
+        "removed": [],
     }
 
 
@@ -1181,6 +1400,7 @@ def ovs_bridge(*, name: str, datapath: str | None, fail_mode: str) -> Footprint:
                 "mtu": 1500,
                 "netnsRef": "netns:*global*",
                 "operState": "DOWN",
+                "owner": "ovn-fabric",
                 "peerRefs": [],
             },
             f"ovs.bridge:{name}": {
@@ -1190,6 +1410,7 @@ def ovs_bridge(*, name: str, datapath: str | None, fail_mode: str) -> Footprint:
                 "id": f"ovs.bridge:{name}",
                 "kind": "ovs.bridge",
                 "name": name,
+                "owner": "ovn-fabric",
                 "portRefs": [f"ovs.port:{name}"],
             },
             f"ovs.iface:{name}": {
@@ -1199,6 +1420,7 @@ def ovs_bridge(*, name: str, datapath: str | None, fail_mode: str) -> Footprint:
                 "name": name,
                 "netnsRef": "netns:*global*",
                 "options": {},
+                "owner": "ovn-fabric",
                 "portRef": f"ovs.port:{name}",
                 "type": "internal",
             },
@@ -1209,13 +1431,13 @@ def ovs_bridge(*, name: str, datapath: str | None, fail_mode: str) -> Footprint:
                 "ifaceRefs": [f"ovs.iface:{name}"],
                 "kind": "ovs.port",
                 "name": name,
+                "owner": "ovn-fabric",
                 "tag": None,
                 "trunks": [],
             },
         },
-        "changed": {
-            "netns:*global*": {"linkRefs": {"added": [f"link:*global*|{name}"], "removed": []}}
-        },
+        "changed": {},
+        "removed": [],
     }
 
 
@@ -1227,10 +1449,12 @@ def ovs_external_id(*, key_name: str, value: str) -> Footprint:
                 "id": f"ovs.external-id:{key_name}",
                 "key": key_name,
                 "kind": "ovs.external-id",
+                "owner": "ovn-fabric",
                 "value": value,
             }
         },
         "changed": {},
+        "removed": [],
     }
 
 
@@ -1238,6 +1462,7 @@ def ovs_mapping(*, mappings: tuple[str, ...]) -> Footprint:
     """OVSMapping (learned with markers only)."""
     added: dict[str, Any] = {}
     changed: dict[str, Any] = {}
+    removed: list[str] = []
     for element in mappings:
         match = re.fullmatch("(?P<network>.+?):(?P<bridge>.+?)", element)
         if match is None:
@@ -1257,7 +1482,8 @@ def ovs_mapping(*, mappings: tuple[str, ...]) -> Footprint:
                 }
             }
         )
-    return {"added": added, "changed": changed}
+        removed.extend([])
+    return {"added": added, "changed": changed, "removed": removed}
 
 
 def ovs_port(*, bridge: str, port: str, tag: int | None, trunks: tuple[int, ...]) -> Footprint:
@@ -1275,6 +1501,7 @@ def ovs_port(*, bridge: str, port: str, tag: int | None, trunks: tuple[int, ...]
                 "name": port,
                 "netnsRef": "netns:*global*",
                 "options": {},
+                "owner": "ovn-fabric",
                 "portRef": f"ovs.port:{port}",
                 "type": "",
             },
@@ -1285,6 +1512,7 @@ def ovs_port(*, bridge: str, port: str, tag: int | None, trunks: tuple[int, ...]
                 "ifaceRefs": [f"ovs.iface:{port}"],
                 "kind": "ovs.port",
                 "name": port,
+                "owner": "ovn-fabric",
                 "tag": None,
                 "trunks": [],
             },
@@ -1295,6 +1523,7 @@ def ovs_port(*, bridge: str, port: str, tag: int | None, trunks: tuple[int, ...]
             },
             f"ovs.bridge:{bridge}": {"portRefs": {"added": [f"ovs.port:{port}"], "removed": []}},
         },
+        "removed": [],
     }
 
 
@@ -1332,6 +1561,7 @@ def route(
                 "kind": "route",
                 "metric": None,
                 "netnsRef": f"netns:{netns}",
+                "owner": "ovn-fabric",
                 "prefix": dst,
                 "protocol": None,
                 "table": "main",
@@ -1346,6 +1576,227 @@ def route(
                 }
             }
         },
+        "removed": [],
+    }
+
+
+def route_metric(
+    *,
+    host: str,
+    netns: str | None,
+    dst: str,
+    dev: str,
+    via: str | None,
+    metric: float | None,
+    table: int | None,
+    family: int | None,
+) -> Footprint:
+    """RoutePrimitive (learned with {'family': 4, 'table': None})."""
+    if family != 4:
+        raise NotLearned(f"RoutePrimitive.family={family!r}: learned only with 4")
+    if table is not None:
+        raise NotLearned(f"RoutePrimitive.table={table!r}: learned only with None")
+    if netns is None:
+        raise NotLearned("RoutePrimitive.netns=None: learned only with a value")
+    if via is None:
+        raise NotLearned("RoutePrimitive.via=None: learned only with a value")
+    if metric is None:
+        raise NotLearned("RoutePrimitive.metric=None: learned only with a value")
+    if _family(dst) != 4:
+        raise NotLearned(f"RoutePrimitive.dst={dst!r}: learned only with IPv4")
+    if _family(via) != 4:
+        raise NotLearned(f"RoutePrimitive.via={via!r}: learned only with IPv4")
+    del host  # not in RawIR
+    return {
+        "added": {
+            f"route:{netns}|ipv4|main|{dst}|{dev}|{via}|{metric}": {
+                "devRef": f"link:{netns}|{dev}",
+                "family": "ipv4",
+                "id": f"route:{netns}|ipv4|main|{dst}|{dev}|{via}|{metric}",
+                "kind": "route",
+                "metric": metric,
+                "netnsRef": f"netns:{netns}",
+                "owner": "ovn-fabric",
+                "prefix": dst,
+                "protocol": None,
+                "table": "main",
+                "via": via,
+            }
+        },
+        "changed": {
+            f"netns:{netns}": {
+                "routeRefs": {
+                    "added": [f"route:{netns}|ipv4|main|{dst}|{dev}|{via}|{metric}"],
+                    "removed": [],
+                }
+            }
+        },
+        "removed": [],
+    }
+
+
+def route_metric_table(
+    *,
+    host: str,
+    netns: str | None,
+    dst: str,
+    dev: str,
+    via: str | None,
+    metric: float | None,
+    table: int | None,
+    family: int | None,
+) -> Footprint:
+    """RoutePrimitive (learned with {'family': 4})."""
+    if family != 4:
+        raise NotLearned(f"RoutePrimitive.family={family!r}: learned only with 4")
+    if netns is None:
+        raise NotLearned("RoutePrimitive.netns=None: learned only with a value")
+    if via is None:
+        raise NotLearned("RoutePrimitive.via=None: learned only with a value")
+    if metric is None:
+        raise NotLearned("RoutePrimitive.metric=None: learned only with a value")
+    if table is None:
+        raise NotLearned("RoutePrimitive.table=None: learned only with a value")
+    if _family(dst) != 4:
+        raise NotLearned(f"RoutePrimitive.dst={dst!r}: learned only with IPv4")
+    if _family(via) != 4:
+        raise NotLearned(f"RoutePrimitive.via={via!r}: learned only with IPv4")
+    del host  # not in RawIR
+    return {
+        "added": {
+            f"route:{netns}|ipv4|{table}|{dst}|{dev}|{via}|{metric}": {
+                "devRef": f"link:{netns}|{dev}",
+                "family": "ipv4",
+                "id": f"route:{netns}|ipv4|{table}|{dst}|{dev}|{via}|{metric}",
+                "kind": "route",
+                "metric": metric,
+                "netnsRef": f"netns:{netns}",
+                "owner": "ovn-fabric",
+                "prefix": dst,
+                "protocol": None,
+                "table": table,
+                "via": via,
+            }
+        },
+        "changed": {
+            f"netns:{netns}": {
+                "routeRefs": {
+                    "added": [f"route:{netns}|ipv4|{table}|{dst}|{dev}|{via}|{metric}"],
+                    "removed": [],
+                }
+            }
+        },
+        "removed": [],
+    }
+
+
+def route_metric_table_v6(
+    *,
+    host: str,
+    netns: str | None,
+    dst: str,
+    dev: str,
+    via: str | None,
+    metric: float | None,
+    table: int | None,
+    family: int | None,
+) -> Footprint:
+    """RoutePrimitive (learned with {'family': 6})."""
+    if family != 6:
+        raise NotLearned(f"RoutePrimitive.family={family!r}: learned only with 6")
+    if netns is None:
+        raise NotLearned("RoutePrimitive.netns=None: learned only with a value")
+    if via is None:
+        raise NotLearned("RoutePrimitive.via=None: learned only with a value")
+    if metric is None:
+        raise NotLearned("RoutePrimitive.metric=None: learned only with a value")
+    if table is None:
+        raise NotLearned("RoutePrimitive.table=None: learned only with a value")
+    if _family(dst) != 6:
+        raise NotLearned(f"RoutePrimitive.dst={dst!r}: learned only with IPv6")
+    if _family(via) != 6:
+        raise NotLearned(f"RoutePrimitive.via={via!r}: learned only with IPv6")
+    del host  # not in RawIR
+    return {
+        "added": {
+            f"route:{netns}|ipv6|{table}|{dst}|{dev}|{via}|{metric}": {
+                "devRef": f"link:{netns}|{dev}",
+                "family": "ipv6",
+                "id": f"route:{netns}|ipv6|{table}|{dst}|{dev}|{via}|{metric}",
+                "kind": "route",
+                "metric": metric,
+                "netnsRef": f"netns:{netns}",
+                "owner": "ovn-fabric",
+                "prefix": dst,
+                "protocol": None,
+                "table": table,
+                "via": via,
+            }
+        },
+        "changed": {
+            f"netns:{netns}": {
+                "routeRefs": {
+                    "added": [f"route:{netns}|ipv6|{table}|{dst}|{dev}|{via}|{metric}"],
+                    "removed": [],
+                }
+            }
+        },
+        "removed": [],
+    }
+
+
+def route_metric_v6(
+    *,
+    host: str,
+    netns: str | None,
+    dst: str,
+    dev: str,
+    via: str | None,
+    metric: float | None,
+    table: int | None,
+    family: int | None,
+) -> Footprint:
+    """RoutePrimitive (learned with {'family': 6, 'table': None})."""
+    if family != 6:
+        raise NotLearned(f"RoutePrimitive.family={family!r}: learned only with 6")
+    if table is not None:
+        raise NotLearned(f"RoutePrimitive.table={table!r}: learned only with None")
+    if netns is None:
+        raise NotLearned("RoutePrimitive.netns=None: learned only with a value")
+    if via is None:
+        raise NotLearned("RoutePrimitive.via=None: learned only with a value")
+    if metric is None:
+        raise NotLearned("RoutePrimitive.metric=None: learned only with a value")
+    if _family(dst) != 6:
+        raise NotLearned(f"RoutePrimitive.dst={dst!r}: learned only with IPv6")
+    if _family(via) != 6:
+        raise NotLearned(f"RoutePrimitive.via={via!r}: learned only with IPv6")
+    del host  # not in RawIR
+    return {
+        "added": {
+            f"route:{netns}|ipv6|main|{dst}|{dev}|{via}|{metric}": {
+                "devRef": f"link:{netns}|{dev}",
+                "family": "ipv6",
+                "id": f"route:{netns}|ipv6|main|{dst}|{dev}|{via}|{metric}",
+                "kind": "route",
+                "metric": metric,
+                "netnsRef": f"netns:{netns}",
+                "owner": "ovn-fabric",
+                "prefix": dst,
+                "protocol": None,
+                "table": "main",
+                "via": via,
+            }
+        },
+        "changed": {
+            f"netns:{netns}": {
+                "routeRefs": {
+                    "added": [f"route:{netns}|ipv6|main|{dst}|{dev}|{via}|{metric}"],
+                    "removed": [],
+                }
+            }
+        },
+        "removed": [],
     }
 
 
@@ -1383,6 +1834,7 @@ def route_v6(
                 "kind": "route",
                 "metric": 1024,
                 "netnsRef": f"netns:{netns}",
+                "owner": "ovn-fabric",
                 "prefix": dst,
                 "protocol": None,
                 "table": "main",
@@ -1397,6 +1849,7 @@ def route_v6(
                 }
             }
         },
+        "removed": [],
     }
 
 
@@ -1436,6 +1889,7 @@ def route_via(
                 "kind": "route",
                 "metric": None,
                 "netnsRef": f"netns:{netns}",
+                "owner": "ovn-fabric",
                 "prefix": dst,
                 "protocol": None,
                 "table": "main",
@@ -1450,6 +1904,7 @@ def route_via(
                 }
             }
         },
+        "removed": [],
     }
 
 
@@ -1489,6 +1944,7 @@ def route_via_v6(
                 "kind": "route",
                 "metric": 1024,
                 "netnsRef": f"netns:{netns}",
+                "owner": "ovn-fabric",
                 "prefix": dst,
                 "protocol": None,
                 "table": "main",
@@ -1503,6 +1959,7 @@ def route_via_v6(
                 }
             }
         },
+        "removed": [],
     }
 
 
@@ -1516,6 +1973,7 @@ def sysctl(*, host: str, netns: str, key: str, value: str) -> Footprint:
     return {
         "added": {},
         "changed": {},
+        "removed": [],
     }
 
 
@@ -1527,7 +1985,6 @@ def vlan(*, host: str, netns: str | None, parent: str, name: str, vlan_id: int) 
     return {
         "added": {
             f"link:*global*|{name}": {
-                "addrRefs": [],
                 "adminUp": True,
                 "id": f"link:*global*|{name}",
                 "ifname": name,
@@ -1538,30 +1995,12 @@ def vlan(*, host: str, netns: str | None, parent: str, name: str, vlan_id: int) 
                 "mtu": 1500,
                 "netnsRef": "netns:*global*",
                 "operState": "UP",
+                "owner": "ovn-fabric",
                 "peerRefs": [],
-            },
-            f"route:*global*|ipv6|local|ff00::/8|{name}|{name}|256": {
-                "devRef": f"link:*global*|{name}",
-                "family": "ipv6",
-                "id": f"route:*global*|ipv6|local|ff00::/8|{name}|{name}|256",
-                "kind": "route",
-                "metric": 256,
-                "netnsRef": "netns:*global*",
-                "prefix": "ff00::/8",
-                "protocol": "kernel",
-                "table": "local",
-                "via": name,
-            },
-        },
-        "changed": {
-            "netns:*global*": {
-                "linkRefs": {"added": [f"link:*global*|{name}"], "removed": []},
-                "routeRefs": {
-                    "added": [f"route:*global*|ipv6|local|ff00::/8|{name}|{name}|256"],
-                    "removed": [],
-                },
             }
         },
+        "changed": {},
+        "removed": [],
     }
 
 
@@ -1572,14 +2011,20 @@ _BY_CLASS: dict[str, tuple[Callable[..., Footprint], ...]] = {
         addr,
         addr_v6,
     ),
+    "DockerPrimitive": (docker,),
     "IpRulePrimitive": (ip_rule,),
     "LinkPrimitive": (link,),
+    "LinkMovePrimitive": (link_move,),
     "MasqRule": (
         masq_rule_ipv4,
         masq_rule_ipv6,
     ),
     "NetnsPrimitive": (netns,),
-    "NetnsLinkPrimitive": (netns_link,),
+    "NetnsLinkPrimitive": (
+        netns_link,
+        netns_link_veth,
+        netns_link_veth_renamed,
+    ),
     "OVNNbCtlAcl": (
         ovn_nb_ctl_acl,
         ovn_nb_ctl_acl_from_allow,
@@ -1623,6 +2068,10 @@ _BY_CLASS: dict[str, tuple[Callable[..., Footprint], ...]] = {
     "OVSPort": (ovs_port,),
     "RoutePrimitive": (
         route,
+        route_metric,
+        route_metric_table,
+        route_metric_table_v6,
+        route_metric_v6,
         route_v6,
         route_via,
         route_via_v6,
@@ -1634,11 +2083,24 @@ _BY_CLASS: dict[str, tuple[Callable[..., Footprint], ...]] = {
 # Fields the system fills in differently every time (not compared).
 VOLATILE: dict[str, list[str]] = {
     "AddrPrimitive": [],
+    "DockerPrimitive": [],
     "IpRulePrimitive": [],
-    "LinkPrimitive": ["link.ifindex", "link.mac"],
+    "LinkPrimitive": ["link.addrRefs", "link.ifindex", "link.mac"],
+    "LinkMovePrimitive": [
+        "link.addrRefs",
+        "link.mac",
+        "netns:{netns}: changed fields",
+        "netns:{to}: changed fields",
+    ],
     "MasqRule": [],
     "NetnsPrimitive": [],
-    "NetnsLinkPrimitive": ["link.ifindex", "link.mac"],
+    "NetnsLinkPrimitive": [
+        "link.addrRefs",
+        "link.ifindex",
+        "link.mac",
+        "netns:{netns}: changed fields",
+        "ovs.iface.mac",
+    ],
     "OVNNbCtlAcl": [],
     "OVNNbCtlConnection": [],
     "OVNNbCtlLr": [],
@@ -1654,7 +2116,7 @@ VOLATILE: dict[str, list[str]] = {
     "OVSPort": ["ovs.iface.mac"],
     "RoutePrimitive": [],
     "SysctlPrimitive": [],
-    "VlanPrimitive": ["link.ifindex", "link.mac"],
+    "VlanPrimitive": ["link.addrRefs", "link.ifindex", "link.mac"],
 }
 
 

@@ -146,6 +146,11 @@ def _with_newline(content: str) -> str:
     return content + ("" if content.endswith("\n") else "\n")
 
 
+def written(content: str) -> str:
+    """What a file written with `content` holds (WriteFileOperation)."""
+    return _with_newline(content)
+
+
 def _write_new(path: Path, content: str, mode: int | None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # A file already there is overwritten — atomically: written next to it,

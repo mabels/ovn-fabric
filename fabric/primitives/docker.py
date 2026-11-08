@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 from collections.abc import Sequence
 
 from ..lifecycle import (
@@ -14,6 +16,14 @@ from .host import NetnsPrimitive
 # A build or pull may take long (a slow link, a big image) — but not forever.
 IMAGE_TIMEOUT = 1800.0
 
+# The label a container or a built image carries: the hash of what it was
+# made from (fabric/decide.py compares it, a run restarts or rebuilds).
+SPEC_LABEL = "ovn-fabric.spec"
+
+
+def _hash(*parts: str) -> str:
+    return hashlib.sha256(json.dumps(parts).encode()).hexdigest()
+
 
 @dataclasses.dataclass(frozen=True)
 class DockerImage(CommandPrimitive):
@@ -24,6 +34,8 @@ class DockerImage(CommandPrimitive):
     image: str
     dockerfile: str
     context: str
+    # A hash of what it is built from (its Dockerfile's content): its label.
+    spec: str = ""
 
     @property
     def key(self) -> str:
@@ -47,6 +59,8 @@ class DockerImage(CommandPrimitive):
                         "build",
                         "-t",
                         self.image,
+                        "--label",
+                        f"{SPEC_LABEL}={self.spec}",
                         "-f",
                         self.dockerfile,
                         self.context,
@@ -127,11 +141,18 @@ class DockerPrimitive(CommandPrimitive):
         """Start `argv` inside the running container (`docker exec -d`)."""
         return DockerExecPrimitive(host=self.host, container=self.name, argv=tuple(argv))
 
-    def _run_argv(self) -> tuple[str, ...]:
+    @property
+    def spec(self) -> str:
+        """A hash of everything it is run with: its label."""
+        return _hash(*self._run_argv(labelled=False))
+
+    def _run_argv(self, labelled: bool = True) -> tuple[str, ...]:
         argv = ["/usr/bin/docker", "run", "-d"]
         if self.privileged:
             argv.append("--privileged")
         argv += ["--network", self.network, "--name", self.name]
+        if labelled:
+            argv += ["--label", f"{SPEC_LABEL}={self.spec}"]
         for key, value in sorted(self.environment):
             argv += ["-e", f"{key}={value}"]
         for host_path, container_path in self.volumes:

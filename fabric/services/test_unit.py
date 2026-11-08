@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import tempfile
 import typing
@@ -9,6 +10,7 @@ import unittest
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from runtime import generated as rg
 from runtime.message import BodySpec, Msg, from_parts, header, register_bodies, to_parts
@@ -16,6 +18,7 @@ from runtime.peer import Peer
 from runtime.runtime import Runtime
 from runtime.transport import connect
 
+from .. import decide
 from .. import generated as g
 from ..primitives.host import HostPrimitive
 from ..units import _KINDS, to_operation, to_step
@@ -298,6 +301,154 @@ class ExecuteTest(unittest.TestCase):
             self.assertIn("-a", lines[1])
 
         asyncio.run(run())
+
+
+class DecideTest(unittest.TestCase):
+    """A step with its own decider (fabric/decide.py): run decides it in
+    the executor, create applies it."""
+
+    def test_run_skips_applies_and_replaces_as_decided_create_applies(self) -> None:
+        by_key = {"s": decide.Decision.skip, "r": decide.Decision.replace}
+
+        async def run(log: Path) -> tuple[list[str], list[str], Any]:
+            steps = []
+            for word in ("s", "r", "a"):
+                step = _logged(log, word, f"-{word}")
+                step.decide = g.AlwaysDecide(kind="always")
+                steps.append(step)
+            unit = _unit(*steps)
+
+            async def decider(spec: Any, decided: decide.Decided, lc: Any) -> decide.Decision:
+                # the step's key is the word: decide by it
+                key = next(s.key for s in steps if s.key not in decided.by_key)
+                return by_key.get(key, decide.Decision.apply)
+
+            with mock.patch.dict(decide.DECIDERS, {"always": decider}):
+                async with _client() as client:
+                    res = (await _exec(client, unit, CREATE, decide=True))[-1].body
+                    ran = log.read_text().split()
+                    log.write_text("")
+                    await _exec(client, unit, CREATE)
+                    created = log.read_text().split()
+            return ran, created, res
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ran, created, res = asyncio.run(run(Path(tmp) / "log"))
+        self.assertEqual(ran, ["-r", "r", "a"])  # s skipped; r undone, then done
+        self.assertEqual(created, ["s", "r", "a"])  # create: every step, undecided
+        self.assertEqual(
+            [(d.index, d.decision.value) for d in res.decisions],
+            [(0, "skip"), (1, "replace"), (2, "apply")],
+        )
+
+
+class WireguardDeciderTest(unittest.TestCase):
+    def _decide(self, running: str, on_disk: str) -> decide.Decision:
+        spec = g.WireguardDecide(
+            kind="wireguard", netns="ns", iface="wg0", confPath="/etc/wg0.conf", confSha256="abc"
+        )
+
+        class Probe:
+            async def capture_cmd(self, label: str, argv: Any, **kw: Any) -> str:
+                return running if "wg" in argv else on_disk
+
+        return asyncio.run(decide.decide(spec, decide.Decided(), Probe()))  # type: ignore[arg-type]
+
+    def test_the_spec_hashes_the_config_as_its_file_is_written(self) -> None:
+        tunnel = HostPrimitive("h").netns("ns").wireguard("wg0", "/etc/wg0.conf", "[Interface]")
+        step = to_step(tunnel, decide.spec(decide.Decide.wireguard, tunnel))
+        assert step.kind == "Primitive" and step.decide is not None
+        self.assertEqual(
+            step.decide.confSha256,  # type: ignore[union-attr]
+            hashlib.sha256(b"[Interface]\n").hexdigest(),  # WriteFile adds the newline
+        )
+        self.assertIsNone(to_step(tunnel).decide)  # type: ignore[union-attr]
+
+    def test_down_applies_same_config_skips_other_config_replaces(self) -> None:
+        self.assertEqual(self._decide("", ""), decide.Decision.apply)
+        self.assertEqual(self._decide("wg0", "abc  /etc/wg0.conf"), decide.Decision.skip)
+        self.assertEqual(self._decide("wg1 wg0", "def  /etc/wg0.conf"), decide.Decision.replace)
+
+
+class _Probe:
+    """A controller answering a decider's probes by the command's words."""
+
+    def __init__(self, answers: dict[str, str]) -> None:
+        self.answers = answers
+        self.ran: list[list[str]] = []
+
+    async def capture_cmd(self, label: str, argv: Any, **kw: Any) -> str:
+        return next((out for word, out in self.answers.items() if word in argv), "")
+
+    async def run_cmd(self, label: str, argv: Any, **kw: Any) -> bool:
+        self.ran.append(list(argv))
+        return True
+
+
+def _decided(
+    spec: Any, probe: _Probe, earlier: dict[str, decide.Decision] | None = None
+) -> decide.Decision:
+    handle = decide.Decided(dict(earlier or {}))
+    return asyncio.run(decide.decide(spec, handle, probe))  # type: ignore[arg-type]
+
+
+class DockerDeciderTest(unittest.TestCase):
+    container = g.DockerContainerDecide(kind="docker.container", name="c", image="img", spec="s1")
+
+    def test_a_container_runs_restarts_or_stays(self) -> None:
+        self.assertEqual(_decided(self.container, _Probe({})), decide.Decision.apply)
+        same = _Probe(
+            {"{{.State.Running}} {{.Image}} " + decide._LABEL: "true sha:1 s1", "{{.Id}}": "sha:1"}
+        )
+        self.assertEqual(_decided(self.container, same), decide.Decision.skip)
+        other_spec = _Probe({"c": "true sha:1 s0", "{{.Id}}": "sha:1"})
+        self.assertEqual(_decided(self.container, other_spec), decide.Decision.replace)
+        new_image = _Probe(
+            {"{{.State.Running}} {{.Image}} " + decide._LABEL: "true sha:1 s1", "{{.Id}}": "sha:2"}
+        )
+        self.assertEqual(_decided(self.container, new_image), decide.Decision.replace)
+        # its image is built anew in this unit
+        built = {"docker.image:img": decide.Decision.apply}
+        self.assertEqual(_decided(self.container, same, built), decide.Decision.replace)
+
+    def test_an_image_is_built_when_its_dockerfile_changed_a_pull_pulls(self) -> None:
+        image = g.DockerImageDecide(kind="docker.image", image="img", spec="h1")
+        self.assertEqual(_decided(image, _Probe({"inspect": "h1"})), decide.Decision.skip)
+        self.assertEqual(_decided(image, _Probe({"inspect": "h0"})), decide.Decision.apply)
+        probe = _Probe({})
+        pull = g.DockerPullDecide(kind="docker.pull", image="img")
+        self.assertEqual(_decided(pull, probe), decide.Decision.skip)
+        self.assertEqual(probe.ran, [["/usr/bin/docker", "pull", "img"]])
+
+    def test_an_exec_runs_with_its_container_started(self) -> None:
+        exec_ = g.DockerExecDecide(kind="docker.exec", container="c")
+        for container, expected in (
+            (decide.Decision.apply, decide.Decision.apply),
+            (decide.Decision.replace, decide.Decision.apply),
+            (decide.Decision.skip, decide.Decision.skip),
+        ):
+            got = _decided(exec_, _Probe({}), {"docker.container:c": container})
+            self.assertEqual(got, expected)
+
+    def test_a_fresh_container_runs_the_unit_s_later_steps_again(self) -> None:
+        async def run(log: Path) -> list[str]:
+            container = _logged(log, "container", "-container")
+            container.decide = g.DockerContainerDecide(
+                kind="docker.container", name="c", image="img", spec="s"
+            )
+            address = _logged(log, "address", "-address")  # found by apply: in skip
+            unit = _unit(container, address)
+
+            async def fresh(spec: Any, decided: decide.Decided, lc: Any) -> decide.Decision:
+                return decide.Decision.apply
+
+            with mock.patch.dict(decide.DECIDERS, {"docker.container": fresh}):
+                async with _client() as client:
+                    await _exec(client, unit, CREATE, decide=True, skip=[1])
+            return log.read_text().split()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(asyncio.run(run(Path(tmp) / "log")), ["container", "address"])
 
 
 if __name__ == "__main__":

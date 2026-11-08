@@ -8,9 +8,10 @@ collection metadata `host`/`time`). For one run of a sample:
     undone  … with the primitive deleted again
 
 `observe()` turns a run into what the primitive did — the nodes it added,
-the fields it changed on nodes that were there, and whether delete undid
-it — with every marker value replaced by its parameter's placeholder
-(`{name}`, or `{addr|ip}` when the system reports a transform of it).
+the fields it changed on nodes that were there, the nodes of its own it
+took away (a link moved elsewhere), and whether delete undid it — with
+every marker value replaced by its parameter's placeholder (`{name}`, or
+`{addr|ip}` when the system reports a transform of it).
 `template()` merges two runs with different markers: what still differs
 between them is volatile (a UUID, an ifindex) and is left out.
 """
@@ -144,6 +145,13 @@ def observe(
         placeholders(node_id, markers): placeholders(after[node_id], markers)
         for node_id in sorted(set(after) - set(before))
     }
+    # Nodes of its own (a marker in the id) that it takes away: a link it
+    # moves to another namespace is gone from the first one.
+    removed = sorted(
+        key
+        for node_id in set(before) - set(after)
+        if _PLACEHOLDER.search(key := placeholders(node_id, markers))
+    )
     changed = {}
     for node_id in sorted(set(after) & set(before)):
         if before[node_id] == after[node_id]:
@@ -171,7 +179,7 @@ def observe(
             )
         )
     )
-    return {"added": added, "changed": changed, "leftover": leftover}
+    return {"added": added, "changed": changed, "removed": removed, "leftover": leftover}
 
 
 def template(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
@@ -211,9 +219,34 @@ def template(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
     }
     for node_id in set(first["changed"]) - set(changed):
         volatile.add(f"{node_id}: changed fields")
+    removed_first, removed_second = first.get("removed", []), second.get("removed", [])
+    if removed_first != removed_second:
+        differ = sorted(set(removed_first) ^ set(removed_second))
+        raise Unexplained(f"removed: not in both runs: {differ}")
     return {
         "added": added,
         "changed": changed,
+        "removed": removed_first,
         "volatile": sorted(volatile),
         "leftover": sorted(set(first["leftover"]) | set(second["leftover"])),
     }
+
+
+def no_trace(free: Mapping[str, Any], learned: Mapping[str, Any]) -> None:
+    """A `free` field must leave no trace in what was learned: none of its
+    (longer) values shows up in the footprint."""
+    footprint = repr((learned["added"], learned["changed"]))
+    for field, value in free.items():
+        parts = value if isinstance(value, tuple) else (value,)
+        for part in parts:
+            text = str(part)
+            if len(text) >= 4 and text in footprint:
+                raise Unexplained(f"free field {field}: {text!r} shows up in RawIR")
+
+
+def pass_on(maps: Mapping[str, tuple[str, Any]], learned: dict[str, Any]) -> None:
+    """A `maps` field: the node's field holds the parameter, as a mapping."""
+    for field, (node_field, _value) in maps.items():
+        for node in learned["added"].values():
+            if node_field in node:
+                node[node_field] = "{" + field + "|map}"

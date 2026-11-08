@@ -43,6 +43,7 @@ import re
 from collections.abc import Callable, Sequence
 from typing import Any
 
+from fabric.decide import Decide
 from fabric.primitives.docker import DockerImage, DockerPrimitive, DockerPull
 from fabric.primitives.fs import ChmodPrimitive, DirectoryPrimitive, RemovePathPrimitive
 from fabric.primitives.host import LinkPrimitive, NetnsPrimitive, VlanPrimitive
@@ -376,7 +377,11 @@ class PythonEmitter(Emitter):
         *,
         bind: str | None = None,
         parent: str | None = None,
+        decide: Decide = Decide.footprint,
     ) -> None:
+        # The generated deployer applies every primitive; who decides in a
+        # run is the runtime's (fabric/decide.py).
+        del decide
         if bind is not None:
             rhs = (
                 f"{parent}.{_ovn_method_call(primitive)}"

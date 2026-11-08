@@ -90,7 +90,7 @@ class OvsPrimitiveTest(unittest.TestCase):
                 ),
                 argv,
             )
-            self.assertIn(("ovs-vsctl", "add-port", "br-home", "eth0.129"), argv)
+            self.assertIn(("ovs-vsctl", "--may-exist", "add-port", "br-home", "eth0.129"), argv)
             self.assertIn(
                 (
                     "ovs-vsctl",

@@ -11,6 +11,7 @@ from .desired import (
     StepState,
     choose,
     compare,
+    consumed_later,
     desired_rawir,
     step_state,
 )
@@ -19,6 +20,7 @@ from .primitives.docker import DockerPull
 from .primitives.fs import DirectoryPrimitive
 from .primitives.host import HostPrimitive
 from .primitives.ovn import OVNNbCtlLs
+from .primitives.ovs import OVSBridge
 from .rawir_learned import rawir
 
 HOST = HostPrimitive("h")
@@ -36,28 +38,11 @@ class DesiredTest(unittest.TestCase):
         )
         self.assertIn("netns:ns-x", desired.nodes)
         self.assertIn("addr:ns-x|eth0|10.1.2.3/24", desired.nodes)
-        self.assertIn("route:ns-x|ipv4|main|10.1.2.0/24|eth0|eth0|None", desired.nodes)
         self.assertIn("ovn.ls:backbone", desired.nodes)
-        # The address's routes were added to the netns the netns primitive added.
-        self.assertIn(
-            "route:ns-x|ipv4|main|10.1.2.0/24|eth0|eth0|None",
-            desired.nodes["netns:ns-x"]["routeRefs"],
-        )
+        # The routes that follow from the address are the kernel's: no part of it.
+        self.assertFalse([i for i in desired.nodes if i.startswith("route:")])
         # The link eth0 itself is no primitive here: its change is kept apart.
         self.assertIn("link:ns-x|eth0", desired.changes)
-
-    def test_the_loopback_and_the_exclude_list_are_left_alone(self) -> None:
-        netns = HOST.netns("ns-x")
-        desired = desired_rawir(
-            [("netns", netns), ("addr", netns.add_addr("eth0", "10.1.2.3/24"))],
-            exclude=["route:*|local|*"],
-        )
-        ids = set(desired.nodes)
-        self.assertFalse([i for i in ids if "|lo" in i])  # lo: always excluded
-        self.assertFalse([i for i in ids if "|local|" in i])  # the host's own pattern
-        refs = desired.nodes["netns:ns-x"]["routeRefs"] + desired.nodes["netns:ns-x"]["linkRefs"]
-        self.assertFalse([r for r in refs if "|lo" in r or "|local|" in r])  # no dangling refs
-        self.assertGreater(desired.excluded, 0)
 
     def test_what_cannot_be_predicted_is_counted(self) -> None:
         desired = desired_rawir(
@@ -117,7 +102,7 @@ class ReconciledTest(unittest.TestCase):
 
         graph.failed(OVNNbCtlLs("b"))
         self.assertEqual(graph.state["ovn.ls:b"], NodeState.missing)
-        self.assertEqual(graph.counts()["applied"], 4)  # the address and its three routes
+        self.assertEqual(graph.counts()["applied"], 1)  # the address
 
 
 P, M, X, R, U = (
@@ -143,6 +128,12 @@ class ChooseTest(unittest.TestCase):
         self.assertFalse(choose([P, M, U]).run)
         self.assertFalse(choose([M, X]).run)
 
+    def test_what_cannot_be_told_is_marked_unchecked(self) -> None:
+        self.assertTrue(choose([U]).unchecked)
+        self.assertTrue(choose([P, M, U]).unchecked)
+        self.assertTrue(choose([M, X]).unchecked)
+        self.assertFalse(choose([P, U]).unchecked)  # there: left alone, but known
+
     def test_without_a_learned_step_only_reads_run(self) -> None:
         self.assertTrue(choose([R]).run)
         self.assertFalse(choose([U]).run)
@@ -153,14 +144,14 @@ class ChooseTest(unittest.TestCase):
 class StepStateTest(unittest.TestCase):
     def test_states_from_the_live_rawir(self) -> None:
         switch = OVNNbCtlLs("a")
-        self.assertEqual(step_state(switch, {}, ())[0], StepState.missing)
+        self.assertEqual(step_state(switch, {})[0], StepState.missing)
         live = {"ovn.ls:a": {"id": "ovn.ls:a", "kind": "ovn.ls", "name": "a"}}
-        self.assertEqual(step_state(switch, live, ())[0], StepState.present)
+        self.assertEqual(step_state(switch, live)[0], StepState.present)
         capture = CaptureOperation("pid", "pid", ("docker", "inspect"))
-        self.assertEqual(step_state(capture, {}, ())[0], StepState.read)
-        self.assertEqual(step_state(DockerPull("h", "busybox"), {}, ())[0], StepState.unknown)
+        self.assertEqual(step_state(capture, {})[0], StepState.read)
+        self.assertEqual(step_state(DockerPull("h", "busybox"), {})[0], StepState.unknown)
         named_later = OVNNbCtlLs(RuntimeRef("name"))  # type: ignore[arg-type]
-        self.assertEqual(step_state(named_later, {}, ())[0], StepState.unknown)
+        self.assertEqual(step_state(named_later, {})[0], StepState.unknown)
 
     def test_a_step_that_only_changes_fields_is_checked_by_them(self) -> None:
         footprint = {
@@ -175,21 +166,51 @@ class StepStateTest(unittest.TestCase):
         bridge_a: dict[str, Any] = {"externalIds": {"ovn-bridge-mappings": "a", "other": "x"}}
         bridge_b: dict[str, Any] = {"portRefs": ["ovs.port:p", "ovs.port:q"]}
         with mock.patch("fabric.desired.rawir", return_value=footprint):
-            state = step_state(OVNNbCtlLs("x"), {"ovs.bridge:br-a": bridge_a}, ())[0]
+            state = step_state(OVNNbCtlLs("x"), {"ovs.bridge:br-a": bridge_a})[0]
             self.assertEqual(state, StepState.partial)
             live = {"ovs.bridge:br-a": bridge_a, "ovs.bridge:br-b": bridge_b}
-            self.assertEqual(step_state(OVNNbCtlLs("x"), live, ())[0], StepState.present)
+            self.assertEqual(step_state(OVNNbCtlLs("x"), live)[0], StepState.present)
             empty: dict[str, dict[str, Any]] = {"ovs.bridge:br-a": {"externalIds": {}}}
-            self.assertEqual(step_state(OVNNbCtlLs("x"), empty, ())[0], StepState.missing)
+            self.assertEqual(step_state(OVNNbCtlLs("x"), empty)[0], StepState.missing)
 
-    def test_partly_there_and_excluded_nodes(self) -> None:
-        addr = HOST.netns("ns-x").add_addr("eth0", "10.1.2.3/24")
-        ids = list(rawir(addr)["added"])
+    def test_what_a_later_step_took_away_counts_as_there(self) -> None:
+        side = OVNNbCtlLs("side")  # stands for a kernel router side
+        move = OVNNbCtlLs("move")  # stands for the move into the container
+        prints = {
+            "side": {
+                "added": {
+                    "link:ns|veth": {"netnsRef": "netns:ns"},
+                    "addr:ns|veth|10.0.0.1/24": {"linkRef": "link:ns|veth"},
+                },
+                "changed": {},
+            },
+            "move": {
+                "added": {"link:c|veth": {"netnsRef": "netns:c"}},
+                "changed": {},
+                "removed": ["link:ns|veth"],
+            },
+        }
+        with mock.patch("fabric.desired.rawir", side_effect=lambda op: prints[op.name]):
+            moved: dict[str, dict[str, Any]] = {"link:c|veth": {}}
+            later = consumed_later([[side], [move]], moved)
+            self.assertEqual(later, [{"link:ns|veth": True}, {}])
+            # the link and the address on it went with the move: there
+            self.assertEqual(step_state(side, moved, later[0])[0], StepState.present)
+            # the move did not happen: the side is checked where it put things
+            empty: dict[str, dict[str, Any]] = {}
+            later = consumed_later([[side], [move]], empty)
+            self.assertEqual(step_state(side, empty, later[0])[0], StepState.missing)
+            # and the desired RawIR has the link where the move left it
+            desired = desired_rawir([("side", side), ("move", move)])
+            self.assertIn("link:c|veth", desired.nodes)
+            self.assertNotIn("link:ns|veth", desired.nodes)
+
+    def test_partly_there(self) -> None:
+        bridge = OVSBridge("br-x")
+        ids = list(rawir(bridge)["added"])
         self.assertGreater(len(ids), 1)
         live = {ids[0]: {"id": ids[0]}}
-        self.assertEqual(step_state(addr, live, ())[0], StepState.partial)
-        # what is excluded is no part of the footprint
-        self.assertEqual(step_state(addr, live, ids[1:])[0], StepState.present)
+        self.assertEqual(step_state(bridge, live)[0], StepState.partial)
 
 
 if __name__ == "__main__":

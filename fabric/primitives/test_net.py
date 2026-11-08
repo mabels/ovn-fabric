@@ -261,7 +261,9 @@ class NetnsPrimitiveTest(unittest.TestCase):
                         "eth0.2280",
                         "netns",
                         "ns-router",
-                    )
+                    ),
+                    # back up, as its owner had it
+                    ("ip", "netns", "exec", "ns-router", "ip", "link", "set", "eth0.2280", "up"),
                 ],
             )
 

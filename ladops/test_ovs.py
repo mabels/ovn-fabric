@@ -93,7 +93,9 @@ class BridgeAndPortWriteTest(unittest.TestCase):
     def test_add_port_is_idempotent(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:
             mod.add_port("br-home", "ens18.128")
-        run.assert_called_once_with(["ovs-vsctl", "add-port", "br-home", "ens18.128"], None)
+        run.assert_called_once_with(
+            ["ovs-vsctl", "--may-exist", "add-port", "br-home", "ens18.128"], None
+        )
 
     def test_del_port_uses_if_exists(self) -> None:
         with mock.patch.object(mod, "run_in_netns") as run:
@@ -101,6 +103,27 @@ class BridgeAndPortWriteTest(unittest.TestCase):
         run.assert_called_once_with(
             ["ovs-vsctl", "--if-exists", "del-port", "br-home", "ens18.128"], None
         )
+
+
+class DeadPortTest(unittest.TestCase):
+    def test_a_port_whose_device_is_gone_is_left_out(self) -> None:
+        tables = {
+            "Bridge": [{"_uuid": "b", "name": "br-home", "ports": ["p-own", "p-live", "p-gone"]}],
+            "Port": [
+                {"_uuid": "p-own", "name": "br-home", "interfaces": "i-own"},
+                {"_uuid": "p-live", "name": "eth0.128", "interfaces": "i-live"},
+                {"_uuid": "p-gone", "name": "veth-ovn-x", "interfaces": "i-gone"},
+            ],
+            "Interface": [
+                {"_uuid": "i-own", "name": "br-home", "ofport": 65534},
+                {"_uuid": "i-live", "name": "eth0.128", "ofport": 3},
+                # a veth after a reboot: OVS keeps the record
+                {"_uuid": "i-gone", "name": "veth-ovn-x", "ofport": -1},
+            ],
+        }
+        with mock.patch.object(mod, "list_table", side_effect=lambda _argv, t: tables[t]):
+            ports = mod.list_bridge_ports()
+        self.assertEqual(sorted(p["port"] for p in ports), ["br-home", "eth0.128"])
 
 
 if __name__ == "__main__":

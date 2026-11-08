@@ -1,6 +1,6 @@
 """The unit executor: runs one unit of work.
 
-    UnitExecReq { unit, action: create|delete, inputs?, host?, dryRun? }
+    UnitExecReq { unit, action: create|delete, inputs?, host?, dryRun?, skip?, decide? }
       → LogMsg …    each operation and every command it runs (with output)
       → UnitExecRes { unit, state, message?, outputs }
 
@@ -26,6 +26,7 @@ import logging
 import re
 import shlex
 import socket
+from typing import cast
 
 from runtime import command
 from runtime.message import BodySpec, register_bodies
@@ -34,7 +35,8 @@ from runtime.service import Service
 
 from .. import generated as g
 from ..context import Ctx, Options
-from ..lifecycle import LifecycleAction, LifecycleController
+from ..decide import STARTS_AFRESH, Decided, Decision, Replaced, decide
+from ..lifecycle import LifecycleAction, LifecycleController, Primitive
 from ..units import to_operation
 
 log = logging.getLogger("fabric.unit")
@@ -147,10 +149,31 @@ class UnitExecutor:
             name=unit.name,
         )
         skip = set(req.skip or [])
+        decided = Decided()
+        decisions: list[g.StepDecision] = []
+        afresh = False  # a step started afresh what the later ones build on
         for index, step in enumerate(unit.steps):
-            if index in skip:
+            if index in skip and not afresh:
                 continue  # already there (apply found it in the live RawIR)
-            await lc.run(to_operation(step, lc.graph.host))
+            operation = to_operation(step, lc.graph.host)
+            # Only a primitive step decides (the kind tags the union).
+            primitive = step if step.kind == "Primitive" else None
+            spec = primitive.decide if req.decide and primitive is not None else None
+            if primitive is not None and spec is not None:
+                # Its own live state decides (fabric/decide.py) — before any
+                # step of the unit runs.
+                decision = await decide(spec, decided, lc)
+                decided.by_key[primitive.key] = decision
+                decisions.append(g.StepDecision(index=index, decision=g.Decision(decision.value)))
+                await call.log("info", f"{primitive.key}: {decision.value}")
+                if spec.kind in STARTS_AFRESH and decision is not Decision.skip:
+                    afresh = True
+                if decision is Decision.skip:
+                    continue
+                if decision is Decision.replace:
+                    # A Primitive step loads as a Primitive (fabric/units.py).
+                    operation = Replaced(cast(Primitive, operation))
+            await lc.run(operation)
         await call.log("info", f"{req.action.value} ({len(unit.steps)} steps)")
 
         state, message = g.IrApplyOutcome.done, None
@@ -173,6 +196,7 @@ class UnitExecutor:
                 g.UnitValue(name=name, json=json.dumps(value))
                 for name, value in sorted(ctx.store.items())
             ],
+            decisions=decisions or None,
         )
 
 

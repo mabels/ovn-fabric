@@ -404,7 +404,7 @@ async def _ir_apply(args: argparse.Namespace) -> int:
     """Apply a stored IR — or store one first (--put FILE, or from stdin
     when no REF is given) and apply that. `run` and `delete` without REF
     and with nothing piped in: the IR that is deployed (the store's name
-    `deployed`, set by create)."""
+    `deployed`, set by create and run)."""
     ref = args.ref
     put = args.put
     piped = not sys.stdin.isatty()
@@ -432,6 +432,7 @@ async def _ir_apply(args: argparse.Namespace) -> int:
         dryRun=args.dry_run or None,
         commandTimeout=args.command_timeout,
         keepDeployed=args.keep_deployed or None,
+        noCleanup=args.no_cleanup or None,
     )
     res = await _ask(args.address, req)
     if not isinstance(res, g.IrApplyRes):
@@ -632,8 +633,8 @@ def main() -> int:
     ir_apply = commands.add_parser(
         "ir-apply",
         help="apply a stored IR on the runtime's host (create, delete rewound, or run "
-        "— converge to the deployed IR: create what is missing, of the primitives "
-        "reconciled so far; --dry-run: the comparison and what it would do)",
+        "— converge to the deployed IR: create what is missing, remove the leftovers; "
+        "--dry-run: the comparison and what it would do)",
     )
     ir_apply.add_argument("action", choices=[a.value for a in g.ApplyAction])
     ir_apply.add_argument(
@@ -649,6 +650,12 @@ def main() -> int:
     ir_apply.add_argument("--name", help="with --put: store it under this name")
     ir_apply.add_argument("--host", help="which of the IR's hosts (default: the runtime's)")
     ir_apply.add_argument("--dry-run", action="store_true", help="describe, run nothing")
+    ir_apply.add_argument(
+        "--no-cleanup",
+        action="store_true",
+        help="run: keep leftovers — what is ours on the host but not in the IR "
+        "(default: remove them once every unit is done)",
+    )
     ir_apply.add_argument(
         "--keep-deployed",
         action="store_true",

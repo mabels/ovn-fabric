@@ -206,6 +206,9 @@ class WireguardPrimitive(CommandPrimitive):
     netns: str
     iface: str
     conf_path: str
+    # The config it is brought up with (written to conf_path by its unit):
+    # what its decider compares the file on the host with.
+    conf: str = ""
 
     @property
     def ref(self) -> str:
@@ -738,8 +741,8 @@ class NetnsLinkPrimitive(CommandPrimitive):
 class LinkMovePrimitive(CommandPrimitive):
     """An existing link lent by its namespace (`netns`, its owner's) to
     another one (`to`): CREATE moves it there and sets it up; DELETE moves
-    it back, so its owner finds it again for its own delete. Neither
-    creates nor deletes the link."""
+    it back and up again, as its owner had it. Neither creates nor deletes
+    the link."""
 
     host: str
     netns: str
@@ -781,6 +784,11 @@ class LinkMovePrimitive(CommandPrimitive):
                 Command(
                     f"{self.host}:link {self.name} -> {self.netns}",
                     _prefix(self.to, ("ip", "link", "set", self.name, "netns", self.netns)),
+                    optional=True,
+                ),
+                Command(
+                    f"{self.host}:link {self.name} (up again)",
+                    _prefix(self.netns, ("ip", "link", "set", self.name, "up")),
                     optional=True,
                 ),
             ),

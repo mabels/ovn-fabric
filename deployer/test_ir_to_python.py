@@ -42,6 +42,7 @@ from collections.abc import Collection, Sequence
 from typing import Any, cast
 from unittest import mock
 
+from fabric.decide import Decide
 from fabric.lifecycle import LifecycleAction
 from protocol import AppDhcpClient, AppDocker, AppWireguard, AppZerotier
 from protocol import generated as pt
@@ -175,6 +176,7 @@ class _OpEmitter(Emitter):
         *,
         bind: str | None = None,
         parent: str | None = None,
+        decide: Decide = Decide.footprint,
     ) -> None:
         if primitive.step_kind != "Primitive":  # done in Python (fs.dir, …)
             action = LifecycleAction.DELETE if self._delete else LifecycleAction.CREATE
@@ -354,6 +356,7 @@ NODES: list[pt.Model] = [
             ovnRole=pt.OvnRole.central,
             encapIp="10.0.0.1",
             os=pt.HostOs(name="ubuntu", version="26.04", packageManager=pt.PackageManager.apt),
+            reconcile=pt.HostReconcile(hostInterfaces=["lo"]),
         ),
     ),
     pt.InfraHostNode(
@@ -365,6 +368,7 @@ NODES: list[pt.Model] = [
             ovnRole=pt.OvnRole.chassis,
             encapIp="10.0.0.2",
             os=pt.HostOs(name="ubuntu", version="26.04", packageManager=pt.PackageManager.apt),
+            reconcile=pt.HostReconcile(hostInterfaces=["lo"]),
         ),
     ),
     pt.OvnLsNode(
@@ -814,7 +818,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
 
     def test_bridge_created_and_port_attached_on_the_owning_host(self) -> None:
         script = self.hosts["chassis-1"]
-        self.assertIn("ovs-vsctl add-port br-home eth0.129", script)
+        self.assertIn("ovs-vsctl --may-exist add-port br-home eth0.129", script)
 
     def test_veth_root_leg_is_left_to_its_router_unit(self) -> None:
         # The binding block only creates the bridge; the kernel-router
@@ -887,7 +891,7 @@ class IfaceBindingCreateTest(unittest.TestCase):
         # Re-running the create pass must not abort on an existing
         # bridge/port/VLAN (2026-09-19).
         script = self.hosts["chassis-1"]
-        self.assertIn("ovs-vsctl add-port", script)
+        self.assertIn("ovs-vsctl --may-exist add-port", script)
         self.assertIn("ip link add link eth0 name eth0.129 type vlan id 129", script)
 
 
@@ -976,9 +980,9 @@ class XdpBindingTest(unittest.TestCase):
         suffix = _short_suffix("br-home")
         trunk = f"veth-xdp-{suffix}"
         seg = f"veth-seg-{suffix}"
-        self.assertIn(f"ovs-vsctl add-port br-xdp {trunk}", script)
+        self.assertIn(f"ovs-vsctl --may-exist add-port br-xdp {trunk}", script)
         self.assertIn(f"ovs-vsctl set port {trunk} tag=1128", script)
-        self.assertIn(f"ovs-vsctl add-port br-home {seg}", script)
+        self.assertIn(f"ovs-vsctl --may-exist add-port br-home {seg}", script)
 
     def test_one_xdp_parent_trunks_every_segment_it_carries(self) -> None:
         nodes: list[pt.Model] = [
@@ -1034,8 +1038,8 @@ class XdpBindingTest(unittest.TestCase):
             script,
         )
         suffix = _short_suffix("br-home")
-        self.assertIn(f"ovs-vsctl add-port br-xdp veth-xdp-{suffix}", script)
-        self.assertIn(f"ovs-vsctl add-port br-home veth-seg-{suffix}", script)
+        self.assertIn(f"ovs-vsctl --may-exist add-port br-xdp veth-xdp-{suffix}", script)
+        self.assertIn(f"ovs-vsctl --may-exist add-port br-home veth-seg-{suffix}", script)
         # No VLAN, no tag.
         self.assertNotIn(f"ovs-vsctl set port veth-xdp-{suffix} tag=", script)
 
@@ -1078,7 +1082,7 @@ class FabricServiceTest(unittest.TestCase):
         body = self.hosts["chassis-1"].bindings
         self.assertIn("ip link add link eth0 name eth0.129 type vlan id 129", body)
         self.assertIn("ip link set eth0.129 up", body)
-        self.assertIn("ovs-vsctl add-port br-home eth0.129", body)
+        self.assertIn("ovs-vsctl --may-exist add-port br-home eth0.129", body)
 
     def test_one_service_runs_the_lazy_phase_once(self) -> None:
         host = self.hosts["chassis-1"]
@@ -3072,8 +3076,8 @@ class KernelServiceDeployTest(unittest.TestCase):
             create,
             r"ip -4 rule add from 10\.43\.0\.0/24 lookup 100\d",
         )
-        self.assertIn("ovs-vsctl add-port br-cont sc-", create)
-        self.assertIn("ovs-vsctl add-port br-cp sc-", create)
+        self.assertIn("ovs-vsctl --may-exist add-port br-cont sc-", create)
+        self.assertIn("ovs-vsctl --may-exist add-port br-cp sc-", create)
         # Create installs + starts a systemd unit (like the kernel router).
         self.assertIn(
             "write_file /etc/systemd/system/ovn-fabric.service",
@@ -3311,6 +3315,7 @@ class DnsServiceEndToEndTest(unittest.TestCase):
                     "connectAddress": "10.0.0.6",
                     "ovnRole": "central",
                     "os": {"name": "ubuntu", "version": "26.04", "packageManager": "apt"},
+                    "reconcile": {"hostInterfaces": ["lo"]},
                 },
             },
             {
@@ -3430,8 +3435,8 @@ class DnsServiceEndToEndTest(unittest.TestCase):
             s,
             r"ip -4 rule add from 10\.43\.0\.0/24 lookup 100\d",
         )
-        self.assertIn("ovs-vsctl add-port br-management-v2 sc-", s)
-        self.assertIn("ovs-vsctl add-port br-control-plane sc-", s)
+        self.assertIn("ovs-vsctl --may-exist add-port br-management-v2 sc-", s)
+        self.assertIn("ovs-vsctl --may-exist add-port br-control-plane sc-", s)
         # Same systemd mechanics as the kernel router: one unit per service.
         self.assertIn(
             "write_file /etc/systemd/system/ovn-fabric.service",

@@ -60,6 +60,7 @@ _CALL = {
     "canonical": "_canonical({})",
     "broadcast": "_broadcast({})",
     "netaddr": "_netaddr({})",
+    "map": "dict({})",
 }
 
 
@@ -108,6 +109,7 @@ def _each_body(cls: str, each: dict[str, str]) -> list[str]:
     return [
         "    added: dict[str, Any] = {}",
         "    changed: dict[str, Any] = {}",
+        "    removed: list[str] = []",
         f"    for element in {field}:",
         f"        match = re.fullmatch({pattern!r}, element)",
         "        if match is None:",
@@ -127,7 +129,8 @@ def render(templates: dict[str, Any], source: str) -> str:
         "What each primitive (fabric/primitives) does to RawIR, learned on a real",
         "system (ADR 0008): `rawir(primitive)` for a primitive object, or the function",
         "of its class with its fields. A footprint is the nodes the primitive",
-        'adds and the fields it changes on nodes that were there."""',
+        "adds, the fields it changes on nodes that were there, and the nodes it",
+        'takes away."""',
         "",
         "from __future__ import annotations",
         "",
@@ -137,7 +140,8 @@ def render(templates: dict[str, Any], source: str) -> str:
         "from collections.abc import Callable",
         "from typing import Any",
         "",
-        "Footprint = dict[str, Any]  # {'added': {id: node}, 'changed': {id: {field: change}}}",
+        "# {'added': {id: node}, 'changed': {id: {field: change}}, 'removed': [id]}",
+        "Footprint = dict[str, Any]",
         "",
         "",
         "class NotLearned(ValueError):",
@@ -202,7 +206,7 @@ def render(templates: dict[str, Any], source: str) -> str:
                     f'        raise NotLearned(f"{template["class"]}.{marker}={{{marker}!r}}: '
                     f'learned only with IPv{_FAMILY[kind]}")',
                 ]
-        used = repr(template["added"]) + repr(template["changed"])
+        used = repr(template["added"]) + repr(template["changed"]) + repr(template.get("removed"))
         unused = [
             p
             for p in template["params"]
@@ -217,18 +221,21 @@ def render(templates: dict[str, Any], source: str) -> str:
             out.append(f"    del {', '.join(unused)}  # not in RawIR")
         if each:
             out += _each_body(template["class"], each)
+        removed = template.get("removed", [])
         out += [
             "    return {",
             f"        'added': {expression(template['added'])},",
             f"        'changed': {expression(template['changed'])},",
+            f"        'removed': {expression(removed)},",
             "    }",
             "",
         ]
         if each:
-            out[-5:] = [
+            out[-6:] = [
                 f"        added.update({expression(template['added'])})",
                 f"        changed.update({expression(template['changed'])})",
-                "    return {'added': added, 'changed': changed}",
+                f"        removed.extend({expression(removed)})",
+                "    return {'added': added, 'changed': changed, 'removed': removed}",
                 "",
             ]
         table.setdefault(template["class"], []).append(name)

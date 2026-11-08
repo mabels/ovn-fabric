@@ -81,6 +81,8 @@ class DockerPrimitiveTest(unittest.TestCase):
                     "none",
                     "--name",
                     "ovn-fabric-dns",
+                    "--label",
+                    f"ovn-fabric.spec={docker.spec}",  # what it runs with, hashed
                     "-e",
                     "A=1",
                     "-v",
@@ -106,6 +108,7 @@ class DockerPrimitiveTest(unittest.TestCase):
                     "ovn-fabric-dns",
                     "/var/lib/ovn-fabric/build/dns/Dockerfile",
                     "/var/lib/ovn-fabric/build/dns",
+                    "abc",
                 ),
             )
             argv = [command[1] for command in job.commands]
@@ -115,6 +118,8 @@ class DockerPrimitiveTest(unittest.TestCase):
                     "build",
                     "-t",
                     "ovn-fabric-dns",
+                    "--label",
+                    "ovn-fabric.spec=abc",
                     "-f",
                     "/var/lib/ovn-fabric/build/dns/Dockerfile",
                     "/var/lib/ovn-fabric/build/dns",

@@ -53,12 +53,14 @@ from deployer.ir_common import (
 from protocol import generated as pt
 
 from . import generated as g
+from .decide import Decide, spec
 from .lifecycle import (
     CaptureOperation,
     RuntimeRef,
     SymlinkNetnsOperation,
     WriteFileOperation,
 )
+from .primitives.host import HostPrimitive
 from .units import to_step
 
 
@@ -107,9 +109,9 @@ class PlanEmitter(Emitter):
     def blank(self) -> None:
         return None
 
-    def _add(self, operation: Any) -> None:
+    def _add(self, operation: Any, decide: Decide = Decide.footprint) -> None:
         resolved = self._resolve(operation)
-        step = to_step(resolved)
+        step = to_step(resolved, spec(decide, resolved))
         if self._unit is None:
             raise PlanError(f"{self.label}: {_what(step)} is declared outside any unit")
         newest = self.plan.units[-1]
@@ -123,10 +125,17 @@ class PlanEmitter(Emitter):
 
     # -- what the declarations call ----------------------------------------------
 
-    def ovn(self, primitive: Any, *, bind: str | None = None, parent: str | None = None) -> None:
+    def ovn(
+        self,
+        primitive: Any,
+        *,
+        bind: str | None = None,
+        parent: str | None = None,
+        decide: Decide = Decide.footprint,
+    ) -> None:
         # `bind`/`parent` only shaped the rendered code; the operation is the
         # primitive itself.
-        self._add(primitive)
+        self._add(primitive, decide)
 
     def append(self, path: str, content: str) -> None:
         self._add(WriteFileOperation(path, content))
@@ -241,6 +250,62 @@ def plan_operations(nodes: Sequence[pt.Model], host: str) -> list[tuple[str, Any
     return [entry for plan in _plans(nodes, host) for entry in plan.operations]
 
 
+# Where scripts/fabric-install.sh puts the runtime.
+_PEX = "/usr/local/lib/ovn-fabric/fabric.pex"
+_SOCKET = "/run/ovn-fabric.sock"
+_REFS = "/var/lib/ovn-fabric/ir/refs.json"
+_BOOT_UNIT = "ovn-fabric-reconcile.service"
+_BOOT_SCRIPT = "/usr/local/lib/ovn-fabric/reconcile-on-boot"
+
+
+def _emit_boot(host: str, emit: Emitter) -> None:
+    """At boot the host comes back to the IR last fed to it (the store's name
+    `deployed`): a unit of its own, so restarting the runtime applies nothing.
+    Without a deployed IR (it was deleted) it does nothing. No cleanup yet:
+    nobody is watching a boot."""
+    primitives = HostPrimitive(host)
+    unit = emit.unit("boot", "reconcile")
+    unit.append(
+        _BOOT_SCRIPT,
+        "\n".join(
+            [
+                "#!/bin/sh",
+                f"grep -q '\"deployed\"' {_REFS} 2>/dev/null || exit 0",
+                "i=0",
+                f"until python3 {_PEX} --socket {_SOCKET} version >/dev/null 2>&1; do",
+                "  i=$((i + 1))",
+                '  [ "$i" -lt 60 ] || exit 1',
+                "  sleep 1",
+                "done",
+                f"exec python3 {_PEX} --socket {_SOCKET} ir-apply run deployed --no-cleanup",
+            ]
+        ),
+    )
+    unit.ovn(primitives.chmod(_BOOT_SCRIPT, "755"))
+    unit.append(
+        f"/etc/systemd/system/{_BOOT_UNIT}",
+        "\n".join(
+            [
+                "[Unit]",
+                "Description=ovn-fabric: run the deployed IR at boot",
+                "Requires=ovn-fabric.service",
+                "After=ovn-fabric.service network-online.target",
+                "Wants=network-online.target",
+                "",
+                "[Service]",
+                "Type=oneshot",
+                "Environment=PEX_ROOT=/var/cache/ovn-fabric/pex",
+                f"ExecStart={_BOOT_SCRIPT}",
+                "TimeoutStartSec=infinity",
+                "",
+                "[Install]",
+                "WantedBy=multi-user.target",
+            ]
+        ),
+    )
+    unit.ovn(primitives.systemd_enabled(_BOOT_UNIT), decide=Decide.always)
+
+
 def _plans(nodes: Sequence[pt.Model], host: str) -> list[_Plan]:
     all_nodes = list(nodes)
     host_node = next(
@@ -267,6 +332,7 @@ def _plans(nodes: Sequence[pt.Model], host: str) -> list[_Plan]:
         name = node.key.name
         faces = _service_faces(name, host, all_nodes)
         plans.append(_scope(name, functools.partial(_emit_service_up, node, faces)))
+    plans.append(_scope("boot", functools.partial(_emit_boot, host)))
     names: set[str] = set()
     for unit in (unit for plan in plans for unit in plan.units):
         if unit.name in names:
