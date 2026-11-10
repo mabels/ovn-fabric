@@ -29,6 +29,7 @@
   },
   "fmt": {
     "include": [
+      "ui/**/*.tsx",
       "src/**/*.ts",
       "examples/**/*.ts",
       "fabric/**/*.ts",
@@ -37,6 +38,7 @@
   },
   "lint": {
     "include": [
+      "ui/**/*.tsx",
       "src/**/*.ts",
       "examples/**/*.ts",
       "fabric/**/*.ts",

@@ -1116,10 +1116,15 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
   );
   // The netns backroutes are scoped to the tunnel router's OWN domain:
   // only the neighbor subnet comes back into the netns (no home/voda
-  // leakage) — the whole point of the separate domains.
+  // leakage) — the whole point of the separate domains. Plus its twin
+  // router's own networks (here the backbone): what it masquerades comes
+  // back from there (ADR 0009).
   assertEquals(
     node(nodes, "kernelrouter:router-mullvad-de|side:left").data["routes"],
-    [{ dst: "192.168.130.0/24", via: "10.12.81.1" }],
+    [
+      { dst: "192.168.130.0/24", via: "10.12.81.1" },
+      { dst: "172.22.0.0/16", via: "10.12.81.1" },
+    ],
   );
 });
 
@@ -1784,6 +1789,123 @@ Deno.test('platform: role "dns" replaces the built-in service and supplies the r
   assertEquals(
     network.platformControlPlane?.resolver?.nameservers.map((n) => n.to_s()),
     ["10.43.0.10"],
+  );
+});
+
+// A control plane, a segment with a gateway, another router on the backbone.
+function ingressNetwork(ingress: boolean) {
+  return defineNetwork("test-net", (net) => {
+    const host = net.localHost({ name: "chassis-1" });
+    const backbone = net.collisionDomain("bb");
+    const domain = net.routingDomain("mesh");
+    const segment = net.collisionDomain("seg");
+    const controlPlane = net.collisionDomain("control-plane");
+    net.createPlatform("plat", {
+      controlPlane: {
+        collisionDomain: controlPlane,
+        hosts: [host],
+        routingDomains: [domain],
+        ipaddrs: [IPv4.parse("10.43.0.1/24")],
+        ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
+        ...(ingress ? { ingress: [segment] } : {}),
+      },
+      zones: [],
+      services: [{ service: net.service("app", { image: "x" }) }],
+      egress: [{ l2Segment: backbone, ipaddrs: [IPv4.parse("172.16.0.2/16")] }],
+    });
+    const gateway = net.defineOvnRouter("gw", (router) => ({
+      routingDomains: [domain],
+      endpoints: [
+        router.ovnRouterEndpoint({
+          l2Segment: segment,
+          ipaddrs: [IPv4.parse("192.168.129.1/24")],
+          ifaces: [{ host, iface: { kind: "physical", name: "eth1" } }],
+        }),
+        router.ovnRouterEndpoint({
+          l2Segment: backbone,
+          ipaddrs: [IPv4.parse("172.16.0.129/16")],
+        }),
+      ],
+    }));
+    const other = net.defineOvnRouter("other", (router) => ({
+      routingDomains: [domain],
+      endpoints: [
+        router.ovnRouterEndpoint({
+          l2Segment: net.collisionDomain("seg2"),
+          ipaddrs: [IPv4.parse("192.168.128.1/24")],
+        }),
+        router.ovnRouterEndpoint({
+          l2Segment: backbone,
+          ipaddrs: [IPv4.parse("172.16.0.128/16")],
+        }),
+      ],
+    }));
+    return { hosts: [host], routers: [gateway, other] };
+  });
+}
+
+Deno.test("platform ingress: the segment's gateway gets a masquerading leg", () => {
+  const nodes = Object.values(toIR(ingressNetwork(true))) as unknown as {
+    id: string;
+    kind: string;
+    key: { name: string };
+    data: {
+      l2Segment: string;
+      addresses: string[];
+      gatewayChassis?: string;
+      rules: { kind: string; logicalIps: string[]; gatewayPort?: string }[];
+    };
+  }[];
+  const legs = nodes.filter((n) =>
+    n.kind === "ovn.lrp" && n.id.startsWith("ovnrouter:gw|") &&
+    n.data.l2Segment === "ls:control-plane"
+  );
+  assertEquals(legs.length, 1);
+  assertEquals(legs[0]!.data.addresses, ["10.43.0.12/24"]); // after app .10, dns .11
+  assertEquals(legs[0]!.data.gatewayChassis, "host:chassis-1");
+  const snat = nodes.filter((n) => n.kind === "security.group")
+    .flatMap((n) => n.data.rules).filter((r) => r.kind === "snat");
+  assertEquals(snat.length, 1);
+  assertEquals(snat[0]!.logicalIps, ["192.168.129.0/24"]); // not the backbone
+  assertEquals(snat[0]!.gatewayPort, legs[0]!.key.name);
+});
+
+Deno.test("platform ingress: no other router learns a way in through the leg", () => {
+  const routes = (ingress: boolean): string[] =>
+    Object.keys(toIR(ingressNetwork(ingress)))
+      .filter((id) => id.includes("|route:")).sort();
+  const without = routes(false);
+  const withIngress = routes(true);
+  assertEquals(withIngress.filter((id) => !without.includes(id)), []);
+  const gone = without.filter((id) => !withIngress.includes(id));
+  // Only the gateway's own route to it: now on-link.
+  assertEquals(gone.length, 1);
+  assertEquals(gone[0]!.startsWith("ovnrouter:gw|"), true);
+  assertEquals(gone[0]!.includes("10.43.0.0/24"), true);
+});
+
+Deno.test("platform ingress: a segment needs exactly one gateway router", () => {
+  assertThrows(
+    () =>
+      defineNetwork("test-net", (net) => {
+        const host = net.localHost({ name: "chassis-1" });
+        net.createPlatform("plat", {
+          controlPlane: {
+            collisionDomain: net.collisionDomain("control-plane"),
+            hosts: [host],
+            ipaddrs: [IPv4.parse("10.43.0.1/24")],
+            ingress: [net.collisionDomain("nobody")],
+          },
+          zones: [],
+          egress: [{
+            l2Segment: net.collisionDomain("bb"),
+            ipaddrs: [IPv4.parse("172.16.0.2/16")],
+          }],
+        });
+        return { hosts: [host], routers: [] };
+      }),
+    Error,
+    'segment "nobody"',
   );
 });
 

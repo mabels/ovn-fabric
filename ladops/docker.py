@@ -9,6 +9,10 @@ def _run(args: list[str]) -> str:
     return subprocess.run(args, check=True, capture_output=True, text=True).stdout
 
 
+# The label a container declares its natural key with (ADR 0010).
+NATURAL_KEY_LABEL = "ovn-fabric.natural-key"
+
+
 def list_containers() -> list[dict[str, Any]]:
     ids = _run(["docker", "ps", "-q"]).split()
     if not ids:

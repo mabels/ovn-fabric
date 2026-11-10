@@ -43,13 +43,14 @@ from typing import Any
 from deployer.deps import abstract_deps
 from protocol import generated as pt
 from protocol.hydrate import hydrate_nodes
+from raw_reconciler.natural_key import natural_keys
 from raw_reconciler.owners import OVN_FABRIC, mark_host, ours
 from runtime import generated as rg
 from runtime.message import BodySpec, ProtocolError, plain, register_bodies
 from runtime.peer import Call, Peer, RemoteError
 from runtime.service import Service
 
-from .. import cleanup, observed
+from .. import cleanup, observed, release
 from .. import generated as g
 from ..decide import STARTS_AFRESH
 from ..desired import (
@@ -366,6 +367,22 @@ class Apply:
             raise ProtocolError("failed", f"cannot collect the live RawIR: {exc}") from None
         host_node = next(n for n in nodes if isinstance(n, pt.InfraHostNode) and n.key.host == host)
         _mark_host(live, host_node, operations)
+        # Release before claim (ADR 0010): a leftover holding a single
+        # resource the plan claims goes first — and out of the first look,
+        # so the step claiming it runs.
+        released: list[g.ApplyUnit] = []
+        found = await self._releases(call, live, [resolve(op, {}) for _unit, op in operations])
+        if found and req.noCleanup:
+            await call.log("info", "release before claim skipped (--no-cleanup)")
+        elif found:
+            held = {item.node_id: live[item.node_id] for item in found}
+            released.append(
+                await self._remove(
+                    call, req, host, "release before claim", cleanup.removal_order(held.values())
+                )
+            )
+            for node_id in held:
+                live.pop(node_id, None)
         graph = Reconciled.of(ours(live), desired_rawir(operations).nodes)
         by_unit: dict[str, list[Any]] = collections.defaultdict(list)
         for unit_name, operation in operations:
@@ -416,7 +433,7 @@ class Apply:
             return Pick(choice.skip)
 
         await call.log("info", f"run {info.hash} on {host}: {len(plan)} units")
-        results = await self._run(call, plan, req, host, choose=choose_unit)
+        results = [*released, *await self._run(call, plan, req, host, choose=choose_unit)]
         for result in results:  # what run did, into the reconciled graph
             for step in ran_of.get(result.name, []):
                 if result.state is g.ApplyState.done:
@@ -462,13 +479,19 @@ class Apply:
         """The end of a run: what the first look found to be ours and no
         step fulfilled is removed (fabric/cleanup.py)."""
         left = await self._leftovers(call, live, steps)
-        name = "cleanup: leftovers"
+        return await self._remove(call, req, host, "cleanup: leftovers", left)
+
+    async def _remove(
+        self, call: Call, req: g.IrApplyReq, host: str, name: str, nodes: list[Any]
+    ) -> g.ApplyUnit:
+        """Remove `nodes` (in the order given) as one unit, best effort."""
         await self._progress(call, g.ApplyUnit(name=name, state=g.ApplyState.running))
         client = await self._client()
+        unit = cleanup.unit(nodes)
         res = await client.ask(
             g.UnitExecReq(
                 kind="UnitExecReq",
-                unit=cleanup.unit(left),
+                unit=dataclasses.replace(unit, name=name),
                 action=g.ApplyAction.delete,
                 host=host,
                 commandTimeout=req.commandTimeout,
@@ -481,11 +504,28 @@ class Apply:
         result = g.ApplyUnit(
             name=name,
             state=g.ApplyState.done if done else g.ApplyState.failed,
-            operations=len(left),
+            operations=len(nodes),
             message=res.body.message,
         )
         await self._progress(call, result)
         return result
+
+    @staticmethod
+    async def _releases(
+        call: Call, live: dict[str, dict[str, Any]], steps: list[Any]
+    ) -> list[release.Release]:
+        """The leftovers holding a single resource the plan claims (ADR
+        0010) — logged; not removed yet."""
+        fulfilled, _untranslated = crossed_out(steps, live)
+        left = [node["id"] for node in cleanup.leftovers(ours(live), fulfilled)]
+        found = release.find(steps, live, left)
+        await call.log("info", f"release before claim: {len(found)}")
+        for item in found:
+            await call.log(
+                "info",
+                f"release {item.node_id} (holds {item.key}, claimed by {item.claimed_by})",
+            )
+        return found
 
     @staticmethod
     async def _leftovers(
@@ -559,7 +599,13 @@ class Apply:
         """What run would do now, per unit (as _converge chooses). Steps with
         a value only known at run time cannot be checked here: they count as
         unknown (run checks them once the values are captured)."""
+        # The single resources and their natural keys (ADR 0010).
+        keys = natural_keys(live)
+        await call.log("info", f"natural keys: {len(keys)} single resources")
+        for node_id, key in sorted(keys.items()):
+            await call.log("debug", f"natural key: {node_id} = {key}")
         operations = plan_operations(nodes, host)
+        await self._releases(call, live, [resolve(op, {}) for _unit, op in operations])
         by_unit: dict[str, list[Any]] = collections.defaultdict(list)
         for unit_name, operation in operations:
             by_unit[unit_name].append(operation)

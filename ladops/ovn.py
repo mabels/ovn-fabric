@@ -196,8 +196,11 @@ def lrp_del_argv(name: str) -> list[str]:
     return [*_NBCTL, "--if-exists", "lrp-del", name]
 
 
-def lr_nat_add_argv(router: str, nat_type: str, external_ip: str, logical_ip: str) -> list[str]:
-    return [*_NBCTL, "lr-nat-add", router, nat_type, external_ip, logical_ip]
+def lr_nat_add_argv(
+    router: str, nat_type: str, external_ip: str, logical_ip: str, gateway_port: str | None = None
+) -> list[str]:
+    option = [] if gateway_port is None else [f"--gateway-port={gateway_port}"]
+    return [*_NBCTL, *option, "lr-nat-add", router, nat_type, external_ip, logical_ip]
 
 
 def lr_nat_del_argv(router: str, nat_type: str, external_ip: str | None = None) -> list[str]:

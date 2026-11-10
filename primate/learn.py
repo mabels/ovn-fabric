@@ -234,11 +234,13 @@ def template(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
 
 def no_trace(free: Mapping[str, Any], learned: Mapping[str, Any]) -> None:
     """A `free` field must leave no trace in what was learned: none of its
-    (longer) values shows up in the footprint."""
+    (longer) values shows up in the footprint. Unset (None), it has none."""
     footprint = repr((learned["added"], learned["changed"]))
     for field, value in free.items():
         parts = value if isinstance(value, tuple) else (value,)
         for part in parts:
+            if part is None:
+                continue
             text = str(part)
             if len(text) >= 4 and text in footprint:
                 raise Unexplained(f"free field {field}: {text!r} shows up in RawIR")

@@ -30,6 +30,65 @@ class RouteNodesTest(unittest.TestCase):
         self.assertIn("route:ns-x|ipv4|main|10.9.0.0/16|eth0|eth0|None", ids)
 
 
+class LinkNodesTest(unittest.TestCase):
+    def test_a_vlan_has_its_parent_by_name_and_its_id(self) -> None:
+        links = [
+            {
+                "ifname": "ovnkern",
+                "ifindex": 2,
+                "kind": "physical",
+                "mac": "bc:24:11:e8:68:a8",
+                "permMac": "bc:24:11:e8:68:a8",
+                "adminUp": True,
+            },
+            {
+                "ifname": "ovnkern.1131",
+                "ifindex": 9,
+                "kind": "vlan",
+                "linkName": "ovnkern",
+                "vlanId": 1131,
+                "mac": "bc:24:11:e8:68:a8",
+                "adminUp": True,
+            },
+        ]
+        with mock.patch.object(collect, "list_links_detail", return_value=links):
+            nodes, _ = collect._link_nodes([("*global*", None, None)])
+        vlan = next(n for n in nodes if n["id"].endswith("ovnkern.1131"))["collection"]
+        self.assertEqual(vlan["linkRef"], "link:*global*|ovnkern")
+        self.assertEqual(vlan["vlanId"], 1131)
+
+
+class MovedVlanTest(unittest.TestCase):
+    def test_a_vlan_in_a_netns_finds_its_parent_in_the_root_one(self) -> None:
+        def links(netns: str | None, pid: int | None = None) -> list[dict[str, Any]]:
+            if netns is None:
+                return [
+                    {
+                        "ifname": "ovnkern",
+                        "ifindex": 2,
+                        "kind": "physical",
+                        "mac": "bc:24:11:e8:68:a8",
+                        "adminUp": True,
+                    }
+                ]
+            return [
+                {
+                    "ifname": "ovnkern.2280",
+                    "ifindex": 5,
+                    "kind": "vlan",
+                    "linkIndex": 2,
+                    "vlanId": 2280,
+                    "mac": "bc:24:11:e8:68:a8",
+                    "adminUp": True,
+                }
+            ]
+
+        with mock.patch.object(collect, "list_links_detail", side_effect=links):
+            nodes, _ = collect._link_nodes([("*global*", None, None), ("ns-wan", "ns-wan", None)])
+        vlan = next(n for n in nodes if n["id"] == "link:ns-wan|ovnkern.2280")["collection"]
+        self.assertEqual(vlan["linkRef"], "link:*global*|ovnkern")
+
+
 class EnterableTest(unittest.TestCase):
     def test_a_link_of_a_container_that_is_gone_is_left_out(self) -> None:
         with mock.patch.object(collect.os.path, "exists", side_effect=lambda p: "alive" in p):

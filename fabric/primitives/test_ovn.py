@@ -190,6 +190,13 @@ class OvnnPrimitiveTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_an_snat_may_name_its_gateway_port(self) -> None:
+        nat = OVNNbCtlNat("r", "snat", "10.43.0.12", "192.168.129.0/24", gateway_port="lrp-x")
+        argv = nat.as_primitive().create_cmds[0].argv
+        self.assertLess(argv.index("--gateway-port=lrp-x"), argv.index("lr-nat-add"))
+        plain = OVNNbCtlNat("r", "snat", "10.43.0.12", "192.168.129.0/24")
+        self.assertFalse(any("gateway-port" in a for a in plain.as_primitive().create_cmds[0].argv))
+
     def test_an_snat_is_deleted_by_its_logical_ip_a_dnat_by_its_external_ip(self) -> None:
         snat = OVNNbCtlNat("r", "snat", "203.0.113.1", "10.0.0.0/24")
         dnat = OVNNbCtlNat("r", "dnat", "203.0.113.1", "10.0.0.5")

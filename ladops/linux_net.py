@@ -21,6 +21,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shlex
@@ -28,7 +29,7 @@ import subprocess
 from typing import Any
 
 from . import JsonObject
-from .netns import list_netns
+from .netns import list_netns, netns_exec_argv
 from .netns import run as run_in_netns
 
 
@@ -133,15 +134,24 @@ def list_links_detail(netns: str | None, pid: int | None = None) -> list[JsonObj
             "patch",
             "tun",
             "loopback",
+            "wireguard",
         }:
             link_type = "other"
+        data = info.get("info_data") or {}
         out.append(
             {
                 "ifname": entry["ifname"],
                 "ifindex": int(entry["ifindex"]),
                 "linkIndex": entry.get("link_index"),
+                # The parent by name, when it is in the same netns (ip gives
+                # link_index only across namespaces).
+                "linkName": entry.get("link"),
                 "kind": link_type,
                 "mac": entry.get("address"),
+                # The hardware's own MAC: `permaddr` only shows when the MAC
+                # was changed (ADR 0010).
+                "permMac": entry.get("permaddr") or entry.get("address"),
+                "vlanId": data.get("id") if link_type == "vlan" else None,
                 "mtu": entry.get("mtu"),
                 "master": entry.get("master"),
                 "adminUp": "UP" in entry.get("flags", []),
@@ -149,6 +159,26 @@ def list_links_detail(netns: str | None, pid: int | None = None) -> list[JsonObj
             }
         )
     return out
+
+
+def wireguard_key_hash(ifname: str, netns: str | None, pid: int | None = None) -> str | None:
+    """A hash of a WireGuard interface's private key — its identity, without
+    the secret (ADR 0010). None when `wg` cannot tell."""
+    argv = ["wg", "show", ifname, "private-key"]
+    if pid is not None:
+        argv = ["nsenter", "-t", str(pid), "-n", "--", *argv]
+        done = subprocess.run(argv, capture_output=True, text=True)
+    else:
+        done = subprocess.run(netns_exec_argv(argv, netns), capture_output=True, text=True)
+    key = done.stdout.strip()
+    if done.returncode != 0 or not key:
+        return None
+    return key_hash(key)
+
+
+def key_hash(secret: str) -> str:
+    """The hash a secret identity is known by in RawIR (never the secret)."""
+    return hashlib.sha256(secret.strip().encode()).hexdigest()[:16]
 
 
 def list_addrs(netns: str | None, pid: int | None = None) -> list[JsonObject]:

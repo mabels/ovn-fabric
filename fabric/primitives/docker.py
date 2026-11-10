@@ -18,6 +18,8 @@ IMAGE_TIMEOUT = 1800.0
 
 # The label a container or a built image carries: the hash of what it was
 # made from (fabric/decide.py compares it, a run restarts or rebuilds).
+from ladops.docker import NATURAL_KEY_LABEL  # noqa: E402
+
 SPEC_LABEL = "ovn-fabric.spec"
 
 
@@ -134,6 +136,9 @@ class DockerPrimitive(CommandPrimitive):
     # A hash of the files it gets through its volumes (written by its unit):
     # part of its spec, so that a changed file restarts it.
     files: str = ""
+    # What it is, by value (ADR 0010): a ZeroTier instance `zt:<node
+    # address>`. Set as a label, so that a run finds it under any name.
+    natural_key: str = ""
 
     @property
     def key(self) -> str:
@@ -161,6 +166,8 @@ class DockerPrimitive(CommandPrimitive):
         argv += ["--network", self.network, "--name", self.name]
         if labelled:
             argv += ["--label", f"{SPEC_LABEL}={self.spec}"]
+            if self.natural_key:
+                argv += ["--label", f"{NATURAL_KEY_LABEL}={self.natural_key}"]
         for key, value in sorted(self.environment):
             argv += ["-e", f"{key}={value}"]
         for host_path, container_path in self.volumes:

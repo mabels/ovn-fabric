@@ -572,6 +572,7 @@ export const SecurityGroupRule = type({
   family: "'ipv4'|'ipv6'",
   externalIp: "string",
   logicalIps: "string[]",
+  "gatewayPort?": "string",
 })).or(FilterRule);
 export const SecurityGroupKey = type({ name: "string" });
 export const SecurityGroupData = type({

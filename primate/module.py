@@ -172,9 +172,12 @@ def render(templates: dict[str, Any], source: str) -> str:
         pairs = template.get("pairs", {})
         each = template.get("each", {})
         # A marked field that may be None was learned with a value only
-        # (the root netns' name None is no netns `netns:None`).
+        # (the root netns' name None is no netns `netns:None`). A free field
+        # leaves no trace in RawIR, set or not.
         for field, kind in template["params"].items():
             if field in template["fixed"] or field in shapes or field in pairs or field in each:
+                continue
+            if field in template.get("free", ()):
                 continue
             if "None" in kind:
                 out += [

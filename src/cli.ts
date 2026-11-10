@@ -13,6 +13,8 @@ import {
   command,
   extendType,
   multioption,
+  number,
+  option,
   positional,
   run,
   string,
@@ -20,6 +22,7 @@ import {
 } from "npm:cmd-ts@0.13.0";
 import { pathToFileURL } from "node:url";
 
+import { buildGraph } from "./graph.ts";
 import { toIR } from "./ir.ts";
 import { buildJsonSchema } from "./protocol.ts";
 import { buildRawJsonSchema } from "./raw.ts";
@@ -95,6 +98,7 @@ const runtimeArgs = multioption({
 async function loadConfig(
   configPath: string,
   args: Readonly<Record<string, string>>,
+  fresh = false,
 ): Promise<NetworkDefinition> {
   // BEFORE the import: a topology is evaluated as it is imported, and
   // that is when it calls runtime().
@@ -112,7 +116,10 @@ async function loadConfig(
   // not the correct 6009-byte original). Constructing the URL via the
   // standard API instead of a string literal that merely starts with
   // "file://" sidesteps whatever static pattern that transform keys on.
-  const mod = await import(pathToFileURL(resolved).href);
+  const url = pathToFileURL(resolved);
+  // A changed topology is evaluated anew (serve-graph's reload).
+  if (fresh) url.search = `?t=${Date.now()}`;
+  const mod = await import(url.href);
 
   const found = Object.values(mod).find(isNetworkDefinition);
   if (!found) {
@@ -190,6 +197,80 @@ const generateIr = command({
     const net = await loadConfig(configPath, runtime);
     const nodes = toIR(net);
     console.log(JSON.stringify(Object.values(nodes), null, 2));
+  },
+});
+
+// ── serve-graph: the topology as a graph in the browser ─────────────
+// The page (ui/graph, bundled when it starts) and
+// /graph.json (src/graph.ts), built from the topology on every request: an
+// edit shows on the page's Reload.
+// The page's files (ui/graph). main.js is main.tsx bundled for the
+// browser when serve-graph starts (`deno bundle`, held in memory).
+const GRAPH_UI = new URL("../ui/graph/", import.meta.url);
+const GRAPH_FILES: Readonly<Record<string, { path: string; type: string }>> = {
+  "/index.html": { path: "index.html", type: "text/html; charset=utf-8" },
+  "/style.css": { path: "style.css", type: "text/css; charset=utf-8" },
+};
+const JS = "text/javascript; charset=utf-8";
+
+async function bundleGraphUi(): Promise<string> {
+  const main = new URL("main.tsx", GRAPH_UI);
+  const out = await new Deno.Command(Deno.execPath(), {
+    args: ["bundle", "--platform", "browser", "--minify", main.pathname],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  if (!out.success) {
+    throw new Error(
+      `bundling ${main.pathname} failed:\n${
+        new TextDecoder().decode(out.stderr)
+      }`,
+    );
+  }
+  return new TextDecoder().decode(out.stdout);
+}
+
+const serveGraph = command({
+  name: "serve-graph",
+  description: "Serve a page that draws the topology: segments, routers, " +
+    "kernel routers and workloads, with their addresses and routes.",
+  args: {
+    configPath: positional({
+      type: string,
+      displayName: "config-path",
+      description: "Path to a topology config module (e.g. config/topology.ts)",
+    }),
+    runtime: runtimeArgs,
+    port: option({ type: number, long: "port", defaultValue: () => 8090 }),
+    hostname: option({
+      type: string,
+      long: "hostname",
+      description: "Where to listen (default 127.0.0.1: this machine only)",
+      defaultValue: () => "127.0.0.1",
+    }),
+  },
+  handler: async ({ configPath, runtime, port, hostname }) => {
+    const mainJs = await bundleGraphUi();
+    Deno.serve({ port, hostname }, async (req) => {
+      const path = new URL(req.url).pathname;
+      if (path === "/main.js") {
+        return new Response(mainJs, { headers: { "content-type": JS } });
+      }
+      if (path === "/graph.json") {
+        try {
+          const graph = buildGraph(await loadConfig(configPath, runtime, true));
+          return Response.json(graph);
+        } catch (err) {
+          return Response.json({ error: String(err) }, { status: 500 });
+        }
+      }
+      const file = GRAPH_FILES[path === "/" ? "/index.html" : path];
+      if (file !== undefined) {
+        const body = await Deno.readFile(new URL(file.path, GRAPH_UI));
+        return new Response(body, { headers: { "content-type": file.type } });
+      }
+      return new Response("not found", { status: 404 });
+    });
   },
 });
 
@@ -327,6 +408,7 @@ const app = subcommands({
   cmds: {
     generate,
     "generate-ir": generateIr,
+    "serve-graph": serveGraph,
     "generate-pytypes": generatePytypes,
   },
 });

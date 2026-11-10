@@ -6,7 +6,7 @@ from typing import Any
 from unittest import mock
 
 from fabric.primitives.net import AddrPrimitive
-from fabric.primitives.ovn import OVNNbCtlLs, OVNNbCtlLsp
+from fabric.primitives.ovn import OVNNbCtlLs, OVNNbCtlLsp, OVNNbCtlNat
 from fabric.primitives.ovs import OVSBridge, OVSMapping
 
 from . import __main__ as primate_main
@@ -170,6 +170,34 @@ class ModuleTest(unittest.TestCase):
         self.assertIn("ovs.bridge:br-x", namespace["rawir"](OVSBridge("br-x"))["added"])
         with self.assertRaisesRegex(namespace["NotLearned"], "datapath='netdev'"):
             namespace["rawir"](OVSBridge("br-x", datapath="netdev"))
+
+    def test_a_free_field_may_be_unset_or_set(self) -> None:
+        # It leaves no trace in RawIR; a marked field that may be None does.
+        template = {
+            "class": "OVNNbCtlNat",
+            "params": {
+                "router": "str",
+                "type": "str",
+                "external_ip": "str",
+                "logical_ip": "str",
+                "reset": "bool",
+                "gateway_port": "str | None",
+            },
+            "fixed": {"type": "snat", "reset": False},
+            "free": ["gateway_port"],
+            "added": {"ovn.nat:{router}|{external_ip}|{logical_ip}": {"type": "snat"}},
+            "changed": {},
+            "volatile": [],
+            "leftover": [],
+        }
+        namespace: dict[str, Any] = {}
+        exec(
+            compile(module.render({"ovn_nb_ctl_nat": template}, "a test"), "generated", "exec"),
+            namespace,
+        )
+        for port in (None, "lrp-x"):
+            nat = OVNNbCtlNat("r", "snat", "10.0.0.1", "10.1.0.0/24", gateway_port=port)
+            self.assertIn("ovn.nat:r|10.0.0.1|10.1.0.0/24", namespace["rawir"](nat)["added"])
 
     def test_shapes_of_one_class_are_tried_in_order_pairs_by_key(self) -> None:
         params = {

@@ -5,9 +5,14 @@ import socket
 from datetime import datetime, timezone
 from typing import Any
 
-from ladops.docker import list_containers
+from ladops.docker import NATURAL_KEY_LABEL, list_containers
 from ladops.iptables import list_rules
-from ladops.linux_net import list_addrs, list_links_detail, list_routes
+from ladops.linux_net import (
+    list_addrs,
+    list_links_detail,
+    list_routes,
+    wireguard_key_hash,
+)
 from ladops.netns import list_netns
 from ladops.ovn import (
     list_acls,
@@ -64,15 +69,21 @@ def _link_nodes(
 ) -> tuple[list[dict[str, Any]], dict[tuple[str, int], str]]:
     nodes: list[dict[str, Any]] = []
     by_index: dict[tuple[str, int], str] = {}
-    raw_links: list[tuple[str, dict[str, Any]]] = []
+    raw_links: list[tuple[str, str | None, int | None, dict[str, Any]]] = []
     for ns, netns, pid in spaces:
         for link in list_links_detail(netns, pid):
-            raw_links.append((ns, link))
+            raw_links.append((ns, netns, pid, link))
             by_index[(ns, link["ifindex"])] = _link_id(ns, link["ifname"])
-    for ns, link in raw_links:
+    for ns, netns, pid, link in raw_links:
         link_ref = (
             by_index.get((ns, link["linkIndex"])) if link.get("linkIndex") is not None else None
         )
+        if link_ref is None and link.get("linkName"):
+            link_ref = _link_id(ns, link["linkName"])
+        if link_ref is None and link["kind"] == "vlan" and link.get("linkIndex") is not None:
+            # A VLAN moved into a netns: its parent NIC stays in the root one,
+            # and ip gives only its ifindex there.
+            link_ref = by_index.get((GLOBAL_NETNS, link["linkIndex"]))
         nodes.append(
             {
                 "id": _link_id(ns, link["ifname"]),
@@ -83,6 +94,13 @@ def _link_nodes(
                     "ifindex": link["ifindex"],
                     "linkKind": link["kind"],
                     "mac": link.get("mac"),
+                    "permMac": link.get("permMac"),
+                    "vlanId": link.get("vlanId"),
+                    "wgKeyHash": (
+                        wireguard_key_hash(link["ifname"], netns, pid)
+                        if link["kind"] == "wireguard"
+                        else None
+                    ),
                     "mtu": link.get("mtu"),
                     "linkRef": link_ref,
                     "peerRefs": [link_ref] if link_ref and link["kind"] == "veth" else [],
@@ -219,6 +237,9 @@ def _docker_nodes(containers: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "pid": container["pid"],
                 "state": container["state"],
                 "netnsRef": container["netnsRef"],
+                # What it declares itself to be (ADR 0010): a ZeroTier
+                # instance its node address.
+                "naturalKeyLabel": container.get("labels", {}).get(NATURAL_KEY_LABEL),
             },
         }
         for container in containers

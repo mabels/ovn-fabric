@@ -9,7 +9,7 @@ second check here.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from ladops import ovn as ovn_ops
@@ -158,11 +158,27 @@ CREATE_ORDER = (
 _ORDER = {kind: index for index, kind in enumerate(CREATE_ORDER)}
 
 
+# Never removed by the cleanup after a run, even when no step fulfils them:
+# a container is a workload — only `delete` or a release before claim (the
+# same natural key under another name, ADR 0010) takes it away.
+NEVER_CLEANED = ("docker.container",)
+
+
 def leftovers(nodes: Mapping[str, Node], fulfilled: set[str]) -> list[Node]:
-    """The nodes not fulfilled, in the order they are removed: the reverse
-    of a create, by kind; within a kind the reverse of how they were found.
-    A bridge's own link goes with the bridge."""
-    left = [node for node_id, node in nodes.items() if node_id not in fulfilled]
+    """The nodes not fulfilled, in removal_order. Kinds in NEVER_CLEANED are
+    not leftovers."""
+    return removal_order(
+        node
+        for node_id, node in nodes.items()
+        if node_id not in fulfilled and node["kind"] not in NEVER_CLEANED
+    )
+
+
+def removal_order(nodes: Iterable[Node]) -> list[Node]:
+    """The order nodes are removed in: the reverse of a create, by kind;
+    within a kind the reverse of how they were found. A bridge's own link
+    goes with the bridge."""
+    left = list(nodes)
     bridges = {f"link:{GLOBAL}|{node['name']}" for node in left if node["kind"] == "ovs.bridge"}
     created = [node for node in left if node["id"] not in bridges]
     created.sort(key=lambda node: _ORDER[str(node["kind"])])  # stable: found order

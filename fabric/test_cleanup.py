@@ -62,7 +62,7 @@ class CleanupTest(unittest.TestCase):
             "docker.container",
         )
         nodes = {kind: {"id": kind, "kind": kind, "name": "x"} for kind in kinds}
-        removed = [node["kind"] for node in cleanup.leftovers(nodes, set())]
+        removed = [node["kind"] for node in cleanup.removal_order(nodes.values())]
         self.assertEqual(removed, list(reversed(kinds)))
 
     def test_within_a_kind_the_reverse_of_how_they_were_found(self) -> None:
@@ -112,3 +112,14 @@ class CleanupTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NeverCleanedTest(unittest.TestCase):
+    def test_a_container_is_no_leftover(self) -> None:
+        from .cleanup import leftovers
+
+        nodes = {
+            "docker.container:x": {"id": "docker.container:x", "kind": "docker.container"},
+            "netns:ns-x": {"id": "netns:ns-x", "kind": "netns"},
+        }
+        self.assertEqual([n["id"] for n in leftovers(nodes, set())], ["netns:ns-x"])

@@ -398,6 +398,9 @@ export interface OvnSnatRule {
   readonly kind: "snat";
   readonly externalIp: IPv4 | IPv6;
   readonly logicalIps: readonly (IPv4 | IPv6)[];
+  /** The endpoint it goes out of, when that one is a gateway port: a router
+   * with several of them must be told which (`--gateway-port`). */
+  readonly gatewayPort?: string;
 }
 
 export type FilterDirection = "input" | "output" | "forward";
@@ -681,6 +684,10 @@ export interface RouterEndpointInputBase<
    * NAT/external egress sets this, not both. Undefined means "fully
    * distributed, no pinning" — OVN's own default. */
   readonly gatewayChassis?: Host;
+  /** A leg only for what this router itself routes into its network (the
+   * platform's ingress leg): no other router learns that network through
+   * it, and this router learns nothing through it. */
+  readonly routeIsolated?: boolean;
   /** Not designed yet — see SecurityGroupRef above. */
   readonly securityGroup?: SecurityGroupRef;
   /** IPv6 RA/SLAAC behavior on this endpoint's LRP — see
@@ -775,6 +782,9 @@ export interface KernelRouterEndpoint extends RouterEndpointInputBase {
    * shortcut builds `masq-<router>` implicitly. Every group must have
    * been declared via net.securityGroup() in the same defineNetwork call. */
   readonly securityGroups?: readonly SecurityGroupRef<"kernel">[];
+  /** The generated name of its transit collision domain (a tenant's or a
+   * wan's `svc` cable, ADR 0009); default `transit-<router>`. */
+  readonly transitName?: string;
 }
 
 /** The input shape for NetworkBuilder.tunnelRouterEndpoint() (define.ts)
@@ -818,6 +828,19 @@ export interface TunnelRouterEndpoint extends EndpointDefinition {
   readonly upstreamBackbone: {
     readonly l2Segment: CollisionDomain;
     readonly ipaddrs: readonly (IPv4 | IPv6)[];
+    /** Its leg's own routes, services (masq), gateway chassis and domains
+     * — a VPN gateway's NAT gateway onto internet-core (ADR 0009). */
+    readonly routes?: readonly RouterEndpointRoute[];
+    readonly services?: readonly RouterEndpointService[];
+    readonly gatewayChassis?: Host;
+    readonly routingDomains?: readonly RoutingDomain[];
+  };
+  /** Generated names (ADR 0009): its two cables and its upstream router;
+   * defaults `transit-<router>`, `backdoor-<router>`, `<router>-upstream`. */
+  readonly names?: {
+    readonly transit?: string;
+    readonly backdoor?: string;
+    readonly upstream?: string;
   };
   /** The RoutingDomains the INTERNAL upstream-peer router joins
    * (2026-08-23) — it needs the mesh's default route (learned via the
@@ -1008,8 +1031,9 @@ export type RouterEndpointService =
   // subnets to this (egress) endpoint's own address of that family. This
   // is router state (`lr-nat-add`), consumed by src/ir.ts's computeOvnNats
   // and never seen by resolveIpv6RaConfigs.
-  | { readonly kind: "ovn.ipv4.masq" }
-  | { readonly kind: "ovn.ipv6.masq" }
+  // `sources`: only these networks, not all the router's other subnets.
+  | { readonly kind: "ovn.ipv4.masq"; readonly sources?: readonly IPv4[] }
+  | { readonly kind: "ovn.ipv6.masq"; readonly sources?: readonly IPv6[] }
   | {
     readonly kind: "ovn.ipv4.block-ingress";
     readonly allow?: readonly DenyInputAllow[];
@@ -1300,6 +1324,11 @@ export interface PlatformControlPlane {
    * without them the platform builds no router of its own. */
   readonly ipaddrs?: readonly (IPv4 | IPv6)[];
   readonly ifaces?: readonly HostInterface[];
+  /** The segments that may reach the control plane. The router that is the
+   * segment's gateway gets a leg on the control plane, and masquerades the
+   * segment out of it: a client needs no route of its own, and a workload
+   * sees the leg's address (allocated like a service's). Needs `ipaddrs`. */
+  readonly ingress?: readonly CollisionDomain[];
 }
 
 export interface PlatformSpec {

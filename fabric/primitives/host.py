@@ -151,6 +151,7 @@ class HostPrimitive(CommandPrimitive):
         run_flags: Sequence[str] = (),
         remove_existing: bool = True,
         files: str = "",
+        natural_key: str = "",
     ) -> "DockerPrimitive":
         from .docker import DockerPrimitive
 
@@ -166,6 +167,7 @@ class HostPrimitive(CommandPrimitive):
             run_flags=tuple(run_flags),
             remove_existing=remove_existing,
             files=files,
+            natural_key=natural_key,
         )
 
     def docker_image(

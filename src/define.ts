@@ -32,6 +32,16 @@ import {
   type RouterEndpointContext,
 } from "./router-endpoints.ts";
 import { SecurityGroupBuilder } from "./security-group.ts";
+import {
+  type CorePrefixes,
+  Internet,
+  Tenant,
+  type TenantBuilder,
+  type TenantSpec,
+  Wan,
+  type WanBuilder,
+  type WanSpec,
+} from "./tenant.ts";
 import { addHostOffset } from "./ip.ts";
 import type { IPv4, IPv6 } from "./ip.ts";
 import {
@@ -176,7 +186,14 @@ class PlatformImpl implements Platform {
     this.#initialized = true;
     const cp = this.spec.controlPlane;
     // No wiring declared → the platform is just a tag (segment/domain/hosts).
-    if (!cp.ipaddrs) return;
+    if (!cp.ipaddrs) {
+      if (cp.ingress?.length) {
+        throw new Error(
+          `platform "${this.name}": controlPlane.ingress needs ipaddrs`,
+        );
+      }
+      return;
+    }
     const ipaddrs = cp.ipaddrs;
     // The BUILT-IN platform services that are in the active set, in REGISTRY
     // order (an omitted id takes its default; IGNORE / delPlatformSvc drops
@@ -296,13 +313,25 @@ class PlatformImpl implements Platform {
     // The router NAME is inferred from the platform name. It lands in the
     // network's router set because the platform defines it THROUGH the
     // network reference it was created with — nothing to report.
-    this.#netRef.defineOvnRouter(`router-${this.name}`, (router) => ({
+    const routerName = `router-${this.name}`;
+    this.#netRef.defineOvnRouter(routerName, (router) => ({
       routingDomains: cp.routingDomains ? [...cp.routingDomains] : [],
       endpoints: [
         router.ovnRouterEndpoint(controlPlaneLeg),
         ...this.#egress.map((input) => router.ovnRouterEndpoint(input)),
       ],
     }));
+    // After the services: they keep the addresses they had without it. The
+    // topology's routers all exist by now (initialize runs after its callback).
+    for (const segment of cp.ingress ?? []) {
+      this.#netRef.addPlatformIngressLeg(
+        routerName,
+        segment,
+        cp.collisionDomain,
+        cp.hosts[0],
+        allocateAddrs,
+      );
+    }
     // The GLOBAL resolver: controlPlane.resolver wins; otherwise the
     // platform CoreDNS address (if the built-in is in the active set).
     const resolver: Resolver | undefined = cp.resolver ??
@@ -583,6 +612,31 @@ export class NetworkBuilder implements RouterEndpointContext {
     return platform;
   }
 
+  private internetScope: Internet | undefined;
+
+  /** The shared side every tenant leaves to (ADR 0009): `internet-core`,
+   * its addresses allocated from `core`. Declared before any wan. */
+  internet(spec: { readonly core: CorePrefixes }): Internet {
+    if (this.internetScope) throw new Error("net.internet() declared twice");
+    this.internetScope = new Internet(this, spec);
+    return this.internetScope;
+  }
+
+  /** A physical uplink, `internet-wan-<name>`, on internet-core. */
+  wan(name: string, build: (wan: WanBuilder) => WanSpec): Wan {
+    if (!this.internetScope) {
+      throw new Error(
+        `net.wan("${name}"): declare net.internet({ core }) first`,
+      );
+    }
+    return new Wan(this, this.internetScope, name, build);
+  }
+
+  /** An isolated group of cables and routers (ADR 0009). */
+  tenant(name: string, build: (tenant: TenantBuilder) => TenantSpec): Tenant {
+    return new Tenant(this, this.internetScope, name, build);
+  }
+
   /** @internal — createPlatform registers the platform's control-plane leg
    * here during initialize(), so the global resolver reaches workload
    * attachments (2026-09-19). */
@@ -591,6 +645,61 @@ export class NetworkBuilder implements RouterEndpointContext {
     resolver?: Resolver,
   ): void {
     this.platformControlPlane = { collisionDomain, resolver };
+  }
+
+  /** @internal — createPlatform's `ingress`: the router that is `segment`'s
+   * gateway gets a leg on the control plane, masquerading `segment` out of
+   * it. Its gateway port, because OVN only does NAT on one. */
+  addPlatformIngressLeg(
+    platformRouter: string,
+    segment: CollisionDomain,
+    controlPlane: CollisionDomain,
+    gatewayChassis: Host | undefined,
+    allocate: () => (IPv4 | IPv6)[],
+  ): void {
+    const gateways = [...this.routersByName.values()].filter((router) =>
+      router.name !== platformRouter &&
+      router.endpoints.some((endpoint) => endpoint.l2Segment === segment)
+    );
+    const [router] = gateways;
+    if (router === undefined || gateways.length > 1) {
+      throw new Error(
+        `platform ingress: segment "${segment.name}" needs exactly one ` +
+          `gateway router, found ${gateways.length}`,
+      );
+    }
+    const sources = router.endpoints
+      .filter((endpoint) => endpoint.l2Segment === segment)
+      .flatMap((endpoint) => [...endpoint.ipaddrs])
+      .map((address) => address.network());
+    const ipaddrs = allocate();
+    const has = (v4: boolean) => ipaddrs.some((a) => a.is_ipv4() === v4);
+    const endpoint = buildOvnRouterEndpoint({
+      l2Segment: controlPlane,
+      ipaddrs,
+      routeIsolated: true,
+      ...(gatewayChassis ? { gatewayChassis } : {}),
+      services: [
+        ...(has(true)
+          ? [{
+            kind: "ovn.ipv4.masq" as const,
+            sources: sources.filter((a): a is IPv4 => a.is_ipv4()),
+          }]
+          : []),
+        ...(has(false)
+          ? [{
+            kind: "ovn.ipv6.masq" as const,
+            sources: sources.filter((a): a is IPv6 => !a.is_ipv4()),
+          }]
+          : []),
+      ],
+    }, { routerName: router.name, role: "ovn" });
+    this.checkRouterEndpoint(router.name, endpoint);
+    this.registerEndpointName(router.name, endpoint.name);
+    this.routersByName.set(router.name, {
+      ...router,
+      endpoints: [...router.endpoints, endpoint].sort(byName),
+    });
   }
 
   /** Declare a reusable WORKLOAD — an image + command + optional build,
@@ -882,10 +991,7 @@ export class NetworkBuilder implements RouterEndpointContext {
    * returned routers' registration, so they stay consistent. */
   build(
     name: string,
-    decl: {
-      readonly hosts?: readonly Host[];
-      readonly routers: readonly Router[];
-    },
+    decl: NetworkDeclaration,
   ): NetworkDefinition {
     // PLATFORMS initialize HERE — once, after the topology callback has
     // returned. Each holds the network reference it was created with
@@ -923,12 +1029,18 @@ export class NetworkBuilder implements RouterEndpointContext {
   }
 }
 
+/** What a defineNetwork() callback returns. Every router, tenant and wan
+ * is registered when it is declared; the lists only document them. */
+export interface NetworkDeclaration {
+  readonly hosts?: readonly Host[];
+  readonly routers?: readonly Router[];
+  readonly tenants?: readonly Tenant[];
+  readonly wans?: readonly Wan[];
+}
+
 export function defineNetwork(
   name: string,
-  build: (net: NetworkBuilder) => {
-    readonly hosts?: readonly Host[];
-    readonly routers: readonly Router[];
-  },
+  build: (net: NetworkBuilder) => NetworkDeclaration,
 ): NetworkDefinition {
   const builder = new NetworkBuilder();
   const decl = build(builder);

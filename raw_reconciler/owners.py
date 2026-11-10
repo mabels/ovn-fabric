@@ -194,7 +194,9 @@ def _docker(nodes: Nodes) -> None:
                 and docker_rule(node)
             )
             or node_id in inside
-            or node.get("netnsRef") in inside
+            # What is inside its netns — not the container itself, whose own
+            # netnsRef is that netns (it is ours when we started it).
+            or (node["kind"] != "docker.container" and node.get("netnsRef") in inside)
         ]
         + [
             f"docker.container:{c['name']}"

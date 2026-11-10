@@ -148,6 +148,7 @@ def docker(
     run_flags: tuple[str, ...],
     remove_existing: bool,
     files: str,
+    natural_key: str,
 ) -> Footprint:
     """DockerPrimitive (learned with markers only)."""
     del (
@@ -162,6 +163,7 @@ def docker(
         run_flags,
         remove_existing,
         files,
+        natural_key,
     )  # not in RawIR
     return {
         "added": {},
@@ -223,6 +225,8 @@ def link(
                 "operState": "UNKNOWN",
                 "owner": "ovn-fabric",
                 "peerRefs": [],
+                "vlanId": None,
+                "wgKeyHash": None,
             }
         },
         "changed": {},
@@ -249,6 +253,8 @@ def link_move(*, host: str, netns: str, name: str, to: str) -> Footprint:
                 "operState": "UNKNOWN",
                 "owner": "ovn-fabric",
                 "peerRefs": [],
+                "vlanId": None,
+                "wgKeyHash": None,
             }
         },
         "changed": {},
@@ -420,6 +426,8 @@ def netns_link(
                 "operState": "UNKNOWN",
                 "owner": "ovn-fabric",
                 "peerRefs": [],
+                "vlanId": None,
+                "wgKeyHash": None,
             }
         },
         "changed": {},
@@ -471,6 +479,8 @@ def netns_link_veth(
                 "operState": "UP",
                 "owner": "ovn-fabric",
                 "peerRefs": [],
+                "vlanId": None,
+                "wgKeyHash": None,
             },
             f"link:{netns}|{name}": {
                 "adminUp": True,
@@ -486,6 +496,9 @@ def netns_link_veth(
                 "operState": "UP",
                 "owner": "ovn-fabric",
                 "peerRefs": [],
+                "permMac": mac,
+                "vlanId": None,
+                "wgKeyHash": None,
             },
             f"ovs.iface:{root_leg}": {
                 "externalIds": {},
@@ -573,6 +586,8 @@ def netns_link_veth_renamed(
                 "operState": "UP",
                 "owner": "ovn-fabric",
                 "peerRefs": [],
+                "vlanId": None,
+                "wgKeyHash": None,
             },
             f"link:{netns}|{rename_to}": {
                 "adminUp": True,
@@ -588,6 +603,9 @@ def netns_link_veth_renamed(
                 "operState": "UP",
                 "owner": "ovn-fabric",
                 "peerRefs": [],
+                "permMac": mac,
+                "vlanId": None,
+                "wgKeyHash": None,
             },
             f"ovs.iface:{root_leg}": {
                 "externalIds": {},
@@ -627,6 +645,59 @@ def netns_link_veth_renamed(
                 "portRefs": {"added": [f"ovs.port:{root_leg}"], "removed": []}
             },
         },
+        "removed": [],
+    }
+
+
+def netns_link_vlan(
+    *,
+    host: str,
+    netns: str,
+    name: str,
+    kind: str,
+    rename_to: str | None,
+    parent: str | None,
+    vlan_id: int | None,
+    mac: str | None,
+    root_leg: str | None,
+    bridge: str | None,
+) -> Footprint:
+    """NetnsLinkPrimitive (learned with {'kind': 'vlan', 'rename_to': None, 'mac': None, 'root_leg': None, 'bridge': None})."""
+    if kind != "vlan":
+        raise NotLearned(f"NetnsLinkPrimitive.kind={kind!r}: learned only with 'vlan'")
+    if rename_to is not None:
+        raise NotLearned(f"NetnsLinkPrimitive.rename_to={rename_to!r}: learned only with None")
+    if mac is not None:
+        raise NotLearned(f"NetnsLinkPrimitive.mac={mac!r}: learned only with None")
+    if root_leg is not None:
+        raise NotLearned(f"NetnsLinkPrimitive.root_leg={root_leg!r}: learned only with None")
+    if bridge is not None:
+        raise NotLearned(f"NetnsLinkPrimitive.bridge={bridge!r}: learned only with None")
+    if parent is None:
+        raise NotLearned("NetnsLinkPrimitive.parent=None: learned only with a value")
+    if vlan_id is None:
+        raise NotLearned("NetnsLinkPrimitive.vlan_id=None: learned only with a value")
+    del host  # not in RawIR
+    return {
+        "added": {
+            f"link:{netns}|{name}": {
+                "adminUp": True,
+                "id": f"link:{netns}|{name}",
+                "ifname": name,
+                "kind": "link",
+                "linkKind": "vlan",
+                "linkRef": f"link:*global*|{parent}",
+                "masterRef": None,
+                "mtu": 1500,
+                "netnsRef": f"netns:{netns}",
+                "operState": "UP",
+                "owner": "ovn-fabric",
+                "peerRefs": [],
+                "vlanId": vlan_id,
+                "wgKeyHash": None,
+            }
+        },
+        "changed": {},
         "removed": [],
     }
 
@@ -1316,7 +1387,13 @@ def ovn_nb_ctl_lsp_router(
 
 
 def ovn_nb_ctl_nat(
-    *, router: str, type: str, external_ip: str, logical_ip: str, reset: bool
+    *,
+    router: str,
+    type: str,
+    external_ip: str,
+    logical_ip: str,
+    reset: bool,
+    gateway_port: str | None,
 ) -> Footprint:
     """OVNNbCtlNat (learned with {'type': 'snat', 'reset': False})."""
     if type != "snat":
@@ -1327,6 +1404,7 @@ def ovn_nb_ctl_nat(
         raise NotLearned(f"OVNNbCtlNat.external_ip={external_ip!r}: learned only with IPv4")
     if _family(logical_ip) != 4:
         raise NotLearned(f"OVNNbCtlNat.logical_ip={logical_ip!r}: learned only with IPv4")
+    del gateway_port  # not in RawIR
     return {
         "added": {
             f"ovn.nat:{router}|snat|{external_ip}|{_net(logical_ip)}": {
@@ -1355,7 +1433,13 @@ def ovn_nb_ctl_nat(
 
 
 def ovn_nb_ctl_nat_v6(
-    *, router: str, type: str, external_ip: str, logical_ip: str, reset: bool
+    *,
+    router: str,
+    type: str,
+    external_ip: str,
+    logical_ip: str,
+    reset: bool,
+    gateway_port: str | None,
 ) -> Footprint:
     """OVNNbCtlNat (learned with {'type': 'snat', 'reset': False})."""
     if type != "snat":
@@ -1366,6 +1450,7 @@ def ovn_nb_ctl_nat_v6(
         raise NotLearned(f"OVNNbCtlNat.external_ip={external_ip!r}: learned only with IPv6")
     if _family(logical_ip) != 6:
         raise NotLearned(f"OVNNbCtlNat.logical_ip={logical_ip!r}: learned only with IPv6")
+    del gateway_port  # not in RawIR
     return {
         "added": {
             f"ovn.nat:{router}|snat|{external_ip}|{_net(logical_ip)}": {
@@ -1490,6 +1575,8 @@ def ovs_bridge(*, name: str, datapath: str | None, fail_mode: str) -> Footprint:
                 "operState": "DOWN",
                 "owner": "ovn-fabric",
                 "peerRefs": [],
+                "vlanId": None,
+                "wgKeyHash": None,
             },
             f"ovs.bridge:{name}": {
                 "datapathType": None,
@@ -2069,7 +2156,7 @@ def vlan(*, host: str, netns: str | None, parent: str, name: str, vlan_id: int) 
     """VlanPrimitive (learned with {'netns': None})."""
     if netns is not None:
         raise NotLearned(f"VlanPrimitive.netns={netns!r}: learned only with None")
-    del host, parent, vlan_id  # not in RawIR
+    del host  # not in RawIR
     return {
         "added": {
             f"link:*global*|{name}": {
@@ -2078,13 +2165,15 @@ def vlan(*, host: str, netns: str | None, parent: str, name: str, vlan_id: int) 
                 "ifname": name,
                 "kind": "link",
                 "linkKind": "vlan",
-                "linkRef": None,
+                "linkRef": f"link:*global*|{parent}",
                 "masterRef": None,
                 "mtu": 1500,
                 "netnsRef": "netns:*global*",
                 "operState": "UP",
                 "owner": "ovn-fabric",
                 "peerRefs": [],
+                "vlanId": vlan_id,
+                "wgKeyHash": None,
             }
         },
         "changed": {},
@@ -2112,6 +2201,7 @@ _BY_CLASS: dict[str, tuple[Callable[..., Footprint], ...]] = {
         netns_link,
         netns_link_veth,
         netns_link_veth_renamed,
+        netns_link_vlan,
     ),
     "OVNNbCtlAcl": (
         ovn_nb_ctl_acl,
@@ -2175,10 +2265,11 @@ VOLATILE: dict[str, list[str]] = {
     "AddrPrimitive": [],
     "DockerPrimitive": [],
     "IpRulePrimitive": [],
-    "LinkPrimitive": ["link.addrRefs", "link.ifindex", "link.mac"],
+    "LinkPrimitive": ["link.addrRefs", "link.ifindex", "link.mac", "link.permMac"],
     "LinkMovePrimitive": [
         "link.addrRefs",
         "link.mac",
+        "link.permMac",
         "netns:{netns}: changed fields",
         "netns:{to}: changed fields",
     ],
@@ -2188,6 +2279,7 @@ VOLATILE: dict[str, list[str]] = {
         "link.addrRefs",
         "link.ifindex",
         "link.mac",
+        "link.permMac",
         "netns:{netns}: changed fields",
         "ovs.iface.mac",
     ],
@@ -2200,13 +2292,13 @@ VOLATILE: dict[str, list[str]] = {
     "OVNNbCtlNat": [],
     "OVNNbCtlRoute": [],
     "OVNSbCtlConnection": [],
-    "OVSBridge": ["link.ifindex", "link.mac", "ovs.iface.mac"],
+    "OVSBridge": ["link.ifindex", "link.mac", "link.permMac", "ovs.iface.mac"],
     "OVSExternalId": [],
     "OVSMapping": [],
     "OVSPort": ["ovs.iface.mac"],
     "RoutePrimitive": [],
     "SysctlPrimitive": [],
-    "VlanPrimitive": ["link.addrRefs", "link.ifindex", "link.mac"],
+    "VlanPrimitive": ["link.addrRefs", "link.ifindex", "link.mac", "link.permMac"],
 }
 
 

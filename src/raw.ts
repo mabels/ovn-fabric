@@ -55,7 +55,7 @@ export const NetnsData = type(netnsFields);
 export const NetnsCollection = nodeType("netns", netnsFields);
 
 export const LinkKind = type(
-  "'physical'|'vlan'|'veth'|'bridge'|'internal'|'patch'|'tun'|'loopback'|'other'",
+  "'physical'|'vlan'|'veth'|'bridge'|'internal'|'patch'|'tun'|'loopback'|'wireguard'|'other'",
 );
 const linkFields = {
   netnsRef: "string",
@@ -63,6 +63,13 @@ const linkFields = {
   ifindex: "number.integer",
   linkKind: LinkKind,
   "mac?": "string",
+  /** The hardware's own MAC (`permaddr`, else its MAC) — a NIC's natural
+   * key (ADR 0010). */
+  "permMac?": "string",
+  /** A VLAN's ID — with its parent's natural key, the VLAN's own. */
+  "vlanId?": "number.integer",
+  /** A WireGuard link's identity: a hash of its private key, never the key. */
+  "wgKeyHash?": "string",
   "mtu?": "number.integer",
   "linkRef?": "string",
   "peerRefs?": "string[]",
@@ -282,6 +289,9 @@ const dockerFields = {
   pid: "number.integer",
   state: "string",
   netnsRef: "string",
+  /** What it declares itself to be (its `ovn-fabric.natural-key` label,
+   * ADR 0010), e.g. a ZeroTier instance's `zt:<node address>`. */
+  "naturalKeyLabel?": "string",
 } as const;
 export const DockerContainerData = type(dockerFields);
 export const DockerContainerCollection = nodeType(

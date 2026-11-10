@@ -343,6 +343,11 @@ def _root_parent(host: HostPrimitive, m: Mapping[str, Any]) -> list[Any]:
     return [host.rootNs().add_if(m["parent"], kind="dummy", up=True)]
 
 
+def _netns_and_root_parent(host: HostPrimitive, m: Mapping[str, Any]) -> list[Any]:
+    """A netns, and the VLAN's parent in the root one (a wan's NIC)."""
+    return [host.netns(m["netns"]), host.rootNs().add_if(m["parent"], kind="dummy", up=True)]
+
+
 def _bridge_and_link(host: HostPrimitive, m: Mapping[str, Any]) -> list[Any]:
     return [host.ovs_bridge(m["bridge"]), host.rootNs().add_if(m["port"], kind="dummy", up=True)]
 
@@ -426,6 +431,14 @@ SAMPLES = [
         setup=_netns_and_bridge,
         variant="veth",
     ),
+    # A VLAN made on its parent in the root netns and moved into a netns (a
+    # wan's interface, ADR 0009).
+    Sample(
+        NetnsLinkPrimitive,
+        fixed={"kind": "vlan", "rename_to": None, "mac": None, "root_leg": None, "bridge": None},
+        setup=_netns_and_root_parent,
+        variant="vlan",
+    ),
     # … renamed in the netns (a workload NIC: eth1 in the container).
     Sample(
         NetnsLinkPrimitive,
@@ -455,6 +468,8 @@ SAMPLES = [
             "run_flags": (),
             "remove_existing": True,
             "files": "",
+            # A label (ADR 0010): RawIR has it as naturalKeyLabel, unset here.
+            "natural_key": "",
         },
     ),
     Sample(OVSBridge, fixed={"datapath": None, "fail_mode": "standalone"}),
@@ -548,10 +563,16 @@ SAMPLES = [
     ),
     Sample(OVNNbCtlRoute, setup=_router),
     Sample(OVNNbCtlRoute, kinds={"prefix": "net6", "nexthop": "ip6"}, setup=_router, variant="v6"),
-    Sample(OVNNbCtlNat, fixed={"type": "snat", "reset": False}, setup=_router),
     Sample(
         OVNNbCtlNat,
         fixed={"type": "snat", "reset": False},
+        free={"gateway_port": None},
+        setup=_router,
+    ),
+    Sample(
+        OVNNbCtlNat,
+        fixed={"type": "snat", "reset": False},
+        free={"gateway_port": None},
         kinds={"external_ip": "ip6", "logical_ip": "cidr6"},
         setup=_router,
         variant="v6",

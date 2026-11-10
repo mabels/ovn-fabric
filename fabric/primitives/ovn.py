@@ -415,6 +415,8 @@ class OVNNbCtlNat(CommandPrimitive):
     external_ip: str
     logical_ip: str
     reset: bool = False
+    # Which gateway port it goes out of: needed on a router with several.
+    gateway_port: str | None = None
 
     @property
     def key(self) -> str:
@@ -441,7 +443,11 @@ class OVNNbCtlNat(CommandPrimitive):
                 f"nat:{self.router}/{self.external_ip} (create)",
                 tuple(
                     ovn_ops.lr_nat_add_argv(
-                        self.router, self.type, self.external_ip, self.logical_ip
+                        self.router,
+                        self.type,
+                        self.external_ip,
+                        self.logical_ip,
+                        self.gateway_port,
                     )
                 ),
             )

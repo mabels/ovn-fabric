@@ -62,6 +62,7 @@ def _learn(samples: list[Sample], host: str) -> dict[str, Any]:
                 f.name: _annotation(hints[f.name]) for f in dataclasses.fields(sample.primitive)
             },
             "fixed": dict(sample.fixed),
+            "free": list(sample.free),
             "shapes": dict(sample.shape),
             "pairs": {field: list(keys) for field, keys in sample.pairs.items()},
             "kinds": marker_kinds(sample),

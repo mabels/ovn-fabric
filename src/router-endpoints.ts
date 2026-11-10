@@ -254,9 +254,12 @@ export function buildKernelRouterEndpoint(
     services,
     securityGroups,
     routes: inputRoutes,
+    transitName,
     ...rest
   } = input;
-  const transitDomain = ctx.collisionDomain(`transit-${routerName}`);
+  const transitDomain = ctx.collisionDomain(
+    transitName ?? `transit-${routerName}`,
+  );
   const ovnSideAddrs = [link.left.ipv4, link.left.ipv6]
     .filter((a): a is IPv4 | IPv6 => Boolean(a));
   const kernelSideAddrs = [link.right.ipv4, link.right.ipv6]
@@ -495,10 +498,15 @@ export function buildTunnelRouterEndpoint(
     services,
     routes,
     routingDomains,
+    names,
     ...rest
   } = input;
-  const transitDomain = ctx.collisionDomain(`transit-${routerName}`);
-  const backdoorDomain = ctx.collisionDomain(`backdoor-${routerName}`);
+  const transitDomain = ctx.collisionDomain(
+    names?.transit ?? `transit-${routerName}`,
+  );
+  const backdoorDomain = ctx.collisionDomain(
+    names?.backdoor ?? `backdoor-${routerName}`,
+  );
   const ovnSideAddrs = [meshLink.left.ipv4, meshLink.left.ipv6]
     .filter((a): a is IPv4 | IPv6 => Boolean(a));
   const kernelSideAddrs = [meshLink.right.ipv4, meshLink.right.ipv6]
@@ -581,7 +589,7 @@ ${ztScriptLines} \\
         return {
           kind: "docker",
           image: `ovn-fabric-${routerName}-zerotier`,
-          name: `${routerName}-zerotier`,
+          name: routerName, // the container is the gateway (its netns)
           cmd: ["/usr/local/bin/zerotier-up"],
           build: { from: "ubuntu:24.04", dockerfile },
           volumes: [
@@ -666,8 +674,9 @@ ${ztScriptLines} \\
   // binds to the backdoor domain's localnet bridge, and the internal
   // router's backdoor port carries that same veth for the bridge
   // binding (mirror of how the mesh transit binds its own veth).
+  const upstreamName = names?.upstream ?? `${routerName}-upstream`;
   const upstreamPeer = ctx.defineOvnRouter(
-    `${routerName}-upstream`,
+    upstreamName,
     () => ({
       routingDomains: upstreamDomains ?? [],
       endpoints: [
@@ -675,11 +684,10 @@ ${ztScriptLines} \\
           l2Segment: backdoorDomain,
           ipaddrs: upstreamPeerAddrs,
           ifaces: [{ host, iface: upstreamVeth }],
-        }, { routerName: `${routerName}-upstream`, role: "ovn" }),
+        }, { routerName: upstreamName, role: "ovn" }),
         buildOvnRouterEndpoint({
-          l2Segment: upstreamBackbone.l2Segment,
-          ipaddrs: upstreamBackbone.ipaddrs,
-        }, { routerName: `${routerName}-upstream`, role: "ovn" }),
+          ...upstreamBackbone,
+        }, { routerName: upstreamName, role: "ovn" }),
       ],
     }),
   );

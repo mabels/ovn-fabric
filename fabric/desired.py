@@ -315,8 +315,10 @@ def _changes_state(
     changed: dict[str, dict[str, Any]], live: dict[str, dict[str, Any]]
 ) -> StepState:
     """A step that only changes fields of nodes others add (a bridge's
-    mapping): present when every change is live, missing when none is.
-    Without changes nothing can be told."""
+    mapping): present when every change is live, else missing — also when
+    some are: it sets the fields again, which is safe (bridge mappings are
+    written as a whole, after a rename only some are still right). Without
+    changes nothing can be told."""
     done = [
         node_id in live
         and all(_has(live[node_id].get(field), delta) for field, delta in change.items())
@@ -326,7 +328,7 @@ def _changes_state(
         return StepState.unknown
     if all(done):
         return StepState.present
-    return StepState.partial if any(done) else StepState.missing
+    return StepState.missing
 
 
 def _has(value: Any, delta: dict[str, Any]) -> bool:
@@ -395,7 +397,18 @@ def crossed_out(
             fulfilled.update(rawir(step)["added"])
         except NotLearned:
             untranslated.add(name)
+            # Not learned: what it declares itself is still its own — never
+            # a leftover (a VLAN moved into a netns, before primate knows it).
+            fulfilled.update(_declared(step))
     return fulfilled, sorted(untranslated)
+
+
+def _declared(step: Any) -> set[str]:
+    """The node ids a step declares by hand (its RawNodeTemplates), those
+    with no run-time value left in them."""
+    as_primitive = getattr(step, "as_primitive", None)
+    templates = as_primitive().nodes if as_primitive is not None else getattr(step, "nodes", ())
+    return {t.id for t in templates if isinstance(t.id, str)}
 
 
 @dataclasses.dataclass(frozen=True)

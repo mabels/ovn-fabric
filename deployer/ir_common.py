@@ -838,7 +838,9 @@ def _emit_router(
                 for rule in sorted(by_external[external], key=lambda r: r.logicalIps):
                     for logical in rule.logicalIps:
                         nat_unit.ovn(
-                            OVNNbCtlNat(router, "snat", external, logical),
+                            OVNNbCtlNat(
+                                router, "snat", external, logical, gateway_port=rule.gatewayPort
+                            ),
                             parent=router_var,
                         )
     _emit_router_acl(router, router_var, ports, lr, nodes, domain_names, router_unit)
@@ -1633,6 +1635,8 @@ def _start_owning_container(
         privileged=True,
         volumes=tuple((volume["host"], volume["container"]) for volume in volumes),
         run_flags=tuple(app.run or ()),
+        # Its natural key: the node address, the public part of its identity.
+        natural_key=f"zt:{identity['public'].split(':')[0]}" if identity else "",
         # A changed identity or state file needs a restart: the daemon read it.
         files=files_hash(
             *(identity.values() if identity else ()),

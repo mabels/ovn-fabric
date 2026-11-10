@@ -123,8 +123,17 @@ class OwnersTest(unittest.TestCase):
             {"id": "route:r|static", "kind": "route", "prefix": "10.1.0.0/16", "protocol": None},
             {"id": "addr:r|slaac", "kind": "addr", "address": "fd00::1", "dynamic": True},
             {"id": "link:ns-r|sit0", "kind": "link", "ifname": "sit0"},
-            {"id": "docker.container:ours", "kind": "docker.container"},
-            {"id": "docker.container:theirs", "kind": "docker.container"},
+            # As collected: a container's netnsRef is its own namespace.
+            {
+                "id": "docker.container:ours",
+                "kind": "docker.container",
+                "netnsRef": "netns:docker:ours",
+            },
+            {
+                "id": "docker.container:theirs",
+                "kind": "docker.container",
+                "netnsRef": "netns:docker:theirs",
+            },
             {"id": "netns:ours", "kind": "netns"},
             {"id": "netns:docker:ours", "kind": "netns"},
             {"id": "link:ours|zt0", "kind": "link", "ifname": "zt0", "netnsRef": "netns:ours"},

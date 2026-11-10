@@ -209,8 +209,10 @@ class StepStateTest(unittest.TestCase):
         bridge_a: dict[str, Any] = {"externalIds": {"ovn-bridge-mappings": "a", "other": "x"}}
         bridge_b: dict[str, Any] = {"portRefs": ["ovs.port:p", "ovs.port:q"]}
         with mock.patch("fabric.desired.rawir", return_value=footprint):
+            # Only some changes live: set again (ADR 0010, a renamed bridge's
+            # mapping), not left alone as partly there.
             state = step_state(OVNNbCtlLs("x"), {"ovs.bridge:br-a": bridge_a})[0]
-            self.assertEqual(state, StepState.partial)
+            self.assertEqual(state, StepState.missing)
             live = {"ovs.bridge:br-a": bridge_a, "ovs.bridge:br-b": bridge_b}
             self.assertEqual(step_state(OVNNbCtlLs("x"), live)[0], StepState.present)
             empty: dict[str, dict[str, Any]] = {"ovs.bridge:br-a": {"externalIds": {}}}
@@ -258,3 +260,37 @@ class StepStateTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CrossedOutTest(unittest.TestCase):
+    def test_a_step_not_learned_still_owns_what_it_declares(self) -> None:
+        from .desired import crossed_out
+        from .rawir_learned import NotLearned
+
+        step = (
+            HostPrimitive("h")
+            .netns("ns-x")
+            .add_link("ovnkern.2280", "vlan", parent="ovnkern", vlan_id=2280)
+        )
+        with mock.patch("fabric.desired.rawir", side_effect=NotLearned("vlan into a netns")):
+            fulfilled, untranslated = crossed_out([step], {})
+        self.assertIn("link:ns-x|ovnkern.2280", fulfilled)
+        self.assertEqual(untranslated, [type(step).__name__])
+
+
+class ChangesStateTest(unittest.TestCase):
+    def test_a_change_only_partly_live_is_set_again(self) -> None:
+        from .desired import _changes_state
+
+        live = {
+            "ovs.bridge:a": {"id": "ovs.bridge:a", "externalIds": {"ovn-bridge-mappings": "net-a"}},
+            "ovs.bridge:b": {"id": "ovs.bridge:b", "externalIds": {}},
+        }
+        changed = {
+            "ovs.bridge:a": {"externalIds": {"from": {}, "to": {"ovn-bridge-mappings": "net-a"}}},
+            "ovs.bridge:b": {"externalIds": {"from": {}, "to": {"ovn-bridge-mappings": "net-b"}}},
+        }
+        self.assertEqual(_changes_state(changed, live), StepState.missing)
+        self.assertEqual(
+            _changes_state({"ovs.bridge:a": changed["ovs.bridge:a"]}, live), StepState.present
+        )

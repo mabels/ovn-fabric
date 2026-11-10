@@ -315,6 +315,20 @@ function kernelRouterBackRoutes(
     if (!via) continue;
     routes.push({ dst: prefix, via: via.to_s() });
   }
+  // The twin's own networks (its other legs): what a NAT gateway
+  // masquerades onto internet-core comes back from there (ADR 0009).
+  const have = new Set(routes.map((r) => r.dst));
+  for (const endpoint of peer.router.endpoints) {
+    if (endpoint === peer.endpoint) continue;
+    for (const addr of endpoint.ipaddrs) {
+      const dst = addr.network().to_string();
+      if (have.has(dst) || rightApplied.has(dst)) continue;
+      const via = peerAddrs.find((a) => a.is_ipv4() === addr.is_ipv4());
+      if (!via) continue;
+      routes.push({ dst, via: via.to_s() });
+      have.add(dst);
+    }
+  }
   return routes;
 }
 
@@ -865,14 +879,16 @@ function computeOvnSecurityGroups(network: NetworkDefinition): {
             if (logical !== externalNet) logicalIps.add(logical);
           }
         }
-        if (logicalIps.size === 0) continue;
+        const logicals = service.sources
+          ? service.sources.map((a) => a.to_string())
+          : [...logicalIps];
+        if (logicals.length === 0) continue;
         rules.push({
           kind: "snat",
           family: isV4 ? "ipv4" : "ipv6",
           externalIp: external,
-          logicalIps: [...logicalIps].map((s) =>
-            isV4 ? IPv4.parse(s) : IPv6.parse(s)
-          ),
+          logicalIps: logicals.map((s) => isV4 ? IPv4.parse(s) : IPv6.parse(s)),
+          ...(endpoint.gatewayChassis ? { gatewayPort: endpoint.name } : {}),
         });
       }
     }
@@ -1577,13 +1593,26 @@ function computeInterconnectRoutes(
       for (const r2 of participants) {
         if (r1.name === r2.name) continue;
         for (const r1side of r1.endpoints) {
+          if (r1side.routeIsolated) continue;
           for (const r2side of r2.endpoints) {
+            if (r2side.routeIsolated) continue;
             if (!sharesL2Segment(r1side, r2side)) continue;
             for (const nexthop of r2side.ipaddrs) {
               for (const other of r2.endpoints) {
-                if (other === r2side) continue;
+                if (other === r2side || other.routeIsolated) continue;
                 for (const peerAddr of other.ipaddrs) {
                   if (!isSameFamily(nexthop, peerAddr)) continue;
+                  // On-link through an isolated leg: no route needed.
+                  if (
+                    r1.endpoints.some((own) =>
+                      own.routeIsolated &&
+                      own.ipaddrs.some((a) =>
+                        isSameFamily(a, peerAddr) &&
+                        a.network().to_string() ===
+                          peerAddr.network().to_string()
+                      )
+                    )
+                  ) continue;
                   nodes.push(
                     routeToIR(
                       r1,
