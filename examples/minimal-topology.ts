@@ -15,20 +15,18 @@
 import { defineNetwork, IPv4 } from "../src/mod.ts";
 
 export const network = defineNetwork("minimal", (net) => {
-  const central = net.sshHost(
-    "central",
-    { ipv4: IPv4.parse("10.99.0.1/32") },
-    "root",
-    undefined,
-    { role: { kind: "central" } },
-  );
-  const chassis = net.sshHost(
-    "chassis",
-    { ipv4: IPv4.parse("10.99.0.2/32") },
-    "root",
-    undefined,
-    { role: { kind: "chassis" } },
-  );
+  const central = net.sshHost({
+    name: "central",
+    address: { ipv4: IPv4.parse("10.99.0.1/32") },
+    user: "root",
+    ovn: { role: { kind: "central" } },
+  });
+  const chassis = net.sshHost({
+    name: "chassis",
+    address: { ipv4: IPv4.parse("10.99.0.2/32") },
+    user: "root",
+    ovn: { role: { kind: "chassis" } },
+  });
 
   const lan = net.collisionDomain("lan");
   const upstream = net.collisionDomain("upstream");
