@@ -265,7 +265,17 @@ def step_state(
     if len(there) < len(added):
         return StepState.partial, {}
     checked = {i: n for i, n in added.items() if i not in taken}
-    return StepState.present, compare(checked, {i: live[i] for i in checked}).differ
+    differ = compare(checked, {i: live[i] for i in checked}).differ
+    # A setting there with another value is not there: set it again (OVS
+    # sets external_ids:hostname to the FQDN itself on a fresh system).
+    if any(checked[i].get("kind") in _SETTINGS for i in differ):
+        return StepState.missing, differ
+    return StepState.present, differ
+
+
+# Kinds whose node is a setting: its value is the point, and setting it
+# again is safe.
+_SETTINGS = ("ovs.external-id",)
 
 
 def _no_commands(operation: Any) -> bool:

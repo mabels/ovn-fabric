@@ -419,6 +419,16 @@ class SymlinkNetnsOperation:
         return [f"rm -f {self.path}"]
 
 
+# A waiting capture: its restart (if any) comes after this many empty answers
+# (about 17 s), its waits grow 1, 2, 4, then 5 s.
+RESTART_AFTER = 5
+
+
+def retry_delay(attempt: int) -> float:
+    """The wait after the `attempt`-th empty answer."""
+    return float(min(2 ** (attempt - 1), 5))
+
+
 @dataclasses.dataclass(frozen=True)
 class CaptureOperation:
     """A queued capture. CREATE stores the value under `name` in the
@@ -453,13 +463,16 @@ class CaptureOperation:
                 )
                 return
             if not last:
-                if self.restart_unit is not None:
-                    await lc.run_cmd(
-                        self.label,
-                        ["systemctl", "restart", self.restart_unit],
-                        optional=True,
-                    )
-                await asyncio.sleep(1)
+                # Restarting while waiting kills what it waits for (a fresh
+                # ovn-controller needs seconds to register its chassis) and
+                # soon hits systemd's start limit: at most once, late, with
+                # the limit reset first.
+                if self.restart_unit is not None and attempt == RESTART_AFTER:
+                    for verb in ("reset-failed", "restart"):
+                        await lc.run_cmd(
+                            self.label, ["systemctl", verb, self.restart_unit], optional=True
+                        )
+                await asyncio.sleep(retry_delay(attempt))
         if not self.optional:
             raise RuntimeError(
                 f"{self.label}: {_argv_line(self.argv)} gave no value"

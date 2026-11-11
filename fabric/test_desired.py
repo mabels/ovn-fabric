@@ -294,3 +294,14 @@ class ChangesStateTest(unittest.TestCase):
         self.assertEqual(
             _changes_state({"ovs.bridge:a": changed["ovs.bridge:a"]}, live), StepState.present
         )
+
+
+class SettingTest(unittest.TestCase):
+    def test_a_setting_there_with_another_value_is_set_again(self) -> None:
+        node = {"id": "ovs.external-id:hostname", "kind": "ovs.external-id", "value": "h"}
+        footprint = {"added": {"ovs.external-id:hostname": node}, "changed": {}}
+        live = {"ovs.external-id:hostname": {**node, "value": "h.example.com"}}
+        with mock.patch("fabric.desired.rawir", return_value=footprint):
+            self.assertEqual(step_state(OVNNbCtlLs("x"), live)[0], StepState.missing)
+            same = {"ovs.external-id:hostname": node}
+            self.assertEqual(step_state(OVNNbCtlLs("x"), same)[0], StepState.present)

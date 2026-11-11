@@ -281,6 +281,27 @@ class LifecycleTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_a_waiting_capture_restarts_once_late_and_backs_off(self) -> None:
+        async def run() -> None:
+            ctx = Ctx()
+            job = FakeJob(capture="")
+            lc = _controller(job, LifecycleAction.CREATE, ctx)
+            lc.wait_capture("chassis", "lookup", ["ovn-sbctl"], retries=8, restart_unit="ovn-c")
+            sleep = mock.AsyncMock()
+            with mock.patch("asyncio.sleep", sleep):
+                with self.assertRaises(RuntimeError):
+                    await lc.execute()
+            systemctl = [c[1] for c in job.commands if c[1][:1] == ("systemctl",)]
+            # Once, after RESTART_AFTER empty answers, the start limit reset first.
+            self.assertEqual(
+                systemctl,
+                [("systemctl", "reset-failed", "ovn-c"), ("systemctl", "restart", "ovn-c")],
+            )
+            waits = [c.args[0] for c in sleep.await_args_list]
+            self.assertEqual(waits, [1.0, 2.0, 4.0, 5.0, 5.0, 5.0, 5.0, 5.0])
+
+        asyncio.run(run())
+
     def test_dry_run_describes_the_ordered_queue_and_runs_nothing(self) -> None:
         async def run() -> None:
             job = FakeJob()
