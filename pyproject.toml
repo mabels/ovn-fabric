@@ -52,6 +52,12 @@ python_version = "3.11"
 files = ["ladops", "deployer", "protocol", "reconciler", "raw_reconciler", "generator", "ovn_fabric", "runtime", "fabric", "primate"]
 exclude = ['^\.venv-build/', '^generator/runtime/thinking\.py$']
 
+# The old generated deployer is kept as reference only (ADR 0007): not
+# kept working, so not type-checked (it predates logical addresses, ADR 0011).
+[[tool.mypy.overrides]]
+module = ["deployer.ir_to_python", "deployer.test_ir_to_python"]
+ignore_errors = true
+
 # mabels-ipaddress (requirements.txt) ships no type information (py.typed).
 [[tool.mypy.overrides]]
 module = ["ip_address", "ip_address.*"]

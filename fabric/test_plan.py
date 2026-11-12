@@ -6,7 +6,7 @@ import unittest
 from collections.abc import Callable
 
 from deployer.ir_common import Emitter
-from deployer.test_ir_to_python import NODES
+from fabric.ir_fixture import NODES
 from protocol import generated as pt
 from protocol.hydrate import hydrate_nodes
 from runtime.test_message import IR_SAMPLE

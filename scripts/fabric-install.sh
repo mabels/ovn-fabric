@@ -25,7 +25,13 @@ unset LC_ALL
 BUNDLE="$ROOT/dist/fabric.pex"
 
 echo "== building $BUNDLE" >&2
-(cd "$ROOT" && python3 -m fabric bundle -o "$BUNDLE" >/dev/null)
+# The build venv: `python3 -m fabric` imports what the runtime imports
+# (requirements.txt, e.g. mabels-ipaddress) — on a host the PEX carries it,
+# here the venv does. pex itself is installed there by the bundle step.
+PY="$ROOT/.venv-build/bin/python"
+[ -x "$PY" ] || python3 -m venv "$ROOT/.venv-build"
+"$PY" -m pip install --quiet --disable-pip-version-check -r "$ROOT/requirements.txt" >&2
+(cd "$ROOT" && "$PY" -m fabric bundle -o "$BUNDLE" >/dev/null)
 
 echo "== copying it to $TARGET" >&2
 scp -q "$BUNDLE" "$TARGET:/tmp/fabric.pex.new"

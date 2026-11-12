@@ -10,7 +10,7 @@ from collections.abc import AsyncIterator
 from typing import Any, cast
 from unittest import mock
 
-from deployer.test_ir_to_python import NODES
+from fabric.ir_fixture import NODES
 from protocol.hydrate import hydrate_nodes
 from runtime import generated as rg
 from runtime.message import Msg, plain

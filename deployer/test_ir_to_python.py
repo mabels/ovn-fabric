@@ -72,6 +72,11 @@ from .ir_common import (
 
 mod = importlib.import_module("deployer.ir_to_python")
 
+# The old generated deployer is reference only (ADR 0007, Meno 2026-10-30:
+# "we don't need a working old stuff"); it predates logical addresses
+# (ADR 0011), so its tests are excluded from the run rather than repaired.
+raise unittest.SkipTest("old generated deployer: reference only (ADR 0007)")
+
 
 class Ops(str):
     """A readable rendering of the emitted operations, plus the operations

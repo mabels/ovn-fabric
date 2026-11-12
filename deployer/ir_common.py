@@ -89,6 +89,7 @@ from typing import Any, Protocol
 
 from ip_address import IPAddress
 
+from fabric.addresses import Addresses
 from fabric.decide import Decide
 from fabric.primitives.docker import DockerPrimitive, files_hash
 from fabric.primitives.host import HostPrimitive, NetnsPrimitive
@@ -542,10 +543,12 @@ def _group_routes_by_router(nodes: list[pt.Model]) -> dict[str, list[RouteNode]]
 # `masq` is carried in the IR but not yet acted on here — NAT has no
 # home in this pipeline yet (see src/ir.ts's own header comment).
 def _emit_router_routes(
-    router: str, router_var: str, routes: list[RouteNode], emit: Emitter
+    router: str, router_var: str, routes: list[RouteNode], addrs: Addresses, emit: Emitter
 ) -> None:
     if not routes:
         return
+    # A next hop is a reference to its carrier (ADR 0011): resolved here.
+    hop = {id(n): addrs.ref(n.data.nexthop) for n in routes}
     # OVN's FIB is one table per router: the same prefix cannot be added
     # twice (ovn-nbctl rejects it; --ecmp is the only duplicate form, and
     # the IR has no ECMP intent). Several domains can legitimately learn
@@ -557,9 +560,9 @@ def _emit_router_routes(
         by_prefix.setdefault(node.key.prefix, []).append(node)
     best: list[RouteNode] = []
     for prefix, group in by_prefix.items():
-        group.sort(key=lambda n: (n.data.metric, n.data.nexthop))
+        group.sort(key=lambda n: (n.data.metric, hop[id(n)]))
         lowest = group[0].data.metric
-        nexthops = {n.data.nexthop for n in group if n.data.metric == lowest}
+        nexthops = {hop[id(n)] for n in group if n.data.metric == lowest}
         if len(nexthops) > 1:
             raise ValueError(
                 f"router {router}: prefix {prefix} has ECMP next hops "
@@ -574,7 +577,7 @@ def _emit_router_routes(
         routes_unit = emit.unit("routes", f"{router} ({domain})")
         for node in sorted(by_domain[domain], key=lambda n: n.key.prefix):
             routes_unit.ovn(
-                OVNNbCtlRoute(router, node.key.prefix, node.data.nexthop),
+                OVNNbCtlRoute(router, node.key.prefix, hop[id(node)]),
                 parent=router_var,
             )
 
@@ -750,6 +753,7 @@ def _emit_router(
     domain_names: dict[str, str],
     lr: pt.OvnLrNode | None,
     nodes: list[pt.Model],
+    addrs: Addresses,
     emit: Emitter,
 ) -> None:
     external_ids: list[tuple[str, str]] = []
@@ -787,13 +791,8 @@ def _emit_router(
         # 2026-08-12, src/ir.ts), resolved back to the real name every
         # ovn-nbctl argument needs via domain_names/host_names.
         domain = domain_names[data.l2Segment]
-        # No "is mac None" check here anymore: OvnLrpData.mac is a
-        # required (non-Optional) str field — a raw IR node missing it
-        # already failed inside protocol/hydrate.py's hydrate_node(),
-        # long before this function ever ran. That's the typed
-        # protocol actually doing its job, not this module trusting
-        # blindly: the failure moved earlier and got clearer, it didn't
-        # disappear.
+        # The MAC: an explicit one from the IR, else the fold of the
+        # resolved IPv4 (ADR 0011 §5).
         port_unit = router_unit.unit("router port", f"{lrp} ({domain})")
         gateway_chassis = (
             chassis_refs[data.gatewayChassis] if data.gatewayChassis is not None else None
@@ -803,8 +802,8 @@ def _emit_router(
             OVNNbCtlLrp(
                 router,
                 lrp,
-                data.mac,
-                tuple(data.addresses),
+                data.mac or addrs.mac(data.addresses, lrp),
+                tuple(addrs.list(data.addresses)),
                 gateway_chassis=gateway_chassis,
                 ipv6_ra_configs=(
                     tuple(_ovn_settings(data.ipv6RaConfigs))
@@ -840,7 +839,7 @@ def _emit_router(
                     # filter rules in the same group are handled by
                     # _emit_router_acl; NAT only consumes snat.
                     continue
-                by_external.setdefault(rule.externalIp, []).append(rule)
+                by_external.setdefault(addrs.ref(rule.externalIp), []).append(rule)
         if by_external:
             nat_unit = router_unit.unit("router NAT", router)
             for external in sorted(by_external):
@@ -853,7 +852,7 @@ def _emit_router(
                             parent=router_var,
                         )
     _emit_router_acl(router, router_var, ports, lr, nodes, domain_names, router_unit)
-    _emit_router_routes(router, router_var, routes, router_unit)
+    _emit_router_routes(router, router_var, routes, addrs, router_unit)
     router_unit.blank()
 
 
@@ -900,7 +899,7 @@ def _emit_gateway_chassis_refs(
     return refs
 
 
-def _emit_cluster_body(nodes: list[pt.Model], emit: Emitter) -> None:
+def _emit_cluster_body(nodes: list[pt.Model], addrs: Addresses, emit: Emitter) -> None:
     """The cluster declaration. DELETE is the same declaration rewound
     by the LifecycleController."""
     # Explicit sorts make the emitted script byte-stable regardless of
@@ -931,6 +930,7 @@ def _emit_cluster_body(nodes: list[pt.Model], emit: Emitter) -> None:
             domain_names,
             router_nodes.get(router),
             nodes,
+            addrs,
             emit,
         )
 
@@ -1135,6 +1135,7 @@ def _apply_side_network(
     groups: list[pt.SecurityGroupNode],
     ipaddrs: list[str] | None,
     routes: list[pt.KernelRouterRoute] | None,
+    addrs: Addresses,
     netns: str,
     dev: str,
     emit: Emitter,
@@ -1153,13 +1154,14 @@ def _apply_side_network(
             argv = linux_net_ops.add_addr_argv(addr, dev)
             emit.sh(netns_ops.netns_exec_argv(argv, netns))
     for route in routes or []:
+        via = addrs.ref(route.via) if route.via is not None else None
         if netns_primitive is not None:
             emit.ovn(
-                netns_primitive.add_route(route.dst, dev, route.via, route.metric),
+                netns_primitive.add_route(route.dst, dev, via, route.metric),
                 parent=netns_var,
             )
         else:
-            argv = linux_net_ops.add_route_argv(route.dst, dev, route.via, route.metric)
+            argv = linux_net_ops.add_route_argv(route.dst, dev, via, route.metric)
             emit.sh(netns_ops.netns_exec_argv(argv, netns))
     for group in groups:
         _emit_security_group_rules(group, netns, dev, emit, netns_primitive, netns_var)
@@ -1212,6 +1214,7 @@ class _SideContext:
 
     netns: str
     dev: str
+    addrs: Addresses
 
 
 def _emit_kernel_app_rules(
@@ -1281,7 +1284,9 @@ def _emit_kernel_app_rules(
                 )
             app_unit = emit.unit("kernel app", f"docker ({container}) on {dev} in {netns}")
             veth = app.vethName or ("ve-" + hashlib.md5(container.encode()).hexdigest()[:8])
-            gateway = app.routerIp.split("/")[0]
+            container_ip = ctx.addrs.one(app.ip)
+            router_ip = ctx.addrs.one(app.routerIp)
+            gateway = router_ip.split("/")[0]
             image = app.image or f"ovn-fabric-{container}"
             app_unit.helper(
                 "_docker_veth_up",
@@ -1291,8 +1296,8 @@ def _emit_kernel_app_rules(
                 list(app.cmd or []),
                 netns,
                 veth,
-                app.routerIp,
-                app.ip,
+                router_ip,
+                container_ip,
                 gateway,
                 # Stopping a docker container is done THE HARD WAY — an
                 # explicit `docker rm -f` via the daemon (SIGTERM through
@@ -1410,7 +1415,11 @@ def _veth_root_bridge(root_leg: str, nodes: list[pt.Model]) -> str | None:
 
 
 def _emit_kernel_router_owner(
-    owner: pt.KernelRouterNode, netns: str, nodes: list[pt.Model], emit: Emitter
+    owner: pt.KernelRouterNode,
+    netns: str,
+    nodes: list[pt.Model],
+    addrs: Addresses,
+    emit: Emitter,
 ) -> None:
     """One kernel router's declaration: its `up` creates it, its `down`
     is the same declaration rewound (the netns' moved-in links are deleted
@@ -1488,7 +1497,7 @@ def _emit_kernel_router_owner(
                     kernel_netns.add_link(
                         dev,
                         "veth",
-                        mac=iface.mac,
+                        mac=iface.mac or addrs.mac(side_node.data.ipaddrs, iface.ifaceName),
                         root_leg=root_leg,
                         bridge=bridge,
                     ),
@@ -1524,8 +1533,9 @@ def _emit_kernel_router_owner(
         )
         _apply_side_network(
             groups,
-            list(side_node.data.ipaddrs or []),
+            addrs.list(side_node.data.ipaddrs),
             list(side_node.data.routes or []),
+            addrs,
             netns,
             dev,
             side_unit,
@@ -1547,6 +1557,7 @@ def _emit_kernel_router_owner(
                 _SideContext(
                     netns=netns,
                     dev=dev,
+                    addrs=addrs,
                 ),
                 nodes,
             )
@@ -2299,16 +2310,18 @@ def _service_faces(service_name: str, host_name: str, nodes: list[pt.Model]) -> 
 def _emit_service_up(
     node: pt.KernelAppContainerNode | pt.KernelAppServiceNode,
     faces: list[Face],
+    addrs: Addresses,
     emit: Emitter,
 ) -> None:
     """A workload: its image, then its container, NICs and addresses."""
     workload_unit = emit.unit("workload", node.key.name, key=node.id)
-    _emit_service_body(node, faces, workload_unit)
+    _emit_service_body(node, faces, addrs, workload_unit)
 
 
 def _emit_service_body(
     node: pt.KernelAppContainerNode | pt.KernelAppServiceNode,
     faces: list[Face],
+    addrs: Addresses,
     emit: Emitter,
 ) -> None:
     """The `up` body: build/run the container, then for EACH NIC (from a
@@ -2360,7 +2373,7 @@ def _emit_service_body(
         resolver = ref.resolver
         if resolver and resolver.nameservers:
             for server in resolver.nameservers:
-                run_flags += ["--dns", server]
+                run_flags += ["--dns", addrs.ref(server)]
             break
     docker = host.docker(
         container,
@@ -2397,20 +2410,21 @@ def _emit_service_body(
         # SAME destination; a separate table per NIC, entered by a rule
         # matching that NIC's own source prefix, keeps every path intact.
         table = 1000 + i
-        networks = [_network_of(a) for a in (ref.ipaddrs or [])]
+        nic_addrs = addrs.list(ref.ipaddrs)
+        networks = [_network_of(a) for a in nic_addrs]
         nic_unit = emit.unit("NIC", f"{nic} on {bridge}")
         nic_unit.ovn(
             container_ns.add_link(
                 peer,
                 "veth",
                 rename_to=nic,
-                mac=ref.mac,
+                mac=ref.mac or addrs.mac(ref.ipaddrs, f"{ref.service}|{nic}"),
                 root_leg=dev,
                 bridge=bridge,
             ),
             parent=container_ns_var,
         )
-        for address in ref.ipaddrs or []:
+        for address in nic_addrs:
             nic_unit.ovn(
                 container_ns.add_addr(nic, address),
                 parent=container_ns_var,
@@ -2422,7 +2436,7 @@ def _emit_service_body(
                     container_ns.add_route(
                         route.dst,
                         nic,
-                        via=route.via,
+                        via=addrs.ref(route.via) if route.via is not None else None,
                         metric=route.metric,
                         table=table,
                         family=family,
@@ -2434,7 +2448,7 @@ def _emit_service_body(
                         container_ns.add_route(
                             route.dst,
                             nic,
-                            via=route.via,
+                            via=addrs.ref(route.via) if route.via is not None else None,
                             metric=route.metric,
                             family=family,
                         ),

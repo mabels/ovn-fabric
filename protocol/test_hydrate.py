@@ -57,7 +57,9 @@ RAW_OVN_LRP: dict[str, Any] = {
     "key": {"ovnrouter": "router-home", "name": "lrp-home"},
     "data": {
         "l2Segment": "ls:home",
-        "addresses": ["192.168.1.1/24"],
+        "addresses": [
+            {"net": "ipnet:ls:home", "owner": "ovnrouter:router-home|lrp:lrp-home", "host": 1}
+        ],
         "mac": "00:00:00:00:01:01",
         "gatewayChassis": "host:chassis-1",
     },
@@ -211,7 +213,13 @@ class HydrateOvnLrpTest(unittest.TestCase):
                         "service": "kernel.app.container:dns",
                         "name": "home",
                         "mac": "00:00:c0:a8:01:35",
-                        "ipaddrs": ["192.168.1.53/24"],
+                        "ipaddrs": [
+                            {
+                                "net": "ipnet:ls:home",
+                                "owner": "kernel.app.container:dns|nic:home",
+                                "host": 53,
+                            }
+                        ],
                     },
                     {"service": "kernel.app.container:ntp", "name": "home"},
                 ],
@@ -221,15 +229,16 @@ class HydrateOvnLrpTest(unittest.TestCase):
         self.assertEqual(refs[0].mac, "00:00:c0:a8:01:35")
         self.assertIsNone(refs[1].mac)
 
-    def test_missing_mac_raises_instead_of_reaching_the_deployer(self) -> None:
-        # The whole point of hydrating at the boundary: a stale IR JSON
-        # (predating src/ir.ts resolving mac itself) fails loudly HERE,
-        # not deep inside ir_common.py's script emission.
+    def test_a_port_without_mac_hydrates_to_none(self) -> None:
+        # Only an explicit MAC is in the IR (ADR 0011 §5); without one the
+        # runtime folds it from the resolved address (fabric/addresses.py).
         raw = {**RAW_OVN_LRP, "data": {k: v for k, v in RAW_OVN_LRP["data"].items() if k != "mac"}}
-        with self.assertRaises(mod.IRShapeError) as caught:
-            mod.hydrate_node(raw)
-        # The message names the node and the path of the missing field.
-        self.assertIn("ovnrouter:router-home|lrp:lrp-home.data.mac", str(caught.exception))
+        self.assertIsNone(mod.hydrate_node(raw).data.mac)
+
+    def test_an_address_hydrates_to_a_logical_ip(self) -> None:
+        address = mod.hydrate_node(RAW_OVN_LRP).data.addresses[0]
+        self.assertIsInstance(address, pt.LogicalIP)
+        self.assertEqual((address.net, address.host), ("ipnet:ls:home", 1))
 
 
 class HydrateKernelRouterTest(unittest.TestCase):
@@ -239,8 +248,24 @@ class HydrateKernelRouterTest(unittest.TestCase):
         "key": {"name": "kernel-0", "side": "right"},
         "data": {
             "host": "host:chassis-1",
-            "ipaddrs": ["192.168.132.93/24"],
-            "routes": [{"dst": "0.0.0.0/0", "via": "192.168.132.1"}],
+            "ipaddrs": [
+                {
+                    "net": "ipnet:kernelrouter:kernel-0|side:right",
+                    "owner": "kernelrouter:kernel-0|side:right",
+                    "host": 93,
+                }
+            ],
+            "routes": [
+                {
+                    "dst": "0.0.0.0/0",
+                    "via": {
+                        "net": "ipnet:kernelrouter:kernel-0|side:right",
+                        "owner": "kernelrouter:kernel-0|side:right|route:0.0.0.0/0|via",
+                        "family": "ipv4",
+                        "host": 1,
+                    },
+                }
+            ],
             "ifaces": [
                 {
                     "host": "chassis-1",
@@ -324,8 +349,8 @@ class HydrateKernelRouterTest(unittest.TestCase):
                         "image": "ubuntu",
                         "name": "kernel-0-test-docker",
                         "cmd": ["sleep", "86400"],
-                        "ip": "10.200.0.2/24",
-                        "routerIp": "10.200.0.1/24",
+                        "ip": {"net": "ipnet:link", "owner": "link|container", "host": 2},
+                        "routerIp": {"net": "ipnet:link", "owner": "link|router", "host": "first"},
                         "vethName": "ve-12345678",
                     }
                 ],
@@ -338,8 +363,8 @@ class HydrateKernelRouterTest(unittest.TestCase):
         self.assertEqual(app.image, "ubuntu")
         self.assertEqual(app.name, "kernel-0-test-docker")
         self.assertEqual(app.cmd, ["sleep", "86400"])
-        self.assertEqual(app.ip, "10.200.0.2/24")
-        self.assertEqual(app.routerIp, "10.200.0.1/24")
+        self.assertEqual(app.ip, pt.LogicalIP(net="ipnet:link", owner="link|container", host=2))
+        self.assertEqual(app.routerIp.host, "first")
         self.assertEqual(app.vethName, "ve-12345678")
 
     def test_wireguard_app_hydrates_with_config_and_masq(self) -> None:

@@ -53,6 +53,7 @@ from deployer.ir_common import (
 from protocol import generated as pt
 
 from . import generated as g
+from .addresses import Addresses
 from .decide import Decide, spec
 from .lifecycle import (
     CaptureOperation,
@@ -308,6 +309,9 @@ def _emit_boot(host: str, emit: Emitter) -> None:
 
 def _plans(nodes: Sequence[pt.Model], host: str) -> list[_Plan]:
     all_nodes = list(nodes)
+    # Every address the IR leaves to the runtime, placed (ADR 0011 §3b):
+    # one metadata object, handed to everything that emits an address.
+    addrs = Addresses.resolve(all_nodes)
     host_node = next(
         (n for n in all_nodes if isinstance(n, pt.InfraHostNode) and n.key.host == host), None
     )
@@ -315,13 +319,15 @@ def _plans(nodes: Sequence[pt.Model], host: str) -> list[_Plan]:
         raise PlanError(f"{host} is not a host of this IR")
     plans = [_scope("configure", functools.partial(_emit_host_configure, host_node, all_nodes))]
     if host_node.data.ovnRole == pt.OvnRole.central:
-        plans.append(_scope("cluster", functools.partial(_emit_cluster_body, all_nodes)))
+        plans.append(_scope("cluster", functools.partial(_emit_cluster_body, all_nodes, addrs)))
     for owner in _kernel_router_owners(host_node.id, all_nodes):
         name = owner.key.name
         plans.append(
             _scope(
                 name,
-                functools.partial(_emit_kernel_router_owner, owner, _netns_name(name), all_nodes),
+                functools.partial(
+                    _emit_kernel_router_owner, owner, _netns_name(name), all_nodes, addrs
+                ),
             )
         )
     for node in all_nodes:
@@ -331,7 +337,7 @@ def _plans(nodes: Sequence[pt.Model], host: str) -> list[_Plan]:
             continue
         name = node.key.name
         faces = _service_faces(name, host, all_nodes)
-        plans.append(_scope(name, functools.partial(_emit_service_up, node, faces)))
+        plans.append(_scope(name, functools.partial(_emit_service_up, node, faces, addrs)))
     plans.append(_scope("boot", functools.partial(_emit_boot, host)))
     names: set[str] = set()
     for unit in (unit for plan in plans for unit in plan.units):
