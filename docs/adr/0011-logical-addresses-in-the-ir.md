@@ -1,6 +1,6 @@
 # ADR 0011: Logical addresses in the IR — the runtime allocates
 
-Status: proposed (2026-11-12)
+Status: accepted (2026-11-12) — built: migration steps 1–4 (commits 1854816, 1821767, ab43c83, f4f0355, d553013, a872730, 6e5246e), verified on VM 302.
 
 ## Context
 
