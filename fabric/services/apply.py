@@ -52,6 +52,7 @@ from runtime.service import Service
 
 from .. import cleanup, observed, release
 from .. import generated as g
+from ..addresses import AddressError, Addresses, live_view
 from ..decide import STARTS_AFRESH
 from ..desired import (
     Reconciled,
@@ -357,14 +358,22 @@ class Apply:
             await call.log("warn", problem)
             return self._result(info.hash, req, host, g.IrApplyOutcome.failed, [])
         try:
-            plan = plan_units(nodes, host)
-            operations = plan_operations(nodes, host)
-        except PlanError as exc:
-            raise ProtocolError("bad-ir", str(exc)) from None
-        try:
             live = await asyncio.to_thread(observed.snapshot)
         except Exception as exc:  # noqa: BLE001 — without the live view, change nothing
             raise ProtocolError("failed", f"cannot collect the live RawIR: {exc}") from None
+        # The addresses first (ADR 0011 §3): a name keeps the number it holds
+        # live; only new names get free ones, and nothing live is handed out.
+        try:
+            addrs = Addresses.resolve(nodes, *live_view(nodes, live))
+        except AddressError as exc:
+            raise ProtocolError("bad-ir", str(exc)) from None
+        for net_id, owner, text, how in addrs.allocated():
+            await call.log("info" if how == "new" else "debug", f"address {how}: {owner} {text}")
+        try:
+            plan = plan_units(nodes, host, addrs)
+            operations = plan_operations(nodes, host, addrs)
+        except PlanError as exc:
+            raise ProtocolError("bad-ir", str(exc)) from None
         host_node = next(n for n in nodes if isinstance(n, pt.InfraHostNode) and n.key.host == host)
         _mark_host(live, host_node, operations)
         # Release before claim (ADR 0010): a leftover holding a single

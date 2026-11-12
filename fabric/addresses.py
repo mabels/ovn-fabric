@@ -26,6 +26,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from typing import Any
 
 from ip_address import IPAddress
 
@@ -207,9 +208,11 @@ class Addresses:
         self,
         prefixes: Mapping[str, Mapping[str, IPAddress]],
         numbers: Mapping[str, Mapping[str, Mapping[str, int]]],
+        origin: Mapping[str, Mapping[str, str]] | None = None,
     ) -> None:
         self._prefixes = prefixes  # net id -> family -> prefix
         self._numbers = numbers  # net id -> owner -> family -> host number
+        self._origin = origin or {}  # net id -> owner -> "live" | "new"
 
     @classmethod
     def resolve(
@@ -254,6 +257,13 @@ class Addresses:
                         if h is not None
                     }
         numbers: dict[str, dict[str, dict[str, int]]] = {}
+        origin = {
+            net_id: {
+                owner: ("live" if owner in (live or {}).get(net_id, {}) else "new")
+                for owner in owners
+            }
+            for net_id, owners in names.items()
+        }
         for net_id, fams in prefixes.items():
             numbers[net_id] = allocate(
                 AllocationRequest(
@@ -266,7 +276,18 @@ class Addresses:
                     held=(held or {}).get(net_id, {}),
                 )
             )
-        return cls(prefixes, numbers)
+        return cls(prefixes, numbers, origin)
+
+    def allocated(self) -> list[tuple[str, str, str, str]]:
+        """(net id, owner, addresses, "live" | "new") for every address the
+        runtime placed — the resolved view a run reports (ADR 0011 §3)."""
+        out = []
+        for net_id, owners in sorted(self._origin.items()):
+            for owner, how in sorted(owners.items()):
+                fams = self._numbers[net_id][owner]
+                text = " ".join(self.address(net_id, owner, f).to_string() for f in sorted(fams))
+                out.append((net_id, owner, text, how))
+        return out
 
     # -- what services ask --
 
@@ -353,3 +374,89 @@ def mac_from_name(name: str) -> str:
         h = (h * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
     hexed = f"{h:016x}"[:10]
     return "02:" + ":".join(hexed[i : i + 2] for i in range(0, 10, 2))
+
+
+# -- the live view (ADR 0011 §3) --------------------------------------------
+
+LiveNumbers = dict[str, dict[str, dict[str, int]]]  # net id -> owner -> family -> n
+HeldNumbers = dict[str, dict[str, list[int]]]  # net id -> family -> every live n
+
+
+def live_view(
+    nodes: Iterable[pt.Model], live: Mapping[str, Mapping[str, Any]]
+) -> tuple[LiveNumbers, HeldNumbers]:
+    """From the live RawIR (node id -> node): the numbers the names of the
+    IR hold now (`live`), and every number taken on each collision domain,
+    ours or not (`held`) — what `Addresses.resolve` keeps and avoids.
+
+    An OVN router port is found by its name: its owner is the IR id of the
+    same port (`ovnrouter:<router>|lrp:<port>`); its collision domain is the switch
+    its peer port binds it to (`options:router-port`). A port of ours with
+    an address outside the IR's prefix means the prefix was changed — an
+    error: renumbering is a reinstall (ADR 0011 §3)."""
+    nodes = list(nodes)
+    prefixes: dict[str, dict[str, IPAddress]] = {}
+    for net in (n for n in nodes if isinstance(n, pt.IpNetNode)):
+        prefixes[net.id] = {
+            f: _parse(p, net.id)
+            for f, p in (("ipv4", net.data.ipv4), ("ipv6", net.data.ipv6))
+            if p is not None
+        }
+    owners: dict[str, set[str]] = {}  # net id -> owners in the IR
+    for node in nodes:
+        for value in _walk(getattr(node, "data", None)):
+            if isinstance(value, pt.LogicalIP):
+                owners.setdefault(value.net, set()).add(value.owner)
+    switch_of_port: dict[str, str] = {}
+    for raw in live.values():
+        if raw.get("kind") == "ovn.lsp":
+            port = (raw.get("options") or {}).get("router-port")
+            if port:
+                switch_of_port[port] = str(raw.get("switchRef", "")).removeprefix("ovn.ls:")
+    out_live: LiveNumbers = {}
+    held: dict[str, dict[str, set[int]]] = {}
+
+    def hold(net_id: str, value: str, owner: str | None, who: str) -> None:
+        addr = IPAddress.parse(value)
+        if addr is None:
+            return
+        family = _family(addr)
+        prefix = prefixes[net_id].get(family)
+        if prefix is None:
+            return
+        inside = addr.change_prefix(prefix.prefix.num)
+        if inside is None or not prefix.includes(inside):
+            if owner is not None:
+                raise AddressError(
+                    f"{net_id}: {who} holds {value}, outside {prefix.to_string()} — the "
+                    "prefix was changed; renumbering a collision domain is a reinstall"
+                )
+            return
+        n = int(inside.host_number())
+        held.setdefault(net_id, {}).setdefault(family, set()).add(n)
+        if owner is not None:
+            out_live.setdefault(net_id, {}).setdefault(owner, {})[family] = n
+
+    for node_id, raw in live.items():
+        kind = raw.get("kind")
+        if kind == "ovn.lrp":
+            switch = switch_of_port.get(str(raw.get("name")))
+            net_id = f"ipnet:ls:{switch}"
+            if switch is None or net_id not in prefixes:
+                continue
+            # its owner: the IR id of the same port (ovn.lrp:<r>|<p> in RawIR)
+            router = str(raw.get("routerRef", "")).removeprefix("ovn.lr:")
+            ir_id = f"ovnrouter:{router}|lrp:{raw.get('name')}"
+            owner = ir_id if ir_id in owners.get(net_id, set()) else None
+            for value in raw.get("networks") or []:
+                hold(net_id, str(value), owner, node_id)
+        elif kind == "ovn.lsp":
+            net_id = f"ipnet:ls:{str(raw.get('switchRef', '')).removeprefix('ovn.ls:')}"
+            if net_id not in prefixes:
+                continue
+            for entry in raw.get("addresses") or []:  # "<mac> <ip> <ip>…", or "router"
+                for value in str(entry).split()[1:]:
+                    hold(net_id, value, None, node_id)
+    return out_live, {
+        net_id: {f: sorted(ns) for f, ns in fams.items()} for net_id, fams in held.items()
+    }

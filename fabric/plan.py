@@ -240,15 +240,21 @@ def _scope(scope: str, declare: Callable[[Emitter], None]) -> _Plan:
     return emit.plan
 
 
-def plan_units(nodes: Sequence[pt.Model], host: str) -> list[g.Unit]:
-    """The units of work `nodes` (an IR) make on `host`, in create order."""
-    return [unit for plan in _plans(nodes, host) for unit in plan.units]
+def plan_units(
+    nodes: Sequence[pt.Model], host: str, addrs: Addresses | None = None
+) -> list[g.Unit]:
+    """The units of work `nodes` (an IR) make on `host`, in create order.
+    `addrs`: the IR's addresses placed against the live view (run); without
+    it, placed against an empty one (create, ADR 0011 §3)."""
+    return [unit for plan in _plans(nodes, host, addrs) for unit in plan.units]
 
 
-def plan_operations(nodes: Sequence[pt.Model], host: str) -> list[tuple[str, Any]]:
+def plan_operations(
+    nodes: Sequence[pt.Model], host: str, addrs: Addresses | None = None
+) -> list[tuple[str, Any]]:
     """The same plan as (unit name, operation) — the typed objects (an
     AddrPrimitive, an OVSBridge, …) its units are serialized from."""
-    return [entry for plan in _plans(nodes, host) for entry in plan.operations]
+    return [entry for plan in _plans(nodes, host, addrs) for entry in plan.operations]
 
 
 # Where scripts/fabric-install.sh puts the runtime.
@@ -307,11 +313,12 @@ def _emit_boot(host: str, emit: Emitter) -> None:
     unit.ovn(primitives.systemd_enabled(_BOOT_UNIT), decide=Decide.always)
 
 
-def _plans(nodes: Sequence[pt.Model], host: str) -> list[_Plan]:
+def _plans(nodes: Sequence[pt.Model], host: str, addrs: Addresses | None) -> list[_Plan]:
     all_nodes = list(nodes)
     # Every address the IR leaves to the runtime, placed (ADR 0011 §3b):
     # one metadata object, handed to everything that emits an address.
-    addrs = Addresses.resolve(all_nodes)
+    if addrs is None:
+        addrs = Addresses.resolve(all_nodes)
     host_node = next(
         (n for n in all_nodes if isinstance(n, pt.InfraHostNode) and n.key.host == host), None
     )

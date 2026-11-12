@@ -11,6 +11,7 @@ from .addresses import (
     Addresses,
     AllocationRequest,
     allocate,
+    live_view,
     mac_from_name,
     mac_from_v4,
 )
@@ -150,3 +151,67 @@ class MacTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _lsp(
+    switch: str, name: str, router_port: str | None = None, *addresses: str
+) -> dict[str, object]:
+    return {
+        "kind": "ovn.lsp",
+        "switchRef": f"ovn.ls:{switch}",
+        "name": name,
+        "addresses": list(addresses) or (["router"] if router_port else []),
+        "options": {"router-port": router_port} if router_port else {},
+        "externalIds": {},
+    }
+
+
+def _lrp(router: str, name: str, *networks: str) -> dict[str, object]:
+    return {
+        "kind": "ovn.lrp",
+        "routerRef": f"ovn.lr:{router}",
+        "name": name,
+        "networks": list(networks),
+        "externalIds": {},
+    }
+
+
+class LiveViewTest(unittest.TestCase):
+    """run keeps the numbers names hold live (ADR 0011 §3)."""
+
+    def _live(self, *nodes: dict[str, object]) -> dict[str, dict[str, object]]:
+        return {f"n{i}": node for i, node in enumerate(nodes)}
+
+    def test_a_live_port_keeps_its_number(self) -> None:
+        live = self._live(
+            _lsp("backbone", "lsp-router-home-right", "lrp-router-home-right"),
+            _lrp("router-home", "lrp-router-home-right", "172.22.0.7/16"),
+        )
+        addrs = Addresses.resolve(NODES, *live_view(NODES, live))
+        lrp = next(n for n in NODES if isinstance(n, pt.OvnLrpNode) and n.id == LRP_BACKBONE)
+        self.assertEqual(addrs.list(lrp.data.addresses), ["172.22.0.7/16"])
+        self.assertIn(
+            ("ipnet:ls:backbone", LRP_BACKBONE, "172.22.0.7/16", "live"), addrs.allocated()
+        )
+
+    def test_what_others_hold_is_never_handed_out(self) -> None:
+        # a foreign port on the switch holds .1: the new name gets .2
+        live = self._live(_lsp("backbone", "foreign", None, "0a:00:00:00:00:01 172.22.0.1"))
+        addrs = Addresses.resolve(NODES, *live_view(NODES, live))
+        lrp = next(n for n in NODES if isinstance(n, pt.OvnLrpNode) and n.id == LRP_BACKBONE)
+        self.assertEqual(addrs.list(lrp.data.addresses), ["172.22.0.2/16"])
+
+    def test_a_changed_prefix_is_an_error(self) -> None:
+        live = self._live(
+            _lsp("backbone", "lsp-router-home-right", "lrp-router-home-right"),
+            _lrp("router-home", "lrp-router-home-right", "10.9.9.9/24"),
+        )
+        with self.assertRaisesRegex(AddressError, "prefix was changed"):
+            live_view(NODES, live)
+
+    def test_switches_the_ir_does_not_address_are_ignored(self) -> None:
+        live = self._live(
+            _lsp("elsewhere", "lsp-x", "lrp-x"),
+            _lrp("other", "lrp-x", "10.1.1.1/24"),
+        )
+        self.assertEqual(live_view(NODES, live), ({}, {}))
