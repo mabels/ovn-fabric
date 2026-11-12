@@ -57,6 +57,7 @@ from ..decide import STARTS_AFRESH
 from ..desired import (
     Reconciled,
     StepState,
+    changed_by_steps,
     choose,
     compare,
     consumed_later,
@@ -392,6 +393,32 @@ class Apply:
             )
             for node_id in held:
                 live.pop(node_id, None)
+        # Fields steps change on nodes others add: not the adder's to compare.
+        changed_elsewhere = changed_by_steps([op for _unit, op in operations])
+        # Replace what differs (ADR 0011 step 4): a node a step makes that is
+        # there with other own fields (a router port with another address) is
+        # removed before the units run, and its unit makes it anew — one way
+        # to apply a change, the same for every kind.
+        differing = await self._differing(call, live, plan, operations, changed_elsewhere)
+        if differing and req.noCleanup:
+            await call.log("info", "replacing what differs skipped (--no-cleanup)")
+        elif differing:
+            released.append(
+                await self._remove(
+                    call,
+                    req,
+                    host,
+                    "replace what differs",
+                    cleanup.removal_order(live[i] for i in differing),
+                )
+            )
+            # What went with them (a bridge's ports, a port's routes) is
+            # missing now too: look again, so their units make it.
+            try:
+                live = await asyncio.to_thread(observed.snapshot)
+            except Exception as exc:  # noqa: BLE001
+                raise ProtocolError("failed", f"cannot collect the live RawIR: {exc}") from None
+            _mark_host(live, host_node, operations)
         graph = Reconciled.of(ours(live), desired_rawir(operations).nodes)
         by_unit: dict[str, list[Any]] = collections.defaultdict(list)
         for unit_name, operation in operations:
@@ -415,7 +442,11 @@ class Apply:
             values_of["latest"] = values
             steps = [resolve(operation, values) for operation in by_unit[unit.name]]
             checked = [
-                ((decider, {}) if decider is not None else step_state(step, live, later[unit.name]))
+                (
+                    (decider, {})
+                    if decider is not None
+                    else step_state(step, live, later[unit.name], changed_elsewhere)
+                )
                 for step, decider in zip(steps, _deciders(unit), strict=True)
             ]
             choice = choose([state for state, _ in checked])
@@ -489,6 +520,37 @@ class Apply:
         step fulfilled is removed (fabric/cleanup.py)."""
         left = await self._leftovers(call, live, steps)
         return await self._remove(call, req, host, "cleanup: leftovers", left)
+
+    @staticmethod
+    async def _differing(
+        call: Call,
+        live: dict[str, dict[str, Any]],
+        plan: list[g.Unit],
+        operations: list[tuple[str, Any]],
+        changed_elsewhere: dict[str, set[str]],
+    ) -> list[str]:
+        """The live nodes the plan makes that are there with other own
+        fields — logged; not removed yet. A step whose values are only known
+        at run time cannot be told: it is not replaced."""
+        by_unit: dict[str, list[Any]] = collections.defaultdict(list)
+        for unit_name, operation in operations:
+            # unresolved: a value only known at run time stays unknown
+            by_unit[unit_name].append(operation)
+        later = consumed_later([by_unit[unit.name] for unit in plan], live)
+        out: list[str] = []
+        for unit, consumed in zip(plan, later, strict=True):
+            for step in by_unit[unit.name]:
+                state, differ = step_state(step, live, consumed, changed_elsewhere)
+                if state is not StepState.present:
+                    continue
+                for node_id, fields in sorted(differ.items()):
+                    if node_id in live and node_id not in out:
+                        await call.log(
+                            "info", f"replace {node_id} (differs in {', '.join(fields)})"
+                        )
+                        out.append(node_id)
+        await call.log("info", f"replace what differs: {len(out)}")
+        return out
 
     async def _remove(
         self, call: Call, req: g.IrApplyReq, host: str, name: str, nodes: list[Any]
@@ -613,13 +675,19 @@ class Apply:
         await call.log("info", f"natural keys: {len(keys)} single resources")
         for node_id, key in sorted(keys.items()):
             await call.log("debug", f"natural key: {node_id} = {key}")
-        operations = plan_operations(nodes, host)
+        # As run: the addresses placed against the live view (ADR 0011 §3).
+        try:
+            addrs = Addresses.resolve(nodes, *live_view(nodes, live))
+        except AddressError as exc:
+            raise ProtocolError("bad-ir", str(exc)) from None
+        operations = plan_operations(nodes, host, addrs)
         await self._releases(call, live, [resolve(op, {}) for _unit, op in operations])
         by_unit: dict[str, list[Any]] = collections.defaultdict(list)
         for unit_name, operation in operations:
             by_unit[unit_name].append(operation)
+        changed_elsewhere = changed_by_steps([op for _unit, op in operations])
         choices: collections.Counter[str] = collections.Counter()
-        units = plan_units(nodes, host)
+        units = plan_units(nodes, host, addrs)
         later = consumed_later([by_unit[unit.name] for unit in units], live)
         held = Failed()
         for unit, consumed in zip(units, later, strict=True):
@@ -629,7 +697,11 @@ class Apply:
                 continue
             steps = by_unit[unit.name]
             states = [
-                decider if decider is not None else step_state(step, live, consumed)[0]
+                (
+                    decider
+                    if decider is not None
+                    else step_state(step, live, consumed, changed_elsewhere)[0]
+                )
                 for step, decider in zip(steps, _deciders(unit), strict=True)
             ]
             choice = choose(states)

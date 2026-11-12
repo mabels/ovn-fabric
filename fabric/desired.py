@@ -231,10 +231,35 @@ class StepState(enum.Enum):
 _REPEATABLE = ("Capture", "WriteFile", "Directory", "Chmod", "SymlinkNetns")
 
 
+def changed_by_steps(operations: Sequence[Any]) -> dict[str, set[str]]:
+    """node id -> the fields steps CHANGE on it (a bridge mapping written
+    onto a bridge another step adds). Such a field belongs to the step that
+    changes it, not to the one that adds the node."""
+    out: dict[str, set[str]] = collections.defaultdict(set)
+    for operation in operations:
+        if getattr(operation, "step_kind", None) != "Primitive" or _has_runtime_value(operation):
+            continue
+        try:
+            footprint = rawir(operation)
+        except NotLearned:
+            continue
+        for node_id, change in footprint["changed"].items():
+            out[node_id].update(change)
+    return dict(out)
+
+
+def _own_fields(field: str) -> bool:
+    """A node's own field — not a back reference its children fill (a
+    switch's portRefs, a router's routeRefs, a link's masterRef in a
+    bridge): those are other nodes' facts, and other steps make them."""
+    return not (field.endswith("Refs") or field == "masterRef")
+
+
 def step_state(
     operation: Any,
     live: dict[str, dict[str, Any]],
     consumed: Mapping[str, bool] | None = None,
+    changed_elsewhere: Mapping[str, set[str]] | None = None,
 ) -> tuple[StepState, dict[str, list[str]]]:
     """The step's state, and — when present — the fields where its
     predicted nodes differ from the live ones. A predicted node is looked
@@ -265,7 +290,14 @@ def step_state(
     if len(there) < len(added):
         return StepState.partial, {}
     checked = {i: n for i, n in added.items() if i not in taken}
-    differ = compare(checked, {i: live[i] for i in checked}).differ
+    # Only what this step sets itself can differ: not back references, not
+    # fields another step of the plan changes (`changed_elsewhere`).
+    elsewhere = changed_elsewhere or {}
+    differ = {
+        node_id: own
+        for node_id, fields in compare(checked, {i: live[i] for i in checked}).differ.items()
+        if (own := [f for f in fields if _own_fields(f) and f not in elsewhere.get(node_id, set())])
+    }
     # A setting there with another value is not there: set it again (OVS
     # sets external_ids:hostname to the FQDN itself on a fresh system).
     if any(checked[i].get("kind") in _SETTINGS for i in differ):

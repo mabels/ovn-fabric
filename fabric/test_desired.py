@@ -19,7 +19,7 @@ from .lifecycle import CaptureOperation, RuntimeRef
 from .primitives.docker import DockerPull
 from .primitives.fs import DirectoryPrimitive
 from .primitives.host import HostPrimitive
-from .primitives.ovn import OVNNbCtlLs
+from .primitives.ovn import OVNNbCtlLrp, OVNNbCtlLs
 from .primitives.ovs import OVSBridge
 from .rawir_learned import rawir
 
@@ -195,6 +195,30 @@ class StepStateTest(unittest.TestCase):
         self.assertEqual(step_state(DockerPull("h", "busybox"), {})[0], StepState.unknown)
         named_later = OVNNbCtlLs(RuntimeRef("name"))  # type: ignore[arg-type]
         self.assertEqual(step_state(named_later, {})[0], StepState.unknown)
+
+    def test_back_references_are_no_difference_of_the_node(self) -> None:
+        # A switch's ports are added by other steps: its portRefs grow.
+        switch = OVNNbCtlLs("a")
+        node = dict(rawir(switch)["added"]["ovn.ls:a"])
+        node["portRefs"] = ["ovn.lsp:a|lsp-1"]
+        state, differ = step_state(switch, {"ovn.ls:a": node})
+        self.assertEqual((state, differ), (StepState.present, {}))
+
+    def test_a_field_another_step_changes_is_no_difference(self) -> None:
+        # The host's bridge mapping is written onto the bridge by another step.
+        switch = OVNNbCtlLs("a")
+        node = dict(rawir(switch)["added"]["ovn.ls:a"])
+        node["externalIds"] = {"x": "y"}
+        self.assertEqual(step_state(switch, {"ovn.ls:a": node})[1], {"ovn.ls:a": ["externalIds"]})
+        elsewhere = {"ovn.ls:a": {"externalIds"}}
+        self.assertEqual(step_state(switch, {"ovn.ls:a": node}, None, elsewhere)[1], {})
+
+    def test_a_port_with_another_address_differs(self) -> None:
+        lrp = OVNNbCtlLrp("r1", "lrp-a", "00:00:0a:00:00:01", ("10.0.0.1/24",))
+        node = dict(rawir(lrp)["added"]["ovn.lrp:r1|lrp-a"])
+        node["networks"] = ["10.0.0.2/24"]
+        state, differ = step_state(lrp, {"ovn.lrp:r1|lrp-a": node})
+        self.assertEqual((state, differ), (StepState.present, {"ovn.lrp:r1|lrp-a": ["networks"]}))
 
     def test_a_step_that_only_changes_fields_is_checked_by_them(self) -> None:
         footprint = {

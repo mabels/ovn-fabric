@@ -388,6 +388,53 @@ class RunTest(unittest.TestCase):
         self.assertNotIn("router port: lrp-router-home-left (home)", ran)
         self.assertTrue(any(line.startswith("units: ") for line in logs), logs)
 
+    def test_what_differs_is_replaced_before_the_units_run(self) -> None:
+        # ADR 0011 step 4: a router port there with another MAC is removed
+        # first; its unit then finds it missing and makes it again.
+        port = "ovn.lrp:router-home|lrp-router-home-right"
+        live = self._all_there()
+        live[port] = {**live[port], "mac": "00:00:00:00:09:09"}
+        after = {k: v for k, v in live.items() if k != port}
+
+        async def run() -> tuple[Fakes, g.IrApplyRes, list[str]]:
+            fakes = Fakes()
+            async with _client(fakes, host=CENTRAL) as (client, _apply_service):
+                await client.ask(_put("central", _central_ir()), timeout=5)
+                with mock.patch(
+                    "fabric.observed.snapshot", side_effect=[_owned(live), _owned(after)]
+                ):
+                    res, seen = await _run(client, _apply("run", ref="central"))
+            logs = [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
+            return fakes, res, logs
+
+        fakes, res, logs = asyncio.run(run())
+        self.assertEqual(res.state, g.IrApplyOutcome.done)
+        self.assertIn(f"replace {port} (differs in mac)", logs)
+        ran = [name for name, _ in fakes.calls]
+        self.assertLess(
+            ran.index("replace what differs"),
+            ran.index("router port: lrp-router-home-right (backbone)"),
+        )
+
+    def test_with_no_cleanup_nothing_is_replaced(self) -> None:
+        port = "ovn.lrp:router-home|lrp-router-home-right"
+        live = self._all_there()
+        live[port] = {**live[port], "mac": "00:00:00:00:09:09"}
+
+        async def run() -> tuple[Fakes, list[str]]:
+            fakes = Fakes()
+            async with _client(fakes, host=CENTRAL) as (client, _apply_service):
+                await client.ask(_put("central", _central_ir()), timeout=5)
+                with mock.patch("fabric.observed.snapshot", return_value=_owned(live)):
+                    req = _apply("run", ref="central")
+                    req = dataclasses.replace(req, noCleanup=True)
+                    _res, seen = await _run(client, req)
+            return fakes, [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
+
+        fakes, logs = asyncio.run(run())
+        self.assertIn("replacing what differs skipped (--no-cleanup)", logs)
+        self.assertNotIn("replace what differs", [name for name, _ in fakes.calls])
+
     def test_a_unit_that_is_gone_runs_completely(self) -> None:
         live = self._all_there()
         del live["ovn.ls:backbone"]

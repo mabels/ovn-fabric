@@ -536,7 +536,12 @@ any — and no resolved numbers. It gets no allocator of its own.
    by **delete + create** — the old node is removed before its unit runs, and
    the unit's dependent steps run again — so any change that does move an
    address is applied rather than skipped. No in-place update: one way to
-   apply a change, the same for every kind.
+   apply a change, the same for every kind. What differs is only what a
+   step sets itself: a back reference its children fill (`portRefs`,
+   `routeRefs`, a link's `masterRef`) or a field another step of the plan
+   changes (the bridge mapping on a bridge) is no difference of the node.
+   Built 2026-11-12: `run` removes what differs before the units run, then
+   looks again; a step with a value only known at run time is not replaced.
 
 ## Open questions
 
