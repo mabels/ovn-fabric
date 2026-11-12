@@ -134,10 +134,34 @@ export function buildOvnRouterEndpoint(
   // but the resolved endpoint's name is always the derived/pinned value —
   // a spread of `spec` after it would otherwise write `name: undefined`
   // back when the spec left it unset.
-  const { masq, ...withoutMasq } = spec;
-  const masqServices: RouterEndpointService[] = (masq ?? []).map((f) => ({
-    kind: f === "ipv4" ? "ovn.ipv4.masq" as const : "ovn.ipv6.masq" as const,
-  }));
+  const { masq, masqSources, ...withoutMasq } = spec;
+  // One spelling for masquerade (ADR 0011 §3b): `masq`, not a service.
+  const written = (spec.services ?? []).find((s) =>
+    s.kind === "ovn.ipv4.masq" || s.kind === "ovn.ipv6.masq"
+  );
+  if (written !== undefined) {
+    throw new Error(
+      `router "${context.routerName}" (${spec.l2Segment.name}): write the ` +
+        `masquerade as \`masq: ["ipv4", "ipv6"]\`, not as a ` +
+        `\`${written.kind}\` service`,
+    );
+  }
+  const sources = masqSources?.map(prefixOf);
+  const masqServices: RouterEndpointService[] = (masq ?? []).map((f) =>
+    f === "ipv4"
+      ? {
+        kind: "ovn.ipv4.masq" as const,
+        ...(sources
+          ? { sources: sources.filter((a): a is IPv4 => a.is_ipv4()) }
+          : {}),
+      }
+      : {
+        kind: "ovn.ipv6.masq" as const,
+        ...(sources
+          ? { sources: sources.filter((a): a is IPv6 => !a.is_ipv4()) }
+          : {}),
+      }
+  );
   const services = [...(spec.services ?? []), ...masqServices];
   const base = {
     ...withoutMasq,

@@ -595,9 +595,10 @@ export const FilterRule = type({
   direction: "'input'|'output'|'forward'",
   action: "'allow'|'deny'|'reject'",
   family: "'ipv4'|'ipv6'",
-  "sources?": "string[]",
-  "excludeSources?": "string[]",
-  "destinations?": "string[]",
+  // A prefix as text, or an address of the fabric by reference (ADR 0011 §3b).
+  "sources?": AddrRef.or("string").array(),
+  "excludeSources?": AddrRef.or("string").array(),
+  "destinations?": AddrRef.or("string").array(),
   "protocol?": "'tcp'|'udp'|'icmp'|'icmpv6'",
   "ports?": type({ from: "number.integer", to: "number.integer" }).array(),
   "priority?": "number.integer",

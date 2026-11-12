@@ -26,7 +26,7 @@ import type {
   SecurityGroupNode,
 } from "./protocol.ts";
 import { IPv4, IPv6 } from "./ip.ts";
-import { toAddr } from "./ipnet.ts";
+import { IpNet, toAddr } from "./ipnet.ts";
 import { deriveEndpointName } from "./router-endpoints.ts";
 import type {
   CollisionDomain,
@@ -2855,10 +2855,7 @@ Deno.test("ovn masq services resolve to SNAT rows on the logical router", () => 
             IPv4.parse("172.22.0.2/16"),
             IPv6.parse("2600:db8:1::2/64"),
           ],
-          services: [
-            { kind: "ovn.ipv4.masq" },
-            { kind: "ovn.ipv6.masq" },
-          ],
+          masq: ["ipv4", "ipv6"],
         }),
       ],
     }));
@@ -3635,4 +3632,89 @@ Deno.test("defineOvnRouter options: a value OVN would reject throws at declarati
     Error,
     "macBindingAgeThreshold",
   );
+});
+
+Deno.test("masq: one spelling — an ovn.*.masq service is refused", () => {
+  assertThrows(
+    () =>
+      defineNetwork("test-net", (net) => {
+        const bb = net.collisionDomain("bb");
+        net.defineOvnRouter("router-x", (router) => ({
+          routingDomains: [],
+          endpoints: [
+            router.ovnRouterEndpoint({
+              l2Segment: bb,
+              ipaddrs: [IPv4.parse("172.22.0.2/16")],
+              services: [{ kind: "ovn.ipv4.masq" }],
+            }),
+          ],
+        }));
+        return { routers: [] };
+      }),
+    Error,
+    "masq: [",
+  );
+});
+
+Deno.test("filter rules: a net is its prefix, an address of the fabric a reference (ADR 0011 §3b)", () => {
+  const coreNet = new IpNet("172.22.0.0/24");
+  const adminLeg = coreNet.allocated(); // allocated: no number in TypeScript
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost({ name: "chassis-1" });
+    const core = net.collisionDomain("core");
+    const lan = net.collisionDomain("lan");
+    const cp = net.ipNet("10.43.0.0/24");
+    net.defineOvnRouter("router-admin", (router) => ({
+      routingDomains: [],
+      endpoints: [
+        router.ovnRouterEndpoint({
+          l2Segment: core,
+          ipaddrs: adminLeg.ipaddrs(),
+        }),
+        router.ovnRouterEndpoint({
+          l2Segment: net.collisionDomain("admin"),
+          ipaddrs: [IPv4.parse("192.168.9.1/24")],
+        }),
+      ],
+    }));
+    net.defineOvnRouter("router-gw", (router) => ({
+      routingDomains: [],
+      endpoints: [
+        router.ovnRouterEndpoint({
+          l2Segment: core,
+          ipaddrs: coreNet.host(1).ipaddrs(),
+          gatewayChassis: host,
+          services: [{
+            kind: "ovn.ipv4.block-ingress",
+            allow: [{
+              sources: [cp, adminLeg],
+              protocol: "tcp",
+              ports: [{ from: 22, to: 22 }],
+            }],
+          }],
+        }),
+        router.ovnRouterEndpoint({
+          l2Segment: lan,
+          ipaddrs: [IPv4.parse("192.168.1.1/24")],
+        }),
+      ],
+    }));
+    return { hosts: [host], routers: [] };
+  });
+  const nodes = Object.values(toIR(network));
+  const rules = nodes.flatMap((n) =>
+    n.kind === "security.group" ? n.data.rules : []
+  );
+  const allow = rules.find((r) =>
+    r.kind === "filter" && r.direction === "input" && r.action === "allow"
+  );
+  if (allow?.kind !== "filter") throw new Error("no allow rule");
+  const [net, leg] = allow.sources ?? [];
+  assertEquals(net, "10.43.0.0/24");
+  assertEquals(
+    typeof leg === "object" &&
+      leg.owner.startsWith("ovnrouter:router-admin|lrp:"),
+    true,
+  );
+  assertEquals(typeof leg === "object" && leg.net, "ipnet:ls:core");
 });

@@ -43,7 +43,6 @@ import {
   type WanSpec,
 } from "./tenant.ts";
 import { type Addr, IpNet, type IpNetSpec, netOf, toAddrs } from "./ipnet.ts";
-import type { IPv4, IPv6 } from "./ip.ts";
 import {
   type CertIssuer,
   type CertIssuerSpec,
@@ -674,20 +673,11 @@ export class NetworkBuilder implements RouterEndpointContext {
       ipaddrs,
       routeIsolated: true,
       ...(gatewayChassis ? { gatewayChassis } : {}),
-      services: [
-        ...(has(true)
-          ? [{
-            kind: "ovn.ipv4.masq" as const,
-            sources: sources.filter((a): a is IPv4 => a.is_ipv4()),
-          }]
-          : []),
-        ...(has(false)
-          ? [{
-            kind: "ovn.ipv6.masq" as const,
-            sources: sources.filter((a): a is IPv6 => !a.is_ipv4()),
-          }]
-          : []),
+      masq: [
+        ...(has(true) ? ["ipv4" as const] : []),
+        ...(has(false) ? ["ipv6" as const] : []),
       ],
+      masqSources: sources,
     }, { routerName: router.name, role: "ovn" });
     this.checkRouterEndpoint(router.name, endpoint);
     this.registerEndpointName(router.name, endpoint.name);

@@ -69,7 +69,7 @@ import type {
   ServiceRef,
 } from "./protocol.ts";
 import { NetworkValue } from "./protocol.ts";
-import { type Addr, prefixOf, toAddr, toAddrs } from "./ipnet.ts";
+import { Addr, prefixOf, selectors, toAddr, toAddrs } from "./ipnet.ts";
 import { AddressIndex } from "./ir-addresses.ts";
 
 // The IR node types are the ones INFERRED from the protocol schema
@@ -538,9 +538,18 @@ function kernelRouterSideToIR(
 // (net.securityGroup(), define.ts — including the implicit `masq-<router>`
 // shortcut expansion); this function is pure serialization, it derives
 // nothing.
-function expandFilterRule(rule: FilterRule): Record<string, unknown>[] {
-  const src = rule.sources ?? [];
-  const dst = rule.destinations ?? [];
+function expandFilterRule(
+  rule: FilterRule,
+  addrs: AddressIndex,
+  line: string,
+): Record<string, unknown>[] {
+  const src = selectors(rule.sources);
+  const dst = selectors(rule.destinations);
+  const exclude = selectors(rule.excludeSources);
+  // A written prefix or a net's prefix as text; an address of the fabric as
+  // a reference to its carrier (ADR 0011 §3b).
+  const out = (a: IPv4 | IPv6 | Addr, field: string) =>
+    a instanceof Addr ? addrs.ref(a, `${line}|${field}`, []) : a.to_string();
   const families = new Set<"ipv4" | "ipv6">();
   for (const a of [...src, ...dst]) families.add(a.is_ipv4() ? "ipv4" : "ipv6");
   if (families.size === 0) {
@@ -572,20 +581,20 @@ function expandFilterRule(rule: FilterRule): Record<string, unknown>[] {
       ...(src.length > 0
         ? {
           sources: src.filter((a) => a.is_ipv4() === (family === "ipv4"))
-            .map((a) => a.to_string()),
+            .map((a) => out(a, "sources")),
         }
         : {}),
-      ...(rule.excludeSources && rule.excludeSources.length > 0
+      ...(exclude.length > 0
         ? {
-          excludeSources: rule.excludeSources
+          excludeSources: exclude
             .filter((a) => a.is_ipv4() === (family === "ipv4"))
-            .map((a) => a.to_string()),
+            .map((a) => out(a, "excludeSources")),
         }
         : {}),
       ...(dst.length > 0
         ? {
           destinations: dst.filter((a) => a.is_ipv4() === (family === "ipv4"))
-            .map((a) => a.to_string()),
+            .map((a) => out(a, "destinations")),
         }
         : {}),
       ...(rule.protocol ? { protocol: rule.protocol } : {}),
@@ -604,7 +613,9 @@ function securityGroupToIR(
     if (rule.kind === "masq") {
       rules.push({ ...rule });
     } else if (rule.kind === "filter") {
-      rules.push(...expandFilterRule(rule));
+      rules.push(
+        ...expandFilterRule(rule, addrs, `securitygroup:${group.name}`),
+      );
     } else {
       // The outgoing port's own address, by reference (ADR 0011 §3b).
       const externalIp = addrs.ref(
@@ -864,7 +875,7 @@ function computeOvnSecurityGroups(network: NetworkDefinition): {
             priority: 200,
           });
           for (const allow of service.allow ?? []) {
-            const sources = (allow.sources ?? []).filter(
+            const sources = selectors(allow.sources).filter(
               (a) => a.is_ipv4() === isV4,
             );
             rules.push({

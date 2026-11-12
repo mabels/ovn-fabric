@@ -612,15 +612,31 @@ def _ovn_settings(record: OvnSettings) -> list[tuple[str, str]]:
 # One flag-taking function per object, create/delete branches adjacent
 # (2026-08-19 — the "write_interface(action)" schema): adding a create
 # command forces you to look at its delete right next to it.
-def _ovn_acl_match(rule: pt.FilterRule, port: pt.Port | None) -> str:
+def _selectors(values: list[str | pt.AddrRef] | None, addrs: Addresses) -> list[str]:
+    """A filter rule's sources/destinations as text: a prefix as written, an
+    address of the fabric (a reference, ADR 0011 §3b) as its host prefix."""
+    out = []
+    for value in values or []:
+        if isinstance(value, str):
+            out.append(value)
+        else:
+            width = 32 if value.family == pt.Family.ipv4 else 128
+            out.append(f"{addrs.ref(value)}/{width}")
+    return out
+
+
+def _ovn_acl_match(rule: pt.FilterRule, port: pt.Port | None, addrs: Addresses) -> str:
     parts: list[str] = []
     family = "ip4" if rule.family == pt.Family.ipv4 else "ip6"
-    if rule.sources:
-        parts.append(f"{family}.src == {{{', '.join(rule.sources)}}}")
-    if rule.excludeSources:
-        parts.append(f"{family}.src != {{{', '.join(rule.excludeSources)}}}")
-    if rule.destinations:
-        parts.append(f"{family}.dst == {{{', '.join(rule.destinations)}}}")
+    sources = _selectors(rule.sources, addrs)
+    excluded = _selectors(rule.excludeSources, addrs)
+    destinations = _selectors(rule.destinations, addrs)
+    if sources:
+        parts.append(f"{family}.src == {{{', '.join(sources)}}}")
+    if excluded:
+        parts.append(f"{family}.src != {{{', '.join(excluded)}}}")
+    if destinations:
+        parts.append(f"{family}.dst == {{{', '.join(destinations)}}}")
     proto = rule.protocol.value if rule.protocol is not None else None
     if proto is not None:
         if proto == "icmp":
@@ -647,6 +663,7 @@ def _emit_router_acl(
     lr: pt.OvnLrNode | None,
     nodes: list[pt.Model],
     domain_names: dict[str, str],
+    addrs: Addresses,
     emit: Emitter,
 ) -> None:
     if lr is None or not lr.data.securityGroups:
@@ -717,7 +734,7 @@ def _emit_router_acl(
                 priority = rule.priority if rule.priority is not None else 100
                 ports_iter: list[pt.Port | None] = list(rule.ports) if rule.ports else [None]
                 for port in ports_iter:
-                    match = _ovn_acl_match(rule, port)
+                    match = _ovn_acl_match(rule, port, addrs)
                     action = action_map[rule.action]
                     if rule.action == pt.Action.allow:
                         action = "allow-related"
@@ -851,7 +868,7 @@ def _emit_router(
                             ),
                             parent=router_var,
                         )
-    _emit_router_acl(router, router_var, ports, lr, nodes, domain_names, router_unit)
+    _emit_router_acl(router, router_var, ports, lr, nodes, domain_names, addrs, router_unit)
     _emit_router_routes(router, router_var, routes, addrs, router_unit)
     router_unit.blank()
 
@@ -1056,6 +1073,7 @@ def _emit_security_group_rules(
     netns: str,
     dev: str,
     emit: Emitter,
+    addrs: Addresses,
     netns_primitive: NetnsPrimitive | None = None,
     netns_var: str | None = None,
 ) -> None:
@@ -1094,9 +1112,9 @@ def _emit_security_group_rules(
                 _FAMILY[rule.family],
                 rule.direction.value,
                 rule.action.value,
-                sources=rule.sources or (),
-                exclude_sources=rule.excludeSources or (),
-                destinations=rule.destinations or (),
+                sources=tuple(_selectors(rule.sources, addrs)),
+                exclude_sources=tuple(_selectors(rule.excludeSources, addrs)),
+                destinations=tuple(_selectors(rule.destinations, addrs)),
                 protocol=rule.protocol.value if rule.protocol is not None else None,
                 ports=[(port.from_, port.to) for port in rule.ports or ()],
             ),
@@ -1164,7 +1182,7 @@ def _apply_side_network(
             argv = linux_net_ops.add_route_argv(route.dst, dev, via, route.metric)
             emit.sh(netns_ops.netns_exec_argv(argv, netns))
     for group in groups:
-        _emit_security_group_rules(group, netns, dev, emit, netns_primitive, netns_var)
+        _emit_security_group_rules(group, netns, dev, emit, addrs, netns_primitive, netns_var)
 
 
 def _docker_dockerfile(build: pt.DockerBuild) -> str:
@@ -1658,7 +1676,7 @@ def _start_owning_container(
         volumes=tuple((volume["host"], volume["container"]) for volume in volumes),
         run_flags=tuple(app.run or ()),
         # Its natural key: the node address, the public part of its identity.
-        natural_key=f"zt:{identity['public'].split(':')[0]}" if identity else "",
+        natural_key=f"zt:{identity['public'].split(':')[0]}" if identity else None,
         # A changed identity or state file needs a restart: the daemon read it.
         files=files_hash(
             *(identity.values() if identity else ()),

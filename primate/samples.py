@@ -463,7 +463,10 @@ SAMPLES = [
     Sample(
         DockerPrimitive,
         setup=_image,
-        kinds={"image": "image"},
+        # natural_key a marker: RawIR shows it as the container's
+        # naturalKeyLabel (ADR 0010) — learned, so a container with one (a
+        # ZeroTier instance) is not "different" from its footprint.
+        kinds={"image": "image", "natural_key": "name"},
         free={
             "command": ("sleep", "3600"),
             "privileged": False,
@@ -473,8 +476,6 @@ SAMPLES = [
             "run_flags": (),
             "remove_existing": True,
             "files": "",
-            # A label (ADR 0010): RawIR has it as naturalKeyLabel, unset here.
-            "natural_key": "",
         },
     ),
     Sample(OVSBridge, fixed={"datapath": None, "fail_mode": "standalone"}),

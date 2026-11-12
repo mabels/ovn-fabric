@@ -169,3 +169,27 @@ class AddressKeyTest(unittest.TestCase):
     def test_without_its_peer_the_domain_is_unknown(self) -> None:
         port = self.LIVE["ovn.lrp:r1|lrp-a"]
         self.assertEqual(address_keys(port, {}), [])
+
+
+class NicAddressKeyTest(unittest.TestCase):
+    """A workload NIC is named after its switch: that is its domain."""
+
+    SWITCH: dict[str, dict[str, Any]] = {
+        "ovn.ls:control-plane": {"id": "ovn.ls:control-plane", "kind": "ovn.ls"}
+    }
+
+    def _addr(self, nic: str, address: str) -> dict[str, Any]:
+        return {
+            "kind": "addr",
+            "netnsRef": "netns:ovn-fabric-dns",
+            "linkRef": f"link:ovn-fabric-dns|{nic}",
+            "address": address,
+        }
+
+    def test_a_nic_address_is_keyed_on_its_switch(self) -> None:
+        node = self._addr("control-plane", "10.43.0.10")
+        self.assertEqual(address_keys(node, self.SWITCH), ["addr:ovn.ls:control-plane|10.43.0.10"])
+
+    def test_no_key_without_that_switch_or_for_the_kernel_s_own(self) -> None:
+        self.assertEqual(address_keys(self._addr("eth0", "10.43.0.10"), self.SWITCH), [])
+        self.assertEqual(address_keys(self._addr("control-plane", "fe80::1"), self.SWITCH), [])

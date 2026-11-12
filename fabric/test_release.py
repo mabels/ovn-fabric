@@ -152,7 +152,13 @@ class AddressTest(unittest.TestCase):
         }
         steps = [
             OVNNbCtlLrp("r1", "lrp-new", "00:00:ac:15:00:05", ("172.21.0.5/24",)),
-            OVNNbCtlLsp("core", "lsp-new", type="router", options=(("router-port", "lrp-new"),)),
+            OVNNbCtlLsp(
+                "core",
+                "lsp-new",
+                type="router",
+                addresses=("router",),
+                options=(("router-port", "lrp-new"),),
+            ),
         ]
         found = release.find(steps, live, ["ovn.lrp:r1|lrp-old", "ovn.lsp:core|lsp-old"])
         self.assertEqual(
@@ -179,6 +185,12 @@ class AddressTest(unittest.TestCase):
         }
         steps = [
             OVNNbCtlLrp("r1", "lrp-new", "00:00:ac:15:00:05", ("172.21.0.5/24",)),
-            OVNNbCtlLsp("core", "lsp-new", type="router", options=(("router-port", "lrp-new"),)),
+            OVNNbCtlLsp(
+                "core",
+                "lsp-new",
+                type="router",
+                addresses=("router",),
+                options=(("router-port", "lrp-new"),),
+            ),
         ]
         self.assertEqual(release.find(steps, live, ["ovn.lrp:r1|lrp-old"]), [])

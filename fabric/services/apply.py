@@ -606,7 +606,9 @@ class Apply:
         fulfilled, untranslated = crossed_out(steps, live)
         if untranslated:
             await call.log("warn", "no RawIR for these steps: " + ", ".join(untranslated))
-        left = cleanup.leftovers(ours(live), fulfilled)
+        # A container of ours no step starts any more (its router or
+        # workload left the IR) goes too.
+        left = cleanup.leftovers(ours(live), fulfilled, cleanup.wanted_containers(steps))
         await call.log("info", f"cleanup: {len(left)} leftovers")
         for node in left:
             await call.log("info", f"cleanup: remove {node['id']}")

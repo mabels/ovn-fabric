@@ -4,7 +4,7 @@
 // declares the FACTS.
 
 import type { TransitNetwork } from "./addressing.ts";
-import type { Addr, AddrLike, Prefix } from "./ipnet.ts";
+import type { Addr, AddrLike, Prefix, Selector } from "./ipnet.ts";
 import type { IPv4, IPv6 } from "./ip.ts";
 import type { EndpointBuilder } from "./builders.ts";
 import type { platformSvc } from "./platform-service.ts";
@@ -415,10 +415,11 @@ export interface FilterRule {
   readonly kind: "filter";
   readonly direction: FilterDirection;
   readonly action: FilterAction;
-  readonly sources?: readonly Address[];
+  /** Written prefixes, nets, or addresses of the fabric (ADR 0011 §3b). */
+  readonly sources?: readonly Selector[];
   /** Sources explicitly NOT matched (OVN: `ip4.src != {...}`). */
-  readonly excludeSources?: readonly Address[];
-  readonly destinations?: readonly Address[];
+  readonly excludeSources?: readonly Selector[];
+  readonly destinations?: readonly Selector[];
   readonly protocol?: "tcp" | "udp" | "icmp" | "icmpv6";
   readonly ports?: readonly { readonly from: number; readonly to: number }[];
   readonly priority?: number;
@@ -427,7 +428,7 @@ export interface FilterRule {
 export interface DenyInputAllow {
   readonly protocol?: "tcp" | "udp";
   readonly ports?: readonly { readonly from: number; readonly to: number }[];
-  readonly sources?: readonly Address[];
+  readonly sources?: readonly Selector[];
 }
 
 export type SecurityGroupRule<R extends SecurityGroupRender> = R extends
@@ -833,6 +834,8 @@ export interface TunnelRouterEndpoint extends EndpointDefinition {
      * — a VPN gateway's NAT gateway onto internet-core (ADR 0009). */
     readonly routes?: readonly RouterEndpointRoute[];
     readonly services?: readonly RouterEndpointService[];
+    readonly masq?: readonly ("ipv4" | "ipv6")[];
+    readonly masqSources?: readonly Prefix[];
     readonly gatewayChassis?: Host;
     readonly routingDomains?: readonly RoutingDomain[];
   };
@@ -1458,6 +1461,8 @@ export type OvnRouterEndpointSpec =
      * spelling (ADR 0011 §3b); on an OVN leg an SNAT to the leg's own
      * address, which the runtime resolves. */
     readonly masq?: readonly ("ipv4" | "ipv6")[];
+    /** The networks `masq` masquerades; default: the router's other legs. */
+    readonly masqSources?: readonly Prefix[];
     readonly services?: readonly RouterEndpointService[];
   };
 

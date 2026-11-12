@@ -9,7 +9,7 @@ second check here.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable, Mapping
 from typing import Any
 
 from ladops import ovn as ovn_ops
@@ -158,20 +158,40 @@ CREATE_ORDER = (
 _ORDER = {kind: index for index, kind in enumerate(CREATE_ORDER)}
 
 
-# Never removed by the cleanup after a run, even when no step fulfils them:
-# a container is a workload — only `delete` or a release before claim (the
-# same natural key under another name, ADR 0010) takes it away.
+# Not removed for being unfulfilled: a container decides itself and has no
+# learned footprint, so "no step fulfils it" says nothing about it. Only
+# `wanted_containers` tells (see leftovers), or `delete`, or a release before
+# claim (the same natural key under another name, ADR 0010).
 NEVER_CLEANED = ("docker.container",)
 
 
-def leftovers(nodes: Mapping[str, Node], fulfilled: set[str]) -> list[Node]:
-    """The nodes not fulfilled, in removal_order. Kinds in NEVER_CLEANED are
-    not leftovers."""
+def leftovers(
+    nodes: Mapping[str, Node],
+    fulfilled: set[str],
+    wanted_containers: Collection[str] | None = None,
+) -> list[Node]:
+    """The nodes not fulfilled, in removal_order. A container of ours is a
+    leftover only when `wanted_containers` (the `docker.container:<name>`
+    ids the plan's steps start) is given and does not name it — its router
+    or workload left the IR. Without it, containers are never leftovers."""
     return removal_order(
         node
         for node_id, node in nodes.items()
-        if node_id not in fulfilled and node["kind"] not in NEVER_CLEANED
+        if node_id not in fulfilled
+        and (
+            node["kind"] not in NEVER_CLEANED
+            or (wanted_containers is not None and node_id not in wanted_containers)
+        )
     )
+
+
+def wanted_containers(steps: Iterable[object]) -> set[str]:
+    """The containers the plan's steps start, as `docker.container:<name>`."""
+    return {
+        f"docker.container:{getattr(step, 'name')}"
+        for step in steps
+        if type(step).__name__ == "DockerPrimitive"
+    }
 
 
 def removal_order(nodes: Iterable[Node]) -> list[Node]:

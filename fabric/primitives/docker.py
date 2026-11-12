@@ -138,7 +138,9 @@ class DockerPrimitive(CommandPrimitive):
     files: str = ""
     # What it is, by value (ADR 0010): a ZeroTier instance `zt:<node
     # address>`. Set as a label, so that a run finds it under any name.
-    natural_key: str = ""
+    # None: it has none — as the collector reports a container without the
+    # label (its naturalKeyLabel), so its footprint matches.
+    natural_key: str | None = None
 
     @property
     def key(self) -> str:

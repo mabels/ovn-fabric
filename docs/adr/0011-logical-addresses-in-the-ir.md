@@ -241,22 +241,27 @@ values through it. The IR itself is not rewritten. Everything below the
 services (primitives, RawIR prediction, the `run` comparison, ADR 0010)
 gets concrete values exactly as today and never sees a LogicalIP.
 
-**Finding a name's live number — an owner tag on the carrier.** The object
-that carries an allocated address is tagged with its owner when it is
-created: `<collision domain>|<name>`. The resolver reads the tags from the
-live RawIR, not port ids or names — so the number sticks to the name, and a
-later change of how ids are derived (`deriveEndpointName`'s hash) renumbers
-nothing. The tag lives on the very object that holds the address; it is no
-separate state store.
+**Finding a name's live number — by the carrier's identity.** The owner of
+an address is the IR id of what carries it (`ovnrouter:<router>|lrp:<port>`,
+`kernel.app.container:<service>|nic:<nic>`), and the live carrier is found by
+that same identity: a router port by its name, a workload NIC by its
+container and link name. Nothing is stored — the live system is the state.
 
-| Carrier | Where the address is | Where the owner tag is |
+*Owner tags* (`external_ids:ovn-fabric-owner` on the LRP, a link `alias`) are
+**not built** (decided 2026-11-12): they only pay off once an IR id may
+change while its address should stay (a change of how `deriveEndpointName`
+derives a port's name). Adding them to live ports is itself a change every
+port would be replaced for (step 4) — so they come with such a change, not
+before.
+
+| Carrier | Where the address is | Found by |
 |---|---|---|
-| OVN router port | LRP `networks` | LRP `external_ids:ovn-fabric-owner` |
-| OVN switch port (a container NIC on a switch) | LSP `addresses` | LSP `external_ids:ovn-fabric-owner` |
-| kernel device (a netns leg, a container NIC) | `addr` on the link | the link's `alias` (ifalias) |
+| OVN router port | LRP `networks` | its name (= the IR id's port) |
+| workload NIC (a container on a switch) | `addr` on its link | container and link name |
+| kernel device (a netns leg) | `addr` on the link | pinned — not allocated today |
 
-An SNAT's external IP is its router port's own address (`src/ir.ts`): it has
-no tag of its own, it follows the port. A rename changes the name, so the
+An SNAT's external IP is a reference to its router port's own address
+(§3b): it follows the port. A rename changes the name, so the
 renamed component gets a new number: a rename is a removal plus an addition.
 
 **Fail closed.** If the live view of a collision domain is incomplete — a
@@ -273,7 +278,8 @@ otherwise held addresses would look free and be handed out again.
 
 **The pool** for new names is the collision domain's prefix minus the
 reserved addresses (IPv4 network and broadcast, `/31` and `/32` as the kernel
-treats them; IPv6 host 0, the subnet-router anycast) minus 1–2 **minus every
+treats them; IPv6 host 0, the subnet-router anycast), minus the numbers
+precedence 1 and 2 already took (pinned and live), **minus every
 address live in the collision domain**: ours and foreign, ports of names no
 longer in the IR, and addresses still referenced by live NAT or route rows of
 ours whose port is gone. An address becomes free only once nothing live holds
@@ -339,11 +345,13 @@ an allocation or from a pinned address. An LRP's collision domain is not on
 the LRP in the RawIR (it sits on its peer LSP, `options:router-port`); the
 natural key follows that link.
 
-Built 2026-11-12 for OVN router ports (`raw_reconciler/natural_key.py`
-`address_keys`, one key per address; `fabric/release.py`). A planned router
-port's switch comes from its planned peer port step — a router-type LSP's
-footprint is not learned. Kernel addresses (netns devices, container NICs)
-have no address key yet.
+Built 2026-11-12 (`raw_reconciler/natural_key.py` `address_keys`, one key
+per address; `fabric/release.py`): an OVN router port, on its peer port's
+switch (a planned one's from its planned peer port); a workload NIC's
+address, on the switch the NIC is named after (`shortIfaceName`: the
+segment's name when it fits IFNAMSIZ — a hashed name has no key). The
+cross-netns veth pair is not in the RawIR, so the name is the link. A
+kernel router's netns legs (pinned transit ends) have no address key.
 
 ### 3b. References and the address metadata
 
@@ -530,14 +538,10 @@ any — and no resolved numbers. It gets no allocator of its own.
    types live in `src/protocol.ts`).
 2. **The natural key `(collision domain, address)`** (§3a).
 3. **The runtime resolves and allocates** (Python): the address metadata
-   (§3b) handed to every service, allocation (§3, §4), owner tags on the
-   carriers.
-   Seed: on the first `run` no carrier has an owner tag yet — a carrier
-   without a tag is matched once by its IR id (as `run` matches it today) and
-   tagged, so every name keeps its live number and introducing it moves
-   nothing. A fresh
-   `create` gives sorted-order numbers from then on; tests that compare
-   `create` output change.
+   (§3b) handed to every service, allocation (§3, §4); `run` finds a name's
+   live number by its carrier's identity (no owner tags, §3), so every name
+   keeps its live number and introducing it moved nothing. A fresh
+   `create` gives sorted-order numbers from then on. Built 2026-11-12.
 4. Independently: `run` applies a node that differs (same id, other fields)
    by **delete + create** — the old node is removed before its unit runs, and
    the unit's dependent steps run again — so any change that does move an

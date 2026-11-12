@@ -27,7 +27,6 @@ import type {
   OvnRouterOptions,
   Router,
   RouterEndpointRoute,
-  RouterEndpointService,
   RoutingDomain,
 } from "./types.ts";
 
@@ -81,25 +80,17 @@ function firstActive(
 function masqFor(
   addrs: readonly Addr[],
   sources?: readonly (IPv4 | IPv6)[],
-): RouterEndpointService[] {
-  const out: RouterEndpointService[] = [];
-  if (addrs.some((a) => a.is_ipv4())) {
-    out.push({
-      kind: "ovn.ipv4.masq",
-      ...(sources
-        ? { sources: sources.filter((a): a is IPv4 => a.is_ipv4()) }
-        : {}),
-    });
-  }
-  if (addrs.some((a) => !a.is_ipv4())) {
-    out.push({
-      kind: "ovn.ipv6.masq",
-      ...(sources
-        ? { sources: sources.filter((a): a is IPv6 => !a.is_ipv4()) }
-        : {}),
-    });
-  }
-  return out;
+): {
+  readonly masq: ("ipv4" | "ipv6")[];
+  readonly masqSources?: readonly (IPv4 | IPv6)[];
+} {
+  return {
+    masq: [
+      ...(addrs.some((a) => a.is_ipv4()) ? ["ipv4" as const] : []),
+      ...(addrs.some((a) => !a.is_ipv4()) ? ["ipv6" as const] : []),
+    ],
+    ...(sources ? { masqSources: sources } : {}),
+  };
 }
 
 // ── the internet core ─────────────────────────────────────────────────────
@@ -369,7 +360,7 @@ export class Tenant {
                   gatewayChassis: wan.host,
                   routes: wan.defaultRoutes(),
                   routingDomains: [natDomain],
-                  services: masqFor(natAddrs),
+                  ...masqFor(natAddrs),
                 },
                 upstreamDomains: [natDomain],
                 names: {
@@ -424,7 +415,7 @@ export class Tenant {
           gatewayChassis: wan.host,
           routes: wan.defaultRoutes(),
           routingDomains: [t.domain],
-          services: masq,
+          ...masq,
           // internet-core is not the tenant's to know: its default covers it.
           routeIsolated: true,
         }),

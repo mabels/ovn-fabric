@@ -67,7 +67,8 @@ PLANNED: dict[str, Callable[[Any], tuple[str, str] | None]] = {
 def claims(steps: Iterable[Any], live: Graph) -> dict[str, str]:
     """The natural keys the plan's steps claim: key → the planned node id.
     A planned node's key may need another planned node (a router port's
-    switch is its peer port's): keys are taken over live and planned."""
+    switch is its planned peer port's): keys are taken over live and
+    planned."""
     out: dict[str, str] = {}
     planned_nodes: dict[str, Mapping[str, Any]] = {}
     for step in steps:
@@ -76,16 +77,6 @@ def claims(steps: Iterable[Any], live: Graph) -> dict[str, str]:
             out.setdefault(claim[0], claim[1])
         if getattr(step, "step_kind", None) != "Primitive":
             continue
-        # A router's peer port binds its router port to a switch: what an
-        # address key of that router port needs — from the step itself, as
-        # a router-type port's footprint is not learned.
-        if type(step).__name__ == "OVNNbCtlLsp" and dict(step.options).get("router-port"):
-            planned_nodes[step.key] = {
-                "id": step.key,
-                "kind": "ovn.lsp",
-                "switchRef": f"ovn.ls:{step.switch}",
-                "options": dict(step.options),
-            }
         try:
             added = rawir(step)["added"]
         except (NotLearned, TypeError):

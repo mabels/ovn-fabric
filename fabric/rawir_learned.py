@@ -161,8 +161,6 @@ def docker(
     """DockerPrimitive (learned with markers only)."""
     del (
         host,
-        name,
-        image,
         command,
         privileged,
         network,
@@ -171,10 +169,20 @@ def docker(
         run_flags,
         remove_existing,
         files,
-        natural_key,
     )  # not in RawIR
     return {
-        "added": {},
+        "added": {
+            f"docker.container:{name}": {
+                "id": f"docker.container:{name}",
+                "image": image,
+                "kind": "docker.container",
+                "name": name,
+                "naturalKeyLabel": natural_key,
+                "netnsRef": f"netns:docker:{name}",
+                "owner": "ovn-fabric",
+                "state": "running",
+            }
+        },
         "changed": {},
         "removed": [],
     }
@@ -2271,7 +2279,7 @@ _BY_CLASS: dict[str, tuple[Callable[..., Footprint], ...]] = {
 # Fields the system fills in differently every time (not compared).
 VOLATILE: dict[str, list[str]] = {
     "AddrPrimitive": [],
-    "DockerPrimitive": [],
+    "DockerPrimitive": ["docker.container.containerId", "docker.container.pid"],
     "IpRulePrimitive": [],
     "LinkPrimitive": ["link.addrRefs", "link.ifindex", "link.mac", "link.permMac"],
     "LinkMovePrimitive": [

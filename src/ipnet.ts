@@ -265,6 +265,25 @@ export function netOf(addrs: readonly Addr[], who: string): IpNet {
   return new IpNet(spec);
 }
 
+/** What a filter rule matches (ADR 0011 §3b): a written prefix, a net (its
+ * prefixes — configuration, exact), or an address of the fabric (`host(n)`,
+ * an allocated leg — resolved by the runtime). */
+export type Selector = IPv4 | IPv6 | IpNet | LogicalIP | Addr;
+
+/** Selectors flattened to one family each: a net into its prefixes, a
+ * LogicalIP into its addresses. */
+export function selectors(
+  list: readonly Selector[] | undefined,
+): (IPv4 | IPv6 | Addr)[] {
+  return (list ?? []).flatMap((s) =>
+    s instanceof IpNet
+      ? s.prefixes()
+      : s instanceof LogicalIP
+      ? s.ipaddrs()
+      : [s]
+  );
+}
+
 /** An address as the DSL takes it: a LogicalIP's Addr, or a written one. */
 export type AddrLike = Addr | IPv4 | IPv6;
 

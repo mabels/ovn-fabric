@@ -151,7 +151,7 @@ class HostPrimitive(CommandPrimitive):
         run_flags: Sequence[str] = (),
         remove_existing: bool = True,
         files: str = "",
-        natural_key: str = "",
+        natural_key: str | None = None,
     ) -> "DockerPrimitive":
         from .docker import DockerPrimitive
 

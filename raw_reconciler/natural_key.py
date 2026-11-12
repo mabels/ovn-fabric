@@ -168,9 +168,25 @@ def _router_port_addresses(node: Node, live: Graph) -> list[str]:
     ]
 
 
+def _nic_address(node: Node, live: Graph) -> list[str]:
+    """A kernel address on a workload NIC: the NIC is named after its switch
+    (src/ir.ts shortIfaceName — the segment's name when it fits IFNAMSIZ),
+    so a switch of that name is its collision domain. A hashed (long) name,
+    a link-local or a loopback address has no key: its domain is unknown,
+    or it is the kernel's own."""
+    fields = _fields(node)
+    address = str(fields.get("address") or "")
+    nic = str(fields.get("linkRef") or "").rpartition("|")[2]
+    if not address or not nic or address.startswith(("fe80:", "127.")) or address == "::1":
+        return []
+    switch = f"ovn.ls:{nic}"
+    return [f"addr:{switch}|{address}"] if switch in live else []
+
+
 # By node kind: the addresses a node holds, each a single resource.
 ADDRESS_KEYS: dict[str, Callable[[Node, Graph], list[str]]] = {
     "ovn.lrp": _router_port_addresses,
+    "addr": _nic_address,
 }
 
 

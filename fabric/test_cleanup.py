@@ -123,3 +123,26 @@ class NeverCleanedTest(unittest.TestCase):
             "netns:ns-x": {"id": "netns:ns-x", "kind": "netns"},
         }
         self.assertEqual([n["id"] for n in leftovers(nodes, set())], ["netns:ns-x"])
+
+
+class ContainerLeftoverTest(unittest.TestCase):
+    """A container of ours goes when no step starts it any more (its router
+    or workload left the IR) — never when one does, never without knowing."""
+
+    NODES = {
+        "docker.container:kept": {"id": "docker.container:kept", "kind": "docker.container"},
+        "docker.container:gone": {"id": "docker.container:gone", "kind": "docker.container"},
+    }
+
+    def test_without_the_plan_s_containers_none_is_a_leftover(self) -> None:
+        self.assertEqual(cleanup.leftovers(self.NODES, set()), [])
+
+    def test_a_container_no_step_starts_is_a_leftover(self) -> None:
+        left = cleanup.leftovers(self.NODES, set(), {"docker.container:kept"})
+        self.assertEqual([n["id"] for n in left], ["docker.container:gone"])
+
+    def test_the_plan_s_containers_are_its_docker_steps(self) -> None:
+        from .primitives.host import HostPrimitive
+
+        steps = [HostPrimitive("h").docker("kept", "img"), HostPrimitive("h").netns("ns")]
+        self.assertEqual(cleanup.wanted_containers(steps), {"docker.container:kept"})

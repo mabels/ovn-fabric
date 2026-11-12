@@ -20,6 +20,7 @@ export {
   type IpNetSpec,
   LogicalIP,
   type Prefix,
+  type Selector,
 } from "./ipnet.ts";
 export * from "./types.ts";
 // Only transitNetwork() (+ its own TransitEndpoint/TransitNetwork

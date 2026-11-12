@@ -254,3 +254,33 @@ class LiveNicTest(unittest.TestCase):
         addrs = Addresses.resolve(nodes, *live_view(nodes, live))
         nic = pt.LogicalIP(net="ipnet:ls:home", owner=owner)
         self.assertEqual(addrs.list([nic]), ["192.168.1.77/24"])
+
+
+class FilterSelectorTest(unittest.TestCase):
+    """A filter rule's address of the fabric is rendered as its host prefix."""
+
+    def test_a_reference_becomes_a_host_prefix_a_prefix_stays(self) -> None:
+        from deployer.ir_common import _selectors
+
+        addrs = Addresses.resolve(NODES)
+        ref = pt.AddrRef(net="ipnet:ls:backbone", owner=LRP_BACKBONE, family=pt.Family.ipv4)
+        self.assertEqual(
+            _selectors(["10.43.0.0/24", ref], addrs), ["10.43.0.0/24", "172.22.0.1/32"]
+        )
+
+
+class LeftoverNicTest(unittest.TestCase):
+    def test_a_leftover_nic_still_holds_its_number(self) -> None:
+        # a workload that left the IR: its NIC (named after the switch) still
+        # holds .1 on ls:home until the cleanup — no new name may get it
+        live = {
+            "addr:ovn-fabric-old|home|192.168.1.2/24": {
+                "kind": "addr",
+                "netnsRef": "netns:ovn-fabric-old",
+                "linkRef": "link:ovn-fabric-old|home",
+                "address": "192.168.1.2",
+                "prefixlen": 24,
+            }
+        }
+        _live, held = live_view(NODES, live)
+        self.assertEqual(held["ipnet:ls:home"]["ipv4"], [2])

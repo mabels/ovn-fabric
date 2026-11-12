@@ -463,12 +463,21 @@ def live_view(
                 continue
             nic = str(raw.get("linkRef", "")).rpartition("|")[2]
             owner = f"kernel.app.container:{container.removeprefix('ovn-fabric-')}|nic:{nic}"
-            nic_net = net_of.get(owner)
-            if nic_net is None or nic_net not in prefixes:
+            # Its net: the owner's in the IR; for a NIC whose workload left
+            # the IR, the switch it is named after (src/ir.ts shortIfaceName)
+            # — its address is still held until the cleanup removes it.
+            nic_net = net_of.get(owner, f"ipnet:ls:{nic}")
+            if nic_net not in prefixes:
                 continue
             value = f"{raw.get('address')}/{raw.get('prefixlen')}"
             # a link-local address is the kernel's, never the net's
-            hold(nic_net, value, owner, node_id, strict=False)
+            hold(
+                nic_net,
+                value,
+                owner if owner in owners.get(nic_net, set()) else None,
+                node_id,
+                strict=False,
+            )
         elif kind == "ovn.lsp":
             net_id = f"ipnet:ls:{str(raw.get('switchRef', '')).removeprefix('ovn.ls:')}"
             if net_id not in prefixes:
