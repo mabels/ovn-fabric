@@ -339,6 +339,12 @@ an allocation or from a pinned address. An LRP's collision domain is not on
 the LRP in the RawIR (it sits on its peer LSP, `options:router-port`); the
 natural key follows that link.
 
+Built 2026-11-12 for OVN router ports (`raw_reconciler/natural_key.py`
+`address_keys`, one key per address; `fabric/release.py`). A planned router
+port's switch comes from its planned peer port step — a router-type LSP's
+footprint is not learned. Kernel addresses (netns devices, container NICs)
+have no address key yet.
+
 ### 3b. References and the address metadata
 
 **The IR never holds a number for a fabric address — only a reference.** A

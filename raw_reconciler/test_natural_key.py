@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from typing import Any
 
-from .natural_key import natural_key, natural_keys
+from .natural_key import address_keys, all_keys, natural_key, natural_keys
 
 G = "*global*"
 
@@ -138,3 +138,34 @@ class NaturalKeyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AddressKeyTest(unittest.TestCase):
+    """ADR 0011 §3a: an address is single within its collision domain."""
+
+    LIVE: dict[str, dict[str, Any]] = {
+        "ovn.lsp:core|lsp-a": {
+            "id": "ovn.lsp:core|lsp-a",
+            "kind": "ovn.lsp",
+            "switchRef": "ovn.ls:core",
+            "options": {"router-port": "lrp-a"},
+        },
+        "ovn.lrp:r1|lrp-a": {
+            "id": "ovn.lrp:r1|lrp-a",
+            "kind": "ovn.lrp",
+            "name": "lrp-a",
+            "networks": ["172.21.0.5/24", "2600:70ff:b3c0::21:5/112"],
+        },
+    }
+
+    def test_a_router_port_holds_its_addresses_on_its_peer_s_switch(self) -> None:
+        port = self.LIVE["ovn.lrp:r1|lrp-a"]
+        self.assertEqual(
+            address_keys(port, self.LIVE),
+            ["addr:ovn.ls:core|172.21.0.5", "addr:ovn.ls:core|2600:70ff:b3c0::21:5"],
+        )
+        self.assertEqual(all_keys(port, self.LIVE), address_keys(port, self.LIVE))
+
+    def test_without_its_peer_the_domain_is_unknown(self) -> None:
+        port = self.LIVE["ovn.lrp:r1|lrp-a"]
+        self.assertEqual(address_keys(port, {}), [])

@@ -43,7 +43,7 @@ from typing import Any
 from deployer.deps import abstract_deps
 from protocol import generated as pt
 from protocol.hydrate import hydrate_nodes
-from raw_reconciler.natural_key import natural_keys
+from raw_reconciler.natural_key import all_keys
 from raw_reconciler.owners import OVN_FABRIC, mark_host, ours
 from runtime import generated as rg
 from runtime.message import BodySpec, ProtocolError, plain, register_bodies
@@ -670,11 +670,12 @@ class Apply:
         """What run would do now, per unit (as _converge chooses). Steps with
         a value only known at run time cannot be checked here: they count as
         unknown (run checks them once the values are captured)."""
-        # The single resources and their natural keys (ADR 0010).
-        keys = natural_keys(live)
-        await call.log("info", f"natural keys: {len(keys)} single resources")
-        for node_id, key in sorted(keys.items()):
-            await call.log("debug", f"natural key: {node_id} = {key}")
+        # The single resources and their natural keys (ADR 0010), with the
+        # addresses a node holds (ADR 0011 §3a).
+        keys = {i: k for i, node in live.items() if (k := all_keys(node, live))}
+        await call.log("info", f"natural keys: {sum(map(len, keys.values()))} single resources")
+        for node_id, node_keys in sorted(keys.items()):
+            await call.log("debug", f"natural key: {node_id} = {', '.join(node_keys)}")
         # As run: the addresses placed against the live view (ADR 0011 §3).
         try:
             addrs = Addresses.resolve(nodes, *live_view(nodes, live))

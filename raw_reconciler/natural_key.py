@@ -11,6 +11,13 @@ with the same value.
     ZeroTier       zt:<node address>   (its container's label)
     OVN route      ovnroute:<router>|<policy>|<prefix>
     kernel route   route:<netns>|<table>|<prefix>|<metric>
+    address        addr:<collision domain>|<address>   (ADR 0011 §3a)
+
+An address is a single resource within its collision domain: OVN does not
+refuse two router ports with one address on a switch (VM 302, 2026-11-11),
+so the key is what makes the second one a clash. Never the address alone —
+tenant prefixes may overlap. A node may hold several addresses, so it has
+several address keys (`address_keys`), beside its one natural key.
 
 A route is single per prefix in its router or netns (OVN: "duplicate
 prefix"; the kernel: "File exists", whatever the next hop): its key is
@@ -134,3 +141,47 @@ def natural_keys(live: Graph) -> dict[str, str]:
         if key is not None:
             out[node_id] = key
     return out
+
+
+def _router_port_switch(node: Node, live: Graph) -> str | None:
+    """The switch an OVN router port is on: the one of its peer port
+    (`options:router-port`), found in `live` (which may hold planned nodes)."""
+    name = _fields(node).get("name")
+    for other in live.values():
+        fields = _fields(other)
+        if (
+            other.get("kind") == "ovn.lsp"
+            and (fields.get("options") or {}).get("router-port") == name
+        ):
+            ref = fields.get("switchRef")
+            return str(ref) if ref else None
+    return None
+
+
+def _router_port_addresses(node: Node, live: Graph) -> list[str]:
+    switch = _router_port_switch(node, live)
+    if switch is None:
+        return []
+    return [
+        f"addr:{switch}|{str(network).split('/')[0]}"
+        for network in _fields(node).get("networks") or []
+    ]
+
+
+# By node kind: the addresses a node holds, each a single resource.
+ADDRESS_KEYS: dict[str, Callable[[Node, Graph], list[str]]] = {
+    "ovn.lrp": _router_port_addresses,
+}
+
+
+def address_keys(node: Node, live: Graph) -> list[str]:
+    """`addr:<collision domain>|<address>` for every address `node` holds."""
+    keys = ADDRESS_KEYS.get(str(node.get("kind")))
+    return keys(node, live) if keys is not None else []
+
+
+def all_keys(node: Node, live: Graph) -> list[str]:
+    """Every single resource `node` is or holds: its natural key and its
+    address keys."""
+    key = natural_key(node, live)
+    return ([key] if key is not None else []) + address_keys(node, live)

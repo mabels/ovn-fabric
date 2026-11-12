@@ -125,3 +125,60 @@ class FindTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AddressTest(unittest.TestCase):
+    """ADR 0011 §3a: a leftover router port holding an address the plan pins
+    on the same switch is released before the new port claims it."""
+
+    def test_a_leftover_port_on_a_claimed_address_is_released(self) -> None:
+        from .primitives.ovn import OVNNbCtlLrp, OVNNbCtlLsp
+
+        live: dict[str, dict[str, Any]] = {
+            "ovn.lr:r1": {"id": "ovn.lr:r1", "kind": "ovn.lr", "portRefs": ["ovn.lrp:r1|lrp-old"]},
+            "ovn.lsp:core|lsp-old": {
+                "id": "ovn.lsp:core|lsp-old",
+                "kind": "ovn.lsp",
+                "switchRef": "ovn.ls:core",
+                "options": {"router-port": "lrp-old"},
+            },
+            "ovn.lrp:r1|lrp-old": {
+                "id": "ovn.lrp:r1|lrp-old",
+                "kind": "ovn.lrp",
+                "name": "lrp-old",
+                "routerRef": "ovn.lr:r1",
+                "networks": ["172.21.0.5/24"],
+            },
+        }
+        steps = [
+            OVNNbCtlLrp("r1", "lrp-new", "00:00:ac:15:00:05", ("172.21.0.5/24",)),
+            OVNNbCtlLsp("core", "lsp-new", type="router", options=(("router-port", "lrp-new"),)),
+        ]
+        found = release.find(steps, live, ["ovn.lrp:r1|lrp-old", "ovn.lsp:core|lsp-old"])
+        self.assertEqual(
+            [(r.node_id, r.key, r.claimed_by) for r in found],
+            [("ovn.lrp:r1|lrp-old", "addr:ovn.ls:core|172.21.0.5", "ovn.lrp:r1|lrp-new")],
+        )
+
+    def test_another_switch_with_the_same_address_is_no_clash(self) -> None:
+        from .primitives.ovn import OVNNbCtlLrp, OVNNbCtlLsp
+
+        live: dict[str, dict[str, Any]] = {
+            "ovn.lsp:other|lsp-old": {
+                "id": "ovn.lsp:other|lsp-old",
+                "kind": "ovn.lsp",
+                "switchRef": "ovn.ls:other",
+                "options": {"router-port": "lrp-old"},
+            },
+            "ovn.lrp:r1|lrp-old": {
+                "id": "ovn.lrp:r1|lrp-old",
+                "kind": "ovn.lrp",
+                "name": "lrp-old",
+                "networks": ["172.21.0.5/24"],
+            },
+        }
+        steps = [
+            OVNNbCtlLrp("r1", "lrp-new", "00:00:ac:15:00:05", ("172.21.0.5/24",)),
+            OVNNbCtlLsp("core", "lsp-new", type="router", options=(("router-port", "lrp-new"),)),
+        ]
+        self.assertEqual(release.find(steps, live, ["ovn.lrp:r1|lrp-old"]), [])

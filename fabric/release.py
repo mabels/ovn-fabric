@@ -24,7 +24,7 @@ from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
 from ladops.linux_net import key_hash
-from raw_reconciler.natural_key import natural_key, natural_keys
+from raw_reconciler.natural_key import all_keys
 
 from .rawir_learned import NotLearned, rawir
 
@@ -65,22 +65,38 @@ PLANNED: dict[str, Callable[[Any], tuple[str, str] | None]] = {
 
 
 def claims(steps: Iterable[Any], live: Graph) -> dict[str, str]:
-    """The natural keys the plan's steps claim: key → the planned node id."""
+    """The natural keys the plan's steps claim: key → the planned node id.
+    A planned node's key may need another planned node (a router port's
+    switch is its peer port's): keys are taken over live and planned."""
     out: dict[str, str] = {}
+    planned_nodes: dict[str, Mapping[str, Any]] = {}
     for step in steps:
         planned = PLANNED.get(type(step).__name__)
         if planned is not None and (claim := planned(step)) is not None:
             out.setdefault(claim[0], claim[1])
         if getattr(step, "step_kind", None) != "Primitive":
             continue
+        # A router's peer port binds its router port to a switch: what an
+        # address key of that router port needs — from the step itself, as
+        # a router-type port's footprint is not learned.
+        if type(step).__name__ == "OVNNbCtlLsp" and dict(step.options).get("router-port"):
+            planned_nodes[step.key] = {
+                "id": step.key,
+                "kind": "ovn.lsp",
+                "switchRef": f"ovn.ls:{step.switch}",
+                "options": dict(step.options),
+            }
         try:
             added = rawir(step)["added"]
         except (NotLearned, TypeError):
             continue
-        for node_id, node in added.items():
-            key = natural_key(node, live)
-            if key is not None:
-                out.setdefault(key, node_id)
+        planned_nodes.update(added)
+    graph = {**live, **planned_nodes}
+    for node_id, node in planned_nodes.items():
+        if node.get("kind") == "ovn.lsp":
+            continue  # only says where a router port is
+        for key in all_keys(node, graph):
+            out.setdefault(key, node_id)
     return out
 
 
@@ -105,7 +121,7 @@ def _holders_index(live: Graph) -> dict[str, set[str]]:
 
 
 # What contains many things — never released early for one of them.
-_CONTAINERS = ("netns", "ovs.bridge")
+_CONTAINERS = ("netns", "ovs.bridge", "ovn.lr", "ovn.ls")
 
 
 def _held(node_id: str, live: Graph, index: Mapping[str, set[str]]) -> list[str]:
@@ -136,7 +152,9 @@ def find(steps: Iterable[Any], live: Graph, leftovers: Iterable[str]) -> list[Re
     index = _holders_index(live)
     out: list[Release] = []
     seen: set[str] = set()
-    for node_id, key in natural_keys(live).items():
+    for node_id, key in (
+        (node_id, key) for node_id, node in live.items() for key in all_keys(node, live)
+    ):
         planned = claimed.get(key)
         if planned is None:
             continue
