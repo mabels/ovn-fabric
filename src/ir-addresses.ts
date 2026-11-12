@@ -21,7 +21,13 @@
 // carries is an error: nothing could ever hold its number.
 
 import type { IPv4, IPv6 } from "./ip.ts";
-import type { Addr, AllocatorStrategy, Family, HostRef } from "./ipnet.ts";
+import {
+  type Addr,
+  type AllocatorStrategy,
+  checkHostBits,
+  type Family,
+  type HostRef,
+} from "./ipnet.ts";
 import type { AddrRefValue, IpNetNode, LogicalIPValue } from "./protocol.ts";
 
 type Mutable<T> = { -readonly [K in keyof T]: T[K] };
@@ -138,6 +144,13 @@ export class AddressIndex {
 
   /** Fill every reference; the `ip.net` nodes, sorted by domain. */
   finish(): IpNetNode[] {
+    for (const [domain, fams] of this.#nets) {
+      checkHostBits(
+        fams.get("ipv4")?.prefix as IPv4 | undefined,
+        fams.get("ipv6")?.prefix as IPv6 | undefined,
+        domain,
+      );
+    }
     for (const p of this.#pending) p.fill(this.#resolve(p));
     for (const { value, fams } of this.#logical) {
       const domainFams = FAMILIES.filter((f) =>

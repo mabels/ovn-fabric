@@ -86,3 +86,12 @@ Deno.test("Addr.from: a written address is pinned on the net its prefix gives", 
     "192.168.132.1",
   );
 });
+
+Deno.test("IpNet: IPv6 needs at least as many host bits as IPv4 (one number for both)", () => {
+  assertThrows(
+    () => new IpNet({ ipv4: "10.0.0.0/16", ipv6: "fd00::/120" }),
+    Error,
+    "fewer host bits",
+  );
+  new IpNet({ ipv4: "10.0.0.0/24", ipv6: "fd00::/120" }); // 8 and 8: fine
+});

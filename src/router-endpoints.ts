@@ -524,6 +524,12 @@ function tailscaleApp(
     `--login-server=${workload.loginServer}`,
     `--auth-key=file:${inside}/authkey`,
     "--netfilter-mode=off",
+    // The node's name at the control server: the router's, not the
+    // container's random hostname — a reinstall shows up as the same name.
+    // An explicit --hostname in upArgs wins.
+    ...((workload.upArgs ?? []).some((a) => a.startsWith("--hostname"))
+      ? []
+      : [`--hostname=${routerName}`]),
     ...(workload.upArgs ?? []),
   ].join(" ");
   // The container's program: the daemon in the background only until it

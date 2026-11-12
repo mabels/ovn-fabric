@@ -1315,6 +1315,7 @@ Deno.test("tunnelRouterEndpoint: tailscale is a docker app with its key as a 600
       "--login-server=https://hs.example",
       "--auth-key=file:/var/lib/tailscale/authkey",
       "--netfilter-mode=off",
+      "--hostname=router-ts", // the router's name at the control server
       "--accept-routes",
       "--tun=tailscale0",
     ]

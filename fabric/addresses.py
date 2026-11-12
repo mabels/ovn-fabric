@@ -389,7 +389,8 @@ def live_view(
     IR hold now (`live`), and every number taken on each collision domain,
     ours or not (`held`) — what `Addresses.resolve` keeps and avoids.
 
-    An OVN router port is found by its name: its owner is the IR id of the
+    A workload NIC is found by its container and link name. An OVN router
+    port is found by its name: its owner is the IR id of the
     same port (`ovnrouter:<router>|lrp:<port>`); its collision domain is the switch
     its peer port binds it to (`options:router-port`). A port of ours with
     an address outside the IR's prefix means the prefix was changed — an
@@ -403,10 +404,12 @@ def live_view(
             if p is not None
         }
     owners: dict[str, set[str]] = {}  # net id -> owners in the IR
+    net_of: dict[str, str] = {}  # owner -> its net id
     for node in nodes:
         for value in _walk(getattr(node, "data", None)):
             if isinstance(value, pt.LogicalIP):
                 owners.setdefault(value.net, set()).add(value.owner)
+                net_of.setdefault(value.owner, value.net)
     switch_of_port: dict[str, str] = {}
     for raw in live.values():
         if raw.get("kind") == "ovn.lsp":
@@ -416,7 +419,7 @@ def live_view(
     out_live: LiveNumbers = {}
     held: dict[str, dict[str, set[int]]] = {}
 
-    def hold(net_id: str, value: str, owner: str | None, who: str) -> None:
+    def hold(net_id: str, value: str, owner: str | None, who: str, strict: bool = True) -> None:
         addr = IPAddress.parse(value)
         if addr is None:
             return
@@ -426,7 +429,7 @@ def live_view(
             return
         inside = addr.change_prefix(prefix.prefix.num)
         if inside is None or not prefix.includes(inside):
-            if owner is not None:
+            if owner is not None and strict:
                 raise AddressError(
                     f"{net_id}: {who} holds {value}, outside {prefix.to_string()} — the "
                     "prefix was changed; renumbering a collision domain is a reinstall"
@@ -450,6 +453,22 @@ def live_view(
             owner = ir_id if ir_id in owners.get(net_id, set()) else None
             for value in raw.get("networks") or []:
                 hold(net_id, str(value), owner, node_id)
+        elif kind == "addr":
+            # A workload NIC: its container's netns (`ovn-fabric-<service>`,
+            # also seen as `docker:…`), its link the NIC's name — owned by
+            # `kernel.app.container:<service>|nic:<nic>` (src/ir.ts).
+            netns = str(raw.get("netnsRef", "")).removeprefix("netns:")
+            container = netns.removeprefix("docker:")
+            if not container.startswith("ovn-fabric-"):
+                continue
+            nic = str(raw.get("linkRef", "")).rpartition("|")[2]
+            owner = f"kernel.app.container:{container.removeprefix('ovn-fabric-')}|nic:{nic}"
+            nic_net = net_of.get(owner)
+            if nic_net is None or nic_net not in prefixes:
+                continue
+            value = f"{raw.get('address')}/{raw.get('prefixlen')}"
+            # a link-local address is the kernel's, never the net's
+            hold(nic_net, value, owner, node_id, strict=False)
         elif kind == "ovn.lsp":
             net_id = f"ipnet:ls:{str(raw.get('switchRef', '')).removeprefix('ovn.ls:')}"
             if net_id not in prefixes:

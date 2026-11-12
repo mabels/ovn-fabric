@@ -215,3 +215,42 @@ class LiveViewTest(unittest.TestCase):
             _lrp("other", "lrp-x", "10.1.1.1/24"),
         )
         self.assertEqual(live_view(NODES, live), ({}, {}))
+
+
+class LiveNicTest(unittest.TestCase):
+    """An allocated workload NIC keeps its number too."""
+
+    def test_a_live_nic_keeps_its_number(self) -> None:
+        owner = "kernel.app.container:dns|nic:home"
+        nodes: list[pt.Model] = [
+            *NODES,
+            pt.OvnLrpNode(
+                id="ovnrouter:router-x|lrp:lrp-x",
+                kind="ovn.lrp",
+                key=pt.OvnLrpKey(ovnrouter="router-x", name="lrp-x"),
+                data=pt.OvnLrpData(
+                    l2Segment="ls:home",
+                    addresses=[],
+                    serviceRefs=[
+                        pt.ServiceRef(
+                            service="kernel.app.container:dns",
+                            name="home",
+                            ipaddrs=[pt.LogicalIP(net="ipnet:ls:home", owner=owner)],
+                        )
+                    ],
+                ),
+            ),
+        ]
+        live = {
+            f"addr:ovn-fabric-dns|home|{a}": {
+                "kind": "addr",
+                "netnsRef": "netns:ovn-fabric-dns",
+                "linkRef": "link:ovn-fabric-dns|home",
+                "address": a.split("/")[0],
+                "prefixlen": int(a.split("/")[1]),
+            }
+            for a in ("192.168.1.77/24", "fe80::1/64")  # link-local: ignored
+        }
+        addrs = Addresses.resolve(nodes, *live_view(nodes, live))
+        nic = pt.LogicalIP(net="ipnet:ls:home", owner=owner)
+        self.assertEqual(addrs.list([nic]), ["192.168.1.77/24"])

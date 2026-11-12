@@ -66,6 +66,7 @@ export class IpNet {
     // "10.12.80.0/28" are the same net.
     if (s.ipv4 !== undefined) this.ipv4 = IPv4.parse(s.ipv4).network();
     if (s.ipv6 !== undefined) this.ipv6 = IPv6.parse(s.ipv6).network();
+    checkHostBits(this.ipv4, this.ipv6, "net.ipNet()");
     const a = s.allocator ?? "low-high";
     this.allocator = typeof a === "string"
       ? { ipv4: a, ipv6: a }
@@ -105,6 +106,26 @@ export class IpNet {
   /** An address on this net the runtime allocates (no `host`). */
   allocated(): LogicalIP {
     return new LogicalIP(this);
+  }
+}
+
+/** One host number for both families (ADR 0011 §5) needs the IPv6 prefix to
+ * have at least as many host bits as the IPv4 one (a /24 needs a /120 or
+ * larger) — else a number valid in IPv4 has no IPv6 partner. */
+export function checkHostBits(
+  ipv4: IPv4 | undefined,
+  ipv6: IPv6 | undefined,
+  where: string,
+): void {
+  if (ipv4 === undefined || ipv6 === undefined) return;
+  const v4 = 32 - ipv4.prefix.num;
+  const v6 = 128 - ipv6.prefix.num;
+  if (v6 < v4) {
+    throw new Error(
+      `${where}: ${ipv6.to_string()} has fewer host bits (${v6}) than ` +
+        `${ipv4.to_string()} (${v4}) — one host number for both families ` +
+        "needs at least as many in IPv6",
+    );
   }
 }
 
