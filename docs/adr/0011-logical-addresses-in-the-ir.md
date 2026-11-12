@@ -132,24 +132,25 @@ LogicalIP("home-svc-tailscale-core", "home-vpn-tailscale", { host: "last" })  //
 strategy:**
 
 ```ts
-const core = net.createNet({
-  ipv4: IPv4.parse("172.21.0.0/24"),
-  ipv6: IPv6.parse("2600:70ff:b3c0::21:0/112"),
+const core = net.ipNet({
+  ipv4: "172.21.0.0/24",
+  ipv6: "2600:70ff:b3c0::21:0/112",
   allocator: "low-high",            // default
   // or per family: allocator: { ipv4: "low-high", ipv6: "high-low" }
 });
-core.logicalIP("home-nat");                     // allocated
-core.logicalIP("platform.dns", { host: 10 });   // pinned
+core.host(10);                      // pinned; a leg without one is allocated
 ```
 
 `allocator` is `"low-high"` (lowest free number first), `"high-low"`
 (highest free first — a removed name's number is reused only when the low
 end is full), `"random"`, or an object with one strategy per family. It is
-**serialized in the IR** on the collision domain's node, with its prefixes:
+**serialized in the IR** as one `ip.net` node per collision domain, with its
+prefixes; every address refers to it:
 
 ```
-ls:<domain>  data.addressing = { ipv4: "172.21.0.0/24", ipv6: "…/112",
-                                 allocator: { ipv4: "low-high", ipv6: "low-high" } }
+ipnet:ls:internet-core  { ipv4: "172.21.0.0/24", ipv6: "…/112",
+                          allocator: { ipv4: "low-high", ipv6: "low-high" } }
+address                 { net: "ipnet:ls:internet-core", owner: "<IR id>", host?: … }
 ```
 
 so the runtime allocates by the declared strategy, never by a default of its
@@ -165,7 +166,7 @@ where its addresses are used, and the runtime checks it. `"random"` stays determ
 collision domain and the name (`create` is reproducible from the IR alone);
 it only spreads numbers, it never draws from a random source. The DSL's own
 cores (`net.internet({ core })`, a tenant's `core`, the control plane) are
-`createNet`s underneath.
+`net.ipNet`s like any other.
 
 **Using a net's address in the topology:**
 
@@ -182,10 +183,11 @@ so `via:` takes `asIpv4()` / `asIpv6()`, never the whole LogicalIP. Asking a
 LogicalIP for a family its net does not have is an error at generation.
 
 What the runtime **allocates** (no `host`):
-- the legs on the shared cores — `internet.allocate()`, `tenant.allocate()`
-  (`src/tenant.ts`);
-- the control-plane addresses handed out from `.10` on (`allocateAddrs`,
-  `src/define.ts`: platform services, ingress legs), except the pinned DNS.
+- the legs on the shared cores — a leg on a core is an address on the core's
+  net without `host`; TypeScript counts nothing (`internet.allocate()`,
+  `tenant.allocate()` in `src/tenant.ts` go away);
+- the control-plane addresses (platform services, ingress legs; the counter
+  `allocateAddrs` in `src/define.ts` goes away), except the pinned DNS.
 
 Everything else is pinned. Route destinations stay prefixes (they are no
 addresses of anyone).
@@ -220,9 +222,10 @@ today still work, because a LogicalIP knows its collision domain:
 
 **Address and prefix.** The same address appears with its prefix length (an
 LRP's `networks`, a NIC's addresses) and bare (a next hop, an SNAT's external
-IP, a nameserver). The protocol says which: a LogicalIP reference carries
-`form: "cidr" | "address"`; the prefix length comes from the collision
-domain.
+IP, a nameserver). The reference does not say which: it always resolves to
+the address **with** its prefix (from its net), and the consumer takes the
+form it needs through the IP address library (`to_string()` with the prefix,
+`to_s()` without) — as the code does today.
 
 What TypeScript can no longer check is a clash between two *allocated*
 values; that moves to the runtime (§3).
@@ -230,11 +233,13 @@ values; that moves to the runtime (§3).
 ### 3. What the runtime does
 
 Before planning — and before release-before-claim, whose natural keys
-(a veth's MAC) depend on resolved addresses — the runtime **resolves** the IR
-into a concrete one: every LogicalIP becomes its address, every derived MAC
-is computed (§5). Everything downstream (primitives, RawIR prediction, the
-`run` comparison, ADR 0010) works on that concrete IR exactly as today and
-never sees a LogicalIP.
+(a veth's MAC) depend on resolved addresses — the runtime **resolves** every
+collision domain once: every LogicalIP gets its address, every derived MAC
+is computed (§5). The result is the **address metadata** (§3b), handed to
+every service; a service turns the references of its IR node into concrete
+values through it. The IR itself is not rewritten. Everything below the
+services (primitives, RawIR prediction, the `run` comparison, ADR 0010)
+gets concrete values exactly as today and never sees a LogicalIP.
 
 **Finding a name's live number — an owner tag on the carrier.** The object
 that carries an allocated address is tagged with its owner when it is
@@ -309,10 +314,11 @@ a view command (not `resolve`: that name is the system-dependency command,
 for `create`. The view is output only: it is never accepted as IR input,
 since every allocated LogicalIP in it would turn into a pinned one.
 
-Every place that carries an address resolves through the same table: LRP
-`networks`, NAT external IPs (derived from the endpoint's own address), OVN
-and kernel route next hops, veth and container NIC addresses, security-group
-sources, ingress/egress legs, resolver nameservers.
+Every place that carries an address resolves through the same metadata
+(§3b): LRP `networks`, NAT external IPs (the port's own address), OVN and
+kernel route next hops, veth and container NIC addresses, security-group
+sources and destinations, ingress/egress legs, resolver nameservers, and
+addresses inside config text.
 
 ### 3a. An address's natural key: (collision domain, address)
 
@@ -332,6 +338,68 @@ before the plan applies (release before claim) — whether the clash comes from
 an allocation or from a pinned address. An LRP's collision domain is not on
 the LRP in the RawIR (it sits on its peer LSP, `options:router-port`); the
 natural key follows that link.
+
+### 3b. References and the address metadata
+
+**The IR never holds a number for a fabric address — only a reference.** A
+service that needs an address names *what* it needs; the runtime knows *which
+number* it is. One vocabulary serves every place:
+
+```ts
+type AddrRef =
+  | { net: "ipnet:ls:home-cable-lan" }                 // "net": the collision domain's prefix(es)
+  | { net: "ipnet:ls:internet-core", owner: "<id>" }   // "host(xyz)": one name's address
+  | { self: true }                                     // the address of the port/NIC the service sits on
+  | string;                                            // not our world: "1.1.1.1/32", as written
+```
+
+A reference names no family; the place that uses it does (a rule's
+`family`, a route's `dst`), and takes that family of the reference — asking
+for a family the collision domain does not have is an error. Prefixes the
+user writes as destinations (a route's `dst`) stay prefixes.
+
+**In the DSL**, the topology writes logical things, never numbers of the
+fabric — a security group's sources, for example:
+
+```ts
+sources: [lan, dmz.host(5), workload, "1.1.1.1/32"]
+//        net   host(xyz)    host(xyz) not our world
+```
+
+**At runtime — on the Python side, never in TypeScript** — resolution (§3)
+builds one **address metadata** object per `create` / `run`, from pinned
+numbers, live numbers and allocation, and passes it to every service. The
+IR carries only the references and the `ip.net` nodes; the metadata is never
+serialized into it:
+
+```python
+addrs.net("ipnet:ls:home-cable-lan", "ipv4")   # 192.168.128.0/24
+addrs.of(ref, "ipv4")                          # 172.21.0.7/24 — with its prefix (§2)
+addrs.self("ipv4")                             # the address of the service's own port
+```
+
+What it serves:
+
+- **Masquerade.** An OVN `snat` is `{ kind: "snat", family, externalIp:
+  { net, owner: "<the outgoing LRP>", family }, logicalIps: ["192.168.128.0/24",
+  …] }`: a reference to the outgoing port's own address — `{ self }` would
+  be ambiguous, a security group sits on the router, not on one port — and
+  the prefixes of the router's other legs, as strings (a net's prefix is
+  configuration, TypeScript knows it). Kernel masquerade needs no address
+  (`-o <iface>`). The DSL has one spelling, `masq: ["ipv4", "ipv6"]`; kernel
+  or OVN follows from the router.
+- **Security groups and firewall rules** stay abstract: sources and
+  destinations are references, rendered into concrete rules on the host only.
+- **Next hops** are `{ net, owner }` references (§2).
+- **Config text.** A generated file names an address by reference, as a
+  template the service renders with the metadata (`{{ addr "<owner>" }}` in a
+  Corefile, a `tailscale up` argument, DNS records later).
+- **Dependencies.** A service records which references it resolved. When one
+  of them resolves to another number, `run` knows exactly which rules and
+  configs to apply again.
+
+A service never reads a number from the IR, and TypeScript never writes one
+for an address it does not pin — there is no `resolve()` in the generator.
 
 ### 4. One authority per collision domain
 
@@ -408,7 +476,8 @@ A **reused** address (rare: a removal, then an addition) gives the new owner
 the **same MAC**; a peer's stale ARP entry or MAC_Binding then still points
 at the right MAC, and the OVN MAC_Binding age threshold (300 s by default,
 `DEFAULT_MAC_BINDING_AGE_THRESHOLD`) clears what is left. A collision domain
-without IPv4 keeps the name-hashed fallback (`02:…`).
+without IPv4 keeps the name-hashed fallback (`02:…`). Only a MAC the
+topology sets **explicitly** is carried in the IR; a derived one is not.
 
 **Out of scope: `serve-graph`.** The graph page was built for debugging and
 may move to the runtime side. Until then it shows addresses as the IR has
@@ -441,14 +510,22 @@ any — and no resolved numbers. It gets no allocator of its own.
 
 ## Migration
 
-1. **Types only.** Introduce `LogicalIP` in the protocol and emit every
-   address as a pinned LogicalIP (`host` from the value it has today, the
-   core legs included). The resolver only substitutes. No behavior change:
-   the **resolved** IR, the tests and VM 302 stay identical (the stored IR's
-   shape changes); the MAC derivation moves to the runtime here.
+1. **The generator emits references** (TypeScript only). Every address is a
+   reference (§3b): written ones pinned, core legs and control-plane addresses
+   without `host`, transit ends `"first"`/`"last"`, an `ip.net` node per
+   collision domain with its allocator; only explicit MACs; `masq: […]` as
+   the one DSL spelling — the tenant NAT gateways and the control plane's
+   egress and ingress legs alike (`externalIp` a reference to the port). TypeScript
+   counts nothing any more. The deployer cannot read this IR until step 3 —
+   accepted (2026-11-12). Done before it: the DSL (`net.ipNet`,
+   `src/ipnet.ts`) and a byte-identical round trip of the old IR through the
+   logical form, as a check of the shape (a temporary converter, removed
+   once the generator wrote references itself: `src/ir-addresses.ts`; the
+   types live in `src/protocol.ts`).
 2. **The natural key `(collision domain, address)`** (§3a).
-3. **Allocation, for the cores and the control plane.** They emit unpinned
-   LogicalIPs; the runtime allocates them (§3, §4) and tags the carriers.
+3. **The runtime resolves and allocates** (Python): the address metadata
+   (§3b) handed to every service, allocation (§3, §4), owner tags on the
+   carriers.
    Seed: on the first `run` no carrier has an owner tag yet — a carrier
    without a tag is matched once by its IR id (as `run` matches it today) and
    tagged, so every name keeps its live number and introducing it moves
@@ -467,12 +544,11 @@ None left.
 
 Deferred, with reasons:
 
-- **Allocated addresses inside config text** (a Corefile's zone records, a
-  `tailscale up` argument, external-dns records later): a generated config
-  file cannot name an allocated address's number, since TypeScript no longer
-  knows it. Whether such addresses must be pinned or are written as a
-  placeholder the runtime fills in is postponed — it belongs to the platform
-  services, not to the allocator.
+- **The template syntax for config text** (§3b): how a generated file
+  names a reference, and which services render templates. Today no config
+  text holds a fabric address (checked on the cluster topology, 2026-11-12);
+  it becomes needed with the platform services.
+
 
 - **Reinstalling one host while others stay live** is **not supported**. A
   `create` on that host allocates against an empty view (§3) while the other

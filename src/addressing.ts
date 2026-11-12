@@ -1,7 +1,7 @@
 // src/addressing.ts — the fold rules the router/kernel model needs:
 // transitNetwork() (an explicit transit block -> its two endpoint
-// addresses) plus the small deterministic helpers (fnv1a32, macFromV4)
-// the generator folds repeated names/addresses into.
+// addresses) plus the small deterministic helpers (fnv1a32, macFromName)
+// the generator folds repeated names into.
 //
 // Fold operation = string construction. Decimal identifiers are placed
 // directly into the address text, so the result stays human-readable.
@@ -23,6 +23,7 @@ import fnv1aModule from "fnv1a";
 import fnv1aIdentity from "@sindresorhus/fnv1a";
 const hash = fnv1aModule as unknown as (s: string, h?: number) => number;
 import type { IPv4, IPv6 } from "./ip.ts";
+import { type Addr, IpNet, type LogicalIP } from "./ipnet.ts";
 
 // ── transit network: an OVN<->kernel-netns point-to-point link ──────
 // The kernelRouterEndpoint()/transit-CollisionDomain design (2026-08-12
@@ -41,8 +42,8 @@ import type { IPv4, IPv6 } from "./ip.ts";
 // (kernelRouterEndpoint() decides), not something this pure fold has
 // any basis to assert.
 export interface TransitEndpoint {
-  readonly ipv4?: IPv4;
-  readonly ipv6?: IPv6;
+  readonly ipv4?: Addr;
+  readonly ipv6?: Addr;
 }
 
 export interface TransitNetwork {
@@ -50,36 +51,30 @@ export interface TransitNetwork {
   readonly right: TransitEndpoint;
 }
 
-export function transitNetwork(ipv4?: IPv4, ipv6?: IPv6): TransitNetwork {
-  return {
-    left: {
-      ipv4: ipv4?.first(),
-      ipv6: ipv6?.first(),
-    },
-    right: {
-      ipv4: ipv4?.last(),
-      ipv6: ipv6?.last(),
-    },
-  };
-}
-
-// ── MAC address derivation ────────────────────────────────────────
-// Folds an IPv4 address's four octets directly into a MAC, prefixed
-// with 00:00 — the convention already used by hand throughout this
-// project (e.g. 192.168.128.2 -> 00:00:c0:a8:80:02, verified against a
-// live deployment). Locally-administered OUI space
-// (00:00:xx is not a real vendor block) is fine for this use — these
-// MACs only need to be unique within OVN's logical topology, never
-// routed on a real physical LAN segment.
-
-export function macFromV4(ipv4: IPv4): string {
-  // Numeric: the address's own value (host_address, a Crunchy — prefix
-  // independent), rendered as the 32-bit hex that folds straight into
-  // the four MAC bytes. No string parsing, no per-octet loop.
-  const hex = ipv4.host_address.toString(16).padStart(8, "0");
-  return `00:00:${hex.slice(0, 2)}:${hex.slice(2, 4)}:${hex.slice(4, 6)}:${
-    hex.slice(6, 8)
-  }`;
+/** A transit's two ends: the first and the last address of each family
+ * (`"first"` / `"last"`, ADR 0011) — of a net
+ * (`transitNetwork(net.ipNet({ ipv4, ipv6 }))`), or of the two parsed
+ * prefixes. */
+export function transitNetwork(
+  net?: IPv4 | IpNet,
+  ipv6Prefix?: IPv6,
+): TransitNetwork {
+  if (net === undefined && ipv6Prefix === undefined) {
+    return { left: {}, right: {} };
+  }
+  if (!(net instanceof IpNet)) {
+    net = new IpNet({
+      ...(net ? { ipv4: net.to_string() } : {}),
+      ...(ipv6Prefix ? { ipv6: ipv6Prefix.to_string() } : {}),
+    });
+  } else if (ipv6Prefix !== undefined) {
+    throw new Error("transitNetwork(net): the net carries its own ipv6");
+  }
+  const ends = (l: LogicalIP): TransitEndpoint => ({
+    ipv4: net.ipv4 ? l.asIpv4() : undefined,
+    ipv6: net.ipv6 ? l.asIpv6() : undefined,
+  });
+  return { left: ends(net.host("first")), right: ends(net.host("last")) };
 }
 
 // ── deterministic short-name hash ───────────────────────────────────
@@ -117,29 +112,12 @@ export function fnv1a64(s: string): string {
     .padStart(FNV1A_IDENTITY_SIZE / 4, "0");
 }
 
-// ── kernel-device MAC derivation ────────────────────────────────────
-// The MAC of a REAL kernel device this project creates on an OVN
-// segment (a kernel router's veth netns leg, a workload container's
-// NIC). Left alone, the kernel picks a RANDOM MAC every time the device
-// is recreated — and an OVN logical router keeps the MAC_Binding it
-// learned for that IP forever (no aging by default, no reachability
-// probing), so after a netns/container restart it keeps sending to the
-// OLD MAC and the kernel drops every frame as "other host" before
-// routing (confirmed live 2026-10-11: IPv4 and IPv6 black-holed on four
-// kernel-router transit legs until something made the netns emit
-// ARP/ND). Making the MAC a pure function of the device's own address
-// means a binding can never go stale, whatever gets recreated or moved.
-//
-// Same fold as an LRP (macFromV4 of the first IPv4 — resolveMac,
-// src/ir.ts). A device with no IPv4 falls back to a locally-administered
-// MAC (02:…) hashed from `name`, which must itself be stable across
-// runs (a config-derived name, never a runtime id).
-export function macFromAddrsOrName(
-  ipaddrs: readonly (IPv4 | IPv6)[],
-  name: string,
-): string {
-  const v4 = ipaddrs.find((addr): addr is IPv4 => addr.is_ipv4());
-  if (v4) return macFromV4(v4);
+// ── a MAC from a name ───────────────────────────────────────────────
+// A locally-administered MAC (02:…) hashed from a stable, config-derived
+// name — for a port that has no IPv4 to fold one from (a DHCP wan's cable)
+// and must not get a random one. An address-derived MAC is the runtime's
+// (ADR 0011 §5): it folds the resolved IPv4.
+export function macFromName(name: string): string {
   const hex = fnv1a64(name).slice(0, 10);
   return `02:${hex.slice(0, 2)}:${hex.slice(2, 4)}:${hex.slice(4, 6)}:${
     hex.slice(6, 8)

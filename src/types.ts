@@ -4,8 +4,9 @@
 // declares the FACTS.
 
 import type { TransitNetwork } from "./addressing.ts";
+import type { Addr, AddrLike, Prefix } from "./ipnet.ts";
 import type { IPv4, IPv6 } from "./ip.ts";
-import type { OvnEndpointFn } from "./builders.ts";
+import type { EndpointBuilder } from "./builders.ts";
 import type { platformSvc } from "./platform-service.ts";
 
 // ── host / chassis ─────────────────────────────────────────────────
@@ -396,7 +397,7 @@ export interface KernelMasqRule {
 export interface OvnSnatRule {
   readonly family: "ipv4" | "ipv6";
   readonly kind: "snat";
-  readonly externalIp: IPv4 | IPv6;
+  readonly externalIp: Addr;
   readonly logicalIps: readonly (IPv4 | IPv6)[];
   /** The endpoint it goes out of, when that one is a gateway port: a router
    * with several of them must be told which (`--gateway-port`). */
@@ -543,10 +544,10 @@ export type KernelApp =
     readonly cmd?: readonly string[];
     /** The container's interface address, e.g. "10.200.0.2/24" — the
      * container's end of the veth injected into the router netns. */
-    readonly ip?: string;
+    readonly ip?: Addr;
     /** The router end of that veth — the subnet's first host, e.g.
      * "10.200.0.1/24", resolved by buildKernelRouterEndpoint. */
-    readonly routerIp?: string;
+    readonly routerIp?: Addr;
     /** The SHORT veth prefix for this app's veth pair, computed from
      * the container name (`ve-<hash>`, src/ir.ts's kernelRouterSideToIR)
      * — the router-netns end is `veth-<vethName>`-free, the pair is
@@ -610,11 +611,8 @@ export type KernelApp =
 // connected by Routers, instead of manually restating the same fact at
 // every hop along the way.
 //
-// No `mac` field on RouterEndpoint: every existing case (segments,
-// uplinks, backbone joins) derives it from the endpoint's own IPv4 via
-// macFromV4 (addressing.ts) at emission time, never stores one
-// separately — RouterEndpoint follows the same convention rather than
-// reintroducing a redundant field.
+// A MAC is set only explicitly (RouterEndpoint.mac); otherwise the
+// runtime folds it from the resolved IPv4 (ADR 0011 §5).
 /** One real (host, interface) pair — see RouterEndpoint.ifaces. */
 export interface HostInterface {
   readonly host: Host;
@@ -663,11 +661,10 @@ export interface RouterEndpointInputBase<
    * array entry per address (IPv4.parse(...), IPv6.parse(...)). A
    * router endpoint has no segment/uplink identity for a fold rule to
    * derive an address from, so its addresses are simply declared. */
-  readonly ipaddrs: readonly (IPv4 | IPv6)[];
-  /** Explicit MAC override. Required when ipaddrs has no IPv4 for
-   * macFromV4() to fold (e.g. an endpoint whose real address isn't
-   * declared yet, or is DHCP-assigned) — undefined otherwise means
-   * "derive it from ipaddrs's IPv4." */
+  readonly ipaddrs: readonly AddrLike[];
+  /** Explicit MAC — the only one the IR carries. Needed when there is
+   * no IPv4 to fold one from (a DHCP-assigned leg); undefined: the
+   * runtime folds it from the resolved IPv4 (ADR 0011 §5). */
   readonly mac?: string;
   /** Real physical/tunnel attachment(s) for this endpoint's side of the
    * collision domain — a segment's localnet port needs one (it bridges
@@ -749,6 +746,8 @@ export interface RouterEndpointBase<
   S = RouterEndpointService,
 > extends RouterEndpointInputBase<S> {
   readonly name: string;
+  /** Stored as Addr (ADR 0011): a written IPv4/IPv6 becomes a pinned one. */
+  readonly ipaddrs: readonly Addr[];
 }
 
 /** Today's ONLY concrete shape — adds the one field that's actually
@@ -829,7 +828,7 @@ export interface TunnelRouterEndpoint extends EndpointDefinition {
    * the root namespace. */
   readonly upstreamBackbone: {
     readonly l2Segment: CollisionDomain;
-    readonly ipaddrs: readonly (IPv4 | IPv6)[];
+    readonly ipaddrs: readonly AddrLike[];
     /** Its leg's own routes, services (masq), gateway chassis and domains
      * — a VPN gateway's NAT gateway onto internet-core (ADR 0009). */
     readonly routes?: readonly RouterEndpointRoute[];
@@ -883,7 +882,7 @@ export interface TunnelRouterEndpoint extends EndpointDefinition {
  * localnet port/bridge binding/bridge-mapping); the `left` side's real
  * iface binding is still its own next step. */
 export interface KernelRouterSide {
-  readonly ipaddrs: readonly (IPv4 | IPv6)[];
+  readonly ipaddrs: readonly Addr[];
   readonly routes?: readonly RouterEndpointRoute[];
   /** Real physical/tunnel attachment(s) for this side — mirrors
    * RouterEndpointBase.ifaces (types.ts): `host` is the chassis the
@@ -954,17 +953,11 @@ export interface KernelRouter {
    * `left.ipaddrs` (this KernelRouter's OWN address on that same
    * domain) — this is the address on the OTHER end of that same wire.
    * Always set, like transitDomain above. */
-  readonly transitPeerAddrs: readonly (IPv4 | IPv6)[];
-  /** The tunnel router's UPSTREAM transit peer (tunnelRouterEndpoint(),
-   * define.ts) — the OTHER end of the upstream wire (e.g. the physical-
-   * path router the tunnel netns borrows egress from): the nexthop for
-   * the netns's default route out the upstream leg, which is how the
-   * tunnel's own endpoint UDP reaches the real internet (wg-quick's
-   * fwmark policy routing keeps it out of the tunnel). Populated by
-   * tunnelRouterEndpoint(); EMPTY for a plain kernelRouterEndpoint() —
-   * it has no upstream leg, its real default lives in `right`'s own
-   * routes (KernelRouterSide.routes). Always present, possibly empty. */
-  readonly upstreamPeerAddrs: readonly (IPv4 | IPv6)[];
+  readonly transitPeerAddrs: readonly Addr[];
+  /** The collision domain the `right` side's leg is plugged into, when it
+   * is one of the fabric's (a tunnel's upstream switch). Absent for a
+   * WAN side, whose LAN only that side is on (ADR 0011). */
+  readonly upstreamDomain?: CollisionDomain;
   /** Same field, same meaning as Router.routingDomains below — a
    * KernelRouter's own routes (KernelRouterSide.routes) only apply if
    * it's actually a participant of some declared RoutingDomain, same
@@ -1096,7 +1089,7 @@ export type RouterEndpointService =
      * FIRST entry is the container's interface address and the peer end is
      * that subnet's first host (`.1`); for a container bound to a segment
      * they are its addresses on that segment. */
-    readonly ipaddrs?: readonly (IPv4 | IPv6)[];
+    readonly ipaddrs?: readonly AddrLike[];
     /** The container's OWN routes (e.g. its default via the segment
      * gateway). Omitted/empty → a default route (per family on the
      * endpoint) is added via the endpoint's address (the segment/router
@@ -1108,7 +1101,7 @@ export type RouterEndpointService =
      * this endpoint's segment — one NIC on this L2 (2026-09-08). */
     readonly kind: "service.attach";
     readonly srvRef: Service;
-    readonly ipaddrs: readonly (IPv4 | IPv6)[];
+    readonly ipaddrs: readonly AddrLike[];
     /** Explicit routes for THIS NIC (over the segment gateway). Omitted/
      * empty → the NIC inherits the routes of the RoutingDomains its
      * endpoint's router participates in, next-hopped at this endpoint's
@@ -1300,7 +1293,7 @@ export interface PlatformServiceCoreDns {
   /** The resolver's address on the platform's CONTROL-PLANE leg. Omitted →
    * allocated like any other platform service (control-plane network +10,
    * +11, …). */
-  readonly ipaddrs?: readonly (IPv4 | IPv6)[];
+  readonly ipaddrs?: readonly AddrLike[];
   /** Upstreams for anything not served locally, in CoreDNS syntax — e.g.
    * "tls://1.1.1.1", "https://cloudflare-dns.com/dns-query". */
   readonly forwarders?: readonly string[];
@@ -1316,7 +1309,7 @@ export interface PlatformServiceCoreDns {
  * resolver ?? (control-plane default) the platform CoreDNS address
  * (2026-09-19). `search`/`options` land later. */
 export interface Resolver {
-  readonly nameservers: readonly (IPv4 | IPv6)[];
+  readonly nameservers: readonly AddrLike[];
 }
 
 export interface PlatformControlPlane {
@@ -1336,7 +1329,7 @@ export interface PlatformControlPlane {
    * from these (the platform's router NAME is inferred from the platform
    * name); only the EGRESS leg(s) are added via addEgress/spec.egress. Optional:
    * without them the platform builds no router of its own. */
-  readonly ipaddrs?: readonly (IPv4 | IPv6)[];
+  readonly ipaddrs?: readonly AddrLike[];
   readonly ifaces?: readonly HostInterface[];
   /** The segments that may reach the control plane. The router that is the
    * segment's gateway gets a leg on the control plane, and masquerades the
@@ -1392,12 +1385,14 @@ export interface Platform {
   delPlatformSvc(id: PlatformServiceId): Platform;
 }
 
-/** One EGRESS leg of the platform's own router — same spec/callback shape
- * as RouterBuilder.ovnRouterEndpoint. Given up front via
- * PlatformSpec.egress[] or added later with platform.addEgress(). */
+/** One EGRESS leg of the platform's own router — the spec/callback shape
+ * of RouterBuilder.ovnRouterEndpoint, without `services`: an egress leg
+ * masquerades with `masq: ["ipv4", "ipv6"]` (ADR 0011 §3b) and runs no
+ * workloads. Given up front via PlatformSpec.egress[] or added later with
+ * platform.addEgress(). */
 export type PlatformEgressSpec =
-  | Omit<OvnRouterEndpointSpec, "kind">
-  | OvnEndpointFn;
+  | Omit<OvnRouterEndpointSpec, "kind" | "services">
+  | ((ep: EndpointBuilder) => Omit<OvnRouterEndpointSpec, "kind" | "services">);
 
 /** One admin NIC for the platform's control-plane leg (platform.addService).
  * Deliberately NO `(ep) => ep.attachTo(...)`: the platform owns that
@@ -1416,7 +1411,7 @@ export interface PlatformServiceSpec {
    * host +10 and counting up (the k8s convention: .1 is the gateway, the
    * first workload lands at .10) — e.g. a 10.99.77.1/24 leg yields
    * 10.99.77.10/24, then .11, … Already-used addresses are skipped. */
-  readonly ipaddrs?: readonly (IPv4 | IPv6)[];
+  readonly ipaddrs?: readonly AddrLike[];
   readonly routes?: readonly RouterEndpointRoute[];
   /** A single name/cert binding — the platform injects itself as the
    * publish's platform (no platform.publish(...) at the call site). */
@@ -1453,10 +1448,16 @@ export type Publish = PublishSpec & {
  * omitted too — it's derived by the builder, never authored (an author who
  * wants a specific name sets `name` instead). */
 export type OvnRouterEndpointSpec =
-  & Omit<OvnRouterEndpoint, "services" | "name">
+  & Omit<OvnRouterEndpoint, "services" | "name" | "ipaddrs">
   & {
     /** Optional explicit port name — see EndpointDefinition. */
     readonly name?: string;
+    /** Written (IPv4/IPv6, pinned) or a LogicalIP's Addr (ADR 0011). */
+    readonly ipaddrs: readonly AddrLike[];
+    /** Masquerade what leaves through this leg, per family — the one DSL
+     * spelling (ADR 0011 §3b); on an OVN leg an SNAT to the leg's own
+     * address, which the runtime resolves. */
+    readonly masq?: readonly ("ipv4" | "ipv6")[];
     readonly services?: readonly RouterEndpointService[];
   };
 
@@ -1490,8 +1491,8 @@ export type OvnRouterEndpointSpec =
  * emission when `via` is absent, every other participant is
  * unaffected). */
 export interface RouterEndpointRoute {
-  readonly dst: IPv4 | IPv6;
-  readonly via?: IPv4 | IPv6;
+  readonly dst: Prefix;
+  readonly via?: AddrLike;
   /** Security groups whose rules apply to traffic for this route. The
    * groups are the single source of what "masq"/NAT means; the IR carries
    * their references, not a boolean. */
@@ -1509,7 +1510,7 @@ export interface RouterEndpointRoute {
  * shared CollisionDomain, or a workload's gateway on the segment it
  * attaches to). */
 export interface RoutingDomainRoute {
-  readonly dst: IPv4 | IPv6;
+  readonly dst: Prefix;
   /** Per-destination override of the domain's `metric` — see
    * RouterEndpointRoute.metric (2026-09-19). */
   readonly metric?: number;

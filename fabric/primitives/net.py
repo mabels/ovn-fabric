@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import dataclasses
-import ipaddress
 import shlex
 from collections.abc import Sequence
 from typing import ClassVar
+
+from ip_address import IPAddress
 
 from ladops import linux_net as linux_net_ops
 from ladops import netns as netns_ops
@@ -42,7 +43,9 @@ class AddrPrimitive(CommandPrimitive):
         return f"addr:{_ns_arg(self.netns)}|{self.link}|{self.addr}"
 
     def as_primitive(self) -> Primitive:
-        interface = ipaddress.ip_interface(self.addr)
+        interface = IPAddress.parse(self.addr)
+        if interface is None:
+            raise ValueError(f"not an address: {self.addr!r}")
         return Primitive(
             key=self.key,
             nodes=(
@@ -52,9 +55,9 @@ class AddrPrimitive(CommandPrimitive):
                     fields={
                         "netnsRef": f"netns:{_ns_arg(self.netns)}",
                         "linkRef": f"link:{_ns_arg(self.netns)}|{self.link}",
-                        "family": "ipv6" if interface.version == 6 else "ipv4",
-                        "address": str(interface.ip),
-                        "prefixlen": interface.network.prefixlen,
+                        "family": "ipv4" if interface.is_ipv4() else "ipv6",
+                        "address": str(interface.to_s()),
+                        "prefixlen": int(interface.prefix.num),
                     },
                 ),
             ),

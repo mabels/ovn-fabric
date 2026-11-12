@@ -28,10 +28,11 @@ link of its own.
 
 from __future__ import annotations
 
-import ipaddress
 import subprocess
 from collections.abc import Callable, Iterable
 from typing import Any
+
+from ip_address import IPAddress
 
 from ladops.docker import list_containers, list_networks
 from ladops.ovs import list_datapath, list_external_ids
@@ -131,14 +132,20 @@ def mark_host(nodes: Nodes, interfaces: Iterable[str], parents: Iterable[str] = 
 # -- discovery: one function per owner ----------------------------------------
 
 
+def _network(value: str) -> IPAddress:
+    """A network as written (`172.17.0.0/16`); host bits are an error."""
+    addr = IPAddress.parse(value)
+    if addr is None or not addr.is_network():
+        raise ValueError(f"not a network: {value!r}")
+    return addr
+
+
 def _kernel(nodes: Nodes) -> None:
-    link_local = ipaddress.ip_network("fe80::/10")
+    link_local = _network("fe80::/10")
 
     def is_link_local(value: Any) -> bool:
-        try:
-            return ipaddress.ip_interface(str(value)).ip in link_local
-        except ValueError:
-            return False
+        addr = IPAddress.parse(str(value))
+        return addr is not None and bool(link_local.includes(addr))
 
     mark(
         nodes,
@@ -162,7 +169,7 @@ def _kernel(nodes: Nodes) -> None:
 
 def _docker(nodes: Nodes) -> None:
     networks = list_networks()
-    subnets = [ipaddress.ip_network(s) for n in networks for s in n["subnets"]]
+    subnets = [_network(s).to_string() for n in networks for s in n["subnets"]]
     containers = _containers()
     # A running container's namespace, by both names it is collected under.
     inside = {f"netns:{prefix}{c['name']}" for c in containers for prefix in ("", "docker:")}
@@ -175,10 +182,8 @@ def _docker(nodes: Nodes) -> None:
             return True
         source = (rule.get("fields") or {}).get("src")
         if rule.get("action") == "MASQUERADE" and source:
-            try:
-                return any(ipaddress.ip_network(source) == net for net in subnets)
-            except ValueError:
-                return False
+            addr = IPAddress.parse(str(source))
+            return addr is not None and addr.to_string() in subnets
         return False
 
     mark(

@@ -43,11 +43,12 @@ told apart from what the system fills in.
 from __future__ import annotations
 
 import dataclasses
-import ipaddress
 import re
 import secrets
 from collections.abc import Callable, Mapping
 from typing import Any
+
+from ip_address import IPAddress
 
 from fabric.lifecycle import Primitive
 from fabric.primitives.docker import DockerPrimitive, DockerPull
@@ -258,9 +259,13 @@ def _netns_and_dev(host: HostPrimitive, m: Mapping[str, Any]) -> list[Any]:
 def _netns_dev_and_gateway(host: HostPrimitive, m: Mapping[str, Any]) -> list[Any]:
     """The netns, its link, and an address on it the gateway `via` is in."""
     netns = host.netns(m["netns"])
-    prefix = 24 if ipaddress.ip_address(m["via"]).version == 4 else 64
-    gateway = ipaddress.ip_interface(f"{m['via']}/{prefix}")
-    own = next(ip for ip in gateway.network.hosts() if ip != gateway.ip)
+    via = IPAddress.parse(m["via"])
+    if via is None:
+        raise ValueError(f"not an address: {m['via']!r}")
+    prefix = 24 if via.is_ipv4() else 64
+    gateway = via.change_prefix(prefix)
+    first = gateway.network().first()
+    own = (first if first.to_s() != gateway.to_s() else first.inc()).to_s()
     return [
         netns,
         netns.add_if(m["dev"], kind="dummy", up=True),

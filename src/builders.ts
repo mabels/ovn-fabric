@@ -4,7 +4,7 @@
 // owns the state.
 
 import type { TransitNetwork } from "./addressing.ts";
-import type { IPv4, IPv6 } from "./ip.ts";
+import type { AddrLike } from "./ipnet.ts";
 import type {
   Host,
   HostInterface,
@@ -50,7 +50,7 @@ export interface DockerAppBuilder {
 export interface KernelRouterEndpointBuilder {
   host: Host;
   transit: TransitNetwork;
-  ipaddrs?: readonly (IPv4 | IPv6)[];
+  ipaddrs?: readonly AddrLike[];
   ifaces?: readonly HostInterface[];
   services?: RouterEndpointService[];
   securityGroups?: readonly SecurityGroup[];
@@ -136,7 +136,7 @@ export interface EndpointBuilder {
   attachTo(
     service: Service,
     attachment: {
-      readonly ipaddrs: readonly (IPv4 | IPv6)[];
+      readonly ipaddrs: readonly AddrLike[];
       readonly routes?: readonly RouterEndpointRoute[];
       /** Default metric for THIS NIC's routes (lower wins) — ranks a
        * workload's default routes, e.g. management-v2 over a control-plane

@@ -52,7 +52,7 @@
 // Apps1/ServiceRef1 and emit the same shape twice).
 
 import { type } from "arktype";
-import { IPAddress } from "jsr:@adviser/ipaddress@0.2.11";
+import { IPAddress } from "jsr:@adviser/ipaddress@0.2.12";
 
 export const InfraHostKey = type({ host: "string" });
 export const PackageManager = type("'apt' | 'dnf'");
@@ -112,8 +112,8 @@ export const InfraHostNode = type({
 //
 //   kernel.router `ifaces[].iface` (KernelIface*) — the InterfaceKind as
 //   declared; only the transit `veth` gains `shortName` (the suffix both
-//   real leg names are built from) and `mac` (the netns leg's
-//   deterministic MAC, src/addressing.ts's macFromAddrsOrName).
+//   real leg names are built from); its MAC is the runtime's (ADR 0011
+//   §5), folded from the leg's resolved address.
 export const WireguardPeerConfig = type({
   publicKey: "string",
   endpoint: "string",
@@ -274,11 +274,57 @@ export const OvnLrpKey = type({
   // which is what makes desired-vs-live merge possible at all.
   name: "string",
 });
+// ── logical addresses (ADR 0011) ──────────────────────────────────
+// No number for a fabric address unless the topology pins it: an address is
+// a LogicalIP on a collision domain's net (an `ip.net` node), owned by the IR
+// id that carries it; the runtime allocates what has no `host`. A next hop,
+// a nameserver or an SNAT's external address is an AddrRef: one family of a
+// LogicalIP, named by its owner — the runtime resolves it (its address
+// metadata, ADR 0011 §3b). Prefixes (route dst, SNAT logicalIps, filter
+// sources) stay strings: a net's prefix is configuration, not allocated.
+export const HostRef = type("number.integer | 'first' | 'last'");
+export const HostNumbers = type({
+  "ipv4?": HostRef,
+  "ipv6?": HostRef,
+});
+export const LogicalIP = type({
+  // `ipnet:<collision domain>` — the ip.net node's id.
+  net: "string",
+  owner: "string",
+  // Absent: allocated by the runtime. A plain value: every family of the
+  // net; an object: exactly the families listed.
+  "host?": HostRef.or(HostNumbers),
+  // The families this address has, when not every family of the net (an
+  // IPv4-only address on a dual-stack net).
+  "families?": "('ipv4'|'ipv6')[]",
+});
+export const AddrRef = type({
+  net: "string",
+  owner: "string",
+  family: "'ipv4'|'ipv6'",
+  // Only for an address no carrier of the fabric holds (an upstream
+  // router's, pinned where it is written).
+  "host?": HostRef,
+});
+export const IpNetKey = type({ domain: "string" });
+export const AllocatorStrategy = type("'low-high' | 'high-low' | 'random'");
+export const IpNetData = type({
+  "ipv4?": "string",
+  "ipv6?": "string",
+  allocator: type({ ipv4: AllocatorStrategy, ipv6: AllocatorStrategy }),
+});
+export const IpNetNode = type({
+  id: "string",
+  kind: "'ip.net'",
+  key: IpNetKey,
+  data: IpNetData,
+});
+
 // (KernelRouterRoute + ServiceRef live here, before OvnLrpData, because
 // OvnLrpData.serviceRefs uses ServiceRef at module-eval time.)
 export const KernelRouterRoute = type({
   dst: "string",
-  "via?": "string",
+  "via?": AddrRef,
   // Preference among equal-prefix routes (lower wins) — resolved by the
   // generator from the route/domain/attachment metric, or left unset for
   // the deployer's execution-order fallback (2026-09-19).
@@ -287,20 +333,19 @@ export const KernelRouterRoute = type({
 // A workload NIC's DNS resolver, already resolved by the generator
 // (attachment > control-plane global > CoreDNS). The deployer renders it as
 // `docker run --dns …` (2026-09-19).
-export const Resolver = type({ nameservers: "string[]" });
+// A nameserver is an AddrRef, or as written when it is not the fabric's.
+export const Resolver = type({ nameservers: AddrRef.or("string").array() });
 export const ServiceRef = type({
   service: "string",
   // The in-container NIC name — RESOLVED by the generator (src/ir.ts's
   // shortIfaceName/fnv1a32: the segment name when it fits IFNAMSIZ, else a
   // hashed short form). The deployer uses it verbatim, never shortens.
   name: "string",
-  // The NIC's MAC — RESOLVED by the generator (src/ir.ts,
-  // macFromAddrsOrName): a pure function of the NIC's own address, so
-  // the segment router's MAC_Binding survives the container being
-  // recreated. Optional only so an IR written by an older build still
-  // validates; the deployer leaves the kernel's random MAC when absent.
+  // Only an explicit MAC (ADR 0011 §5); otherwise the runtime folds it
+  // from the NIC's resolved address, so the segment router's MAC_Binding
+  // survives the container being recreated.
   "mac?": "string",
-  "ipaddrs?": "string[]",
+  "ipaddrs?": LogicalIP.array(),
   "routes?": KernelRouterRoute.array(),
   "resolver?": Resolver,
 });
@@ -319,12 +364,10 @@ export const OvnLrpData = type({
   // domain name (src/ir.ts's own routerEndpointToIR — every cross-node
   // reference in the IR is an id, confirmed live 2026-08-12).
   l2Segment: "string",
-  addresses: "string[]",
-  // Always resolved by the time toIR() emits it (src/ir.ts's own
-  // resolveMac) — not optional here, so a JSON file missing it (e.g.
-  // generated by a stale pre-mac-resolution build) fails protocol
-  // validation instead of reaching the deployer at all.
-  mac: "string",
+  addresses: LogicalIP.array(),
+  // Only a MAC the topology sets explicitly (ADR 0011 §5): a derived one
+  // is computed by the runtime from the resolved address.
+  "mac?": "string",
   // `host:<name>` — the referenced infra.host node's own id, same
   // reasoning as l2Segment above.
   "gatewayChassis?": "string",
@@ -359,7 +402,7 @@ export const RouteKey = type({ ovnrouter: "string", prefix: "string" });
 // deployer group a router's routes into labeled blocks instead of one
 // flat, unlabeled dump.
 export const RouteData = type({
-  nexthop: "string",
+  nexthop: AddrRef,
   securityGroups: SecurityGroupRef.array(),
   domain: "string",
   metric: "number",
@@ -437,8 +480,8 @@ export const DockerApp = type({
   "build?": DockerBuild,
   name: "string",
   "cmd?": "string[]",
-  "ip?": "string",
-  "routerIp?": "string",
+  "ip?": LogicalIP,
+  "routerIp?": LogicalIP,
   "vethName?": "string",
   "volumes?": type({
     host: "string",
@@ -481,7 +524,7 @@ export const KernelApp = DhcpClientApp.or(WireguardApp).or(ZerotierApp).or(
 );
 export const KernelRouterData = type({
   host: "string",
-  "ipaddrs?": "string[]",
+  "ipaddrs?": LogicalIP.array(),
   "routes?": KernelRouterRoute.array(),
   // Real physical attachment(s) for this side — {host, iface}, the
   // iface a KernelIface (see the interface shapes above). Present on the
@@ -493,12 +536,6 @@ export const KernelRouterData = type({
   // shortcut) attached to THIS side's interface (right side only in
   // practice) — the attachment point for the rules those groups carry.
   "securityGroups?": SecurityGroupRef.array(),
-  // The tunnel router's UPSTREAM peer address(es) — the OTHER end of the
-  // upstream veth (right side only; tunnelRouterEndpoint, define.ts). The
-  // deployer brings that root-side peer leg up and assigns it these
-  // addresses so the netns's default route (via the peer) has a live
-  // gateway (2026-08-23).
-  "upstreamPeerAddrs?": "string[]",
   // Applications running inside the netns on this side's real interface
   // (right side only in practice — src/ir.ts's kernelRouterSideToIR,
   // from KernelApp, types.ts). The deployer turns each into its
@@ -571,7 +608,8 @@ export const SecurityGroupRule = type({
 }).or(type({
   kind: "'snat'",
   family: "'ipv4'|'ipv6'",
-  externalIp: "string",
+  // The outgoing port's own address (ADR 0011 §3b).
+  externalIp: AddrRef,
   logicalIps: "string[]",
   "gatewayPort?": "string",
 })).or(FilterRule);
@@ -658,7 +696,8 @@ export const KernelAppServiceNode = type({
   data: KernelAppServiceData,
 });
 
-export const IRNode = InfraHostNode.or(OvnLsNode).or(OvnLrNode).or(OvnLrpNode)
+export const IRNode = IpNetNode.or(InfraHostNode).or(OvnLsNode).or(OvnLrNode)
+  .or(OvnLrpNode)
   .or(
     Ipv4RouteNode,
   ).or(
@@ -686,6 +725,10 @@ type DeepReadonly<T> = T extends readonly (infer Item)[]
   : T extends object ? { readonly [Key in keyof T]: DeepReadonly<T[Key]> }
   : T;
 export type InfraHostNode = DeepReadonly<typeof InfraHostNode.infer>;
+export type IpNetNode = DeepReadonly<typeof IpNetNode.infer>;
+export type LogicalIPValue = DeepReadonly<typeof LogicalIP.infer>;
+export type AddrRefValue = DeepReadonly<typeof AddrRef.infer>;
+export type HostRefValue = DeepReadonly<typeof HostRef.infer>;
 export type OvnLsNode = DeepReadonly<typeof OvnLsNode.infer>;
 export type OvnLsIface = DeepReadonly<typeof OvnLsIface.infer>;
 export type OvnLsInterface = DeepReadonly<typeof OvnLsInterface.infer>;
@@ -712,6 +755,7 @@ export type KernelAppServiceNode = DeepReadonly<
   typeof KernelAppServiceNode.infer
 >;
 export type IRNode =
+  | IpNetNode
   | InfraHostNode
   | OvnLsNode
   | OvnLrNode
@@ -856,6 +900,13 @@ export function buildJsonSchema(): Record<string, unknown> {
     OvnLrOptions: shape(OvnLrOptions),
     OvnLrData: shape(OvnLrData),
     OvnLrpKey: shape(OvnLrpKey),
+    HostRef: shape(HostRef),
+    HostNumbers: shape(HostNumbers),
+    LogicalIP: shape(LogicalIP),
+    AddrRef: shape(AddrRef),
+    IpNetKey: shape(IpNetKey),
+    AllocatorStrategy: shape(AllocatorStrategy),
+    IpNetData: shape(IpNetData),
     KernelRouterRoute: shape(KernelRouterRoute),
     Resolver: shape(Resolver),
     ServiceRef: shape(ServiceRef),
@@ -895,6 +946,7 @@ export function buildJsonSchema(): Record<string, unknown> {
   });
   const defs: Record<string, unknown> = {
     ...shapes,
+    IpNetNode: nodeSchema("ip.net", "IpNetKey", "IpNetData"),
     InfraHostNode: nodeSchema("infra.host", "InfraHostKey", "InfraHostData"),
     OvnLsNode: nodeSchema("ovn.ls", "OvnLsKey", "OvnLsData"),
     OvnLrNode: nodeSchema("ovn.lr", "OvnLrKey", "OvnLrData"),
@@ -927,6 +979,7 @@ export function buildJsonSchema(): Record<string, unknown> {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "$defs": defs,
     "oneOf": [
+      "IpNetNode",
       "InfraHostNode",
       "OvnLsNode",
       "OvnLrNode",

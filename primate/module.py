@@ -16,35 +16,42 @@ _PLACEHOLDER = re.compile(r"\{([a-z_0-9]+)(?:\|([a-z]+))?\}")
 
 # The helpers the transforms (learn.TRANSFORMS) become in the module.
 _HELPERS = """
+def _addr(value: str) -> IPAddress:
+    addr = IPAddress.parse(value)
+    if addr is None:
+        raise ValueError(f"not an address: {value!r}")
+    return addr
+
+
 def _ip(value: str) -> str:
-    return str(ipaddress.ip_interface(value).ip)
+    return str(_addr(value).to_s())
 
 
 def _len(value: str) -> int:
-    return ipaddress.ip_interface(value).network.prefixlen
+    return int(_addr(value).prefix.num)
 
 
 def _net(value: str) -> str:
-    return str(ipaddress.ip_interface(value).network)
+    return str(_addr(value).network().to_string())
 
 
 def _canonical(value: str) -> str:
-    return str(ipaddress.ip_interface(value))
+    return str(_addr(value).to_string())
 
 
 def _broadcast(value: str) -> str:
-    return str(ipaddress.ip_interface(value).network.broadcast_address)
+    return str(_addr(value).broadcast().to_s())
 
 
 def _netaddr(value: str) -> str:
-    return str(ipaddress.ip_interface(value).network.network_address)
+    return str(_addr(value).network().to_s())
 
 
 def _family(value: Any) -> int | None:
-    try:
-        return ipaddress.ip_interface(value).version
-    except ValueError:
+    addr = IPAddress.parse(value) if isinstance(value, str) else None
+    if addr is None:
         return None
+    return 4 if addr.is_ipv4() else 6
 """
 
 # The address family a marker kind was learned with.
@@ -135,10 +142,11 @@ def render(templates: dict[str, Any], source: str) -> str:
         "from __future__ import annotations",
         "",
         "import dataclasses",
-        "import ipaddress",
         "import re",
         "from collections.abc import Callable",
         "from typing import Any",
+        "",
+        "from ip_address import IPAddress",
         "",
         "# {'added': {id: node}, 'changed': {id: {field: change}}, 'removed': [id]}",
         "Footprint = dict[str, Any]",

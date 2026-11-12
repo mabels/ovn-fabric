@@ -2,6 +2,7 @@ import { assertEquals } from "jsr:@std/assert@1";
 import { defineNetwork } from "./define.ts";
 import { IPv4, IPv6 } from "./ip.ts";
 import { toIR } from "./ir.ts";
+import type { IRNode } from "./protocol.ts";
 import { transitNetwork } from "./mod.ts";
 
 function network() {
@@ -89,15 +90,18 @@ function network() {
   });
 }
 
+/** prefix → the router whose port is the next hop (ADR 0011: a next hop
+ * is a reference to its carrier, the number is the runtime's). */
 function routes(
-  nodes: Record<string, unknown>,
+  nodes: Record<string, IRNode>,
   router: string,
 ): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [id, node] of Object.entries(nodes)) {
     if (!id.startsWith(`ovnrouter:${router}|route:`)) continue;
-    const n = node as { key: { prefix: string }; data: { nexthop: string } };
-    out[n.key.prefix] = n.data.nexthop;
+    if (node.kind !== "ipv4.route" && node.kind !== "ipv6.route") continue;
+    const owner = node.data.nexthop.owner;
+    out[node.key.prefix] = owner.replace(/^ovnrouter:([^|]*)\|.*$/, "$1");
   }
   return out;
 }
@@ -131,8 +135,8 @@ Deno.test("tenant: the parts are named <scope>-<code>[-<name>]", () => {
 
 Deno.test("tenant: out through its NAT gateway, which masquerades its cables", () => {
   const nodes = toIR(network());
-  assertEquals(routes(nodes, "home-rt-main")["0.0.0.0/0"], "172.22.0.2"); // home-nat
-  assertEquals(routes(nodes, "home-nat")["0.0.0.0/0"], "172.21.0.1"); // the wan
+  assertEquals(routes(nodes, "home-rt-main")["0.0.0.0/0"], "home-nat");
+  assertEquals(routes(nodes, "home-nat")["0.0.0.0/0"], "internet-wan-avm");
   const snat = Object.values(nodes).flatMap((n) => {
     const node = n as {
       kind: string;
@@ -189,8 +193,11 @@ Deno.test("tenant: leaves through its first active wan", () => {
     }));
     return { hosts: [host], tenants: [neighbor], wans: [starlink, avm] };
   });
-  // starlink is 172.21.0.1, avm 172.21.0.2: the inactive one is skipped.
-  assertEquals(routes(toIR(net), "neighbor-nat")["0.0.0.0/0"], "172.21.0.2");
+  // starlink is inactive: skipped.
+  assertEquals(
+    routes(toIR(net), "neighbor-nat")["0.0.0.0/0"],
+    "internet-wan-avm",
+  );
 });
 
 Deno.test("tenant: no route leads into another tenant or onto internet-core", () => {
@@ -214,5 +221,48 @@ Deno.test("tenant: no route leads into another tenant or onto internet-core", ()
     }
   }
   // usa has no NAT gateway: out only into the tunnel.
-  assertEquals(routes(nodes, "usa-rt-lan")["0.0.0.0/0"], "172.22.2.2");
+  assertEquals(routes(nodes, "usa-rt-lan")["0.0.0.0/0"], "usa-vpn-mullvad");
+});
+
+Deno.test("logical IR: core legs are allocated, nothing counts in TypeScript", () => {
+  const nodes = toIR(network());
+  const lrp = Object.values(nodes).find((n) =>
+    n.kind === "ovn.lrp" && n.key.ovnrouter === "home-nat" &&
+    n.data.l2Segment === "ls:internet-core"
+  );
+  assertEquals(lrp?.kind, "ovn.lrp");
+  if (lrp?.kind !== "ovn.lrp") return;
+  // its address: on internet-core's net, owned by the port, no number
+  assertEquals(lrp.data.addresses, [{
+    net: "ipnet:ls:internet-core",
+    owner: lrp.id,
+  }]);
+  assertEquals(lrp.data.mac, undefined); // derived by the runtime
+  const net = nodes["ipnet:ls:internet-core"];
+  assertEquals(net?.kind, "ip.net");
+});
+
+Deno.test("logical IR: a pinned next hop no port carries is owned by its line", () => {
+  const nodes = toIR(network());
+  const right = nodes["kernelrouter:internet-wan-avm|side:right"];
+  if (right?.kind !== "kernel.router") throw new Error("no wan side");
+  assertEquals(right.data.routes?.[0]?.via, {
+    net: "ipnet:kernelrouter:internet-wan-avm|side:right",
+    owner: "kernelrouter:internet-wan-avm|side:right|route:0.0.0.0/0|via",
+    family: "ipv4",
+    host: 1,
+  });
+});
+
+Deno.test("logical IR: SNAT names its outgoing port, not a number", () => {
+  const nodes = toIR(network());
+  const snat = Object.values(nodes).flatMap((n) =>
+    n.kind === "security.group" ? n.data.rules : []
+  ).find((r) => r.kind === "snat" && r.family === "ipv4");
+  if (snat?.kind !== "snat") throw new Error("no snat");
+  assertEquals(
+    snat.externalIp.owner.startsWith("ovnrouter:home-nat|lrp:"),
+    true,
+  );
+  assertEquals(snat.externalIp.net, "ipnet:ls:internet-core");
 });

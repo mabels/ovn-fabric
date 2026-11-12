@@ -42,7 +42,7 @@ import {
   type WanBuilder,
   type WanSpec,
 } from "./tenant.ts";
-import { addHostOffset } from "./ip.ts";
+import { type Addr, IpNet, type IpNetSpec, netOf, toAddrs } from "./ipnet.ts";
 import type { IPv4, IPv6 } from "./ip.ts";
 import {
   type CertIssuer,
@@ -91,7 +91,9 @@ export { SecurityGroupBuilder } from "./security-group.ts";
 
 /** k8s-style default: the leg's `.1` is the gateway, so an
  * auto-allocated service address starts at host +10 and counts up. */
-const DEFAULT_SERVICE_HOST_OFFSET = 10;
+/** The platform DNS's host number on the control plane: pinned, since its
+ * address is handed to every workload as `--dns` (ADR 0011). */
+const DNS_HOST = 10;
 
 /** The appliance's own service platform — the IMPLEMENTATION of the
  * Platform interface (types.ts).
@@ -194,7 +196,11 @@ class PlatformImpl implements Platform {
       }
       return;
     }
-    const ipaddrs = cp.ipaddrs;
+    const ipaddrs = toAddrs(cp.ipaddrs);
+    // The control plane's net: the leg's own prefixes (ADR 0011). Its
+    // services' addresses are allocated on it by the runtime — except the
+    // DNS, pinned at host 10, whose address workloads get as `--dns`.
+    const cpNet = netOf(ipaddrs, `platform "${this.name}" control plane`);
     // The BUILT-IN platform services that are in the active set, in REGISTRY
     // order (an omitted id takes its default; IGNORE / delPlatformSvc drops
     // it). Resolved BEFORE the leg is built, so they attach through the very
@@ -234,33 +240,12 @@ class PlatformImpl implements Platform {
       if (resolved) builtIns.push(resolved);
     }
     const attached = [...this.#services, ...builtIns];
-    // k8s-style ALLOCATION for any service that declares no address: the
-    // control-plane network's host +10, +11, … (its own .1 is the gateway),
-    // skipping addresses anything already claims.
-    const used = new Set<string>(ipaddrs.map((a) => a.to_string()));
-    for (const spec of attached) {
-      for (const a of spec.ipaddrs ?? []) used.add(a.to_string());
-    }
-    const nextOffset = new Map<string, number>();
-    const allocateAddrs = (): (IPv4 | IPv6)[] =>
-      ipaddrs.map((legAddr) => {
-        const family = legAddr.is_ipv4() ? "v4" : "v6";
-        let offset = nextOffset.get(family) ?? DEFAULT_SERVICE_HOST_OFFSET;
-        for (;;) {
-          const candidate = addHostOffset(legAddr, offset);
-          offset += 1;
-          if (!used.has(candidate.to_string())) {
-            nextOffset.set(family, offset);
-            used.add(candidate.to_string());
-            return candidate;
-          }
-        }
-      });
+    const allocateAddrs = (): Addr[] => cpNet.allocated().ipaddrs();
     // Captured while attaching: the DNS-role service's control-plane
     // address, which becomes the DEFAULT global resolver when the topology
     // doesn't set controlPlane.resolver (2026-09-19). Identified by ROLE,
     // not by the built-in's service name, so a custom DNS service works.
-    const corednsNameservers: (IPv4 | IPv6)[] = [];
+    const corednsNameservers: Addr[] = [];
     const controlPlaneLeg = (
       ep: EndpointBuilder,
     ): Omit<OvnRouterEndpointSpec, "kind"> => ({
@@ -272,7 +257,11 @@ class PlatformImpl implements Platform {
       ...(attached.length > 0
         ? {
           services: attached.map((spec) => {
-            const addrs = spec.ipaddrs ?? allocateAddrs();
+            const addrs = spec.ipaddrs
+              ? toAddrs(spec.ipaddrs)
+              : spec.role === "dns"
+              ? cpNet.host(DNS_HOST).ipaddrs()
+              : allocateAddrs();
             if (spec.role === "dns") {
               for (const a of addrs) {
                 if (a.is_ipv4()) corednsNameservers.push(a);
@@ -529,7 +518,7 @@ export class NetworkBuilder implements RouterEndpointContext {
   // only ever one possible chassis to pin to. Injected HERE, at
   // declaration time, not left for toIR()/the deployer to guess later
   // — same "resolve it once, at the boundary that has the real Host
-  // objects" reasoning as macFromV4 (ir.ts). Ambiguous (0 or 2+ hosts
+  // objects" reasoning as everything else resolved there. Ambiguous (0 or 2+ hosts
   // on ifaces) leaves gatewayChassis unset, same as an explicit
   // omission — this only fills in the unambiguous case.
   private deriveGatewayChassis(endpoint: OvnRouterEndpoint): OvnRouterEndpoint {
@@ -612,6 +601,12 @@ export class NetworkBuilder implements RouterEndpointContext {
     return platform;
   }
 
+  /** A net: the prefixes of a collision domain and its allocator (ADR
+   * 0011). Configuration only — `.host(n)` gives a pinned address on it. */
+  ipNet(spec: string | IpNetSpec): IpNet {
+    return new IpNet(spec);
+  }
+
   private internetScope: Internet | undefined;
 
   /** The shared side every tenant leaves to (ADR 0009): `internet-core`,
@@ -655,7 +650,7 @@ export class NetworkBuilder implements RouterEndpointContext {
     segment: CollisionDomain,
     controlPlane: CollisionDomain,
     gatewayChassis: Host | undefined,
-    allocate: () => (IPv4 | IPv6)[],
+    allocate: () => Addr[],
   ): void {
     const gateways = [...this.routersByName.values()].filter((router) =>
       router.name !== platformRouter &&
@@ -969,8 +964,8 @@ export class NetworkBuilder implements RouterEndpointContext {
       readonly left: KernelRouterSide;
       readonly right: KernelRouterSide;
       readonly transitDomain: CollisionDomain;
-      readonly transitPeerAddrs: readonly (IPv4 | IPv6)[];
-      readonly upstreamPeerAddrs: readonly (IPv4 | IPv6)[];
+      readonly transitPeerAddrs: readonly Addr[];
+      readonly upstreamDomain?: CollisionDomain;
       readonly routingDomains?: readonly RoutingDomain[];
     },
   ): KernelRouter {

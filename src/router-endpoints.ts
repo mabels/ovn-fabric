@@ -32,6 +32,7 @@ import type {
   SecurityGroupRef,
   TunnelRouterEndpoint,
 } from "./types.ts";
+import { type Addr, IpNet, prefixOf, toAddr, toAddrs } from "./ipnet.ts";
 
 /** The slice of NetworkBuilder the endpoint builders need — state and
  * registration stay on the builder, this just names what they touch. */
@@ -48,8 +49,8 @@ export interface RouterEndpointContext {
       readonly left: KernelRouterSide;
       readonly right: KernelRouterSide;
       readonly transitDomain: CollisionDomain;
-      readonly transitPeerAddrs: readonly (IPv4 | IPv6)[];
-      readonly upstreamPeerAddrs: readonly (IPv4 | IPv6)[];
+      readonly transitPeerAddrs: readonly Addr[];
+      readonly upstreamDomain?: CollisionDomain;
       readonly routingDomains?: readonly RoutingDomain[];
     },
   ): KernelRouter;
@@ -133,7 +134,18 @@ export function buildOvnRouterEndpoint(
   // but the resolved endpoint's name is always the derived/pinned value —
   // a spread of `spec` after it would otherwise write `name: undefined`
   // back when the spec left it unset.
-  const base = { ...spec, kind: "ovn" as const, name };
+  const { masq, ...withoutMasq } = spec;
+  const masqServices: RouterEndpointService[] = (masq ?? []).map((f) => ({
+    kind: f === "ipv4" ? "ovn.ipv4.masq" as const : "ovn.ipv6.masq" as const,
+  }));
+  const services = [...(spec.services ?? []), ...masqServices];
+  const base = {
+    ...withoutMasq,
+    ipaddrs: toAddrs(spec.ipaddrs),
+    ...(services.length > 0 ? { services } : {}),
+    kind: "ovn" as const,
+    name,
+  };
   // Inject THIS endpoint into every service entry (EndpointService<T> =
   // T & { endpoint }) so the generator can read the endpoint's
   // l2Segment/ipaddrs/routes per service (2026-09-08). The endpoint
@@ -262,9 +274,9 @@ export function buildKernelRouterEndpoint(
     transitName ?? `transit-${routerName}`,
   );
   const ovnSideAddrs = [link.left.ipv4, link.left.ipv6]
-    .filter((a): a is IPv4 | IPv6 => Boolean(a));
+    .filter((a): a is Addr => Boolean(a));
   const kernelSideAddrs = [link.right.ipv4, link.right.ipv6]
-    .filter((a): a is IPv4 | IPv6 => Boolean(a));
+    .filter((a): a is Addr => Boolean(a));
 
   // Kernel-side services (the `kernel.*` kinds of RouterEndpointService
   // — today `kernel.ipv4.masq`/`kernel.ipv6.masq`, later docker/
@@ -350,10 +362,16 @@ export function buildKernelRouterEndpoint(
       const cmd = typeof s.cmd === "string"
         ? s.cmd.trim().split(/\s+/).filter((t) => t.length > 0)
         : s.cmd;
-      const containerIp =
-        (s.ipaddrs && s.ipaddrs.length > 0 ? s.ipaddrs[0] : undefined) ??
-          IPv4.parse(`10.200.${fnv1a32(routerName) % 256}.2/24`);
-      const routerIp = containerIp.network().first();
+      // The link between container and netns is a net of its own: the
+      // container's address pinned (written, or host 2 of the derived
+      // slot), the router end its first address (ADR 0011).
+      const written = s.ipaddrs && s.ipaddrs.length > 0
+        ? toAddr(s.ipaddrs[0]!)
+        : undefined;
+      const linkNet = written?.net ??
+        new IpNet(`10.200.${fnv1a32(routerName) % 256}.0/24`);
+      const containerIp = written ?? linkNet.host(2).ipaddrs()[0]!;
+      const routerIp = linkNet.host("first").as(containerIp.family);
       apps.push({
         kind: "docker",
         // `image` is optional — defaults to the router name (2026-08-31).
@@ -361,8 +379,8 @@ export function buildKernelRouterEndpoint(
         ...(s.build ? { build: s.build } : {}),
         name: s.name ? `${routerName}-${s.name}` : `${routerName}-docker`,
         ...(cmd && cmd.length > 0 ? { cmd } : {}),
-        ip: containerIp.to_string(),
-        routerIp: routerIp.to_string(),
+        ip: containerIp,
+        routerIp,
       });
     }
   }
@@ -385,10 +403,14 @@ export function buildKernelRouterEndpoint(
     // anything OVN can reach on the transit link (confirmed live,
     // 2026-08-21: keeping 192.168.132.1 made the OVN logical router
     // ARP for its WAN gateway out the transit veth).
-    const via = route.dst.is_ipv4() ? link.right.ipv4 : link.right.ipv6;
+    const via = prefixOf(route.dst).is_ipv4()
+      ? link.right.ipv4
+      : link.right.ipv6;
     if (!via) {
       throw new Error(
-        `kernelRouterEndpoint: route to ${route.dst.to_string()} has ` +
+        `kernelRouterEndpoint: route to ${
+          prefixOf(route.dst).to_string()
+        } has ` +
           `no matching-family kernel-side address on the transit link ` +
           `to route via`,
       );
@@ -424,7 +446,7 @@ export function buildKernelRouterEndpoint(
       ifaces: [{ host, iface: transitVeth }],
     },
     right: {
-      ipaddrs,
+      ipaddrs: toAddrs(ipaddrs),
       ...(input.routes ? { routes: input.routes } : {}),
       ...(ifaces ? { ifaces } : {}),
       ...(apps.length > 0 ? { apps } : {}),
@@ -434,10 +456,6 @@ export function buildKernelRouterEndpoint(
     },
     transitDomain,
     transitPeerAddrs: ovnSideAddrs,
-    // A plain kernelRouterEndpoint() has no upstream leg — its real
-    // default lives in `right`'s own routes — so the upstream peers are
-    // always present but EMPTY (only tunnelRouterEndpoint() fills them).
-    upstreamPeerAddrs: [],
     // The endpoint's OWN per-endpoint routingDomains override the
     // router-level ones stamped by ovnRouter() (2026-08-23) — an
     // endpoint-level membership gates only THIS side's routes.
@@ -555,7 +573,9 @@ ${lines} \\
     securityGroups: masqGroup ? [masqGroup] : [],
     tunnel: {
       iface: TAILSCALE_IFACE,
-      routes: routes.filter((r) => !r.via).map((r) => r.dst.to_string()),
+      routes: routes.filter((r) => !r.via).map((r) =>
+        prefixOf(r.dst).to_string()
+      ),
     },
   };
 }
@@ -585,13 +605,13 @@ export function buildTunnelRouterEndpoint(
     names?.backdoor ?? `backdoor-${routerName}`,
   );
   const ovnSideAddrs = [meshLink.left.ipv4, meshLink.left.ipv6]
-    .filter((a): a is IPv4 | IPv6 => Boolean(a));
+    .filter((a): a is Addr => Boolean(a));
   const kernelSideAddrs = [meshLink.right.ipv4, meshLink.right.ipv6]
-    .filter((a): a is IPv4 | IPv6 => Boolean(a));
+    .filter((a): a is Addr => Boolean(a));
   const upstreamKernelAddrs = [upLink.right.ipv4, upLink.right.ipv6]
-    .filter((a): a is IPv4 | IPv6 => Boolean(a));
+    .filter((a): a is Addr => Boolean(a));
   const upstreamPeerAddrs = [upLink.left.ipv4, upLink.left.ipv6]
-    .filter((a): a is IPv4 | IPv6 => Boolean(a));
+    .filter((a): a is Addr => Boolean(a));
 
   // The tunnel WORKLOAD is a `wireguard`/`zerotier` entry in services[]
   // (the config-side shortcut) — define.ts maps it to the kernel app; the
@@ -632,7 +652,7 @@ export function buildTunnelRouterEndpoint(
         const ztNetworkId = workload.networkId;
         const ztRoutes = (routes ?? [])
           .filter((route) => !route.via)
-          .map((route) => route.dst.to_string());
+          .map((route) => prefixOf(route.dst).to_string());
         // The container's program, baked into the image at build time (one
         // image per router): only the daemon, in the foreground, so that it
         // is gone from the container when it ends (a run starts it again).
@@ -707,10 +727,14 @@ ${ztScriptLines} \\
   // routes are left as the author declared them.
   const ovnSideRoutes = (routes ?? []).map((route) => {
     if (route.via) return route;
-    const via = route.dst.is_ipv4() ? meshLink.right.ipv4 : meshLink.right.ipv6;
+    const via = prefixOf(route.dst).is_ipv4()
+      ? meshLink.right.ipv4
+      : meshLink.right.ipv6;
     if (!via) {
       throw new Error(
-        `tunnelRouterEndpoint: via-less route to ${route.dst.to_string()} has no ` +
+        `tunnelRouterEndpoint: via-less route to ${
+          prefixOf(route.dst).to_string()
+        } has no ` +
           `matching-family kernel-side transit address to forward into the netns`,
       );
     }
@@ -787,7 +811,7 @@ ${ztScriptLines} \\
     },
     transitDomain,
     transitPeerAddrs: ovnSideAddrs,
-    upstreamPeerAddrs,
+    upstreamDomain: backdoorDomain,
     ...(routingDomains ? { routingDomains } : {}),
   });
 

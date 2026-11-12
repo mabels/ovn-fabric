@@ -81,12 +81,13 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import ipaddress
 import posixpath
 import re
 import shlex
 from collections.abc import Sequence
 from typing import Any, Protocol
+
+from ip_address import IPAddress
 
 from fabric.decide import Decide
 from fabric.primitives.docker import DockerPrimitive, files_hash
@@ -124,6 +125,14 @@ class Ref:
 
     def __init__(self, name: str) -> None:
         self.name = name
+
+
+def _network_of(addr: str) -> str:
+    """`192.168.128.1/24` → `192.168.128.0/24`."""
+    parsed = IPAddress.parse(addr)
+    if parsed is None:
+        raise ValueError(f"not an address: {addr!r}")
+    return str(parsed.network().to_string())
 
 
 def _shell_token(token: str | Ref) -> str:
@@ -2388,7 +2397,7 @@ def _emit_service_body(
         # SAME destination; a separate table per NIC, entered by a rule
         # matching that NIC's own source prefix, keeps every path intact.
         table = 1000 + i
-        networks = [str(ipaddress.ip_interface(a).network) for a in (ref.ipaddrs or [])]
+        networks = [_network_of(a) for a in (ref.ipaddrs or [])]
         nic_unit = emit.unit("NIC", f"{nic} on {bridge}")
         nic_unit.ovn(
             container_ns.add_link(

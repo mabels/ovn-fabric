@@ -158,7 +158,7 @@ const generate = command({
     for (const r of net.allRouters) {
       console.log(`    - ${r.name}`);
       for (const ep of r.endpoints) {
-        const addrs = ep.ipaddrs.map((a) => a.to_string());
+        const addrs = ep.ipaddrs.map((a) => a.toString());
         const ifaces = (ep.ifaces ?? [])
           .map((hi) => describeInterface(hi.iface))
           .join(", ");

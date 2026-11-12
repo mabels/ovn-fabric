@@ -17,6 +17,11 @@ PACKAGES = (
 )
 
 
+# What the bundled code imports beyond the stdlib — pinned there, installed
+# into the PEX (a host needs no pip).
+REQUIREMENTS = "requirements.txt"
+
+
 def source_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
@@ -75,6 +80,8 @@ def build_pex(
             path.write_text(content)
         cmd = [
             pex,
+            "-r",
+            str(root / REQUIREMENTS),
             "-D",
             str(staging),
             "-m",

@@ -16,8 +16,9 @@
 // masquerades onto internet-core, where a wan knows no tenant network.
 
 import type { RouterBuilder } from "./builders.ts";
-import { addHostOffset, IPv4, IPv6 } from "./ip.ts";
-import { macFromAddrsOrName, type TransitNetwork } from "./addressing.ts";
+import { IPv4, IPv6 } from "./ip.ts";
+import { type Addr, type AddrLike, IpNet } from "./ipnet.ts";
+import { macFromName, type TransitNetwork } from "./addressing.ts";
 import type {
   CollisionDomain,
   Host,
@@ -30,10 +31,18 @@ import type {
   RoutingDomain,
 } from "./types.ts";
 
-/** The networks a core's addresses are allocated from (host 1, 2, …). */
-export interface CorePrefixes {
-  readonly ipv4?: IPv4;
-  readonly ipv6?: IPv6;
+/** A core's net: `net.ipNet({…})`, or (still accepted) its parsed
+ * prefixes. The runtime allocates the legs' addresses on it (ADR 0011). */
+export type CorePrefixes =
+  | IpNet
+  | { readonly ipv4?: IPv4; readonly ipv6?: IPv6 };
+
+function coreNet(core: CorePrefixes): IpNet {
+  if (core instanceof IpNet) return core;
+  return new IpNet({
+    ...(core.ipv4 ? { ipv4: core.ipv4.to_string() } : {}),
+    ...(core.ipv6 ? { ipv6: core.ipv6.to_string() } : {}),
+  });
 }
 
 /** The builder parts a tenant, wan or the internet core is made of. */
@@ -48,17 +57,6 @@ export interface ScopeContext {
       readonly options?: OvnRouterOptions;
     },
   ): Router;
-}
-
-/** Next addresses of a core, one per family, with the core's prefix length. */
-export function allocator(prefixes: CorePrefixes): () => (IPv4 | IPv6)[] {
-  let next = 1;
-  return () => {
-    const offset = next++;
-    return [prefixes.ipv4, prefixes.ipv6]
-      .filter((p): p is IPv4 | IPv6 => p !== undefined)
-      .map((p) => addHostOffset(p, offset));
-  };
 }
 
 /** The wan a tenant or gateway leaves through: the first active one. */
@@ -81,7 +79,7 @@ function firstActive(
 /** Masquerade for each family `addrs` has (an IPv4-only core: IPv4 only),
  * of `sources` when given, else of the router's other legs. */
 function masqFor(
-  addrs: readonly (IPv4 | IPv6)[],
+  addrs: readonly Addr[],
   sources?: readonly (IPv4 | IPv6)[],
 ): RouterEndpointService[] {
   const out: RouterEndpointService[] = [];
@@ -104,18 +102,16 @@ function masqFor(
   return out;
 }
 
-const bare = (a: IPv4 | IPv6): IPv4 | IPv6 =>
-  a.is_ipv4() ? IPv4.parse(a.to_s()) : IPv6.parse(a.to_s());
-
 // ── the internet core ─────────────────────────────────────────────────────
 
 export class Internet {
   readonly core: CollisionDomain;
-  readonly allocate: () => (IPv4 | IPv6)[];
+  /** internet-core's net: a leg on it is `net.allocated()`. */
+  readonly net: IpNet;
 
   constructor(ctx: ScopeContext, spec: { readonly core: CorePrefixes }) {
     this.core = ctx.collisionDomain("internet-core");
-    this.allocate = allocator(spec.core);
+    this.net = coreNet(spec.core);
   }
 }
 
@@ -128,7 +124,7 @@ export interface WanSpec {
    * interface, masquerading. `dhcp`: not modelled yet — an OVN router on
    * the interface's cable, as today. */
   readonly addressing?: "static" | "dhcp";
-  readonly ipaddrs?: readonly (IPv4 | IPv6)[];
+  readonly ipaddrs?: readonly AddrLike[];
   readonly routes?: readonly RouterEndpointRoute[];
   /** The cable between its OVN side and its netns (`static` only). */
   readonly svc?: TransitNetwork;
@@ -145,7 +141,7 @@ export class Wan {
   readonly host: Host;
   readonly router: Router;
   /** Its address on internet-core, per family: a NAT gateway's next hop. */
-  readonly coreAddrs: readonly (IPv4 | IPv6)[];
+  readonly coreAddrs: readonly Addr[];
   readonly active: boolean;
 
   constructor(
@@ -158,7 +154,7 @@ export class Wan {
     this.name = name;
     this.host = spec.host;
     this.active = spec.active ?? true;
-    this.coreAddrs = internet.allocate();
+    this.coreAddrs = internet.net.allocated().ipaddrs();
     const routerName = `internet-wan-${name}`;
     const domain = ctx.routingDomain(routerName);
     const coreLeg = { l2Segment: internet.core, ipaddrs: this.coreAddrs };
@@ -170,7 +166,7 @@ export class Wan {
             l2Segment: ctx.collisionDomain(`internet-cable-${name}`),
             ipaddrs: [],
             // No address to fold a MAC from: one from the name.
-            mac: macFromAddrsOrName([], `internet-cable-${name}`),
+            mac: macFromName(`internet-cable-${name}`),
             ifaces: [{ host: spec.host, iface: spec.iface }],
           }),
           router.ovnRouterEndpoint(coreLeg),
@@ -203,9 +199,10 @@ export class Wan {
 
   /** The default routes of a NAT gateway leaving through this wan. */
   defaultRoutes(): RouterEndpointRoute[] {
+    // `via` is the wan's own leg — a reference; the runtime knows its number.
     return this.coreAddrs.map((a) => ({
       dst: a.is_ipv4() ? IPv4.parse("0.0.0.0/0") : IPv6.parse("::/0"),
-      via: bare(a),
+      via: a,
     }));
   }
 }
@@ -256,7 +253,8 @@ export interface TenantRouter {
 interface TenantBuild {
   readonly domain: RoutingDomain;
   readonly core: CollisionDomain;
-  readonly allocate: () => (IPv4 | IPv6)[];
+  /** The tenant core's net: a leg on it is `net.allocated()`. */
+  readonly net: IpNet;
 }
 
 export interface TenantBuilder {
@@ -305,7 +303,7 @@ export class Tenant {
                 ...result.endpoints,
                 router.ovnRouterEndpoint({
                   l2Segment: t.core,
-                  ipaddrs: t.allocate(),
+                  ipaddrs: t.net.allocated().ipaddrs(),
                 }),
               ],
               ...(result.options ? { options: result.options } : {}),
@@ -353,7 +351,7 @@ export class Tenant {
               : []),
             ...(spec.routes ?? []),
           ];
-          const natAddrs = internet.allocate();
+          const natAddrs = internet.net.allocated().ipaddrs();
           return ctx.defineOvnRouter(`${name}-vpn-${vpn}`, (router) => ({
             routingDomains: [t.domain],
             endpoints: [
@@ -382,7 +380,7 @@ export class Tenant {
               }),
               router.ovnRouterEndpoint({
                 l2Segment: t.core,
-                ipaddrs: t.allocate(),
+                ipaddrs: t.net.allocated().ipaddrs(),
               }),
             ],
           }));
@@ -394,7 +392,7 @@ export class Tenant {
     const t: TenantBuild = {
       domain: ctx.routingDomain(name),
       core: ctx.collisionDomain(`${name}-core`),
-      allocate: allocator(spec.core),
+      net: coreNet(spec.core),
     };
     for (const router of spec.routers) this.routers.push(router.build(t));
 
@@ -411,12 +409,15 @@ export class Tenant {
         e,
       ) => [...e.ipaddrs])
     ).map((a) => a.network());
-    const natAddrs = internet.allocate();
+    const natAddrs = internet.net.allocated().ipaddrs();
     const masq = masqFor(natAddrs, sources);
     this.routers.push(ctx.defineOvnRouter(`${name}-nat`, (router) => ({
       routingDomains: [t.domain],
       endpoints: [
-        router.ovnRouterEndpoint({ l2Segment: t.core, ipaddrs: t.allocate() }),
+        router.ovnRouterEndpoint({
+          l2Segment: t.core,
+          ipaddrs: t.net.allocated().ipaddrs(),
+        }),
         router.ovnRouterEndpoint({
           l2Segment: internet.core,
           ipaddrs: natAddrs,

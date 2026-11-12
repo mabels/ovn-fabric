@@ -31,7 +31,7 @@
 // resolved below) both ARE covered. toIR() walks allCollisionDomains/
 // allRouters/allHosts.
 
-import { fnv1a32, macFromAddrsOrName, macFromV4 } from "./addressing.ts";
+import { fnv1a32, macFromName } from "./addressing.ts";
 import { IPv4, IPv6 } from "./ip.ts";
 import {
   CollisionDomain,
@@ -53,6 +53,7 @@ import {
 } from "./types.ts";
 import type { NetworkDefinition } from "./define.ts";
 import type {
+  AddrRefValue,
   BridgeNode,
   InfraHostNode,
   Ipv6RaConfigs,
@@ -67,7 +68,9 @@ import type {
   SecurityGroupNode,
   ServiceRef,
 } from "./protocol.ts";
-import { IpValue, NetworkValue } from "./protocol.ts";
+import { NetworkValue } from "./protocol.ts";
+import { type Addr, prefixOf, toAddr, toAddrs } from "./ipnet.ts";
+import { AddressIndex } from "./ir-addresses.ts";
 
 // The IR node types are the ones INFERRED from the protocol schema
 // (src/protocol.ts) — not a loose `{key, data: Record<string, unknown>}`
@@ -83,11 +86,16 @@ type PlatformControlPlaneResolver = {
   readonly resolver?: Resolver;
 };
 
-// RouterEndpoint.ipaddrs is a flat (IPv4 | IPv6)[], one entry per
-// address (see RouterEndpoint, types.ts). to_string() (not to_s()) is
-// the one that includes the prefix length.
-function addrStrings(ipaddrs: OvnRouterEndpoint["ipaddrs"]): string[] {
-  return ipaddrs.map((addr) => addr.to_string());
+// Addresses go into the IR as references (ADR 0011, src/ir-addresses.ts):
+// a carrier's own as LogicalIPs on its collision domain, everyone else's
+// as an AddrRef to the carrier. The collision domain of an OVN leg is its
+// logical switch; the legs of a router are where its next hops can be.
+function lsId(domain: CollisionDomain): string {
+  return `ls:${domain.name}`;
+}
+
+function routerLegs(router: Router): string[] {
+  return router.endpoints.map((e) => lsId(e.l2Segment));
 }
 
 // ── infra.host ───────────────────────────────────────────────────────
@@ -279,14 +287,14 @@ function kernelRouterBackRoutes(
   kernelRouter: KernelRouter,
   routers: readonly Router[],
   routeNodes: readonly RouteNode[],
-): Array<{ dst: string; via: string }> {
+  addrs: AddressIndex,
+): Array<{ dst: string; via: AddrRefValue }> {
   const peer = transitPeer(kernelRouter, routers);
   if (!peer) return [];
-  // .to_s() (bare, no prefix length), not addrStrings()'s .to_string() —
-  // a route node's own `nexthop` is always stored bare (routeToIR
-  // above: `nexthop: nexthop.to_s()`), so comparing against it needs
-  // the same format or this exclusion silently never matches anything.
-  const ownAddrs = new Set(kernelRouter.left.ipaddrs.map((a) => a.to_s()));
+  const domain = lsId(kernelRouter.transitDomain);
+  const line = `kernelrouter:${kernelRouter.name}|side:left`;
+  // By identity: a route node's nexthop is a reference to an Addr.
+  const ownAddrs = new Set<Addr>(kernelRouter.left.ipaddrs);
   const peerAddrs = kernelRouter.transitPeerAddrs ?? [];
   // Scope the mirrored routes to the KernelRouter's OWN RoutingDomains
   // (the domain its left endpoint anchors — e.g. a tunnelRouterEndpoint's
@@ -301,19 +309,22 @@ function kernelRouterBackRoutes(
   const rightApplied = new Set(
     (kernelRouter.right.routes ?? [])
       .filter((r) => r.via)
-      .map((r) => r.dst.to_string()),
+      .map((r) => prefixOf(r.dst).to_string()),
   );
-  const routes: Array<{ dst: string; via: string }> = [];
+  const routes: Array<{ dst: string; via: AddrRefValue }> = [];
   for (const node of routeNodes) {
     if (node.key.ovnrouter !== peer.router.name) continue;
     if (!ownDomains.has(node.data.domain)) continue;
-    const nexthop = node.data.nexthop;
-    if (ownAddrs.has(nexthop)) continue;
+    const nexthop = addrs.addrOf(node.data.nexthop);
+    if (nexthop !== undefined && ownAddrs.has(nexthop)) continue;
     const prefix = node.key.prefix;
     if (rightApplied.has(prefix)) continue;
     const via = peerAddrs.find((a) => a.is_ipv4() === !prefix.includes(":"));
     if (!via) continue;
-    routes.push({ dst: prefix, via: via.to_s() });
+    routes.push({
+      dst: prefix,
+      via: addrs.ref(via, `${line}|route:${prefix}|via`, [domain]),
+    });
   }
   // The twin's own networks (its other legs): what a NAT gateway
   // masquerades onto internet-core comes back from there (ADR 0009).
@@ -325,7 +336,10 @@ function kernelRouterBackRoutes(
       if (have.has(dst) || rightApplied.has(dst)) continue;
       const via = peerAddrs.find((a) => a.is_ipv4() === addr.is_ipv4());
       if (!via) continue;
-      routes.push({ dst, via: via.to_s() });
+      routes.push({
+        dst,
+        via: addrs.ref(via, `${line}|route:${dst}|via`, [domain]),
+      });
       have.add(dst);
     }
   }
@@ -369,17 +383,33 @@ function kernelRouterSideToIR(
   side: "left" | "right",
   routers: readonly Router[],
   routeNodes: readonly RouteNode[],
+  addrs: AddressIndex,
 ): KernelRouterNode {
   const id = `kernelrouter:${router.name}|side:${side}`;
+  // Its collision domain: the transit switch on the left; on the right the
+  // switch its leg is plugged into, else the side itself (a WAN's LAN,
+  // which only this side is on).
+  const domain = side === "left"
+    ? lsId(router.transitDomain)
+    : router.upstreamDomain
+    ? lsId(router.upstreamDomain)
+    : id;
+  const ipaddrs = addrs.own(router[side].ipaddrs, domain, id);
   const inDomain = router.routingDomains &&
     router.routingDomains.length > 0;
   const declaredRoutes = inDomain
     ? router[side].routes
       ?.filter((r) => r.via)
-      .map((r) => ({ dst: r.dst.to_string(), via: r.via!.to_s() }))
+      .map((r) => {
+        const dst = prefixOf(r.dst).to_string();
+        return {
+          dst,
+          via: addrs.ref(toAddr(r.via!), `${id}|route:${dst}|via`, [domain]),
+        };
+      })
     : undefined;
   const backRoutes = side === "left"
-    ? kernelRouterBackRoutes(router, routers, routeNodes)
+    ? kernelRouterBackRoutes(router, routers, routeNodes, addrs)
     : [];
   const routes = [...(declaredRoutes ?? []), ...backRoutes];
   // `ifaces` — KernelRouterSide.ifaces — mirrored to the side node. A
@@ -392,11 +422,9 @@ function kernelRouterSideToIR(
   // (`veth-krn-<shortName>`/`veth-ovn-<shortName>`) from it
   // (deployer/ir_common.py's _emit_kernel_router_create) — same
   // "generator computes the final name" boundary as shortIfaceName.
-  // It also carries the netns-side leg's `mac`, resolved HERE for the
-  // same reason an LRP's is (resolveMac): deterministic from this
-  // side's own addresses (macFromAddrsOrName, addressing.ts), so the
-  // OVN router's MAC_Binding for them survives the leg being recreated
-  // instead of pointing at the previous leg's random MAC (2026-10-11).
+  // No `mac`: the netns-side leg's MAC is derived from its resolved
+  // address by the runtime (ADR 0011 §5), so the OVN router's MAC_Binding
+  // still survives the leg being recreated.
   const ifaces = router[side].ifaces?.map((hi) => {
     const iface = hi.iface;
     // An AF_XDP port is owned by OVS's userspace datapath; a kernel
@@ -424,7 +452,6 @@ function kernelRouterSideToIR(
       iface: {
         ...iface,
         shortName: vethShortId(iface.ifaceName),
-        mac: macFromAddrsOrName(router[side].ipaddrs, iface.ifaceName),
       },
     };
   });
@@ -434,19 +461,9 @@ function kernelRouterSideToIR(
     key: { name: router.name, side },
     data: {
       host: `host:${router.host.name}`,
-      ipaddrs: addrStrings(router[side].ipaddrs),
+      ipaddrs,
       routes: routes.length > 0 ? routes : undefined,
       ifaces: ifaces && ifaces.length > 0 ? ifaces : undefined,
-      // The tunnel router's UPSTREAM peer address (tunnelRouterEndpoint(),
-      // define.ts) — the OTHER end of the upstream veth (right side only):
-      // the deployer brings that peer leg UP and assigns it this address
-      // in the root namespace (the tunnel netns's default route points at
-      // it via the right side's routes; without a live peer the leg stays
-      // LOWERLAYERDOWN and the default is `linkdown`, confirmed live
-      // 2026-08-23).
-      upstreamPeerAddrs: side === "right"
-        ? addrStrings(router.upstreamPeerAddrs)
-        : undefined,
       // The security group attached to THIS side's interface (right
       // side only in practice — set by buildKernelRouterEndpoint,
       // define.ts). Carried here as the generic `security.group` node's
@@ -485,9 +502,22 @@ function kernelRouterSideToIR(
         // interfaces" is exactly the ABSENCE of the veth machinery.
         if (app.kind === "docker" && app.ip) {
           const hash = fnv1a32(app.name).toString(16).padStart(8, "0");
-          return { ...withRefs, vethName: `ve-${hash}` };
+          // The container-to-netns link is a collision domain of its own.
+          const link = `${id}|app:${app.name}`;
+          const { ip, routerIp, ...rest } = withRefs as typeof app;
+          return {
+            ...rest,
+            ip: addrs.ownOne(ip!, link, `${link}|container`),
+            ...(routerIp
+              ? { routerIp: addrs.ownOne(routerIp, link, `${link}|router`) }
+              : {}),
+            vethName: `ve-${hash}`,
+          };
         }
-        return withRefs;
+        // A docker app without veth addressing carries no address at all.
+        return withRefs as unknown as NonNullable<
+          KernelRouterNode["data"]["apps"]
+        >[number];
       }),
     },
   };
@@ -565,7 +595,10 @@ function expandFilterRule(rule: FilterRule): Record<string, unknown>[] {
   });
 }
 
-function securityGroupToIR(group: SecurityGroup): SecurityGroupNode {
+function securityGroupToIR(
+  group: SecurityGroup,
+  addrs: AddressIndex,
+): SecurityGroupNode {
   const rules: Record<string, unknown>[] = [];
   for (const rule of group.rules) {
     if (rule.kind === "masq") {
@@ -573,13 +606,13 @@ function securityGroupToIR(group: SecurityGroup): SecurityGroupNode {
     } else if (rule.kind === "filter") {
       rules.push(...expandFilterRule(rule));
     } else {
-      const externalIp = rule.externalIp.to_s();
+      // The outgoing port's own address, by reference (ADR 0011 §3b).
+      const externalIp = addrs.ref(
+        rule.externalIp,
+        `securitygroup:${group.name}|snat:${rule.family}|externalIp`,
+        [],
+      );
       const logicalIps = rule.logicalIps.map((a) => a.to_string());
-      if (IpValue(externalIp) instanceof Error) {
-        throw new Error(
-          `security group "${group.name}": bad externalIp ${externalIp}`,
-        );
-      }
       for (const logicalIp of logicalIps) {
         if (NetworkValue(logicalIp) instanceof Error) {
           throw new Error(
@@ -933,25 +966,13 @@ function routerToIR(
 // name>`), which is what lets the two sides be merged at all. `name` is
 // derived from configuration (or pinned by the author), never positional,
 // so reordering endpoints cannot re-key a port.
-// Resolved HERE, not left for the shell-conversion step to guess: the
-// IR is the desired-state boundary between this project's TypeScript
-// half and its Python half (deployer/ir_common.py) — it should carry
-// the FINAL mac, not push "how do I fold one" across that boundary
-// (macFromV4 only exists on this side). Same reasoning as
-// resolveEncapIp above. Matches RouterEndpoint.mac's own doc comment
-// (types.ts): explicit override wins outright, else fold the first
-// IPv4 in ipaddrs — required to exist as one or the other, since an
-// LRP with no mac at all can't be created.
-function resolveMac(lrp: string, endpoint: OvnRouterEndpoint): string {
-  if (endpoint.mac) return endpoint.mac;
-  const v4 = endpoint.ipaddrs.find((addr): addr is IPv4 => addr.is_ipv4());
-  if (!v4) {
-    throw new Error(
-      `${lrp}: no IPv4 address to derive a MAC from, and no explicit ` +
-        `RouterEndpoint.mac override`,
-    );
-  }
-  return macFromV4(v4);
+// The MAC: only an explicit RouterEndpoint.mac reaches the IR (ADR 0011
+// §5). Otherwise the runtime folds it from the resolved IPv4 — TypeScript
+// does not know an allocated address's number.
+function resolveMac(endpoint: OvnRouterEndpoint): string | undefined {
+  // Only an explicit one (ADR 0011 §5): a derived MAC is the fold of the
+  // resolved IPv4, which only the runtime knows.
+  return endpoint.mac;
 }
 
 // Folds RouterEndpoint.services into the single ipv6_ra_configs smap
@@ -1047,6 +1068,7 @@ function routerEndpointToIR(
   router: Router,
   endpoint: OvnRouterEndpoint,
   dstsByDomain: ReadonlyMap<string, ReadonlySet<string>>,
+  addrs: AddressIndex,
   platformCp?: PlatformControlPlaneResolver,
 ): OvnLrpNode {
   const scope = `ovnrouter:${router.name}`;
@@ -1061,8 +1083,8 @@ function routerEndpointToIR(
       // bare name, so every cross-node reference in the IR is
       // consistently an id, not a mix of ids and bare strings.
       l2Segment: `ls:${endpoint.l2Segment.name}`,
-      addresses: addrStrings(endpoint.ipaddrs),
-      mac: resolveMac(endpoint.name, endpoint),
+      addresses: addrs.own(endpoint.ipaddrs, lsId(endpoint.l2Segment), id),
+      mac: resolveMac(endpoint),
       gatewayChassis: endpoint.gatewayChassis
         ? `host:${endpoint.gatewayChassis.name}`
         : undefined,
@@ -1071,6 +1093,7 @@ function routerEndpointToIR(
         router,
         endpoint,
         dstsByDomain,
+        addrs,
         platformCp,
       ),
     },
@@ -1100,8 +1123,8 @@ function domainDsts(
   if (domain.routes && domain.routes.length > 0) {
     return domain.routes.map((r) =>
       r.metric !== undefined
-        ? { dst: r.dst.to_string(), metric: r.metric }
-        : { dst: r.dst.to_string() }
+        ? { dst: prefixOf(r.dst).to_string(), metric: r.metric }
+        : { dst: prefixOf(r.dst).to_string() }
     );
   }
   return [...(dstsByDomain.get(domain.name) ?? [])].map((dst) => ({ dst }));
@@ -1119,12 +1142,14 @@ function domainDsts(
 function workloadDomainRoutes(
   router: Router,
   endpoint: OvnRouterEndpoint,
-  attachmentAddrs: readonly (IPv4 | IPv6)[],
+  attachmentAddrs: readonly Addr[],
   dstsByDomain: ReadonlyMap<string, ReadonlySet<string>>,
+  addrs: AddressIndex,
+  line: string,
   attachmentMetric?: number,
-): { dst: string; via: string; metric?: number }[] {
+): { dst: string; via: AddrRefValue; metric?: number }[] {
   const domains = endpoint.routingDomains ?? router.routingDomains ?? [];
-  const out: { dst: string; via: string; metric?: number }[] = [];
+  const out: { dst: string; via: AddrRefValue; metric?: number }[] = [];
   for (const domain of domains) {
     for (const { dst, metric } of domainDsts(domain, dstsByDomain)) {
       const isV4 = !dst.includes(":");
@@ -1148,7 +1173,9 @@ function workloadDomainRoutes(
       const resolved = metric ?? attachmentMetric ?? domain.metric;
       out.push({
         dst,
-        via: gateway.to_s(),
+        via: addrs.ref(gateway, `${line}|route:${dst}|via`, [
+          lsId(endpoint.l2Segment),
+        ]),
         ...(resolved !== undefined ? { metric: resolved } : {}),
       });
     }
@@ -1166,6 +1193,7 @@ function resolveServiceRefs(
   router: Router,
   endpoint: OvnRouterEndpoint,
   dstsByDomain: ReadonlyMap<string, ReadonlySet<string>>,
+  addrs: AddressIndex,
   platformCp?: PlatformControlPlaneResolver,
 ): ServiceRef[] | undefined {
   const refs = (endpoint.services ?? []).filter((s) =>
@@ -1177,16 +1205,23 @@ function resolveServiceRefs(
   // GLOBAL resolver (controlPlane.resolver, else the CoreDNS address).
   const onControlPlane = platformCp !== undefined &&
     endpoint.l2Segment.name === platformCp.collisionDomain.name;
+  const domain = lsId(endpoint.l2Segment);
   return refs.map((ref) => {
+    const service = `kernel.app.container:${ref.srvRef.name}`;
+    const nic = shortIfaceName("", endpoint.l2Segment.name);
+    const owner = `${service}|nic:${nic}`;
+    const nicAddrs = toAddrs(ref.ipaddrs);
     const routes = ref.routes && ref.routes.length > 0
       ? ref.routes.map((r) => {
-        if (r.via && !viaIsOnSegment(endpoint, r.via)) {
+        if (r.via && !viaIsOnSegment(endpoint, toAddr(r.via))) {
           throw new Error(
             `service "${ref.srvRef.name}" on ${router.name} ` +
               `(${endpoint.name}): route ` +
-              `${r.dst.to_string()} via ${r.via.to_s()} — the via is not on ` +
+              `${prefixOf(r.dst).to_string()} via ${
+                toAddr(r.via)
+              } — the via is not on ` +
               `segment "${endpoint.l2Segment.name}" (${
-                endpoint.ipaddrs.map((a) => a.to_string()).join(", ")
+                endpoint.ipaddrs.map((a) => a.toString()).join(", ")
               }); a container next-hop must be reachable on its own L2`,
           );
         }
@@ -1194,46 +1229,54 @@ function resolveServiceRefs(
         // default), else unset — the generator fills the execution-order
         // fallback in assignFallbackRouteMetrics below (2026-09-19).
         const metric = r.metric ?? ref.metric;
+        const dst = prefixOf(r.dst).to_string();
         return {
-          dst: r.dst.to_string(),
-          ...(r.via ? { via: r.via.to_s() } : {}),
+          dst,
+          ...(r.via
+            ? {
+              via: addrs.ref(toAddr(r.via), `${owner}|route:${dst}|via`, [
+                domain,
+              ]),
+            }
+            : {}),
           ...(metric !== undefined ? { metric } : {}),
         };
       })
       : workloadDomainRoutes(
         router,
         endpoint,
-        ref.ipaddrs,
+        nicAddrs,
         dstsByDomain,
+        addrs,
+        owner,
         ref.metric,
       );
     // Resolver precedence (innermost wins): the attachment's own, else the
     // platform's global control-plane resolver (2026-09-19).
     const resolver = ref.resolver ??
       (onControlPlane ? platformCp?.resolver : undefined);
+    // A nameserver is a reference, or as written when it is not ours.
+    const nameservers: (AddrRefValue | string)[] = [];
+    for (const [i, n] of (resolver?.nameservers ?? []).entries()) {
+      nameservers.push("");
+      addrs.nameserver(toAddr(n), `${owner}|nameserver`, (v) => {
+        nameservers[i] = v;
+      });
+    }
     return {
-      service: `kernel.app.container:${ref.srvRef.name}`,
+      service,
       // The in-container NIC name — resolved HERE (generator side), not by
       // the deployer: the segment name when it fits IFNAMSIZ, else the fnv1a
       // short form (shortIfaceName, same rule as every other short name).
-      name: shortIfaceName("", endpoint.l2Segment.name),
-      // The NIC's MAC — deterministic (macFromAddrsOrName, addressing.ts)
-      // for the same reason as a kernel router's veth leg: the container
-      // is recreated on every `up`, and the segment's OVN router would
-      // otherwise keep a MAC_Binding for the previous NIC (2026-10-11).
-      mac: macFromAddrsOrName(
-        ref.ipaddrs,
-        `${ref.srvRef.name}|${endpoint.l2Segment.name}`,
-      ),
-      ...(ref.ipaddrs.length > 0
-        ? { ipaddrs: ref.ipaddrs.map((a) => a.to_string()) }
+      name: nic,
+      // No `mac`: the NIC's MAC is derived from its resolved address by the
+      // runtime (ADR 0011 §5) — still stable across the container being
+      // recreated, so the segment router's MAC_Binding survives.
+      ...(nicAddrs.length > 0
+        ? { ipaddrs: addrs.own(nicAddrs, domain, owner) }
         : {}),
       ...(routes.length > 0 ? { routes: orderRoutes(routes) } : {}),
-      ...(resolver
-        ? {
-          resolver: { nameservers: resolver.nameservers.map((n) => n.to_s()) },
-        }
-        : {}),
+      ...(resolver ? { resolver: { nameservers } } : {}),
     };
   });
 }
@@ -1245,9 +1288,9 @@ function resolveServiceRefs(
 // the container with no default at all (hit live, 2026-09-16). Putting the
 // v4 default first makes that failure survivable; sorting the rest keeps
 // the IR diff-stable.
-function orderRoutes(
-  routes: readonly { dst: string; via?: string; metric?: number }[],
-): { dst: string; via?: string; metric?: number }[] {
+function orderRoutes<R extends { readonly dst: string }>(
+  routes: readonly R[],
+): R[] {
   const key = (dst: string): [number, number, string] => [
     dst.includes(":") ? 1 : 0, // IPv4 before IPv6
     dst === "0.0.0.0/0" || dst === "::/0" ? 0 : 1, // default before the rest
@@ -1307,7 +1350,10 @@ interface Anchor {
 // on routeToIR's validation below) — and `.includes()` never actually
 // needed narrowed arguments in the first place (its inherited base
 // IPAddress signature already accepts either family).
-function isSameFamily(a: IPv4 | IPv6, b: IPv4 | IPv6): boolean {
+function isSameFamily(
+  a: { is_ipv4(): boolean },
+  b: { is_ipv4(): boolean },
+): boolean {
   return a.is_ipv4() === b.is_ipv4();
 }
 
@@ -1333,7 +1379,7 @@ function anchorAddressSharedWith(
   router: Router,
   anchor: Anchor,
   dst: IPv4 | IPv6,
-): (IPv4 | IPv6) | undefined {
+): Addr | undefined {
   for (const candidate of anchor.router.endpoints) {
     if (candidate === anchor.endpoint) continue;
     const shared = router.endpoints.some((e) => sharesL2Segment(e, candidate));
@@ -1353,9 +1399,10 @@ function anchorAddressSharedWith(
 // with its router and its source, unlike every other section of the
 // script.
 function routeToIR(
+  addrs: AddressIndex,
   router: Router,
   dst: IPv4 | IPv6,
-  nexthop: IPv4 | IPv6,
+  nexthop: Addr,
   securityGroups: readonly {
     readonly render: "kernel" | "ovn";
     readonly name: string;
@@ -1375,7 +1422,7 @@ function routeToIR(
   if (!isSameFamily(dst, nexthop)) {
     throw new Error(
       `router "${router.name}": route to ${dst.to_string()} has a ` +
-        `next-hop of the wrong address family (${nexthop.to_s()}) — ` +
+        `next-hop of the wrong address family (${nexthop}) — ` +
         `dst and via/nexthop must both be IPv4 or both be IPv6`,
     );
   }
@@ -1386,7 +1433,7 @@ function routeToIR(
     kind: dst.is_ipv4() ? "ipv4.route" : "ipv6.route",
     key: { ovnrouter: router.name, prefix },
     data: {
-      nexthop: nexthop.to_s(),
+      nexthop: addrs.ref(nexthop, `${id}|nexthop`, routerLegs(router)),
       securityGroups: [...securityGroups],
       domain,
       metric,
@@ -1404,7 +1451,10 @@ function isDomainParticipant(router: Router, domain: RoutingDomain): boolean {
     router.endpoints.some((e) => e.routingDomains?.includes(domain) === true);
 }
 
-function computeRoutes(network: NetworkDefinition): RouteNode[] {
+function computeRoutes(
+  network: NetworkDefinition,
+  addrs: AddressIndex,
+): RouteNode[] {
   const nodes: RouteNode[] = [];
   // Anchor-outer (2026-08-23): routing-domain membership is PER ENDPOINT
   // now — an endpoint's declared routes participate in its OWN
@@ -1423,7 +1473,9 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
   for (const r of network.allRouters) {
     const set = new Set<string>();
     for (const endpoint of r.endpoints) {
-      for (const rt of endpoint.routes ?? []) set.add(rt.dst.to_string());
+      for (const rt of endpoint.routes ?? []) {
+        set.add(prefixOf(rt.dst).to_string());
+      }
     }
     ownPrefixes.set(r.name, set);
   }
@@ -1460,9 +1512,10 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
               if (!route.via) continue;
               nodes.push(
                 routeToIR(
+                  addrs,
                   router,
-                  route.dst,
-                  route.via,
+                  prefixOf(route.dst),
+                  toAddr(route.via),
                   securityGroups,
                   domain.name,
                   domain.metric ?? 400,
@@ -1470,19 +1523,26 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
               );
               continue;
             }
-            const nexthop = anchorAddressSharedWith(router, anchor, route.dst);
+            const nexthop = anchorAddressSharedWith(
+              router,
+              anchor,
+              prefixOf(route.dst),
+            );
             if (!nexthop) continue; // no shared domain / family with the anchor
             // A router's OWN declared route to this prefix is its own
             // authoritative egress — don't overwrite it with a learned one
             // (e.g. a full-tunnel router must keep its tunnel egress, not
             // take another domain's default, 2026-08-30).
-            if (ownPrefixes.get(router.name)?.has(route.dst.to_string())) {
+            if (
+              ownPrefixes.get(router.name)?.has(prefixOf(route.dst).to_string())
+            ) {
               continue;
             }
             nodes.push(
               routeToIR(
+                addrs,
                 router,
-                route.dst,
+                prefixOf(route.dst),
                 nexthop,
                 securityGroups,
                 domain.name,
@@ -1511,8 +1571,8 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
     // anchor/interconnect routes already produced above, so distributing
     // them again here would just duplicate those node ids.
     for (const route of domain.routes ?? []) {
-      if (isDefaultDst(route.dst)) continue;
-      const dst = route.dst.to_string();
+      if (isDefaultDst(prefixOf(route.dst))) continue;
+      const dst = prefixOf(route.dst).to_string();
       for (const router of participants) {
         if (ownPrefixes.get(router.name)?.has(dst)) continue;
         const ownsDst = (
@@ -1520,7 +1580,7 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
         ): OvnRouterEndpoint | undefined =>
           candidate.endpoints.find((e) =>
             e.ipaddrs.some((a) =>
-              a.is_ipv4() === route.dst.is_ipv4() &&
+              a.is_ipv4() === prefixOf(route.dst).is_ipv4() &&
               a.network().to_string() === dst
             )
           );
@@ -1534,13 +1594,14 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
         const nexthop = anchorAddressSharedWith(
           router,
           { router: owner, endpoint: ownerEndpoint },
-          route.dst,
+          prefixOf(route.dst),
         );
         if (!nexthop) continue;
         nodes.push(
           routeToIR(
+            addrs,
             router,
-            route.dst,
+            prefixOf(route.dst),
             nexthop,
             [],
             domain.name,
@@ -1586,6 +1647,7 @@ function computeRoutes(network: NetworkDefinition): RouteNode[] {
 // "other side".
 function computeInterconnectRoutes(
   network: NetworkDefinition,
+  addrs: AddressIndex,
 ): RouteNode[] {
   const nodes: RouteNode[] = [];
   for (const domain of network.allRoutingDomains) {
@@ -1618,6 +1680,7 @@ function computeInterconnectRoutes(
                   ) continue;
                   nodes.push(
                     routeToIR(
+                      addrs,
                       r1,
                       peerAddr.network(),
                       nexthop,
@@ -1650,13 +1713,12 @@ function computeInterconnectRoutes(
 // sits on — i.e. inside the network of one of the hosting endpoint's OWN
 // ipaddrs (same family). A via off-segment would be an unreachable
 // next-hop for a single-homed container (2026-09-08).
-function viaIsOnSegment(
-  endpoint: OvnRouterEndpoint,
-  via: IPv4 | IPv6,
-): boolean {
+function viaIsOnSegment(endpoint: OvnRouterEndpoint, via: Addr): boolean {
+  // A pinned via by its number; an allocated one by its net.
+  const value = via.pinned() ?? via.network();
   for (const addr of endpoint.ipaddrs) {
     if (addr.is_ipv4() !== via.is_ipv4()) continue;
-    if (addr.network().includes(via)) return true;
+    if (addr.network().includes(value)) return true;
   }
   return false;
 }
@@ -1776,14 +1838,18 @@ function assignFallbackRouteMetrics(nodes: Record<string, IRNode>): void {
 
 export function toIR(network: NetworkDefinition): Record<string, IRNode> {
   const nodes: Record<string, IRNode> = {};
+  // Every address of the IR goes through this index (ADR 0011): carriers
+  // register theirs, everything else refers to them; finish() below fills
+  // the references and gives the `ip.net` nodes.
+  const addrs = new AddressIndex();
 
   // Route nodes FIRST (2026-09-16): a RoutingDomain's CALCULATED destinations
   // are the prefixes its participants actually resolved (anchors +
   // interconnect), and a workload inherits them (workloadDomainRoutes) — so
   // they must exist before the endpoints are emitted. Insertion order is
   // irrelevant here; the final map is sorted by id below.
-  const interconnectRoutes = computeInterconnectRoutes(network);
-  const domainRoutes = computeRoutes(network);
+  const interconnectRoutes = computeInterconnectRoutes(network, addrs);
+  const domainRoutes = computeRoutes(network, addrs);
   // Infrastructure subnets (OVN-internal transit/backdoor links and the
   // backbone) are NOT destinations a workload should route to: they're
   // router plumbing. Their prefixes leak into a domain's calculated set via
@@ -1827,7 +1893,7 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
 
   const ovnGroups = computeOvnSecurityGroups(network).byRouter;
   for (const group of ovnGroups.values()) {
-    const node = securityGroupToIR(group);
+    const node = securityGroupToIR(group, addrs);
     nodes[node.id] = node;
   }
   for (const router of network.allRouters) {
@@ -1863,6 +1929,7 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
         router,
         endpoint,
         dstsByDomain,
+        addrs,
         network.platformControlPlane,
       );
       nodes[node.id] = node;
@@ -1903,6 +1970,7 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
         side,
         network.allRouters,
         routeNodes,
+        addrs,
       );
       nodes[node.id] = node;
     }
@@ -1978,7 +2046,7 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
       // the same router, so they need different short ids.
       const shortId = vethShortId(`veth-krn-${node.key.name}-wan`);
       const mac = entry.iface.mac ??
-        macFromAddrsOrName([], `${node.key.name}-${node.key.side}`);
+        macFromName(`${node.key.name}-${node.key.side}`);
       domain.addInterface({
         kind: "veth",
         ifaceName: `veth-krn-${shortId}`,
@@ -2009,13 +2077,16 @@ export function toIR(network: NetworkDefinition): Record<string, IRNode> {
   // (which side/interface carries it) lives on the kernel.router side
   // nodes via `data.securityGroup`, not here.
   for (const group of network.allSecurityGroups) {
-    const node = securityGroupToIR(group);
+    const node = securityGroupToIR(group, addrs);
     nodes[node.id] = node;
   }
 
   // Resolve any route metric the topology left implicit, so the IR always
   // carries a concrete value (2026-09-19).
   assignFallbackRouteMetrics(nodes);
+
+  // Every reference filled; one `ip.net` node per collision domain.
+  for (const node of addrs.finish()) nodes[node.id] = node;
 
   // Deterministic output order: sorted by node id. The caller (cli.ts's
   // generate-ir) serializes Object.values(nodes) as-is, so insertion

@@ -246,9 +246,12 @@ that code is a separate, explicit step once the replacement works.
 
 ### 10. Types: arktype → JSON Schema → Python codegen, twice
 
-The host side stays Python (stdlib only: available everywhere, small
-footprint, runs on a Raspberry Pi or a small RISC-V board). Types keep the
-existing pipeline:
+The host side stays Python (available everywhere, small footprint, runs on
+a Raspberry Pi or a small RISC-V board). Nothing is pip-installed on a host:
+what the code imports beyond the stdlib is pinned in `requirements.txt` and
+bundled into the PEX (2026-11-12: `mabels-ipaddress`, the same address
+library as the TypeScript side; "stdlib only" dated from the create/delete
+script, before the runtime). Types keep the existing pipeline:
 
 - the **runtime** owns its schema: the envelope, the control frames and the
   built-in states (`service/*`);

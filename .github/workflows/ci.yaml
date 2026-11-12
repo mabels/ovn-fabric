@@ -86,7 +86,7 @@ jobs:
       - name: Set up Python build venv (black, ruff, mypy)
         run: |
           python3 -m venv .venv-build
-          .venv-build/bin/pip install --quiet black ruff mypy
+          .venv-build/bin/pip install --quiet black ruff mypy -r requirements.txt
 
       - name: Python format check (black)
         run: .venv-build/bin/black --check ladops/ deployer/ protocol/ reconciler/ runtime/ fabric/
@@ -121,7 +121,8 @@ jobs:
         run: .venv-build/bin/mypy
 
       - name: Python unit tests (ladops, reconciler, deployer, protocol, runtime, fabric)
-        run: python3 -m unittest discover -s . -p "test_*.py" -v
+        # The venv's Python: it has requirements.txt (a host gets it in the PEX).
+        run: .venv-build/bin/python -m unittest discover -s . -p "test_*.py" -v
 
   publish:
     needs: ci

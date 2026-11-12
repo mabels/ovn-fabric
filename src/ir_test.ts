@@ -1,18 +1,18 @@
-// src/ir_test.ts — covers toIR()'s shortIfaceName derivation, moved
+// src/ir_test.ts — covers pinnedIR()'s shortIfaceName derivation, moved
 // here from deployer/ir_common.py's own _bridge_name/_fnv1a_32
 // (2026-08-12 — see ir.ts's own shortIfaceName() doc comment for why:
 // the generator computes the FINAL name a real kernel object needs,
 // the translator only ever applies an already-resolved fact).
 
 import { assertEquals, assertNotEquals, assertThrows } from "jsr:@std/assert@1";
-import {
-  fnv1a32,
-  fnv1a64,
-  macFromAddrsOrName,
-  transitNetwork,
-} from "./addressing.ts";
+import { fnv1a32, fnv1a64, macFromName, transitNetwork } from "./addressing.ts";
 import { defineNetwork } from "./define.ts";
 import { toIR } from "./ir.ts";
+import { type Pinned, type PinnedNode, resolvePinned } from "./ir-pinned.ts";
+
+// The IR with its pinned addresses as text (ADR 0011: the IR itself holds
+// references) — what these tests read.
+const pinnedIR = (net: Parameters<typeof toIR>[0]) => resolvePinned(toIR(net));
 import type { IRNode } from "./ir.ts";
 import type {
   BridgeNode,
@@ -26,6 +26,7 @@ import type {
   SecurityGroupNode,
 } from "./protocol.ts";
 import { IPv4, IPv6 } from "./ip.ts";
+import { toAddr } from "./ipnet.ts";
 import { deriveEndpointName } from "./router-endpoints.ts";
 import type {
   CollisionDomain,
@@ -57,15 +58,17 @@ function endpointOn(router: Router, domainName: string): OvnRouterEndpoint {
 // The node type an id names — every IR id starts with (or contains) a
 // marker for its kind, so `node(nodes, "ls:home")` is an OvnLsNode and its
 // `.data.interfaces` is typed, with no cast at the call site.
-type NodeForId<Id extends string> = Id extends `host:${string}` ? InfraHostNode
-  : Id extends `ls:${string}` ? OvnLsNode
-  : Id extends `${string}|lrp:${string}` ? OvnLrpNode
-  : Id extends `${string}|route:${string}` ? RouteNode
-  : Id extends `kernelrouter:${string}` ? KernelRouterNode
-  : Id extends `securitygroup:${string}` ? SecurityGroupNode
-  : Id extends `kernel.app.container:${string}` ? KernelAppContainerNode
-  : Id extends `ovnrouter:${string}` ? OvnLrNode
-  : IRNode;
+type NodeForId<Id extends string> = Pinned<
+  Id extends `host:${string}` ? InfraHostNode
+    : Id extends `ls:${string}` ? OvnLsNode
+    : Id extends `${string}|lrp:${string}` ? OvnLrpNode
+    : Id extends `${string}|route:${string}` ? RouteNode
+    : Id extends `kernelrouter:${string}` ? KernelRouterNode
+    : Id extends `securitygroup:${string}` ? SecurityGroupNode
+    : Id extends `kernel.app.container:${string}` ? KernelAppContainerNode
+    : Id extends `ovnrouter:${string}` ? OvnLrNode
+    : PinnedNode
+>;
 
 // The same rule at runtime, most specific marker first.
 const KIND_MARKERS: readonly (readonly [RegExp, readonly IRNode["kind"][]])[] =
@@ -81,9 +84,9 @@ const KIND_MARKERS: readonly (readonly [RegExp, readonly IRNode["kind"][]])[] =
   ];
 
 function isNodeForId<Id extends string>(
-  found: IRNode,
+  found: PinnedNode,
   id: Id,
-): found is IRNode & NodeForId<Id> {
+): found is PinnedNode & NodeForId<Id> {
   const marker = KIND_MARKERS.find(([pattern]) => pattern.test(id));
   return marker === undefined || marker[1].includes(found.kind);
 }
@@ -92,9 +95,9 @@ function isNodeForId<Id extends string>(
 // the kind its id says), instead of letting a later property access blow
 // up with a TypeError.
 function node<Id extends string>(
-  nodes: Record<string, IRNode>,
+  nodes: Record<string, PinnedNode>,
   id: Id,
-): IRNode & NodeForId<Id> {
+): PinnedNode & NodeForId<Id> {
   const found = nodes[id];
   if (!found) throw new Error(`missing IR node: ${id}`);
   if (!isNodeForId(found, id)) {
@@ -104,7 +107,7 @@ function node<Id extends string>(
 }
 
 function lsShortIfaceName(
-  nodes: Record<string, IRNode>,
+  nodes: Record<string, PinnedNode>,
   domain: string,
 ): string {
   const first = node(nodes, `ls:${domain}`).data.interfaces[0];
@@ -139,7 +142,7 @@ function networkWithBoundDomain(domainName: string) {
 
 Deno.test("collisionDomainToIR: short domain name -> readable br-<name>, no hashing", () => {
   const network = networkWithBoundDomain("home");
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   assertEquals(lsShortIfaceName(nodes, "home"), "br-home");
 });
 
@@ -153,7 +156,7 @@ Deno.test("collisionDomainToIR: long domain name falls back to a short determini
   const longName = "voda-modem-v2-extremely-long-domain-name";
   const network = networkWithBoundDomain(longName);
 
-  const short = lsShortIfaceName(toIR(network), longName);
+  const short = lsShortIfaceName(pinnedIR(network), longName);
   assertEquals(short.startsWith("br-"), true);
   assertEquals(
     short.length <= 15,
@@ -163,7 +166,7 @@ Deno.test("collisionDomainToIR: long domain name falls back to a short determini
   assertNotEquals(short, `br-${longName}`);
 
   // Same input, same output.
-  assertEquals(lsShortIfaceName(toIR(network), longName), short);
+  assertEquals(lsShortIfaceName(pinnedIR(network), longName), short);
 });
 
 // buildKernelRouterEndpoint puts the kernelRouterEndpoint() input's
@@ -206,7 +209,7 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
     return { routers: [r1] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   const right = node(nodes, "kernelrouter:router-wan|side:right");
   assertEquals(right.data["ipaddrs"], ["192.168.132.93/24"]);
   assertEquals(right.data["ifaces"], [
@@ -225,10 +228,8 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
   // buildKernelRouterEndpoint from the ovnRouter() name — the LONG leg
   // names exceed IFNAMSIZ, so the IR resolves the IFNAMSIZ-safe
   // `shortName` (readable when it fits, else a deterministic 6-hex
-  // fnv1a32) and the deployer builds the real pair from it. `mac` is the
-  // netns-side leg's own MAC, folded from this side's transit address
-  // (10.12.80.14, the same fold an LRP uses) so the OVN router's
-  // MAC_Binding survives the leg being recreated.
+  // fnv1a32) and the deployer builds the real pair from it. No `mac`: the
+  // runtime folds it from the leg's resolved address (ADR 0011 §5).
   const shortId = fnv1a32("router-wan").toString(16).padStart(8, "0").slice(
     0,
     6,
@@ -245,7 +246,6 @@ Deno.test("kernelRouterSideToIR: right carries the WAN ifaces, transit ovn.ls ca
         ifaceName: "veth-krn-router-wan",
         peerName: "veth-ovn-router-wan",
         shortName: shortId,
-        mac: "00:00:0a:0c:50:0e",
       },
     },
   ]);
@@ -286,7 +286,7 @@ Deno.test("collisionDomain: host-only domain emits a bridge with its ports", () 
     return { routers: [] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   // No OVN logical switch for a host-only domain.
   assertThrows(() => node(nodes, "ls:wan"));
   const bridge = node(nodes, "bridge:br-wan") as BridgeNode;
@@ -330,7 +330,7 @@ Deno.test("collisionDomain: auto-registers every ovnRouterEndpoint port", () => 
     return { routers: [] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   const ls = node(nodes, "ls:segment");
   assertEquals((ls.data["interfaces"] as readonly unknown[]).length, 1);
 });
@@ -375,7 +375,7 @@ Deno.test("kernelRouterSideToIR: shared WAN VLAN becomes a bridge with veth port
     };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   const bridgeName = `br-upl-${
     fnv1a32("eth0:2280").toString(16).padStart(8, "0")
   }`;
@@ -429,7 +429,7 @@ Deno.test("iface resolution: a VLAN on an xdp parent carries the resolved AF_XDP
     return { routers: [r1] };
   });
 
-  const ls = node(toIR(network), "ls:home");
+  const ls = node(pinnedIR(network), "ls:home");
   assertEquals(ls.data.interfaces, [
     {
       host: "chassis-1",
@@ -492,7 +492,7 @@ Deno.test("iface resolution: a bare xdp iface defaults to best-effort/1; an expl
     return { routers: [r1, r2] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   assertEquals(node(nodes, "ls:home").data.interfaces[0]!.iface, {
     kind: "xdp",
     name: "ovnxdp",
@@ -560,7 +560,7 @@ Deno.test("kernelRouterEndpoint: OVN side carries only transit addrs and routes 
     return { routers: [r1] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
 
   // OVN side of the transit link: transit addresses only — the WAN
   // 192.168.132.93/24 must not be here, it lives on the kernel router's
@@ -648,7 +648,7 @@ Deno.test("kernelRouterEndpoint: explicit security group wins, masq services are
     return { routers: [r1] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   // The explicit group is attached, exactly as built (ipv4-only masq);
   // the services' ipv6 masq never made it in.
   assertEquals(
@@ -774,7 +774,7 @@ Deno.test("kernelRouterEndpoint: kernel.app services resolve to app descriptors 
     return { routers: [r1] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   // dhcpcd is expressed as a generic docker app that OWNS the router's
   // interfaces, with an auto-build for the dhcpcd image.
   assertEquals(node(nodes, "kernelrouter:router-wan|side:right").data["apps"], [
@@ -851,7 +851,7 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker resolves router-prefixed name
     return { routers: [r1] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   // The veth prefix is a short `ve-<hash>` derived from the container
   // name (same fnv1a32 rule shortIfaceName applies).
   assertEquals(node(nodes, "kernelrouter:router-wan|side:right").data["apps"], [
@@ -904,7 +904,7 @@ Deno.test("kernelRouterEndpoint: kernel.app.docker without ip gets a determinist
     return { routers: [r1] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   assertEquals(node(nodes, "kernelrouter:router-wan|side:right").data["apps"], [
     {
       kind: "docker",
@@ -959,7 +959,7 @@ Deno.test("kernelRouterEndpoint: builder function + buildAppDocker, image defaul
     return { routers: [r1] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   assertEquals(node(nodes, "kernelrouter:router-wan|side:right").data["apps"], [
     {
       kind: "docker",
@@ -1074,7 +1074,7 @@ Deno.test("tunnelRouterEndpoint: per-endpoint routingDomains keep the anchor's d
     return { routers: [r1, r2, r3] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   // neighbor defaults out the tunnel (rewritten to its backbone addr).
   assertEquals(
     node(
@@ -1174,7 +1174,7 @@ Deno.test("tunnelRouterEndpoint: zerotier is a docker app with its state volume"
     });
     return { routers: [r1] };
   });
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   // The via-less supernet egresses the tunnel: wired from the host.
   const right = node(nodes, "kernelrouter:router-zerotier|side:right").data as {
     apps?: Array<{
@@ -1283,7 +1283,7 @@ Deno.test("tunnelRouterEndpoint: tailscale is a docker app with its key as a 600
     }));
     return { routers: [r1] };
   });
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   const right = node(nodes, "kernelrouter:router-ts|side:right").data as {
     apps?: Array<{
       kind: string;
@@ -1357,7 +1357,7 @@ Deno.test("tunnelRouterEndpoint: zerotier state directory is derived from the ro
     });
     return { routers: [r1] };
   });
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   const right = node(nodes, "kernelrouter:router-zt|side:right").data as {
     apps?: Array<{
       kind: string;
@@ -1413,7 +1413,7 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
     return { routers: [r1] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   const hostNode = node(nodes, "host:chassis-1");
   assertEquals(hostNode.data["dependencies"], [
     "arp",
@@ -1464,7 +1464,7 @@ Deno.test("hostToIR: monitoring.ipfix becomes host data.ipfix", () => {
     return { routers: [r1] };
   });
 
-  const hostData = node(toIR(network), "host:chassis-1").data as Record<
+  const hostData = node(pinnedIR(network), "host:chassis-1").data as Record<
     string,
     unknown
   >;
@@ -1502,7 +1502,7 @@ Deno.test("collisionDomainToIR: flow:false rides the leg's bridge iface", () => 
     return { routers: [r1] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   const quietIfaces = node(nodes, "ls:quiet").data.interfaces;
   assertEquals(quietIfaces[0]!.iface.flow, false);
   // No flag -> no `flow` key at all (inherit), not `flow: true`.
@@ -1553,7 +1553,7 @@ Deno.test("defineOvnRouter object form: declarative OvnRouterSpec resolves endpo
   );
   const firstAddr = endpointOn(r, "seg-a").ipaddrs[0];
   if (!firstAddr) throw new Error("expected one seg-a ipaddr");
-  assertEquals(firstAddr.to_string(), "192.168.1.1/24");
+  assertEquals(firstAddr.toString(), "192.168.1.1/24");
 });
 
 // A Service attached at an OVN endpoint (ep.attachTo) becomes a
@@ -1594,7 +1594,7 @@ Deno.test("net.service + ep.attachTo -> kernel.service node + endpoint serviceRe
       ],
     };
   });
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   // The workload is its OWN node (no network baked in)…
   assertEquals(node(nodes, "kernel.app.container:dns").data, {
     host: "host:chassis-1",
@@ -1620,7 +1620,6 @@ Deno.test("net.service + ep.attachTo -> kernel.service node + endpoint serviceRe
         service: "kernel.app.container:dns",
         name: "seg-a",
         // The NIC's MAC is folded from its own address (192.168.1.53).
-        mac: "00:00:c0:a8:01:35",
         ipaddrs: ["192.168.1.53/24"],
       },
     ],
@@ -1690,7 +1689,7 @@ Deno.test("route metrics: domain, attachment and per-route precedence", () => {
       ],
     };
   });
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   const refsOn = (seg: string) =>
     (node(
       nodes,
@@ -1751,7 +1750,7 @@ Deno.test("route metrics fall back to execution order (first NIC lowest)", () =>
       ],
     };
   });
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   const metricOn = (seg: string): number | undefined => {
     const lrp = node(
       nodes,
@@ -1798,7 +1797,7 @@ Deno.test("resolver: control-plane attachments inherit the platform resolver", (
       r.endpoints.some((e) => e.l2Segment.name === seg)
     )!;
     const lrp = node(
-      toIR(network),
+      pinnedIR(network),
       `ovnrouter:${router.name}|lrp:${endpointOn(router, seg).name}`,
     );
     return lrp.data.serviceRefs ?? [];
@@ -1818,7 +1817,9 @@ Deno.test("resolver: control-plane attachments inherit the platform resolver", (
   assertEquals(coredns.resolver, { nameservers: [corednsAddr] });
   // The registry on the network carries the same global resolver.
   assertEquals(
-    network.platformControlPlane?.resolver?.nameservers.map((n) => n.to_s()),
+    network.platformControlPlane?.resolver?.nameservers.map((n) =>
+      toAddr(n).pinned()?.to_s()
+    ),
     [corednsAddr],
   );
 });
@@ -1854,7 +1855,7 @@ Deno.test('platform: role "dns" replaces the built-in service and supplies the r
     });
     return { hosts: [host], routers: [] };
   });
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   // The built-in is NOT instantiated.
   assertThrows(() => node(nodes, "kernel.app.container:cp-plat-platform.dns"));
   const custom = node(nodes, "kernel.app.container:cp-plat-my-dns");
@@ -1877,7 +1878,9 @@ Deno.test('platform: role "dns" replaces the built-in service and supplies the r
   assertEquals(dnsRef.ipaddrs, ["10.43.0.10/24"]);
   assertEquals(appRef.resolver, { nameservers: ["10.43.0.10"] });
   assertEquals(
-    network.platformControlPlane?.resolver?.nameservers.map((n) => n.to_s()),
+    network.platformControlPlane?.resolver?.nameservers.map((n) =>
+      toAddr(n).pinned()?.to_s()
+    ),
     ["10.43.0.10"],
   );
 });
@@ -1935,7 +1938,7 @@ function ingressNetwork(ingress: boolean) {
 }
 
 Deno.test("platform ingress: the segment's gateway gets a masquerading leg", () => {
-  const nodes = Object.values(toIR(ingressNetwork(true))) as unknown as {
+  const nodes = Object.values(pinnedIR(ingressNetwork(true))) as unknown as {
     id: string;
     kind: string;
     key: { name: string };
@@ -1951,7 +1954,8 @@ Deno.test("platform ingress: the segment's gateway gets a masquerading leg", () 
     n.data.l2Segment === "ls:control-plane"
   );
   assertEquals(legs.length, 1);
-  assertEquals(legs[0]!.data.addresses, ["10.43.0.12/24"]); // after app .10, dns .11
+  // Allocated by the runtime (ADR 0011): no number in the IR.
+  assertEquals(legs[0]!.data.addresses, [`auto:${legs[0]!.id}`]);
   assertEquals(legs[0]!.data.gatewayChassis, "host:chassis-1");
   const snat = nodes.filter((n) => n.kind === "security.group")
     .flatMap((n) => n.data.rules).filter((r) => r.kind === "snat");
@@ -1962,7 +1966,7 @@ Deno.test("platform ingress: the segment's gateway gets a masquerading leg", () 
 
 Deno.test("platform ingress: no other router learns a way in through the leg", () => {
   const routes = (ingress: boolean): string[] =>
-    Object.keys(toIR(ingressNetwork(ingress)))
+    Object.keys(pinnedIR(ingressNetwork(ingress)))
       .filter((id) => id.includes("|route:")).sort();
   const without = routes(false);
   const withIngress = routes(true);
@@ -2078,7 +2082,7 @@ Deno.test("resolver: controlPlane.resolver overrides the CoreDNS default", () =>
     r.endpoints.some((e) => e.l2Segment.name === "control-plane")
   )!;
   const lrp = node(
-    toIR(network),
+    pinnedIR(network),
     `ovnrouter:${router.name}|lrp:${endpointOn(router, "control-plane").name}`,
   );
   const refs = lrp.data.serviceRefs ?? [];
@@ -2125,7 +2129,7 @@ Deno.test("resolver: attachment resolver is emitted for a plain segment NIC", ()
   const network2 = network;
   const router = network2.allRouters[0]!;
   const lrp = node(
-    toIR(network2),
+    pinnedIR(network2),
     `ovnrouter:router-x|lrp:${endpointOn(router, "seg-a").name}`,
   );
   const refs = lrp.data.serviceRefs ?? [];
@@ -2172,8 +2176,8 @@ Deno.test("attached service route via must be on the endpoint's segment", () => 
         ],
       };
     });
-  toIR(build("192.168.1.1")); // on-segment via is fine
-  assertThrows(() => toIR(build("10.9.9.1"))); // off-segment -> error
+  pinnedIR(build("192.168.1.1")); // on-segment via is fine
+  assertThrows(() => pinnedIR(build("10.9.9.1"))); // off-segment -> error
 });
 
 // Multiple DISTINCT services, each attached to its own segment AND the
@@ -2202,13 +2206,15 @@ Deno.test("multiple services attached across endpoints -> one service node each"
           endpoints: [
             r.ovnRouterEndpoint((ep) => ({
               l2Segment: l2,
-              ipaddrs: [IPv4.parse(v4)],
+              // The gateway .1; the NIC gets `v4` (one name per number).
+              ipaddrs: [IPv4.parse(v4.replace(/\.\d+\//, ".1/"))],
               ifaces: [{ host, iface: { kind: "physical", name: "eth0" } }],
               services: [ep.attachTo(svc, { ipaddrs: [IPv4.parse(v4)] })],
             })),
             r.ovnRouterEndpoint({
               l2Segment: backbone,
-              ipaddrs: [IPv4.parse("172.22.0.9/16")],
+              // One number per router on the shared backbone.
+              ipaddrs: [IPv4.parse(`172.22.0.${v4.split(".")[2]}/16`)],
             }),
           ],
         };
@@ -2246,7 +2252,7 @@ Deno.test("multiple services attached across endpoints -> one service node each"
       ],
     };
   });
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   assertEquals(
     Object.keys(nodes).filter((k) => k.startsWith("kernel.app.container:"))
       .sort(),
@@ -2271,7 +2277,6 @@ Deno.test("multiple services attached across endpoints -> one service node each"
       {
         service: "kernel.app.container:dns-128",
         name: "home-v2",
-        mac: "00:00:c0:a8:80:05",
         ipaddrs: ["192.168.128.5/24"],
       },
     ],
@@ -2337,7 +2342,7 @@ Deno.test("endpoint builder injects `endpoint` into every service entry", () => 
   };
   assertEquals(svc.kind, "ipv6.slaac");
   assertEquals(svc.endpoint.l2Segment.name, "seg-a");
-  assertEquals(svc.endpoint.ipaddrs[0]?.to_string(), "192.168.1.1/24");
+  assertEquals(svc.endpoint.ipaddrs[0]?.toString(), "192.168.1.1/24");
 });
 
 // Attaching a reusable service records an ENDPOINT REFERENCE on the
@@ -2649,7 +2654,7 @@ Deno.test("routingDomain: calculated routes reach a workload via its segment gat
   const router = network.allRouters.find((r) => r.name === "router-a");
   if (!router) throw new Error("expected router-a");
   const lrp = node(
-    toIR(network),
+    pinnedIR(network),
     `ovnrouter:router-a|lrp:${endpointOn(router, "seg-a").name}`,
   );
   const refs = (lrp.data as { serviceRefs?: { routes?: unknown }[] })
@@ -2702,7 +2707,7 @@ Deno.test("routingDomain: explicit routes replace the calculated set", () => {
   const router = network.allRouters[0];
   if (!router) throw new Error("expected one router");
   const lrp = node(
-    toIR(network),
+    pinnedIR(network),
     `ovnrouter:router-a|lrp:${endpointOn(router, "seg-a").name}`,
   );
   const refs = (lrp.data as { serviceRefs?: { routes?: unknown }[] })
@@ -2753,7 +2758,7 @@ Deno.test("routingDomain: a dst the attachment is on-link for is skipped", () =>
   const router = network.allRouters[0];
   if (!router) throw new Error("expected one router");
   const lrp = node(
-    toIR(network),
+    pinnedIR(network),
     `ovnrouter:router-a|lrp:${endpointOn(router, "seg-a").name}`,
   );
   const refs = (lrp.data as { serviceRefs?: { routes?: unknown }[] })
@@ -2817,7 +2822,7 @@ Deno.test("workload routes: a prefix reached from two NICs stays on both (per-NI
   });
   const router = network.allRouters[0];
   if (!router) throw new Error("expected one router");
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   const withRoute = router.endpoints.filter((ep) => {
     const lrp = node(nodes, `ovnrouter:router-a|lrp:${ep.name}`);
     const refs = (lrp.data as {
@@ -2859,7 +2864,7 @@ Deno.test("ovn masq services resolve to SNAT rows on the logical router", () => 
     return { hosts: [host], routers: [] };
   });
 
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   const lr = node(nodes, "ovnrouter:router-x");
   assertEquals(lr.data["securityGroups"], [
     { render: "ovn", name: "masq-router-x-ovn" },
@@ -3241,7 +3246,7 @@ Deno.test("routingDomain: calculated routes reach a workload via its segment gat
   const router = network.allRouters.find((r) => r.name === "router-a");
   if (!router) throw new Error("expected router-a");
   const lrp = node(
-    toIR(network),
+    pinnedIR(network),
     `ovnrouter:router-a|lrp:${endpointOn(router, "seg-a").name}`,
   );
   const refs = (lrp.data as { serviceRefs?: { routes?: unknown }[] })
@@ -3294,7 +3299,7 @@ Deno.test("routingDomain: explicit routes replace the calculated set", () => {
   const router = network.allRouters[0];
   if (!router) throw new Error("expected one router");
   const lrp = node(
-    toIR(network),
+    pinnedIR(network),
     `ovnrouter:router-a|lrp:${endpointOn(router, "seg-a").name}`,
   );
   const refs = (lrp.data as { serviceRefs?: { routes?: unknown }[] })
@@ -3345,7 +3350,7 @@ Deno.test("routingDomain: a dst the attachment is on-link for is skipped", () =>
   const router = network.allRouters[0];
   if (!router) throw new Error("expected one router");
   const lrp = node(
-    toIR(network),
+    pinnedIR(network),
     `ovnrouter:router-a|lrp:${endpointOn(router, "seg-a").name}`,
   );
   const refs = (lrp.data as { serviceRefs?: { routes?: unknown }[] })
@@ -3409,7 +3414,7 @@ Deno.test("workload routes: a prefix reached from two NICs stays on both (per-NI
   });
   const router = network.allRouters[0];
   if (!router) throw new Error("expected one router");
-  const nodes = toIR(network);
+  const nodes = pinnedIR(network);
   const withRoute = router.endpoints.filter((ep) => {
     const lrp = node(nodes, `ovnrouter:router-a|lrp:${ep.name}`);
     const refs = (lrp.data as {
@@ -3518,24 +3523,13 @@ Deno.test("platform: attachTo(ingressService) injects endpoint + service into pu
   assertEquals(platform?.ingressService.endpointRefs.length, 1);
 });
 
-// A kernel device's MAC must be the SAME on every recreation, or an OVN
-// router keeps a MAC_Binding for the device that used to hold the address
-// (2026-10-11). The first IPv4 folds exactly like an LRP's MAC; a device
-// with no IPv4 gets a locally-administered MAC hashed from its name.
-Deno.test("macFromAddrsOrName: first IPv4 wins, else a stable hash of the name", () => {
-  assertEquals(
-    macFromAddrsOrName(
-      [IPv6.parse("fd00::10:12:80:f/124"), IPv4.parse("10.12.80.14/28")],
-      "veth-krn-router-wan",
-    ),
-    "00:00:0a:0c:50:0e",
-  );
-  const v6Only = [IPv6.parse("fd00::10:12:80:f/124")];
-  const hashed = macFromAddrsOrName(v6Only, "veth-krn-router-wan");
+// A port with no IPv4 gets a MAC hashed from its name: stable across runs,
+// locally administered (02:…), different per name.
+Deno.test("macFromName: a stable, locally-administered hash of the name", () => {
+  const hashed = macFromName("veth-krn-router-wan");
   assertEquals(/^02(:[0-9a-f]{2}){5}$/.test(hashed), true);
-  assertEquals(macFromAddrsOrName(v6Only, "veth-krn-router-wan"), hashed);
-  assertEquals(macFromAddrsOrName([], "veth-krn-router-wan"), hashed);
-  assertNotEquals(macFromAddrsOrName(v6Only, "veth-krn-router-lan"), hashed);
+  assertEquals(macFromName("veth-krn-router-wan"), hashed);
+  assertNotEquals(macFromName("veth-krn-router-lan"), hashed);
 });
 
 // net.defineOvnRouter()'s `options` (OvnRouterOptions, types.ts): whatever
@@ -3570,7 +3564,7 @@ function routerWithOptions(options?: { macBindingAgeThreshold?: number }) {
 Deno.test("defineOvnRouter options: omitted -> macBindingAgeThreshold defaults to 300", () => {
   const network = routerWithOptions();
   assertEquals(network.allRouters[0]!.options, { macBindingAgeThreshold: 300 });
-  assertEquals(node(toIR(network), "ovnrouter:router-x"), {
+  assertEquals(node(pinnedIR(network), "ovnrouter:router-x"), {
     id: "ovnrouter:router-x",
     kind: "ovn.lr",
     key: { name: "router-x" },
@@ -3584,7 +3578,7 @@ Deno.test("defineOvnRouter options: empty object still defaults, explicit value 
   });
   assertEquals(
     node(
-      toIR(routerWithOptions({ macBindingAgeThreshold: 60 })),
+      pinnedIR(routerWithOptions({ macBindingAgeThreshold: 60 })),
       "ovnrouter:router-x",
     )
       .data["options"],
@@ -3593,7 +3587,7 @@ Deno.test("defineOvnRouter options: empty object still defaults, explicit value 
   // 0 is OVN's own "never age" — an explicit choice, not "unset".
   assertEquals(
     node(
-      toIR(routerWithOptions({ macBindingAgeThreshold: 0 })),
+      pinnedIR(routerWithOptions({ macBindingAgeThreshold: 0 })),
       "ovnrouter:router-x",
     )
       .data["options"],

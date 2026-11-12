@@ -51,3 +51,8 @@ strict = true
 python_version = "3.11"
 files = ["ladops", "deployer", "protocol", "reconciler", "raw_reconciler", "generator", "ovn_fabric", "runtime", "fabric", "primate"]
 exclude = ['^\.venv-build/', '^generator/runtime/thinking\.py$']
+
+# mabels-ipaddress (requirements.txt) ships no type information (py.typed).
+[[tool.mypy.overrides]]
+module = ["ip_address", "ip_address.*"]
+ignore_missing_imports = true

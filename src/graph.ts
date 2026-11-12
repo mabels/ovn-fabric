@@ -19,6 +19,8 @@ import type {
   KernelRouter,
   OvnRouterEndpoint,
 } from "./types.ts";
+import { type AddrLike, prefixOf, toAddr } from "./ipnet.ts";
+import { resolvePinned } from "./ir-pinned.ts";
 
 export type GraphNodeKind =
   | "segment"
@@ -194,8 +196,10 @@ function netnsName(kr: KernelRouter): string {
   return `ns-${kr.name}`;
 }
 
-const addrs = (list: readonly { to_string(): string }[]): string[] =>
-  list.map((a) => a.to_string());
+// The graph shows addresses as the IR has them (ADR 0011): a pinned one by
+// its number, an allocated one as `<net>#auto` (`auto:<owner>` in routes).
+const addrs = (list: readonly AddrLike[]): string[] =>
+  list.map((a) => toAddr(a).toString());
 
 export function buildGraph(net: NetworkDefinition): Graph {
   const nodes = new Map<string, Node>();
@@ -266,7 +270,8 @@ export function buildGraph(net: NetworkDefinition): Graph {
   const groupRefs: { node: string; group: string; out?: string }[] = [];
   const refNames = (value: unknown): string[] =>
     ((value ?? []) as { name: string }[]).map((g) => String(g.name));
-  for (const irNode of Object.values(toIR(net))) {
+  // Pinned addresses as numbers, allocated ones as `auto:<owner>`.
+  for (const irNode of Object.values(resolvePinned(toIR(net)))) {
     const n = irNode as {
       kind: string;
       key: Record<string, unknown>;
@@ -317,7 +322,10 @@ export function buildGraph(net: NetworkDefinition): Graph {
           groupRefs.push({ node, group, out });
         }
       }
-      const routes = (n.data["routes"] ?? []) as { dst: string; via: string }[];
+      const routes = (n.data["routes"] ?? []) as {
+        dst: string;
+        via: unknown;
+      }[];
       const id = `netns:${String(n.key["name"])}`;
       const list = kernelRoutes.get(id) ?? [];
       for (const r of routes) {
@@ -437,8 +445,8 @@ export function buildGraph(net: NetworkDefinition): Graph {
     }
     node.routes = [
       ...(kr.right.routes ?? []).map((r) => ({
-        dst: r.dst.to_string(),
-        via: r.via ? r.via.to_s() : "(the side's own link)",
+        dst: prefixOf(r.dst).to_string(),
+        via: r.via ? toAddr(r.via).toString() : "(the side's own link)",
       })),
       ...(kernelRoutes.get(id) ?? []),
     ].filter((r, i, all) =>

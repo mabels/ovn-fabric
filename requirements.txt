@@ -1,0 +1,4 @@
+# What the Python side imports beyond the stdlib. Bundled into the host's
+# PEX (ovn_fabric/bundle.py, `pex -r requirements.txt`): a host needs no pip.
+# The same library and version as the TypeScript side (jsr:@adviser/ipaddress).
+mabels-ipaddress==0.2.12

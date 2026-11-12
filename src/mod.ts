@@ -11,10 +11,20 @@
 // entrypoint, not something a config module needs to import.)
 export * from "./define.ts";
 export * from "./ip.ts";
+export {
+  type Allocator,
+  type AllocatorStrategy,
+  type Host as HostNumber,
+  type HostRef,
+  IpNet,
+  type IpNetSpec,
+  LogicalIP,
+  type Prefix,
+} from "./ipnet.ts";
 export * from "./types.ts";
 // Only transitNetwork() (+ its own TransitEndpoint/TransitNetwork
 // types) from addressing.ts — the rest (transferNet/
-// macFromV4/macFromVlan/fnv1a32) are internal fold-rule helpers
+// macFromName/fnv1a32) are internal fold-rule helpers
 // src/ir.ts calls itself; a config author never calls those directly
 // the way they call transitNetwork() itself, e.g. to build the
 // `transit` a router.kernelRouterEndpoint() call needs (define.ts).
