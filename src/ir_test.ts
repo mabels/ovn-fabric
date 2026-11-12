@@ -1238,6 +1238,96 @@ Deno.test("tunnelRouterEndpoint: zerotier is a docker app with its state volume"
   );
 });
 
+Deno.test("tunnelRouterEndpoint: tailscale is a docker app with its key as a 600 file", () => {
+  const network = defineNetwork("test-net", (net) => {
+    const host = net.localHost({ name: "chassis-1" });
+    const backbone = net.collisionDomain("backbone");
+    const ts = net.routingDomain("Tailscale-route");
+    const r1 = net.defineOvnRouter("router-ts", (router) => ({
+      routingDomains: [],
+      endpoints: [
+        router.tunnelRouterEndpoint({
+          routingDomains: [ts],
+          host,
+          transit: transitNetwork(
+            IPv4.parse("10.12.87.1/28"),
+            IPv6.parse("fd00::10:12:87:1/124"),
+          ),
+          upstream: transitNetwork(
+            IPv4.parse("10.12.88.1/28"),
+            IPv6.parse("fd00::10:12:88:1/124"),
+          ),
+          routes: [
+            { dst: IPv4.parse("100.64.0.0/10") },
+            { dst: IPv6.parse("fd7a:115c:a1e0::/48") },
+          ],
+          services: [
+            {
+              kind: "tailscale",
+              loginServer: "https://hs.example",
+              authKey: "the-key",
+              upArgs: ["--accept-routes"],
+              masq: ["ipv4"],
+            },
+          ],
+          upstreamBackbone: {
+            l2Segment: backbone,
+            ipaddrs: [IPv4.parse("172.22.0.152/16")],
+          },
+        }),
+        router.ovnRouterEndpoint({
+          l2Segment: backbone,
+          ipaddrs: [IPv4.parse("172.22.0.142/16")],
+        }),
+      ],
+    }));
+    return { routers: [r1] };
+  });
+  const nodes = toIR(network);
+  const right = node(nodes, "kernelrouter:router-ts|side:right").data as {
+    apps?: Array<{
+      kind: string;
+      name?: string;
+      cmd?: string[];
+      build?: { dockerfile?: string };
+      volumes?: Array<{ host: string; container: string }>;
+      stateFiles?: Array<{ path: string; content?: string; mode?: string }>;
+      securityGroups?: Array<{ name: string }>;
+      tunnel?: { iface: string; routes: string[] };
+    }>;
+  };
+  const app = right.apps?.find((a) => a.kind === "docker");
+  assertEquals(app?.name, "router-ts");
+  assertEquals(app?.cmd, ["/usr/local/bin/tailscale-up"]);
+  const state = "/var/lib/ovn-fabric/router-ts/tailscale";
+  assertEquals(app?.volumes, [{
+    host: state,
+    container: "/var/lib/tailscale",
+  }]);
+  // The key: a file only root reads — never in the image or a command line.
+  assertEquals(app?.stateFiles, [
+    { path: `${state}/authkey`, content: "the-key\n", mode: "600" },
+  ]);
+  const dockerfile = app?.build?.dockerfile ?? "";
+  assertEquals(dockerfile.includes("the-key"), false);
+  for (
+    const part of [
+      "--login-server=https://hs.example",
+      "--auth-key=file:/var/lib/tailscale/authkey",
+      "--netfilter-mode=off",
+      "--accept-routes",
+      "--tun=tailscale0",
+    ]
+  ) {
+    assertEquals(dockerfile.includes(part), true, part);
+  }
+  assertEquals(app?.tunnel, {
+    iface: "tailscale0",
+    routes: ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
+  });
+  assertEquals(app?.securityGroups?.length, 1);
+});
+
 // The ZeroTier docker app keeps its identity under the router's state
 // directory.
 Deno.test("tunnelRouterEndpoint: zerotier state directory is derived from the router name", () => {

@@ -26,6 +26,7 @@ import type {
   OvnRouterEndpointSpec,
   Router,
   RouterEndpointRoute,
+  RouterEndpointService,
   RoutingDomain,
   SecurityGroup,
   SecurityGroupRef,
@@ -483,6 +484,82 @@ export function buildKernelRouterEndpoint(
 // A zerotier tunnel's device: the container's netns holds only this one.
 const ZEROTIER_IFACE = "zt0";
 
+// A tailscale tunnel's device (`tailscaled --tun`).
+const TAILSCALE_IFACE = "tailscale0";
+
+/** A Tailscale (or headscale) node as the container that owns its tunnel:
+ * `tailscaled` in the foreground, `tailscale up` once with the pre-auth key
+ * from its state directory (mode 600). Its own netfilter rules are off
+ * (`--netfilter-mode=off`): the image needs no network tools, its device
+ * is wired from the host (masq, routes) like ZeroTier's. */
+function tailscaleApp(
+  routerName: string,
+  workload: Extract<RouterEndpointService, { kind: "tailscale" }>,
+  routes: readonly RouterEndpointRoute[],
+  masqGroup: SecurityGroupRef<"kernel"> | undefined,
+): KernelApp {
+  const state = `/var/lib/ovn-fabric/${routerName}/tailscale`;
+  const inside = "/var/lib/tailscale";
+  const up = [
+    "tailscale",
+    "up",
+    `--login-server=${workload.loginServer}`,
+    `--auth-key=file:${inside}/authkey`,
+    "--netfilter-mode=off",
+    ...(workload.upArgs ?? []),
+  ].join(" ");
+  // The container's program: the daemon in the background only until it
+  // listens, `tailscale up`, then waiting on the daemon — the container
+  // loses its app when tailscaled ends (a run starts it again).
+  const script = [
+    "#!/bin/sh",
+    "exec >/proc/1/fd/1 2>&1",
+    `tailscaled --state=${inside}/tailscaled.state --tun=${TAILSCALE_IFACE} &`,
+    "daemon=$!",
+    "for i in $(seq 1 30); do",
+    "  [ -S /var/run/tailscale/tailscaled.sock ] && break",
+    "  sleep 1",
+    "done",
+    `${up} || echo "tailscale-up: up failed"`,
+    'wait "$daemon"',
+  ];
+  const lines = script
+    .map((line) => `      '${line.replaceAll("'", `'\\''`)}'`)
+    .join(" \\\n");
+  const dockerfile = `
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \\
+      ca-certificates curl \\
+ && curl -fsSL https://tailscale.com/install.sh | sh \\
+ && rm -rf /var/lib/apt/lists/*
+RUN printf '%s\\n' \\
+${lines} \\
+      > /usr/local/bin/tailscale-up \\
+ && chmod 755 /usr/local/bin/tailscale-up
+`;
+  return {
+    kind: "docker",
+    image: `ovn-fabric-${routerName}-tailscale`,
+    name: routerName, // the container is the gateway (its netns)
+    cmd: ["/usr/local/bin/tailscale-up"],
+    build: { from: "ubuntu:24.04", dockerfile },
+    volumes: [{ host: state, container: inside }],
+    run: ["--dns", "1.1.1.1"],
+    stateFiles: [
+      {
+        path: `${state}/authkey`,
+        content: `${workload.authKey}\n`,
+        mode: "600",
+      },
+    ],
+    securityGroups: masqGroup ? [masqGroup] : [],
+    tunnel: {
+      iface: TAILSCALE_IFACE,
+      routes: routes.filter((r) => !r.via).map((r) => r.dst.to_string()),
+    },
+  };
+}
+
 export function buildTunnelRouterEndpoint(
   ctx: RouterEndpointContext,
   input: Omit<TunnelRouterEndpoint, "kind">,
@@ -521,12 +598,13 @@ export function buildTunnelRouterEndpoint(
   // IR never sees wireguard/zerotier (2026-09-08). The egress masq now
   // lives ON the workload (masq), not as separate kernel.*.masq services.
   const workload = (services ?? []).find(
-    (s) => s.kind === "wireguard" || s.kind === "zerotier",
+    (s) =>
+      s.kind === "wireguard" || s.kind === "zerotier" || s.kind === "tailscale",
   );
   if (workload === undefined) {
     throw new Error(
       `tunnelRouterEndpoint "${routerName}": services[] must include a ` +
-        `wireguard or zerotier workload`,
+        `wireguard, zerotier or tailscale workload`,
     );
   }
   const masq = workload.masq ?? [];
@@ -548,6 +626,8 @@ export function buildTunnelRouterEndpoint(
         config: workload.config,
         securityGroups: masqGroup ? [masqGroup] : [],
       }
+      : workload.kind === "tailscale"
+      ? tailscaleApp(routerName, workload, routes ?? [], masqGroup)
       : (() => {
         const ztNetworkId = workload.networkId;
         const ztRoutes = (routes ?? [])

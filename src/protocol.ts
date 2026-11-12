@@ -454,6 +454,7 @@ export const DockerApp = type({
   "stateFiles?": type({
     path: "string",
     "content?": "string",
+    "mode?": "string",
   }).array(),
   // Its masq rules go out of `tunnel.iface`.
   "securityGroups?": SecurityGroupRef.array(),

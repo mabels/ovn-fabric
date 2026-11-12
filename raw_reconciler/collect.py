@@ -32,6 +32,11 @@ from .owners import discover
 
 GLOBAL_NETNS = "*global*"
 
+# The targets a rule of ours can have (the RawIR's IptablesAction). Another
+# tool's rule (tailscaled's MARK/CONNMARK, docker's …) is not collected:
+# never ours, so nothing to compare or clean up.
+_OUR_ACTIONS = frozenset(action.value for action in raw.IptablesAction)
+
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -190,6 +195,8 @@ def _iptables_nodes(
             continue
         seen: dict[str, int] = {}
         for rule in list_rules(netns):
+            if rule["action"] not in _OUR_ACTIONS:
+                continue
             family = "ipv4" if rule["family"] == "ip" else "ipv6"
             # By content — what it matches and what it does — so a rule is
             # found wherever it sits in its chain (its position: `handle`);

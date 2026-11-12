@@ -75,6 +75,18 @@ def _ovn_route(node: Node, live: Graph) -> str | None:
     return f"ovnroute:{fields.get('routerRef')}|{policy}|{fields.get('prefix')}"
 
 
+def _ovn_nat(node: Node, live: Graph) -> str | None:
+    """What OVN holds unique in a router: an SNAT per logical network, any
+    other NAT per external address — a changed other side is the same NAT
+    (`lr-nat-add` refuses a second)."""
+    fields = _fields(node)
+    nat_type = fields.get("type")
+    unique = fields.get("logicalIp") if nat_type == "snat" else fields.get("externalIp")
+    if nat_type is None or unique is None:
+        return None
+    return f"ovnnat:{fields.get('routerRef')}|{nat_type}|{unique}"
+
+
 def _route(node: Node, live: Graph) -> str | None:
     fields = _fields(node)
     table = fields.get("table") or "main"
@@ -101,6 +113,7 @@ KEYS: dict[str, Callable[[Node, Graph], str | None]] = {
         else None
     ),
     "docker.container": _container,
+    "ovn.nat": _ovn_nat,
     "ovn.route": _ovn_route,
     "route": _route,
 }

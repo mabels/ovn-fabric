@@ -1029,7 +1029,10 @@ function resolveIpv6RaConfigs(
     // buildTunnelRouterEndpoint and never reach an OVN endpoint's services
     // (they'd be a config error if they did) — skip so the exhaustiveness
     // check below stays meaningful (2026-09-08).
-    if (service.kind === "wireguard" || service.kind === "zerotier") {
+    if (
+      service.kind === "wireguard" || service.kind === "zerotier" ||
+      service.kind === "tailscale"
+    ) {
       continue;
     }
     const unknownKind: never = service;

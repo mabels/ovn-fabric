@@ -92,6 +92,22 @@ class NaturalKeyTest(unittest.TestCase):
         v6 = {**kernel, "family": "ipv6", "prefix": "::/0"}
         self.assertEqual(natural_key(v6, {}), natural_key({**v6, "metric": 1024}, {}))
 
+    def test_an_snat_is_one_per_logical_network_in_its_router(self) -> None:
+        old = {
+            "id": "ovn.nat:home-nat|snat|172.21.0.5|192.168.129.0/24",
+            "kind": "ovn.nat",
+            "routerRef": "ovn.lr:home-nat",
+            "type": "snat",
+            "externalIp": "172.21.0.5",
+            "logicalIp": "192.168.129.0/24",
+        }
+        moved = {**old, "id": "ovn.nat:home-nat|snat|172.21.0.6|192.168.129.0/24"}
+        moved["externalIp"] = "172.21.0.6"
+        self.assertEqual(natural_key(old, {}), "ovnnat:ovn.lr:home-nat|snat|192.168.129.0/24")
+        self.assertEqual(natural_key(old, {}), natural_key(moved, {}))
+        dnat = {**old, "type": "dnat_and_snat", "logicalIp": "10.0.0.5"}
+        self.assertEqual(natural_key(dnat, {}), "ovnnat:ovn.lr:home-nat|dnat_and_snat|172.21.0.5")
+
     def test_a_nic_is_its_permanent_mac(self) -> None:
         changed = _link("nic0", "physical", mac="02:00:00:00:00:01", permMac="bc:24:11:00:00:01")
         self.assertEqual(natural_key(changed, {}), "nic:bc:24:11:00:00:01")

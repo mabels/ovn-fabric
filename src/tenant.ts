@@ -213,7 +213,7 @@ export class Wan {
 // ── tenants ───────────────────────────────────────────────────────────────
 
 export interface VpnGatewaySpec {
-  readonly kind: "wireguard" | "zerotier";
+  readonly kind: "wireguard" | "zerotier" | "tailscale";
   readonly host: Host;
   /** The two cables: to the tenant's core, to its own NAT gateway. */
   readonly svc: { readonly core: TransitNetwork; readonly nat: TransitNetwork };
@@ -230,6 +230,10 @@ export interface VpnGatewaySpec {
   // zerotier
   readonly networkId?: string;
   readonly identity?: { readonly public: string; readonly secret: string };
+  // tailscale
+  readonly loginServer?: string;
+  readonly authKey?: string;
+  readonly upArgs?: readonly string[];
 }
 
 /** What a tenant's callback returns. */
@@ -327,6 +331,14 @@ export class Tenant {
               kind: "wireguard" as const,
               ifaceName: spec.ifaceName ?? "wg0",
               config: spec.config,
+              ...(spec.masq ? { masq: spec.masq } : {}),
+            }
+            : spec.kind === "tailscale"
+            ? {
+              kind: "tailscale" as const,
+              loginServer: spec.loginServer,
+              authKey: spec.authKey,
+              ...(spec.upArgs ? { upArgs: spec.upArgs } : {}),
               ...(spec.masq ? { masq: spec.masq } : {}),
             }
             : {

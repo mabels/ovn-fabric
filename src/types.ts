@@ -574,6 +574,8 @@ export type KernelApp =
     readonly stateFiles?: readonly {
       readonly path: string;
       readonly content?: string;
+      /** Its mode (e.g. "600" for a key); default the system's. */
+      readonly mode?: string;
     }[];
     /** Security groups whose `masq` rules apply out `tunnel.iface`. */
     readonly securityGroups?: readonly SecurityGroupRef<"kernel">[];
@@ -1148,6 +1150,18 @@ export type RouterEndpointService =
       readonly public: string;
       readonly secret: string;
     };
+  }
+  | {
+    readonly kind: "tailscale";
+    /** The control server (e.g. a headscale), `tailscale up --login-server`. */
+    readonly loginServer: string;
+    /** A pre-auth key: written to a file of mode 600 in its state
+     * directory, read by `tailscale up --auth-key=file:…` — never in env. */
+    readonly authKey: string;
+    /** More `tailscale up` options, e.g. ["--advertise-routes=…"]. */
+    readonly upArgs?: readonly string[];
+    readonly masq?: readonly ("ipv4" | "ipv6")[];
+    readonly routes?: readonly RouterEndpointRoute[];
   };
 
 // ── Service: a reusable WORKLOAD, and its network attachments ──────────

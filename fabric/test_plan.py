@@ -112,6 +112,7 @@ class PlanTest(unittest.TestCase):
             stateFiles=[
                 pt.StateFile(path=f"{state}/devicemap", content="n=zt0\n"),
                 pt.StateFile(path=f"{state}/networks.d/n.conf"),
+                pt.StateFile(path=f"{state}/authkey", content="k\n", mode="600"),
             ],
             securityGroups=[pt.SecurityGroupRef(render=pt.Render.kernel, name="sg")],
             tunnel=pt.Tunnel(iface="zt0", routes=["192.168.0.0/16"]),
@@ -156,6 +157,8 @@ class PlanTest(unittest.TestCase):
         for line in (at("MASQUERADE"), at("ip link set dev zt0 up"), at("192.168.0.0/16")):
             self.assertIn("ip netns exec c", lines[line])  # from the host, not in the image
         self.assertNotIn("docker exec -d c iptables", joined)
+        # A key file gets its mode before the daemon reads it.
+        self.assertLess(at(f"chmod 600 {state}/authkey"), at("docker run"))
 
 
 def _plan(declare: Callable[[Emitter], None]) -> list[g.Unit]:

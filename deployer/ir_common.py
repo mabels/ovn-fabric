@@ -1625,6 +1625,8 @@ def _start_owning_container(
             unit.ovn(host.state_dir(directory))
         if state_file.content is not None:
             unit.append(state_file.path, state_file.content)
+            if state_file.mode is not None:
+                unit.ovn(host.chmod(state_file.path, state_file.mode))
         else:
             # The app writes into it: not written over, whatever a run finds.
             unit.ovn(host.touch(state_file.path), decide=Decide.always)

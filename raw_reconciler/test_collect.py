@@ -114,6 +114,20 @@ class IptablesNodesTest(unittest.TestCase):
             ],
         )
 
+    def test_a_rule_of_another_tool_is_not_collected(self) -> None:
+        # tailscaled on the host: `-A ts-forward -i tailscale0 -j MARK …`.
+        rule = {"family": "ip", "table": "filter", "chain": "ts-forward", "fields": {}}
+        rules = [
+            {**rule, "fields": {"iif": "tailscale0"}, "action": "MARK", "order": "000"},
+            {**rule, "action": "ACCEPT", "order": "001"},
+        ]
+        with mock.patch.object(collect, "list_rules", return_value=rules):
+            nodes = collect._iptables_nodes([("ns-x", "ns-x", None)])
+        self.assertEqual(
+            [node["id"] for node in nodes],
+            ["iptables:ns-x|ipv4|filter|ts-forward||ACCEPT"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
