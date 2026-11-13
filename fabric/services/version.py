@@ -8,6 +8,7 @@ from runtime.peer import Call
 from runtime.service import Service
 
 from .. import generated as g
+from ..runtime_store import own_hash
 
 BODIES = {
     "VersionReq": BodySpec(g.VersionReq, "request"),
@@ -18,7 +19,7 @@ register_bodies(BODIES)  # clients decode these too
 
 async def version(call: Call) -> object:
     await call.log("info", f"version requested by {call.msg.header.source}")
-    return g.VersionRes(kind="VersionRes", runtime=__version__, protocol=PROTOCOL)
+    return g.VersionRes(kind="VersionRes", runtime=__version__, protocol=PROTOCOL, hash=own_hash())
 
 
 def service() -> Service:

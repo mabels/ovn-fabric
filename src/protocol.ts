@@ -498,6 +498,11 @@ export const DockerApp = type({
     path: "string",
     "content?": "string",
     "mode?": "string",
+    // With content: written only when missing (a seed the app keeps).
+    "keep?": "boolean",
+    // Its owner and group (uid/gid), as a service file's.
+    "user?": "number.integer >= 0",
+    "group?": "number.integer >= 0",
   }).array(),
   // Its masq rules go out of `tunnel.iface`.
   "securityGroups?": SecurityGroupRef.array(),
@@ -655,6 +660,11 @@ export const KernelAppServiceFile = type({
   // A string, or its LINES — an array diffs far better in the IR (one
   // changed line vs one long escaped string), so generated config uses it.
   content: "string | string[]",
+  // Owner and group as the container sees them (uid/gid: the file is
+  // bind-mounted from the host); its mode, octal ("600").
+  "user?": "number.integer >= 0",
+  "group?": "number.integer >= 0",
+  "mode?": /^0?[0-7]{3,4}$/,
 });
 // Environment variables for a workload (Service.env) — CONFIG, not
 // secrets, since it travels through the IR as plain JSON.

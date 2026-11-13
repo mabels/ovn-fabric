@@ -118,12 +118,20 @@ def _dump_primitive(
 
 
 def _load_write_file(step: g.WriteFileStep, host: str) -> Operation:
-    return WriteFileOperation(step.path, step.content, step.mode)
+    return WriteFileOperation(
+        step.path, step.content, step.mode, bool(step.keep), step.uid, step.gid
+    )
 
 
 def _dump_write_file(operation: WriteFileOperation) -> g.WriteFileStep:
     return g.WriteFileStep(
-        kind="WriteFile", path=operation.path, content=operation.content, mode=operation.mode
+        kind="WriteFile",
+        path=operation.path,
+        content=operation.content,
+        mode=operation.mode,
+        keep=operation.keep or None,
+        uid=operation.uid,
+        gid=operation.gid,
     )
 
 

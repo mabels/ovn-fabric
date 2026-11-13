@@ -55,7 +55,10 @@ gateway.
   numbers again.
 - **An allocation state file next to the topology.** Works, but it is a
   second source of truth beside the topology that must stay in sync, and
-  the live system already *is* that state.
+  the live system already *is* that state. (What came later is a different thing:
+  the runtime's own allocator state file on the host, ADR 0012 §6 — written
+  by the runtime only, read below the live view, so it never contradicts
+  the system; it remembers what a reboot takes away.)
 - **Make `run` replace a node that differs** (same id, other fields →
   remove, then create). Needed anyway, but it only makes the renumbering
   *apply*; it still renumbers, with an outage on every moved port.
@@ -245,7 +248,8 @@ gets concrete values exactly as today and never sees a LogicalIP.
 an address is the IR id of what carries it (`ovnrouter:<router>|lrp:<port>`,
 `kernel.app.container:<service>|nic:<nic>`), and the live carrier is found by
 that same identity: a router port by its name, a workload NIC by its
-container and link name. Nothing is stored — the live system is the state.
+container and link name. The live system is the state; the allocator state
+file (precedence 2b) only remembers what a reboot takes away.
 
 *Owner tags* (`external_ids:ovn-fabric-owner` on the LRP, a link `alias`) are
 **not built** (decided 2026-11-12): they only pay off once an IR id may
@@ -272,6 +276,10 @@ otherwise held addresses would look free and be handed out again.
 **Precedence**, per collision domain, highest first:
 1. pinned numbers (`{ host }`) of the IR;
 2. live numbers of names still in the IR — such a name keeps its number;
+2b. the **allocator state file**'s numbers for names still in the IR that
+   are not live (ADR 0012 §6: after a reboot the kernel has forgotten a
+   workload NIC) — the last run's assignment, written by the runtime; a
+   number something live holds now is not taken from it;
 3. new names, sorted, by the collision domain's allocator: `low-high`
    (lowest free first), `high-low` (highest free first) or `random`
    (deterministic order seeded by domain and name), per family as declared.
@@ -520,7 +528,8 @@ any — and no resolved numbers. It gets no allocator of its own.
   address.
 - A system converged by `run` and a fresh `create` of the same IR can have
   different numbers. Intended: the live system is the state for addresses
-  only the fabric needs.
+  only the fabric needs (and the allocator state file its memory across a
+  reboot, ADR 0012 §6).
 
 ## Migration
 

@@ -10,7 +10,17 @@
 // checkout.
 
 import { refNamedShapes, shape } from "../../src/protocol.ts";
-import { ErrorRes, LogLevel, LogMsg, MsgHeader } from "./protocol.ts";
+import {
+  ErrorRes,
+  FollowReq,
+  JobInfo,
+  JobListReq,
+  JobListRes,
+  JobState,
+  LogLevel,
+  LogMsg,
+  MsgHeader,
+} from "./protocol.ts";
 
 const CODEGEN = ".venv-build/bin/datamodel-codegen";
 
@@ -59,6 +69,11 @@ if (import.meta.main) {
       LogLevel: shape(LogLevel),
       LogMsg: shape(LogMsg),
       ErrorRes: shape(ErrorRes),
+      FollowReq: shape(FollowReq),
+      JobState: shape(JobState),
+      JobInfo: shape(JobInfo),
+      JobListReq: shape(JobListReq),
+      JobListRes: shape(JobListRes),
     }),
     "runtime/protocol.schema.json",
     "runtime/generated.py",

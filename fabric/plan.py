@@ -61,7 +61,6 @@ from .lifecycle import (
     SymlinkNetnsOperation,
     WriteFileOperation,
 )
-from .primitives.host import HostPrimitive
 from .units import to_step
 
 
@@ -140,6 +139,18 @@ class PlanEmitter(Emitter):
 
     def append(self, path: str, content: str) -> None:
         self._add(WriteFileOperation(path, content))
+
+    def write_file(
+        self, path: str, content: str, mode: int | None, uid: int | None, gid: int | None
+    ) -> None:
+        """A file with its mode and owner, set before it is in place."""
+        self._add(WriteFileOperation(path, content, mode, uid=uid, gid=gid))
+
+    def seed(
+        self, path: str, content: str, mode: int | None, uid: int | None, gid: int | None
+    ) -> None:
+        """A file written only where there is none (WriteFileOperation.keep)."""
+        self._add(WriteFileOperation(path, content, mode, keep=True, uid=uid, gid=gid))
 
     def capture(self, var: str, argv: Sequence[str | Ref]) -> None:
         self.plan.refs[var] = RuntimeRef(var)
@@ -257,62 +268,6 @@ def plan_operations(
     return [entry for plan in _plans(nodes, host, addrs) for entry in plan.operations]
 
 
-# Where scripts/fabric-install.sh puts the runtime.
-_PEX = "/usr/local/lib/ovn-fabric/fabric.pex"
-_SOCKET = "/run/ovn-fabric.sock"
-_REFS = "/var/lib/ovn-fabric/ir/refs.json"
-_BOOT_UNIT = "ovn-fabric-reconcile.service"
-_BOOT_SCRIPT = "/usr/local/lib/ovn-fabric/reconcile-on-boot"
-
-
-def _emit_boot(host: str, emit: Emitter) -> None:
-    """At boot the host comes back to the IR last fed to it (the store's name
-    `deployed`): a unit of its own, so restarting the runtime applies nothing.
-    Without a deployed IR (it was deleted) it does nothing. No cleanup yet:
-    nobody is watching a boot."""
-    primitives = HostPrimitive(host)
-    unit = emit.unit("boot", "reconcile")
-    unit.append(
-        _BOOT_SCRIPT,
-        "\n".join(
-            [
-                "#!/bin/sh",
-                f"grep -q '\"deployed\"' {_REFS} 2>/dev/null || exit 0",
-                "i=0",
-                f"until python3 {_PEX} --socket {_SOCKET} version >/dev/null 2>&1; do",
-                "  i=$((i + 1))",
-                '  [ "$i" -lt 60 ] || exit 1',
-                "  sleep 1",
-                "done",
-                f"exec python3 {_PEX} --socket {_SOCKET} ir-apply run deployed --no-cleanup",
-            ]
-        ),
-    )
-    unit.ovn(primitives.chmod(_BOOT_SCRIPT, "755"))
-    unit.append(
-        f"/etc/systemd/system/{_BOOT_UNIT}",
-        "\n".join(
-            [
-                "[Unit]",
-                "Description=ovn-fabric: run the deployed IR at boot",
-                "Requires=ovn-fabric.service",
-                "After=ovn-fabric.service network-online.target",
-                "Wants=network-online.target",
-                "",
-                "[Service]",
-                "Type=oneshot",
-                "Environment=PEX_ROOT=/var/cache/ovn-fabric/pex",
-                f"ExecStart={_BOOT_SCRIPT}",
-                "TimeoutStartSec=infinity",
-                "",
-                "[Install]",
-                "WantedBy=multi-user.target",
-            ]
-        ),
-    )
-    unit.ovn(primitives.systemd_enabled(_BOOT_UNIT), decide=Decide.always)
-
-
 def _plans(nodes: Sequence[pt.Model], host: str, addrs: Addresses | None) -> list[_Plan]:
     all_nodes = list(nodes)
     # Every address the IR leaves to the runtime, placed (ADR 0011 §3b):
@@ -345,7 +300,8 @@ def _plans(nodes: Sequence[pt.Model], host: str, addrs: Addresses | None) -> lis
         name = node.key.name
         faces = _service_faces(name, host, all_nodes)
         plans.append(_scope(name, functools.partial(_emit_service_up, node, faces, addrs)))
-    plans.append(_scope("boot", functools.partial(_emit_boot, host)))
+    # No boot unit: the runtime replays the deployed IR itself after a
+    # reboot (ADR 0012 §6, fabric/boot.py).
     names: set[str] = set()
     for unit in (unit for plan in plans for unit in plan.units):
         if unit.name in names:

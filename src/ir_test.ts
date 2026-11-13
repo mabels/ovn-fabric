@@ -35,6 +35,7 @@ import type {
   Platform,
   Publish,
   Router,
+  RouterEndpointService,
   Service,
 } from "./types.ts";
 
@@ -1238,7 +1239,10 @@ Deno.test("tunnelRouterEndpoint: zerotier is a docker app with its state volume"
   );
 });
 
-Deno.test("tunnelRouterEndpoint: tailscale is a docker app with its key as a 600 file", () => {
+/** The tailscale container a tunnel endpoint with `service` becomes. */
+function tailscaleRight(
+  service: Extract<RouterEndpointService, { kind: "tailscale" }>,
+) {
   const network = defineNetwork("test-net", (net) => {
     const host = net.localHost({ name: "chassis-1" });
     const backbone = net.collisionDomain("backbone");
@@ -1262,13 +1266,7 @@ Deno.test("tunnelRouterEndpoint: tailscale is a docker app with its key as a 600
             { dst: IPv6.parse("fd7a:115c:a1e0::/48") },
           ],
           services: [
-            {
-              kind: "tailscale",
-              loginServer: "https://hs.example",
-              authKey: "the-key",
-              upArgs: ["--accept-routes"],
-              masq: ["ipv4"],
-            },
+            service,
           ],
           upstreamBackbone: {
             l2Segment: backbone,
@@ -1291,11 +1289,24 @@ Deno.test("tunnelRouterEndpoint: tailscale is a docker app with its key as a 600
       cmd?: string[];
       build?: { dockerfile?: string };
       volumes?: Array<{ host: string; container: string }>;
-      stateFiles?: Array<{ path: string; content?: string; mode?: string }>;
+      stateFiles?: Array<
+        { path: string; content?: string; mode?: string; keep?: boolean }
+      >;
       securityGroups?: Array<{ name: string }>;
       tunnel?: { iface: string; routes: string[] };
     }>;
   };
+  return right;
+}
+
+Deno.test("tunnelRouterEndpoint: tailscale is a docker app with its key as a 600 file", () => {
+  const right = tailscaleRight({
+    kind: "tailscale",
+    loginServer: "https://hs.example",
+    authKey: "the-key",
+    upArgs: ["--accept-routes"],
+    masq: ["ipv4"],
+  });
   const app = right.apps?.find((a) => a.kind === "docker");
   assertEquals(app?.name, "router-ts");
   assertEquals(app?.cmd, ["/usr/local/bin/tailscale-up"]);
@@ -1327,6 +1338,29 @@ Deno.test("tunnelRouterEndpoint: tailscale is a docker app with its key as a 600
     routes: ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
   });
   assertEquals(app?.securityGroups?.length, 1);
+});
+
+Deno.test("tunnelRouterEndpoint: a tailscale node's state is a 600 seed, its key optional", () => {
+  const right = tailscaleRight({
+    kind: "tailscale",
+    loginServer: "https://hs.example",
+    state: '{"_machinekey":"m"}',
+  });
+  const app = right.apps?.find((a) => a.kind === "docker");
+  const state = "/var/lib/ovn-fabric/router-ts/tailscale";
+  // Written only when missing: tailscaled keeps it up to date itself.
+  assertEquals(app?.stateFiles, [
+    {
+      path: `${state}/tailscaled.state`,
+      content: '{"_machinekey":"m"}',
+      mode: "600",
+      keep: true,
+    },
+  ]);
+  const dockerfile = app?.build?.dockerfile ?? "";
+  // No key: the restored node is logged in already.
+  assertEquals(dockerfile.includes("--auth-key"), false);
+  assertEquals(dockerfile.includes("_machinekey"), false);
 });
 
 // The ZeroTier docker app keeps its identity under the router's state
@@ -2916,14 +2950,22 @@ Deno.test("service: accepts a builder object or a callback that returns one", ()
     returned = net.service("returned", (svc) => ({
       ...svc,
       image: "img-b",
-      files: [{ path: "/etc/x", content: ["a", "b"] }],
+      files: [{
+        path: "/etc/x",
+        content: ["a", "b"],
+        user: 101,
+        group: 102,
+        mode: "640",
+      }],
     }));
     return { hosts: [host], routers: [] };
   });
   assertEquals(plain?.image, "img-a");
   assertEquals(plain?.cmd, ["sh", "-c", "true"]);
   assertEquals(returned?.image, "img-b");
-  assertEquals(returned?.files, [{ path: "/etc/x", content: ["a", "b"] }]);
+  assertEquals(returned?.files, [
+    { path: "/etc/x", content: ["a", "b"], user: 101, group: 102, mode: "640" },
+  ]);
 });
 
 Deno.test("platform: createPlatform is a dummy carrying ingressService + publish", () => {

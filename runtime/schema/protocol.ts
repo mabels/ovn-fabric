@@ -41,3 +41,35 @@ export const ErrorRes = type({
   code: "string",
   message: "string",
 });
+
+// ── jobs (ADR 0012 §7) ──────────────────────────────────────────────────
+// A long request (a service declares which) belongs to the runtime, not to
+// the connection that sent it: its log is kept, every follower gets it, and
+// the request goes on when its connection closes.
+
+/** Follow a job: everything it emitted so far, then the rest as it comes,
+ * then its final response — as if this were the request. */
+export const FollowReq = type({
+  kind: "'FollowReq'",
+  reqId: "string",
+});
+
+export const JobState = type("'running' | 'done' | 'failed'");
+
+export const JobInfo = type({
+  reqId: "string",
+  /** The request's body kind, e.g. IrApplyReq. */
+  request: "string",
+  state: JobState,
+  startedAt: "number",
+  "finishedAt?": "number",
+  /** Messages kept for a follower. */
+  messages: "number.integer",
+});
+
+export const JobListReq = type({ kind: "'JobListReq'" });
+
+export const JobListRes = type({
+  kind: "'JobListRes'",
+  jobs: JobInfo.array(),
+});

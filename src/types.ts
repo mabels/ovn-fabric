@@ -578,6 +578,13 @@ export type KernelApp =
       readonly content?: string;
       /** Its mode (e.g. "600" for a key); default the system's. */
       readonly mode?: string;
+      /** With `content`: written only when missing — a seed the app keeps
+       * up to date itself (a tailscaled.state), never written over. */
+      readonly keep?: boolean;
+      /** Its owner and group as uid/gid (the container sees the host's
+       * file), as a service file's. Default: root. */
+      readonly user?: number;
+      readonly group?: number;
     }[];
     /** Security groups whose `masq` rules apply out `tunnel.iface`. */
     readonly securityGroups?: readonly SecurityGroupRef<"kernel">[];
@@ -1152,8 +1159,14 @@ export type RouterEndpointService =
     /** The control server (e.g. a headscale), `tailscale up --login-server`. */
     readonly loginServer: string;
     /** A pre-auth key: written to a file of mode 600 in its state
-     * directory, read by `tailscale up --auth-key=file:…` — never in env. */
-    readonly authKey: string;
+     * directory, read by `tailscale up --auth-key=file:…` — never in env.
+     * Optional: a node restored from `state` is logged in already. */
+    readonly authKey?: string;
+    /** The node itself: its `tailscaled.state` (machine key, node key,
+     * logged-in profile), as ZeroTier's `identity`. Written (mode 600)
+     * only when the file is missing — tailscaled keeps it up to date —
+     * so a lost state directory comes back as the same node. */
+    readonly state?: string;
     /** More `tailscale up` options, e.g. ["--advertise-routes=…"]. */
     readonly upArgs?: readonly string[];
     readonly masq?: readonly ("ipv4" | "ipv6")[];
@@ -1175,6 +1188,14 @@ export interface ServiceFile {
    * (one changed line instead of one long escaped string), so generated
    * config uses it; the deployer joins with newlines either way. */
   readonly content: string | readonly string[];
+  /** Its owner, as the uid the container sees (the file is bind-mounted
+   * from the host: a user NAME would be the host's, not the image's).
+   * Default: root. */
+  readonly user?: number;
+  /** Its group, as a gid (as `user`). Default: root's. */
+  readonly group?: number;
+  /** Its permissions, octal (e.g. "600", "0640"). Default: the system's. */
+  readonly mode?: string;
 }
 
 export interface Service {

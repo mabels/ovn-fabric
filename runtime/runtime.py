@@ -11,10 +11,19 @@ import asyncio
 import contextlib
 import logging
 
-from .message import ProtocolError, register_bodies
+from . import generated as g
+from .jobs import Job, JobOutbox, Jobs, follow
+from .message import BodySpec, ProtocolError, register_bodies
 from .peer import Call, Peer
 from .service import Handler, Service
 from .transport import Connection, connect, dump_wire, listen, wire_log
+
+_JOB_BODIES = {
+    "FollowReq": BodySpec(g.FollowReq, "request"),
+    "JobListReq": BodySpec(g.JobListReq, "request"),
+    "JobListRes": BodySpec(g.JobListRes, "response"),
+}
+register_bodies(_JOB_BODIES)  # clients decode these too
 
 
 class Runtime:
@@ -31,6 +40,10 @@ class Runtime:
         self._client: Peer | None = None
         self._client_reader: asyncio.Task[None] | None = None
         self._client_lock = asyncio.Lock()
+        # Long requests (Service.detached) run as jobs (ADR 0012 §7).
+        self._detached: set[str] = set()
+        self._jobs = Jobs()
+        register_bodies(_JOB_BODIES)
 
     def register(self, *services: Service) -> None:
         for service in services:
@@ -40,6 +53,7 @@ class Runtime:
             register_bodies(service.bodies)
             self._handlers.update(service.handlers)
             self._owners.update(dict.fromkeys(service.handlers, service.name))
+            self._detached |= set(service.detached)
             self._services.append(service)
 
     def handle(self, kind: str, handler: Handler) -> None:
@@ -57,6 +71,8 @@ class Runtime:
             ]
             async with listen(self._internal, self._connected), listen(address, self._connected):
                 await stop.wait()
+                # The jobs first: they use the internal connection.
+                await self._jobs.stop()
                 if self._client is not None:
                     await self._client.close()
                 for peer in list(self._peers):
@@ -89,8 +105,25 @@ class Runtime:
                 await conn.close()
 
     async def _dispatch(self, call: Call) -> object:
-        handler = self._handlers.get(call.msg.kind)
+        kind = call.msg.kind
+        if kind == "FollowReq":
+            return await follow(self._jobs.get(call.body.reqId), call.emit)
+        if kind == "JobListReq":
+            return g.JobListRes(kind="JobListRes", jobs=self._jobs.infos())
+        handler = self._handlers.get(kind)
         if handler is None:
-            raise ProtocolError("unknown-request", f"{call.msg.kind} is not handled here")
+            raise ProtocolError("unknown-request", f"{kind} is not handled here")
         # Handled by the service that answers it: its logs carry its name.
-        return await handler(call.with_component(self._owners.get(call.msg.kind, self.source)))
+        component = self._owners.get(kind, self.source)
+        if kind not in self._detached:
+            return await handler(call.with_component(component))
+        # A job: the handler runs as the runtime's, writing into the job; this
+        # connection is its first follower — closing it ends only the
+        # following.
+        job = Job(call.req_id, kind)
+        detached = Call(call.peer, call.msg, component, JobOutbox(job))
+        self._jobs.start(job, lambda: handler(detached))
+        await detached.log(
+            "info", f"{kind} runs as job {call.req_id} (fabric follow {call.req_id})", "rt"
+        )
+        return await follow(job, call.emit)

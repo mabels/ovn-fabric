@@ -280,6 +280,20 @@ class Emitter:
     def append(self, path: str, content: str) -> None:
         raise NotImplementedError
 
+    def write_file(
+        self, path: str, content: str, mode: int | None, uid: int | None, gid: int | None
+    ) -> None:
+        """A file with its mode and owner (uid/gid), set before it is in
+        place: a workload's file as its user reads it."""
+        raise NotImplementedError
+
+    def seed(
+        self, path: str, content: str, mode: int | None, uid: int | None, gid: int | None
+    ) -> None:
+        """A file written only where there is none: a seed the app keeps
+        up to date itself (a tailscaled.state)."""
+        raise NotImplementedError
+
     def install_self(self, path: str) -> None:
         """Copy the running generated program to `path` — what the boot
         restore unit execs (Python: install_self(); the tests' trace
@@ -1024,8 +1038,7 @@ def _security_groups_from_refs(
         group = _security_group_by_name(ref.name, nodes)
         if group is None:
             raise ValueError(
-                f'{where} references security group "{ref.name}", but no such '
-                "security.group node"
+                f'{where} references security group "{ref.name}", but no such security.group node'
             )
         groups.append(group)
     return groups
@@ -1140,8 +1153,7 @@ def _masq_families(security_groups: list[pt.SecurityGroupRef], nodes: list[pt.Mo
         group = _security_group_by_name(ref.name, nodes)
         if group is None:
             raise ValueError(
-                f'kernel app references security group "{ref.name}", which is '
-                "not present in the IR"
+                f'kernel app references security group "{ref.name}", which is not present in the IR'
             )
         for rule in group.data.rules:
             if rule.kind == "masq":
@@ -1340,8 +1352,8 @@ def _emit_kernel_app_rules(
             conf = "\n".join(_wg_conf_lines(app))
             app_unit = emit.unit("kernel app", f"wireguard ({app.ifaceName}) in {netns}")
             app_unit.ovn(host.make_dir("/etc/wireguard"))
-            app_unit.append(conf_path, conf)
-            app_unit.ovn(host.chmod(conf_path, "600"))
+            # Its private key: only root reads it, from the moment it is there.
+            app_unit.write_file(conf_path, conf, 0o600, None, None)
             netns_primitive = host.netns(netns)
             # Up with the config it should have: run leaves it; with another
             # one it brings it down and up again (fabric/decide.py).
@@ -1444,14 +1456,17 @@ def _emit_kernel_router_owner(
     from inside the netns before the netns itself). See the module doc
     block above for the netns/side semantics."""
     host = HostPrimitive(owner.data.host.removeprefix("host:"))
+    # A router whose container owns its interfaces has no netns of its own:
+    # the container's is it. Its image is a unit of its own, first in the
+    # scope (ADR 0012 §4: built in the background, in parallel); the rest is
+    # one unit: a restart of the container makes everything in its netns again.
+    owning = _owning_app(owner, nodes)
+    if owning is not None:
+        _emit_app_image(owning[0], owning[1], host, emit)
     kernel_var = emit.local("kernel")
     netns_var = emit.local(netns)
     netns_unit = emit.unit("kernel router", owner.key.name, key=owner.id)
     netns_unit.ovn(host.rootNs(), bind=kernel_var)
-    # A router whose container owns its interfaces has no netns of its own:
-    # the container's is it. All of it is one unit: a restart of the
-    # container makes everything in its netns again.
-    owning = _owning_app(owner, nodes)
     docker = None
     if owning is None:
         kernel_netns = host.netns(netns)
@@ -1622,6 +1637,19 @@ def _owning_app(
     return None
 
 
+def _emit_app_image(app: pt.DockerApp, container: str, host: HostPrimitive, emit: Emitter) -> None:
+    """A router app's image, as a unit of its own (kind `image`)."""
+    image = app.image or f"ovn-fabric-{container}"
+    dockerfile = _docker_dockerfile(app.build) if app.build else None
+    _emit_image(
+        host,
+        image,
+        dockerfile,
+        f"/var/lib/ovn-fabric/build/{container}",
+        emit.unit("image", image),
+    )
+
+
 def _start_owning_container(
     app: pt.DockerApp, container: str, host: HostPrimitive, unit: Emitter
 ) -> DockerPrimitive:
@@ -1634,8 +1662,7 @@ def _start_owning_container(
     identity = (
         {"public": app.identity.public, "secret": app.identity.secret} if app.identity else None
     )
-    dockerfile = _docker_dockerfile(app.build) if app.build else None
-    _emit_image(host, image, dockerfile, f"/var/lib/ovn-fabric/build/{container}", unit)
+    # (Its image: a unit of its own before this one, _emit_app_image.)
     # The app owns its volume directories: DELETE removes them with whatever
     # the app wrote into them.
     for volume in volumes:
@@ -1652,19 +1679,23 @@ def _start_owning_container(
         if state_dir is not None:
             public = f"{state_dir}/identity.public"
             secret = f"{state_dir}/identity.secret"
-            unit.append(public, identity["public"])
-            unit.append(secret, identity["secret"])
-            unit.ovn(host.chmod(public, "644"))
-            unit.ovn(host.chmod(secret, "600"))
+            unit.write_file(public, identity["public"], 0o644, None, None)
+            unit.write_file(secret, identity["secret"], 0o600, None, None)
     state_files = list(app.stateFiles or [])
     for state_file in state_files:
         directory = posixpath.dirname(state_file.path)
         if directory not in {volume["host"] for volume in volumes}:
             unit.ovn(host.state_dir(directory))
-        if state_file.content is not None:
-            unit.append(state_file.path, state_file.content)
-            if state_file.mode is not None:
-                unit.ovn(host.chmod(state_file.path, state_file.mode))
+        # Its mode and owner are set before it is in place (a key is never
+        # readable by others, not even for a moment).
+        mode = int(state_file.mode, 8) if state_file.mode is not None else None
+        owner = (state_file.user, state_file.group)
+        if state_file.content is not None and state_file.keep:
+            # A seed (a tailscaled.state): written only where there is
+            # none — the app keeps it up to date itself.
+            unit.seed(state_file.path, state_file.content, mode, *owner)
+        elif state_file.content is not None:
+            unit.write_file(state_file.path, state_file.content, mode, *owner)
         else:
             # The app writes into it: not written over, whatever a run finds.
             unit.ovn(host.touch(state_file.path), decide=Decide.always)
@@ -1678,9 +1709,10 @@ def _start_owning_container(
         # Its natural key: the node address, the public part of its identity.
         natural_key=f"zt:{identity['public'].split(':')[0]}" if identity else None,
         # A changed identity or state file needs a restart: the daemon read it.
+        # A seed is not: it is not written over a running app's own.
         files=files_hash(
             *(identity.values() if identity else ()),
-            *(f"{f.path}={f.content}" for f in state_files),
+            *(f"{f.path}={f.content}" for f in state_files if not f.keep),
         ),
     )
     # Running from its image with what it should run with: run leaves it;
@@ -2294,7 +2326,7 @@ def _segment_bridge(host_name: str, l2_segment: str, nodes: list[pt.Model]) -> s
             if binding.host == host_name and binding.iface.bridge:
                 return binding.iface.bridge
     raise ValueError(
-        f"no ovn.ls interface on {host_name} for {l2_segment} to bind a " f"container veth to"
+        f"no ovn.ls interface on {host_name} for {l2_segment} to bind a container veth to"
     )
 
 
@@ -2332,6 +2364,15 @@ def _emit_service_up(
     emit: Emitter,
 ) -> None:
     """A workload: its image, then its container, NICs and addresses."""
+    # Its image: a unit of its own, first in the scope (ADR 0012 §4).
+    if node.kind == "kernel.app.container":
+        _emit_image(
+            HostPrimitive(emit.label.split(":", 1)[0]),
+            node.data.image or "",
+            _docker_dockerfile(node.data.build) if node.data.build is not None else None,
+            f"/var/lib/ovn-fabric/build/{node.key.name}",
+            emit.unit("image", node.data.image or node.key.name),
+        )
     workload_unit = emit.unit("workload", node.key.name, key=node.id)
     _emit_service_body(node, faces, addrs, workload_unit)
 
@@ -2359,23 +2400,22 @@ def _emit_service_body(
     # directory mount, so whatever else lives in that container directory
     # isn't shadowed. Host state lives under /var/lib/ovn-fabric/<service>/
     # and is removed on `down`.
-    file_mounts = [
-        (f"/var/lib/ovn-fabric/{name}{f.path}", f.path, f.content) for f in (node.data.files or [])
-    ]
+    files = list(node.data.files or [])
+    file_mounts = [(f"/var/lib/ovn-fabric/{name}{f.path}", f.path, f.content) for f in files]
     emit.py(f"container = {container!r}")
     emit.py(f"image = {node.data.image!r}")
-    for host_path, _container_path, content in file_mounts:
+    for (host_path, _container_path, content), file in zip(file_mounts, files, strict=True):
         parent = host_path.rsplit("/", 1)[0]
         body = "\n".join(content) if isinstance(content, list) else content
         emit.ovn(host.make_dir(parent))
-        emit.append(host_path, body)
-    _emit_image(
-        host,
-        node.data.image or "",
-        _docker_dockerfile(node.data.build) if node.data.build is not None else None,
-        f"/var/lib/ovn-fabric/build/{name}",
-        emit,
-    )
+        if file.user is None and file.group is None and file.mode is None:
+            emit.append(host_path, body)
+        else:
+            # Its owner and mode as the container's user needs them (the
+            # mount is the host's file: same uid/gid, same permissions).
+            mode = int(file.mode, 8) if file.mode is not None else None
+            emit.write_file(host_path, body, mode, file.user, file.group)
+    # (Its image: a unit of its own before this one, _emit_service_up.)
     # The service IS the container's command — `docker run -d` runs it
     # in the background (no sleep + docker exec dance).
     env = tuple(sorted((node.data.env or {}).items()))
@@ -2401,12 +2441,18 @@ def _emit_service_body(
         environment=env,
         volumes=mounts,
         run_flags=tuple(run_flags),
-        # A changed file needs a restart: the service read it.
+        # A changed file needs a restart: the service read it (its owner
+        # and mode too: whether it may).
         files=files_hash(
             *(
                 "\n".join(content) if isinstance(content, list) else content
                 for _path, _container_path, content in file_mounts
-            )
+            ),
+            *(
+                f"{f.path}:{f.user}:{f.group}:{f.mode}"
+                for f in files
+                if (f.user, f.group, f.mode) != (None, None, None)
+            ),
         ),
     )
     docker_var = emit.local(container)

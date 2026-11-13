@@ -29,20 +29,17 @@ Storage, under <state root>/ir/:
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
-import os
 import re
-import time
 from pathlib import Path
-from typing import Any
 
 from runtime.message import BodySpec, ProtocolError, hydrate_part, plain, register_bodies
 from runtime.peer import Call
 from runtime.service import Service
 
 from .. import generated as g
+from ..store import ContentStore, StoreError, digest_of
 
 log = logging.getLogger("fabric.ir")
 
@@ -73,22 +70,16 @@ def normal_form(ir: g.IrCollection) -> bytes:
 
 
 def ir_hash(normal: bytes) -> str:
-    return f"sha256:{hashlib.sha256(normal).hexdigest()}"
+    return digest_of(normal)
 
 
 def _hosts(ir: g.IrCollection) -> list[str]:
     return sorted(node.key.host for node in ir.collection if isinstance(node, g.InfraHostNode))
 
 
-def _write_atomically(path: Path, data: bytes) -> None:
-    tmp = path.with_name(f".{path.name}.tmp")
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
-
-
 class IrStore:
     def __init__(self, state_root: str = STATE_ROOT) -> None:
-        self._dir = Path(state_root) / "ir"
+        self._store = ContentStore(Path(state_root) / "ir", ".json")
         self._lock = asyncio.Lock()  # one change at a time
 
     def service(self) -> Service:
@@ -108,69 +99,41 @@ class IrStore:
     async def put(self, call: Call) -> object:
         req = call.body
         assert isinstance(req, g.IrPutReq)
-        if req.name is not None:
-            self._check_name(req.name)
         normal = normal_form(req.ir)
-        digest = ir_hash(normal)
-        name = req.name if req.name is not None else digest
+        meta = {"nodes": len(req.ir.collection), "hosts": _hosts(req.ir), "bytes": len(normal)}
         async with self._lock:
-            refs = await asyncio.to_thread(self._read_refs)
-            previous = refs.get(name)
-            if req.name is None and digest in refs.values():
-                # Without a name and already stored: that entry (its hash
-                # entry, else its first name), unchanged.
-                if digest not in refs:
-                    name = min(n for n, d in refs.items() if d == digest)
-                previous = digest
-            if previous == digest:
-                status = g.IrPutStatus.unchanged
-            else:
-                meta = {
-                    "nodes": len(req.ir.collection),
-                    "hosts": _hosts(req.ir),
-                    "bytes": len(normal),
-                    "storedAt": time.time(),
-                }
-                await asyncio.to_thread(self._store, digest, normal, meta)
-                refs[name] = digest
-                await asyncio.to_thread(self._write_refs, refs)
-                if previous is not None:
-                    await asyncio.to_thread(self._collect, previous, refs)
-                status = g.IrPutStatus.created if previous is None else g.IrPutStatus.replaced
-        was = f", was {previous}" if status is g.IrPutStatus.replaced else ""
-        called = "" if name == digest else f" as {name}"
+            try:
+                put = await asyncio.to_thread(self._store.put, req.name, normal, meta)
+            except StoreError as exc:
+                raise ProtocolError("bad-request", f"not an IR name: {req.name!r}") from exc
+        status = g.IrPutStatus(put.status)
+        was = f", was {put.previous}" if status is g.IrPutStatus.replaced else ""
+        called = "" if put.name == put.digest else f" as {put.name}"
         await call.log(
-            "info", f"{digest}{called}: {status.value} ({len(req.ir.collection)} nodes{was})"
+            "info", f"{put.digest}{called}: {status.value} ({len(req.ir.collection)} nodes{was})"
         )
         return g.IrPutRes(
             kind="IrPutRes",
-            name=name,
-            hash=digest,
+            name=put.name,
+            hash=put.digest,
             nodes=len(req.ir.collection),
             status=status,
-            previous=previous if status is g.IrPutStatus.replaced else None,
+            previous=put.previous if status is g.IrPutStatus.replaced else None,
         )
 
     async def list(self, call: Call) -> object:
-        refs = await asyncio.to_thread(self._read_refs)
-        infos = [await asyncio.to_thread(self._info, name, digest) for name, digest in refs.items()]
+        entries = await asyncio.to_thread(self._store.entries)
+        infos = [await asyncio.to_thread(self._info, name, digest) for name, digest in entries]
         return g.IrListRes(kind="IrListRes", irs=sorted(infos, key=lambda info: info.name))
 
     async def get(self, call: Call) -> object:
         req = call.body
         assert isinstance(req, g.IrGetReq)
-        refs = await asyncio.to_thread(self._read_refs)
-        if _HASH.match(req.ref):
-            digest = req.ref
-            name = next((n for n, d in refs.items() if d == digest), "")
-        elif req.ref in refs:
-            name, digest = req.ref, refs[req.ref]
-        else:
-            raise ProtocolError("not-found", f"no IR named or hashed {req.ref!r}")
         try:
-            raw = await asyncio.to_thread(self._blob(digest).read_bytes)
-        except FileNotFoundError:
-            raise ProtocolError("not-found", f"no IR with hash {digest}") from None
+            name, digest = await asyncio.to_thread(self._store.resolve, req.ref)
+            raw = await asyncio.to_thread(self._store.blob(digest).read_bytes)
+        except (StoreError, FileNotFoundError):
+            raise ProtocolError("not-found", f"no IR named or hashed {req.ref!r}") from None
         ir = hydrate_part(g.IrCollection, {"kind": "IrCollection", "collection": json.loads(raw)})
         info = await asyncio.to_thread(self._info, name, digest)
         return g.IrGetRes(kind="IrGetRes", info=info, ir=ir)
@@ -179,64 +142,18 @@ class IrStore:
         req = call.body
         assert isinstance(req, g.IrDeleteReq)
         async with self._lock:
-            refs = await asyncio.to_thread(self._read_refs)
-            if req.ref not in refs:
-                names = sorted(n for n, d in refs.items() if d == req.ref)
-                if names:
-                    raise ProtocolError(
-                        "still-named", f"{req.ref} is named {', '.join(names)}: delete those"
-                    )
-                raise ProtocolError("not-found", f"no IR named or hashed {req.ref!r}")
-            digest = refs.pop(req.ref)
-            await asyncio.to_thread(self._write_refs, refs)
-            await asyncio.to_thread(self._collect, digest, refs)
+            try:
+                digest = await asyncio.to_thread(self._store.delete, req.ref)
+            except StoreError as exc:
+                raise ProtocolError(exc.code, str(exc).replace("nothing", "no IR")) from None
         called = "" if req.ref == digest else f" as {req.ref}"
         await call.log("info", f"{digest}{called}: deleted")
         return g.IrDeleteRes(kind="IrDeleteRes", name=req.ref, hash=digest)
 
     # -- storage -------------------------------------------------------------
 
-    @staticmethod
-    def _check_name(name: str) -> None:
-        if not _NAME.match(name):
-            raise ProtocolError("bad-request", f"not an IR name: {name!r}")
-
-    def _blob(self, digest: str) -> Path:
-        return self._dir / f"{digest.removeprefix('sha256:')}.json"
-
-    def _meta(self, digest: str) -> Path:
-        return self._dir / f"{digest.removeprefix('sha256:')}.meta.json"
-
-    def _read_refs(self) -> dict[str, str]:
-        try:
-            refs = json.loads((self._dir / "refs.json").read_text())
-        except FileNotFoundError:
-            return {}
-        assert isinstance(refs, dict)
-        return {str(k): str(v) for k, v in refs.items()}
-
-    def _write_refs(self, refs: dict[str, str]) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        _write_atomically(
-            self._dir / "refs.json", json.dumps(refs, sort_keys=True, indent=2).encode()
-        )
-
-    def _store(self, digest: str, normal: bytes, meta: dict[str, Any]) -> None:
-        self._dir.mkdir(parents=True, exist_ok=True)
-        if not self._blob(digest).exists():  # content-addressed: never rewritten
-            _write_atomically(self._blob(digest), normal)
-            _write_atomically(self._meta(digest), json.dumps(meta).encode())
-
-    def _collect(self, digest: str, refs: dict[str, str]) -> None:
-        """Remove content no name points to any more."""
-        if digest in refs.values():
-            return
-        for path in (self._blob(digest), self._meta(digest)):
-            path.unlink(missing_ok=True)
-        log.info("removed %s: no name points to it", digest)
-
     def _info(self, name: str, digest: str) -> g.IrInfo:
-        meta = json.loads(self._meta(digest).read_text())
+        meta = self._store.meta(digest)
         return g.IrInfo(
             name=name,
             hash=digest,

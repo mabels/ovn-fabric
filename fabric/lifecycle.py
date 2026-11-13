@@ -151,16 +151,31 @@ def written(content: str) -> str:
     return _with_newline(content)
 
 
-def _write_new(path: Path, content: str, mode: int | None) -> None:
+def _write_new(
+    path: Path, content: str, mode: int | None, owner: tuple[int | None, int | None] = (None, None)
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     # A file already there is overwritten — atomically: written next to it,
     # then renamed over it, so nothing ever reads half a file.
     tmp = path.with_name(f".{path.name}.tmp")
-    with tmp.open("w", encoding="utf-8") as out:
+    tmp.unlink(missing_ok=True)
+    # Made with its mode (a key is never readable by others, not even
+    # for a moment); then set exactly, whatever the umask took away.
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode if mode is not None else 0o666)
+    with os.fdopen(fd, "w", encoding="utf-8") as out:
         out.write(_with_newline(content))
     if mode is not None:
         tmp.chmod(mode)
+    uid, gid = owner
+    if uid is not None or gid is not None:  # its owner before anyone sees it
+        os.chown(tmp, -1 if uid is None else uid, -1 if gid is None else gid)
     os.replace(tmp, path)
+
+
+def _seed(path: Path, content: str, mode: int | None, owner: tuple[int | None, int | None]) -> None:
+    """Write `path` only where there is none (WriteFileOperation.keep)."""
+    if not path.exists():
+        _write_new(path, content, mode, owner)
 
 
 def _unlink(path: Path) -> None:
@@ -332,7 +347,9 @@ class SystemdStartOperation:
 @dataclasses.dataclass(frozen=True)
 class WriteFileOperation:
     """A file this deployer owns: CREATE writes it (one already there is
-    overwritten), DELETE removes it."""
+    overwritten), DELETE removes it. A `keep` file is a seed: CREATE writes
+    it only where there is none — the app keeps it up to date itself (a
+    tailscaled.state), what it wrote is never written over."""
 
     # Its kind as a unit step (fabric/units.py; the schema's `kind`).
     step_kind: ClassVar[str] = "WriteFile"
@@ -340,16 +357,30 @@ class WriteFileOperation:
     path: str
     content: str
     mode: int | None = None
+    keep: bool = False
+    uid: int | None = None
+    gid: int | None = None
 
     async def create(self, lc: LifecycleController) -> None:
-        await asyncio.to_thread(_write_new, Path(self.path), self.content, self.mode)
+        owner = (self.uid, self.gid)
+        if self.keep:
+            await asyncio.to_thread(_seed, Path(self.path), self.content, self.mode, owner)
+            return
+        await asyncio.to_thread(_write_new, Path(self.path), self.content, self.mode, owner)
 
     async def delete(self, lc: LifecycleController) -> None:
         await asyncio.to_thread(_unlink, Path(self.path))
 
     def describe(self, action: LifecycleAction) -> list[str]:
         if action is LifecycleAction.CREATE:
-            return [f"write_file {self.path} ({len(self.content.splitlines())} lines)"]
+            how = "seed_file" if self.keep else "write_file"
+            notes = [f"{len(self.content.splitlines())} lines"]
+            if self.mode is not None:
+                notes.append(f"mode {self.mode:o}")
+            if self.uid is not None or self.gid is not None:
+                owner = f"{'-' if self.uid is None else self.uid}:"
+                notes.append(f"owner {owner}{'-' if self.gid is None else self.gid}")
+            return [f"{how} {self.path} ({', '.join(notes)})"]
         return [f"rm -f {self.path}"]
 
 

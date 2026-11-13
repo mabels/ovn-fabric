@@ -47,12 +47,11 @@ class PlanTest(unittest.TestCase):
                 "kernel router: kernel-0",
                 "kernel router side: kernel-0 (left)",
                 "kernel router side: kernel-0 (right)",
-                "boot: reconcile",
             ],
         )
         self.assertEqual(
             [u.kind for u in units][5:],
-            ["kernel router", "kernel router side", "kernel router side", "boot"],
+            ["kernel router", "kernel router side", "kernel router side"],
         )
 
     def test_the_chassis_id_is_a_ref_until_it_runs(self) -> None:
@@ -63,20 +62,60 @@ class PlanTest(unittest.TestCase):
         self.assertTrue(refs)
         self.assertEqual(refs[0].key, "CHASSIS_ID")
 
+    def test_a_workload_file_carries_its_owner_and_mode(self) -> None:
+        nodes = hydrate_nodes(IR_SAMPLE)
+        for i, node in enumerate(nodes):
+            if isinstance(node, pt.KernelAppContainerNode):
+                files = [
+                    dataclasses.replace(f, user=101, group=102, mode="0640")
+                    for f in node.data.files or []
+                ]
+                data = dataclasses.replace(node.data, files=files)
+                nodes[i] = dataclasses.replace(node, data=data)
+        units = {u.name: u for u in plan_units(nodes, "net-test-hh-b")}
+        workload = units["workload: cp-mam-hh-platform-platform.dns"]
+        written = [s for s in workload.steps if isinstance(s, g.WriteFileStep)]
+        self.assertEqual(
+            [(s.path, s.mode, s.uid, s.gid) for s in written],
+            [
+                (
+                    "/var/lib/ovn-fabric/cp-mam-hh-platform-platform.dns/etc/coredns/Corefile",
+                    0o640,
+                    101,
+                    102,
+                )
+            ],
+        )
+        # Without them: written as before.
+        plain = {u.name: u for u in plan_units(hydrate_nodes(IR_SAMPLE), "net-test-hh-b")}
+        written = [
+            s
+            for s in plain["workload: cp-mam-hh-platform-platform.dns"].steps
+            if isinstance(s, g.WriteFileStep)
+        ]
+        self.assertEqual([(s.mode, s.uid, s.gid) for s in written], [(None, None, None)])
+
     def test_a_workload_is_its_container_then_its_nics(self) -> None:
         units = plan_units(hydrate_nodes(IR_SAMPLE), "net-test-hh-b")
-        workload = units[-2]  # the last one is the boot's
+        workload = units[-1]
         self.assertEqual(workload.name, "workload: cp-mam-hh-platform-platform.dns")
         kinds = [s.kind for s in workload.steps]
         self.assertIn("Capture", kinds)  # the container's PID …
         self.assertIn("SymlinkNetns", kinds)  # … linked as its netns
-        argvs = [
-            [a for a in c.argv if isinstance(a, str)]
-            for s in workload.steps
-            if isinstance(s, g.PrimitiveStep)
-            for c in s.create
-        ]
-        self.assertTrue(any(argv[:2] == ["/usr/bin/docker", "build"] for argv in argvs))
+
+        def argvs(unit: g.Unit) -> list[list[str]]:
+            return [
+                [a for a in c.argv if isinstance(a, str)]
+                for s in unit.steps
+                if isinstance(s, g.PrimitiveStep)
+                for c in s.create
+            ]
+
+        # Its image is a unit of its own, right before it (ADR 0012 §4).
+        image = units[-2]
+        self.assertEqual((image.kind, image.scope), ("image", workload.scope))
+        self.assertTrue(any(a[:2] == ["/usr/bin/docker", "build"] for a in argvs(image)))
+        self.assertFalse(any(a[:2] == ["/usr/bin/docker", "build"] for a in argvs(workload)))
 
     def test_every_step_is_data_and_turns_back_into_its_operation(self) -> None:
         for host in ("central-1", "chassis-1"):
@@ -157,8 +196,9 @@ class PlanTest(unittest.TestCase):
         for line in (at("MASQUERADE"), at("ip link set dev zt0 up"), at("192.168.0.0/16")):
             self.assertIn("ip netns exec c", lines[line])  # from the host, not in the image
         self.assertNotIn("docker exec -d c iptables", joined)
-        # A key file gets its mode before the daemon reads it.
-        self.assertLess(at(f"chmod 600 {state}/authkey"), at("docker run"))
+        # A key file is written with its mode, before the daemon reads it.
+        self.assertIn("mode 600", lines[at(f"write_file {state}/authkey")])
+        self.assertLess(at(f"write_file {state}/authkey"), at("docker run"))
 
 
 def _plan(declare: Callable[[Emitter], None]) -> list[g.Unit]:
@@ -216,25 +256,11 @@ class UnitBoundaryTest(unittest.TestCase):
 
 
 class BootTest(unittest.TestCase):
-    def test_every_host_comes_back_at_boot_as_the_plan_s_last_unit(self) -> None:
+    def test_no_host_plans_a_boot_unit_the_runtime_replays(self) -> None:
+        # ADR 0012 §6: the runtime replays the deployed IR after a reboot
+        # (fabric/boot.py); the oneshot of before is no unit any more.
         for host in ("central-1", "chassis-1"):
-            unit = plan_units(NODES, host)[-1]
-            self.assertEqual((unit.name, unit.scope), ("boot: reconcile", "boot"))
-            kinds = [step.kind for step in unit.steps]
-            self.assertEqual(kinds, ["WriteFile", "Chmod", "WriteFile", "Primitive"])
-            script, _mode, service, enable = unit.steps
-            self.assertIn("ir-apply run deployed --no-cleanup", script.content)  # type: ignore[union-attr]
-            self.assertIn("grep -q '\"deployed\"'", script.content)  # type: ignore[union-attr]
-            self.assertEqual(
-                service.path, "/etc/systemd/system/ovn-fabric-reconcile.service"  # type: ignore[union-attr]
-            )
-            self.assertIn("WantedBy=multi-user.target", service.content)  # type: ignore[union-attr]
-            # enabled every run; a delete disables it again
-            self.assertEqual(enable.decide.kind, "always")  # type: ignore[union-attr]
-            self.assertEqual(
-                [c.argv for c in enable.delete],  # type: ignore[union-attr]
-                [["systemctl", "disable", "--quiet", "ovn-fabric-reconcile.service"]],
-            )
+            self.assertNotIn("boot", {u.scope for u in plan_units(NODES, host)})
 
 
 if __name__ == "__main__":

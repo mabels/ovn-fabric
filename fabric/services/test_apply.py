@@ -24,12 +24,15 @@ from .. import generated as g
 from ..desired import desired_rawir
 from ..plan import plan_operations, plan_units
 from . import abstract_deps, apply, unit
-from .apply import Apply, Failed
+from .apply import Apply, Failed, split_plan
 from .ir import IrStore
 from .test_ir import _put
 
 HOST = "net-test-hh-b"  # the host in IR_SAMPLE
 PLAN = [u.name for u in plan_units(hydrate_nodes(IR_SAMPLE), HOST)]
+_SPLIT = split_plan(plan_units(hydrate_nodes(IR_SAMPLE), HOST))
+NETWORK = [u.name for u in _SPLIT.network]
+BACKGROUND = _SPLIT.background
 DONE, FAILED, SKIPPED = g.ApplyState.done, g.ApplyState.failed, g.ApplyState.skipped
 
 
@@ -40,6 +43,9 @@ class Fakes:
         self.calls: list[tuple[str, Any]] = []
         self.skips: dict[str, list[int]] = {}  # unit -> the steps it was told to skip
         self.fail, self.deps_fail = fail, deps_fail
+        # A unit that waits for `gate` (a pull that takes its time).
+        self.hold: str | None = None
+        self.gate = asyncio.Event()
 
     async def deps(self, call: Call) -> object:
         self.calls.append(("deps", [d.name for d in call.body.deps]))
@@ -54,6 +60,8 @@ class Fakes:
         inputs = {v.name: json.loads(v.json) for v in req.inputs or []}
         self.calls.append((req.unit.name, (req.action.value, inputs, req.dryRun)))
         self.skips[req.unit.name] = list(req.skip or [])
+        if req.unit.name == self.hold:
+            await self.gate.wait()
         await call.log("info", f"{req.action.value} unit: {req.unit.name}")
         failed = req.unit.name == self.fail
         outputs = {**inputs, f"seen-{len(self.calls)}": req.unit.name}
@@ -77,9 +85,11 @@ class Fakes:
 
 
 @contextlib.asynccontextmanager
-async def _client(fakes: Fakes, host: str = HOST) -> AsyncIterator[tuple[Peer, Apply]]:
+async def _client(
+    fakes: Fakes, host: str = HOST, state_root: str | None = None
+) -> AsyncIterator[tuple[Peer, Apply]]:
     runtime = Runtime()
-    apply = Apply(runtime.client, host)
+    apply = Apply(runtime.client, host, state_root)
     runtime.register(IrStore(tempfile.mkdtemp()).service(), apply.service(), *fakes.services())
     stop = asyncio.Event()
     address = f"mem://apply-{id(runtime)}"
@@ -118,19 +128,167 @@ async def _run(client: Peer, req: g.IrApplyReq) -> tuple[g.IrApplyRes, list[Msg[
     return seen[-1].body, seen
 
 
+async def _background(client: Peer, res: g.IrApplyRes) -> g.IrApplyRes:
+    """Follow the background job a create or a run left (ADR 0012 §3)."""
+    assert res.background is not None
+    follow = await client.request(rg.FollowReq(kind="FollowReq", reqId=res.background.reqId))
+    final = await follow.wait(10)
+    assert isinstance(final.body, g.IrApplyRes), final.body
+    return final.body
+
+
+class BackgroundTest(unittest.TestCase):
+    """The job a create leaves behind (ADR 0012 §3–§5)."""
+
+    def test_a_failed_image_skips_its_workload(self) -> None:
+        async def run() -> g.IrApplyRes:
+            async with _client(Fakes(fail=BACKGROUND[0])) as (client, _a):
+                res, _seen = await _run(client, _apply())
+                self.assertEqual(res.state, g.IrApplyOutcome.done)  # the network is
+                return await _background(client, res)
+
+        job = asyncio.run(run())
+        self.assertEqual(job.state, g.IrApplyOutcome.failed)
+        self.assertEqual(
+            [(u.state, u.message) for u in job.units[1:]],
+            [(SKIPPED, "its image failed")] * (len(BACKGROUND) - 1),
+        )
+
+    def test_the_same_work_goes_on_other_work_releases_it(self) -> None:
+        async def run() -> tuple[g.IrApplyRes, g.IrApplyRes, g.IrApplyRes]:
+            fakes = Fakes()
+            fakes.hold = BACKGROUND[0]  # the image takes its time
+            async with _client(fakes) as (client, _a):
+                first, _ = await _run(client, _apply())
+                again, _ = await _run(client, _apply())
+                # A delete is other work: the job stops before its next unit
+                # (the delete waits for the pull it is in).
+                deleting = asyncio.create_task(_run(client, _apply("delete")))
+                await asyncio.sleep(0.05)
+                fakes.gate.set()
+                await deleting
+                return first, again, await _background(client, first)
+
+        first, again, job = asyncio.run(run())
+        assert first.background is not None and again.background is not None
+        self.assertEqual(again.background.reqId, first.background.reqId)
+        self.assertTrue(again.background.kept)
+        self.assertEqual(job.units[0].state, DONE)  # the pull it was in
+        self.assertEqual(
+            {(u.state, u.message) for u in job.units[1:]},
+            {(SKIPPED, "released: a newer apply took over")},
+        )
+
+
+class StatusTest(unittest.TestCase):
+    def test_status_shows_the_last_apply_and_its_background_job(self) -> None:
+        async def run() -> tuple[g.IrApplyRes, g.StatusRes]:
+            async with _client(Fakes()) as (client, _a):
+                res, _seen = await _run(client, _apply())
+                await _background(client, res)
+                status = await client.ask(g.StatusReq(kind="StatusReq"), timeout=5)
+                assert isinstance(status.body, g.StatusRes)
+                return res, status.body
+
+        res, status = asyncio.run(run())
+        assert status.lastApply is not None and status.background is not None
+        assert res.background is not None
+        self.assertEqual(
+            (status.lastApply.why, status.lastApply.state, status.lastApply.hash),
+            (g.ApplyWhy.client, g.TrackState.done, res.hash),
+        )
+        self.assertEqual(
+            (status.background.reqId, status.background.why, status.background.state),
+            (res.background.reqId, g.ApplyWhy.background, g.TrackState.done),
+        )
+        self.assertEqual([u.name for u in status.background.units], BACKGROUND)
+        self.assertEqual({u.state for u in status.background.units}, {DONE})
+        # No state root in a test: nothing is supervised.
+        self.assertEqual((status.supervising, status.containers), (False, []))
+
+
+DNS = "cp-mam-hh-platform-platform.dns"  # the workload in IR_SAMPLE
+
+
+class KeepAliveTest(unittest.TestCase):
+    def test_the_applied_ir_s_containers_are_kept_alive_until_its_delete(self) -> None:
+        async def run() -> tuple[dict[str, str], dict[str, str]]:
+            with tempfile.TemporaryDirectory() as root:
+                # The runtime's own start (boot, supervising) is not run here.
+                with mock.patch.object(Apply, "_at_start", new=mock.AsyncMock()):
+                    async with _client(Fakes(), state_root=root) as (client, a):
+                        res, _ = await _run(client, _apply())
+                        await _background(client, res)
+                        after_create = await a._wanted_containers()
+                        # Even keeping the name `deployed`: nothing is applied.
+                        delete = _apply("delete", ref=res.hash)
+                        delete.keepDeployed = True
+                        await _run(client, delete)
+                        after_delete = await a._wanted_containers()
+            return after_create, after_delete
+
+        after_create, after_delete = asyncio.run(run())
+        self.assertEqual(
+            after_create,
+            {f"ovn-fabric-{DNS}": f"workload: {DNS}"},
+        )
+        self.assertEqual(after_delete, {})
+
+
+class LookAgainTest(unittest.TestCase):
+    def test_after_a_unit_starts_a_container_the_next_is_decided_on_a_fresh_look(
+        self,
+    ) -> None:
+        # The workload's container is new (a new netns): its NIC unit must
+        # not be decided on what the first look found in the old one.
+        nic = g.Unit(kind="NIC", name="NIC: control-plane on br-x", steps=[], scope=DNS)
+
+        def with_a_nic(*args: Any, **kwargs: Any) -> list[g.Unit]:
+            return [*plan_units(*args, **kwargs), nic]  # as on a host: after its workload
+
+        async def run() -> tuple[list[str], int]:
+            fakes = Fakes()
+            async with _client(fakes) as (client, _a):
+                with (
+                    mock.patch("fabric.observed.snapshot", return_value=_owned({})) as snapshot,
+                    mock.patch("fabric.services.apply.plan_units", side_effect=with_a_nic),
+                ):
+                    res, _ = await _run(client, _apply("run"))
+                    await _background(client, res)
+                    return [c[0] for c in fakes.calls], snapshot.call_count
+
+        calls, looks = asyncio.run(run())
+        self.assertIn(f"workload: {DNS}", calls)  # it ran: a container started afresh
+        # The network part, the background job's own, and one more after
+        # the workload unit started its container.
+        self.assertEqual(looks, 3)
+
+
 class ApplyTest(unittest.TestCase):
     def test_create_resolves_deps_first_then_runs_the_units_in_order(self) -> None:
         async def run() -> None:
             fakes = Fakes()
             async with _client(fakes) as (client, _a):
                 res, seen = await _run(client, _apply())
+                job = await _background(client, res)
             self.assertEqual(fakes.calls[0][0], "deps")
             self.assertIn("ovn", fakes.calls[0][1])
-            self.assertEqual([c[0] for c in fakes.calls[1:]], PLAN)
+            # The network decides the run; what has an image is its
+            # background job (ADR 0012 §3), started once the network is done.
+            assert res.background is not None
+            self.assertEqual([c[0] for c in fakes.calls[1:]], [*NETWORK, *BACKGROUND])
+            self.assertEqual(res.background.units, BACKGROUND)
             self.assertEqual(
-                (res.state, [u.state for u in res.units]),
-                (g.IrApplyOutcome.done, [DONE] * len(PLAN)),
+                (res.state, [u.name for u in res.units], [u.state for u in res.units]),
+                (g.IrApplyOutcome.done, NETWORK, [DONE] * len(NETWORK)),
             )
+            self.assertEqual(
+                (job.state, [u.state for u in job.units]),
+                (g.IrApplyOutcome.done, [DONE] * len(BACKGROUND)),
+            )
+            # It starts with what the network captured.
+            first = fakes.calls[1 + len(NETWORK)][1][1]
+            self.assertIn(f"seen-{len(NETWORK)}", first)
             progress = [m.body.unit for m in seen if isinstance(m.body, g.IrApplyProgress)]
             self.assertEqual([p.state for p in progress[:2]], [g.ApplyState.running, DONE])
             logs = [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]

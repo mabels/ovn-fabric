@@ -72,7 +72,7 @@ async def _serve(args: argparse.Namespace) -> int:
         docker.service(runtime.client),
         docker_run.service(runtime.client, files_root=args.files_root),
         ir.service(args.state_root),
-        apply.service(runtime.client, args.host),
+        apply.service(runtime.client, args.host, args.state_root),
         unit_executor.service(args.host),
     )
     logging.getLogger("fabric").info("listening on %s", args.address)
@@ -173,6 +173,56 @@ _SHOW: dict[str, Callable[[Msg[Any], Hidden], None]] = {
 }
 
 
+async def _connect_runtime(address: str) -> Any:
+    """Connect to the runtime; on this host, start the deployed one first if
+    it does not answer (ADR 0012 §2). `run` never deploys."""
+    try:
+        return await connect(address)
+    except Closed:
+        if not address.startswith("unix://"):
+            raise
+    from .runtime_store import store
+
+    try:
+        deployed = store().refs().get("deployed")
+    except OSError:
+        deployed = None
+    if deployed is None:
+        raise Closed(
+            f"no runtime answers on {address.removeprefix('unix://')} and none is deployed "
+            "here: `fabric deploy <user@host>` from where the PEX is built"
+        )
+    _show(INFO, "cli", "the runtime is not running: starting ovn-fabric.service")
+    proc = await asyncio.create_subprocess_exec("systemctl", "start", "ovn-fabric.service")
+    await proc.wait()
+    deadline = time.monotonic() + 30
+    while True:
+        try:
+            return await connect(address)
+        except Closed:
+            if time.monotonic() > deadline:
+                raise Closed("ovn-fabric.service was started but does not answer") from None
+            await asyncio.sleep(0.5)
+
+
+def _refuse_not_deployed() -> str | None:
+    """On a host with a deployed runtime, only that executable is its CLI
+    (ADR 0012 §0): another PEX, or a source checkout, is refused."""
+    from .runtime_store import LINK, own_hash, store
+
+    try:
+        deployed = store().refs().get("deployed")
+    except OSError:
+        return None
+    if deployed is None or own_hash() == deployed:
+        return None
+    what = f"this PEX ({own_hash()})" if own_hash() else "a source checkout"
+    return (
+        f"{what} is not the runtime deployed here ({deployed}): use {LINK}, "
+        "or deploy this one (`fabric deploy`)"
+    )
+
+
 async def _ask(
     address: str, body: object, on_request: Callable[[str], None] | None = None
 ) -> object | None:
@@ -180,7 +230,7 @@ async def _ask(
     return the final response's body (None when it never arrived).
     `on_request` gets its reqId once it is sent."""
     try:
-        conn = await connect(address)
+        conn = await _connect_runtime(address)
     except Closed as exc:
         _show(ERROR, "cli", str(exc))
         return None
@@ -220,7 +270,8 @@ async def _version(args: argparse.Namespace) -> int:
     res = await _ask(args.address, g.VersionReq(kind="VersionReq"))
     if not isinstance(res, g.VersionRes):
         return 1
-    print(f"runtime {res.runtime} (protocol {res.protocol})")
+    runs = f", {res.hash}" if res.hash else ", from a source checkout"
+    print(f"runtime {res.runtime} (protocol {res.protocol}{runs})")
     return 0
 
 
@@ -438,22 +489,72 @@ async def _ir_apply(args: argparse.Namespace) -> int:
         commandTimeout=args.command_timeout,
         keepDeployed=args.keep_deployed or None,
         noCleanup=args.no_cleanup or None,
+        imageJobs=args.image_jobs or None,
     )
+    if args.detach:
+        return await _detach(args.address, req)
     # Its last line says how to find it: journalctl -u ovn-fabric --grep <req>.
     req_ids: list[str] = []
-    res = await _ask(args.address, req, req_ids.append)
+    res = await _ask(args.address, req, _following(req_ids))
     if not isinstance(res, g.IrApplyRes):
         if req_ids:
             print(f"req={req_ids[0]} ir={ref}", file=sys.stderr)
         return 1
+    _print_apply(res, req_ids[0])
+    return 0 if res.state is g.IrApplyOutcome.done else 1
+
+
+def _print_apply(res: g.IrApplyRes, req_id: str) -> None:
     print(
         f"{res.action.value} {res.hash} on {res.host}: {res.state.value} ({len(res.units)} units)"
     )
     for unit in res.units:
         note = f" — {unit.message}" if unit.message else ""
         print(f"  {unit.name}: {unit.state.value}{note}")
-    print(f"req={req_ids[0]} ir={res.hash}")
-    return 0 if res.state is g.IrApplyOutcome.done else 1
+    job = res.background
+    if job is not None:
+        # What has an image goes on (ADR 0012 §3): the run is done without it.
+        how = "goes on (the same work, from before)" if job.kept else "started"
+        print(f"background: {len(job.units)} units {how} — fabric follow {job.reqId}")
+        for name in job.units:
+            print(f"  {name}")
+    print(f"req={req_id} ir={res.hash}")
+
+
+# The job this CLI follows: Ctrl-C ends only the following (ADR 0012 §7).
+_FOLLOWING: list[str] = []
+
+
+def _following(req_ids: list[str]) -> Callable[[str], None]:
+    def seen(req_id: str) -> None:
+        req_ids.append(req_id)
+        _FOLLOWING.append(req_id)
+
+    return seen
+
+
+async def _detach(address: str, body: object) -> int:
+    """Send `body`, wait until the runtime took it as a job, and leave it
+    running: `fabric follow <req>` attaches again."""
+    try:
+        conn = await _connect_runtime(address)
+    except Closed as exc:
+        _show(ERROR, "cli", str(exc))
+        return 1
+    peer = Peer(conn, "cli")
+    reader = asyncio.create_task(peer.run())
+    try:
+        request = await peer.request(body)
+        async for msg in request:  # the first message: it runs as a job
+            if isinstance(msg.body, rg.ErrorRes):
+                _show(ERROR, "cli", f"{msg.body.code}: {msg.body.message}")
+                return 1
+            break
+        print(f"req={request.req_id} running — fabric follow {request.req_id}")
+        return 0
+    finally:
+        await peer.close()
+        await reader
 
 
 async def _ir_list(args: argparse.Namespace) -> int:
@@ -480,6 +581,106 @@ async def _ir_delete(args: argparse.Namespace) -> int:
 
 # What the runtime and its services need on a host (their imports).
 BUNDLE_PACKAGES = ("fabric", "runtime", "deployer", "protocol", "ladops", "raw_reconciler")
+
+
+async def _follow(args: argparse.Namespace) -> int:
+    """Follow a job: what it logged so far, the rest as it comes, its end."""
+    res = await _ask(args.address, rg.FollowReq(kind="FollowReq", reqId=args.req))
+    if isinstance(res, g.IrApplyRes):
+        _print_apply(res, args.req)
+        return 0 if res.state is g.IrApplyOutcome.done else 1
+    return 0 if res is not None else 1
+
+
+async def _jobs(args: argparse.Namespace) -> int:
+    res = await _ask(args.address, rg.JobListReq(kind="JobListReq"))
+    if not isinstance(res, rg.JobListRes):
+        return 1
+    for job in res.jobs:
+        started = time.strftime("%H:%M:%S", time.localtime(job.startedAt))
+        took = f"{job.finishedAt - job.startedAt:.0f}s" if job.finishedAt else "running"
+        print(f"{job.reqId}  {job.request:12} {job.state.value:8} {started} {took}")
+    return 0
+
+
+def _clock(at: float | None) -> str:
+    return time.strftime("%H:%M:%S", time.localtime(at)) if at else "-"
+
+
+def _print_track(label: str, track: g.ApplyTrack) -> None:
+    took = f"{track.finishedAt - track.startedAt:.0f}s" if track.finishedAt else "running"
+    print(
+        f"{label}: {track.action.value} {track.hash} {track.state.value} "
+        f"({track.why.value}, {_clock(track.startedAt)}, {took}) — fabric follow {track.reqId}"
+    )
+    for unit in track.units:
+        note = f" — {unit.message}" if unit.message else ""
+        print(f"  {unit.name}: {unit.state.value}{note}")
+
+
+async def _status(args: argparse.Namespace) -> int:
+    """What the runtime holds (ADR 0012 §3): the deployed IR, the last
+    apply, the background job, the containers it keeps alive."""
+    res = await _ask(args.address, g.StatusReq(kind="StatusReq"))
+    if not isinstance(res, g.StatusRes):
+        return 1
+    print(f"host {res.host}  boot {res.bootId or '-'}")
+    applied = "applied" if res.applied and res.applied == res.deployed else "not applied"
+    print(f"deployed {res.deployed or '-'} ({applied})")
+    if res.lastApply is not None:
+        _print_track("last apply", res.lastApply)
+    if res.background is not None:
+        _print_track("background", res.background)
+    if not res.supervising:
+        print("containers: not supervised")
+    elif not res.containers:
+        print("containers: none to keep alive")
+    else:
+        print("containers (kept alive):")
+    for c in res.containers:
+        line = f"  {c.name}: {c.state}"
+        if c.restarts:
+            line += f" — brought back {c.restarts}x, last {_clock(c.lastRestart)}"
+        if c.nextRestart:
+            line += f", next try {_clock(c.nextRestart)}"
+        print(line)
+    down = any(c.state != "running" for c in res.containers)
+    failed = any(
+        t is not None and t.state is g.TrackState.failed for t in (res.lastApply, res.background)
+    )
+    return 1 if down or failed else 0
+
+
+async def _deploy(args: argparse.Namespace) -> int:
+    """Where a PEX is built: make it (or a stored runtime, --ref) the deployed
+    runtime of a host (ADR 0012 §1)."""
+    from .runtime_store import deploy, own_pex
+
+    if args.ref is not None:
+        return deploy(args.target, None, args.ref)
+    pex = Path(args.pex) if args.pex else own_pex()
+    if pex is None:  # from a source checkout: build it first
+        args.output = "dist/fabric.pex"
+        code = await _bundle(args)
+        if code != 0:
+            return code
+        pex = Path(args.output).resolve()
+    return await asyncio.to_thread(deploy, args.target, pex, None)
+
+
+async def _runtime_install(args: argparse.Namespace) -> int:
+    """On the host: store this PEX and make it the deployed runtime."""
+    from .runtime_store import install
+
+    return await asyncio.to_thread(install, args.ref, args.state_root)
+
+
+async def _runtime_list(args: argparse.Namespace) -> int:
+    from .runtime_store import listing
+
+    for line in await asyncio.to_thread(listing, args.state_root):
+        print(line)
+    return 0
 
 
 async def _bundle(args: argparse.Namespace) -> int:
@@ -667,6 +868,13 @@ def main() -> int:
         "(default: remove them once every unit is done)",
     )
     ir_apply.add_argument(
+        "--image-jobs",
+        type=int,
+        metavar="N",
+        default=0,
+        help="create/run: images built or pulled at once in the background (0: all; default)",
+    )
+    ir_apply.add_argument(
         "--keep-deployed",
         action="store_true",
         help="delete: keep the name `deployed` on the deleted IR (default: drop it)",
@@ -677,12 +885,46 @@ def main() -> int:
         metavar="SECONDS",
         help="kill a command running longer and fail its unit (0: no limit; default 300)",
     )
+    ir_apply.add_argument(
+        "--detach",
+        action="store_true",
+        help="leave the run going once it started (fabric follow <req> attaches again)",
+    )
     ir_apply.set_defaults(run=_ir_apply)
+    follow_cmd = commands.add_parser("follow", help="follow a job: its log so far, then live")
+    follow_cmd.add_argument("req", help="the job's request id (req=… of a run)")
+    follow_cmd.set_defaults(run=_follow)
+    jobs_cmd = commands.add_parser("jobs", help="the runtime's running and recent jobs")
+    jobs_cmd.set_defaults(run=_jobs)
     bundle = commands.add_parser(
         "bundle", help="package the runtime and fabric's services as one PEX (for a host)"
     )
     bundle.add_argument("-o", "--output", default="dist/fabric.pex", help="default dist/fabric.pex")
     bundle.set_defaults(run=_bundle)
+    status_cmd = commands.add_parser(
+        "status",
+        help="the deployed IR, the last apply, its background job, the containers kept alive",
+    )
+    status_cmd.set_defaults(run=_status)
+    deploy_cmd = commands.add_parser(
+        "deploy",
+        help="make this PEX (or, from a checkout, a fresh bundle) the runtime of a host",
+    )
+    deploy_cmd.add_argument("target", help="the host over ssh, e.g. root@192.168.128.32")
+    deploy_cmd.add_argument("--pex", help="deploy this PEX file instead")
+    deploy_cmd.add_argument(
+        "--ref", help="switch the host to a runtime it stores: `previous` or a hash"
+    )
+    deploy_cmd.set_defaults(run=_deploy)
+    runtime_install = commands.add_parser(
+        "runtime-install", help="on the host: deploy this PEX (what `deploy` runs there)"
+    )
+    runtime_install.add_argument("--ref", help="a stored runtime instead: `previous` or a hash")
+    runtime_install.add_argument("--state-root", default="/var/lib/ovn-fabric")
+    runtime_install.set_defaults(run=_runtime_install)
+    runtime_list = commands.add_parser("runtime-list", help="on the host: the stored runtimes")
+    runtime_list.add_argument("--state-root", default="/var/lib/ovn-fabric")
+    runtime_list.set_defaults(run=_runtime_list)
     for command in (
         serve,
         version_cmd,
@@ -696,6 +938,11 @@ def main() -> int:
         ir_delete,
         ir_apply,
         bundle,
+        deploy_cmd,
+        runtime_install,
+        runtime_list,
+        follow_cmd,
+        jobs_cmd,
     ):
         _common(command, top=False)
     args = parser.parse_args()
@@ -705,9 +952,18 @@ def main() -> int:
         parser.error(str(exc))
     _show_remote_by_component()
     args.address = args.socket if "://" in args.socket else f"unix://{args.socket}"
+    # Only the deployed executable is a host's CLI (ADR 0012 §0); a PEX
+    # elsewhere deploys, builds, or serves (the runtime itself).
+    if args.run not in (_deploy, _runtime_install, _runtime_list, _bundle, _serve):
+        refused = _refuse_not_deployed()
+        if refused is not None:
+            print(f"error: {refused}", file=sys.stderr)
+            return 2
     try:
         code: int = asyncio.run(args.run(args))
-    except KeyboardInterrupt:  # the request was ended (and its connection closed)
+    except KeyboardInterrupt:  # only the following ends: a job runs on
+        if _FOLLOWING:
+            print(f"\nstill running — fabric follow {_FOLLOWING[-1]}", file=sys.stderr)
         return 130
     return code
 

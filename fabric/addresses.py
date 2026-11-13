@@ -90,6 +90,9 @@ class AllocationRequest:
     names: Sequence[tuple[str, tuple[str, ...]]]  # (owner, families) to place
     live: Mapping[str, Mapping[str, int]] = dataclasses.field(default_factory=dict)
     held: Mapping[str, Sequence[int]] = dataclasses.field(default_factory=dict)  # family -> taken
+    # What an earlier run placed (the allocator state file, ADR 0012 §6):
+    # owner -> family -> number, kept unless something holds it now.
+    remembered: Mapping[str, Mapping[str, int]] = dataclasses.field(default_factory=dict)
 
 
 def allocate(request: AllocationRequest) -> dict[str, dict[str, int]]:
@@ -137,6 +140,21 @@ def allocate(request: AllocationRequest) -> dict[str, dict[str, int]]:
                 "that the fabric already uses"
             )
         claim(owner, {f: n for f, n in numbers.items() if f in wanted[owner]}, "live")
+    # 2b. what an earlier run placed (lost from the live view by a reboot)
+    #     goes back to its name — unless taken meanwhile, or no longer usable
+    for owner, numbers in sorted(request.remembered.items()):
+        if owner in out or owner not in wanted:
+            continue
+        keep = {
+            f: n
+            for f, n in numbers.items()
+            if f in wanted[owner]
+            and f in prefixes
+            and n not in taken[f]
+            and n in _usable(prefixes[f])
+        }
+        if set(keep) == set(wanted[owner]):
+            claim(owner, keep, "remembered")
     # 3. new names, sorted, by strategy
     for owner, families in sorted(request.names):
         if owner in out:
@@ -212,7 +230,7 @@ class Addresses:
     ) -> None:
         self._prefixes = prefixes  # net id -> family -> prefix
         self._numbers = numbers  # net id -> owner -> family -> host number
-        self._origin = origin or {}  # net id -> owner -> "live" | "new"
+        self._origin = origin or {}  # net id -> owner -> "live" | "remembered" | "new"
 
     @classmethod
     def resolve(
@@ -220,10 +238,12 @@ class Addresses:
         nodes: Iterable[pt.Model],
         live: Mapping[str, Mapping[str, Mapping[str, int]]] | None = None,
         held: Mapping[str, Mapping[str, Sequence[int]]] | None = None,
+        remembered: Mapping[str, Mapping[str, Mapping[str, int]]] | None = None,
     ) -> Addresses:
         """Place every name of `nodes`. `live` (net id -> owner -> family ->
         number) and `held` (net id -> family -> every live number) are the
-        live view; empty for `create`."""
+        live view; empty for `create`. `remembered` (as `live`): what an
+        earlier run placed — the allocator state file (ADR 0012 §6)."""
         nodes = list(nodes)
         nets = [n for n in nodes if isinstance(n, pt.IpNetNode)]
         prefixes: dict[str, dict[str, IPAddress]] = {}
@@ -257,13 +277,7 @@ class Addresses:
                         if h is not None
                     }
         numbers: dict[str, dict[str, dict[str, int]]] = {}
-        origin = {
-            net_id: {
-                owner: ("live" if owner in (live or {}).get(net_id, {}) else "new")
-                for owner in owners
-            }
-            for net_id, owners in names.items()
-        }
+        remembered = remembered or {}
         for net_id, fams in prefixes.items():
             numbers[net_id] = allocate(
                 AllocationRequest(
@@ -274,12 +288,32 @@ class Addresses:
                     names=sorted(names.get(net_id, {}).items()),
                     live=(live or {}).get(net_id, {}),
                     held=(held or {}).get(net_id, {}),
+                    remembered=remembered.get(net_id, {}),
                 )
             )
+
+        def how(net_id: str, owner: str) -> str:
+            if owner in (live or {}).get(net_id, {}):
+                return "live"
+            before = remembered.get(net_id, {}).get(owner)
+            return "remembered" if before == numbers[net_id].get(owner) else "new"
+
+        origin = {
+            net_id: {owner: how(net_id, owner) for owner in owners}
+            for net_id, owners in names.items()
+        }
         return cls(prefixes, numbers, origin)
 
+    def placed(self) -> LiveNumbers:
+        """net id -> owner -> family -> number, for every name the runtime
+        placed (not the pinned ones): what the allocator state file keeps."""
+        return {
+            net_id: {owner: dict(self._numbers[net_id][owner]) for owner in owners}
+            for net_id, owners in self._origin.items()
+        }
+
     def allocated(self) -> list[tuple[str, str, str, str]]:
-        """(net id, owner, addresses, "live" | "new") for every address the
+        """(net id, owner, addresses, "live" | "remembered" | "new") for every address the
         runtime placed — the resolved view a run reports (ADR 0011 §3)."""
         out = []
         for net_id, owners in sorted(self._origin.items()):

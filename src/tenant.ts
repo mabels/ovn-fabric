@@ -221,6 +221,8 @@ export interface VpnGatewaySpec {
   // tailscale
   readonly loginServer?: string;
   readonly authKey?: string;
+  /** The node's tailscaled.state (see RouterEndpointService). */
+  readonly state?: string;
   readonly upArgs?: readonly string[];
 }
 
@@ -326,7 +328,8 @@ export class Tenant {
             ? {
               kind: "tailscale" as const,
               loginServer: spec.loginServer,
-              authKey: spec.authKey,
+              ...(spec.authKey !== undefined ? { authKey: spec.authKey } : {}),
+              ...(spec.state !== undefined ? { state: spec.state } : {}),
               ...(spec.upArgs ? { upArgs: spec.upArgs } : {}),
               ...(spec.masq ? { masq: spec.masq } : {}),
             }

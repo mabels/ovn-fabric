@@ -28,3 +28,6 @@ class Service:
     bodies: Mapping[str, BodySpec]
     handlers: Mapping[str, Handler]
     run: Callable[[], Coroutine[Any, Any, None]] | None = None
+    # Requests run as jobs of the runtime (runtime/jobs.py, ADR 0012 §7):
+    # they go on when the connection that sent them closes.
+    detached: frozenset[str] = frozenset()

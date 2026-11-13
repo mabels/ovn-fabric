@@ -63,6 +63,30 @@ class AllocateTest(unittest.TestCase):
         self.assertEqual(got["a"], {"ipv4": 2, "ipv6": 2})
         self.assertNotIn("gone", got)
 
+    def test_a_remembered_number_comes_back_after_a_reboot(self) -> None:
+        # ADR 0012 §6: the live view lost it (only the kernel held it); the
+        # allocator state file puts the name back on its number.
+        got = allocate(
+            _request(
+                names=[("a", BOTH), ("b", BOTH)],
+                remembered={"b": {"ipv4": 7, "ipv6": 7}},
+            )
+        )
+        self.assertEqual(got["b"], {"ipv4": 7, "ipv6": 7})
+        self.assertEqual(got["a"], {"ipv4": 1, "ipv6": 1})
+
+    def test_live_beats_remembered_and_a_taken_number_is_placed_anew(self) -> None:
+        got = allocate(
+            _request(
+                names=[("a", BOTH), ("b", BOTH)],
+                live={"a": {"ipv4": 7, "ipv6": 7}},
+                held={"ipv4": [7], "ipv6": [7]},
+                remembered={"a": {"ipv4": 3, "ipv6": 3}, "b": {"ipv4": 7, "ipv6": 7}},
+            )
+        )
+        self.assertEqual(got["a"], {"ipv4": 7, "ipv6": 7})
+        self.assertEqual(got["b"], {"ipv4": 1, "ipv6": 1})  # its 7 is a's now
+
     def test_high_low_starts_at_the_top(self) -> None:
         got = allocate(
             _request(

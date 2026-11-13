@@ -26,6 +26,7 @@ from typing import Any
 from . import generated as g
 from . import journal
 from .forward import Outbox
+from .jobs import JobOutbox
 from .message import Msg, ProtocolError, decode, encode, header, new_req_id
 from .transport import Closed, Connection
 
@@ -40,7 +41,9 @@ class Call:
     before the response. `component` is who handles it: a log line carries
     it unless it names its own."""
 
-    def __init__(self, peer: Peer, msg: Msg[Any], component: str, outbox: Outbox) -> None:
+    def __init__(
+        self, peer: Peer, msg: Msg[Any], component: str, outbox: Outbox | JobOutbox
+    ) -> None:
         assert msg.req_id is not None
         self.peer = peer
         self.msg = msg

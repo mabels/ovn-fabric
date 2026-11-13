@@ -164,6 +164,36 @@ class LifecycleTest(unittest.TestCase):
 
         asyncio.run(run())
 
+    def test_a_file_is_in_place_with_its_mode_and_owner(self) -> None:
+        async def run() -> tuple[int, int, int]:
+            path = Path(tempfile.mkdtemp()) / "Corefile"
+            # Our own uid/gid: what a test may chown to.
+            uid, gid = os.getuid(), os.getgid()
+            lc = _controller(FakeJob(), LifecycleAction.CREATE)
+            await lc.run(WriteFileOperation(str(path), "x", 0o640, uid=uid, gid=gid))
+            await lc.execute()
+            st = path.stat()
+            return st.st_mode & 0o777, st.st_uid, st.st_gid
+
+        self.assertEqual(asyncio.run(run()), (0o640, os.getuid(), os.getgid()))
+
+    def test_a_kept_file_is_a_seed_never_written_over(self) -> None:
+        async def run() -> tuple[str, str, int]:
+            path = Path(tempfile.mkdtemp()) / "tailscaled.state"
+            seed = WriteFileOperation(str(path), "from the topology", 0o600, keep=True)
+            lc = _controller(FakeJob(), LifecycleAction.CREATE)
+            await lc.run(seed)
+            await lc.execute()
+            first, mode = path.read_text(), path.stat().st_mode & 0o777
+            path.write_text("the app's own")  # tailscaled updated it
+            lc = _controller(FakeJob(), LifecycleAction.CREATE)
+            await lc.run(seed)
+            await lc.execute()
+            return first, path.read_text(), mode
+
+        first, after, mode = asyncio.run(run())
+        self.assertEqual((first, after, mode), ("from the topology\n", "the app's own", 0o600))
+
     def test_create_records_and_delete_removes_raw_nodes(self) -> None:
         async def run() -> None:
             lc = _controller(FakeJob(), LifecycleAction.CREATE)

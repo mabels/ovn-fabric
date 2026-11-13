@@ -18,6 +18,9 @@ export const VersionRes = type({
   kind: "'VersionRes'",
   runtime: "string",
   protocol: "number.integer",
+  // The sha256 of the PEX the runtime runs from (ADR 0012) — absent when it
+  // runs from a source checkout.
+  "hash?": "string",
 });
 
 // ── system dependency resolver (fabric/services/sysdeps.py) ─────────────────
@@ -291,6 +294,9 @@ export const IrDeleteRes = type({
  * primitives that are reconciled so far — and leaves the rest alone. */
 export const ApplyAction = type("'create' | 'delete' | 'run'");
 
+/** A value captured during the run, JSON-encoded, handed between units. */
+export const UnitValue = type({ name: "string", json: "string" });
+
 /** Apply a stored IR on this host. */
 export const IrApplyReq = type({
   kind: "'IrApplyReq'",
@@ -311,6 +317,16 @@ export const IrApplyReq = type({
   /** run: keep what is ours on the host but no step of the IR fulfilled
    * (by default it is removed once every unit is done). */
   "noCleanup?": "boolean",
+  /** How many images are built or pulled at once in the background
+   * (ADR 0012 §4); 0 or absent: all at once. */
+  "imageJobs?": "number.integer",
+  /** The part a create or a run leaves behind (ADR 0012 §3): only the
+   * units of the scopes with an image — the images first, then each
+   * container and what is in it, in plan order. A create or a run starts
+   * it itself, as a job, once its network is done. */
+  "background?": "boolean",
+  /** Values captured before (the network part's, for its background). */
+  "inputs?": UnitValue.array(),
 });
 
 export const ApplyState = type(
@@ -336,6 +352,15 @@ export const IrApplyProgress = type({
 
 export const IrApplyOutcome = type("'done' | 'failed'");
 
+/** The job a create or a run left behind (ADR 0012 §3): its images and
+ * workloads. `fabric follow <reqId>`. */
+export const BackgroundJob = type({
+  reqId: "string",
+  units: "string[]",
+  /** A job of an earlier run with the same work goes on (§5). */
+  "kept?": "boolean",
+});
+
 /** The final answer: what was applied, and how each unit of work ended. */
 export const IrApplyRes = type({
   kind: "'IrApplyRes'",
@@ -343,8 +368,62 @@ export const IrApplyRes = type({
   hash: "string",
   action: ApplyAction,
   host: "string",
+  /** The network's outcome (ADR 0012 §3) — the background job reports
+   * its own. */
   state: IrApplyOutcome,
   units: ApplyUnit.array(),
+  "background?": BackgroundJob,
+});
+
+// ── status (ADR 0012 §3) ──────────────────────────────────────────────────
+
+export const StatusReq = type({ kind: "'StatusReq'" });
+
+/** Who started an apply: a client, the runtime at boot, the runtime
+ * bringing a container back, or a create/run leaving its background job. */
+export const ApplyWhy = type("'client' | 'boot' | 'repair' | 'background'");
+
+export const TrackState = type("'running' | 'done' | 'failed' | 'released'");
+
+/** One apply as the runtime remembers it. */
+export const ApplyTrack = type({
+  reqId: "string",
+  action: ApplyAction,
+  hash: "string",
+  why: ApplyWhy,
+  state: TrackState,
+  startedAt: "number",
+  "finishedAt?": "number",
+  /** Each unit's last state (the background job's; empty for others). */
+  units: ApplyUnit.array(),
+});
+
+/** A container of the applied IR, as the runtime keeps it alive. */
+export const ContainerStatus = type({
+  name: "string",
+  /** The plan's unit that starts it. */
+  unit: "string",
+  /** docker's state (running, exited, …) or 'missing'. */
+  state: "string",
+  restarts: "number.integer",
+  "lastRestart?": "number",
+  /** When it is started again at the earliest (it keeps dying: backoff). */
+  "nextRestart?": "number",
+});
+
+export const StatusRes = type({
+  kind: "'StatusRes'",
+  host: "string",
+  "bootId?": "string",
+  /** The IR named `deployed`, and the one the last create or run applied
+   * (none after a delete): containers are kept alive only when they are
+   * the same. */
+  "deployed?": "string",
+  "applied?": "string",
+  "lastApply?": ApplyTrack,
+  "background?": ApplyTrack,
+  supervising: "boolean",
+  containers: ContainerStatus.array(),
 });
 
 // ── unit executor (fabric/services/unit.py) ──────────────────────────────
@@ -431,6 +510,12 @@ export const WriteFileStep = type({
   path: "string",
   content: "string",
   "mode?": "number.integer",
+  /** Written only when missing: a seed the app keeps up to date itself
+   * (a tailscaled.state) — never written over. */
+  "keep?": "boolean",
+  /** Its owner and group (uid/gid), set before it is in place. */
+  "uid?": "number.integer",
+  "gid?": "number.integer",
 });
 
 export const CaptureStep = type({
@@ -489,9 +574,6 @@ export const Unit = type({
   "scope?": "string",
   steps: UnitStepSpec.array(),
 });
-
-/** A value captured during the run, JSON-encoded, handed between units. */
-export const UnitValue = type({ name: "string", json: "string" });
 
 export const UnitExecReq = type({
   kind: "'UnitExecReq'",

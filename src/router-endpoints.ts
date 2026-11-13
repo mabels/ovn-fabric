@@ -530,8 +530,10 @@ const ZEROTIER_IFACE = "zt0";
 const TAILSCALE_IFACE = "tailscale0";
 
 /** A Tailscale (or headscale) node as the container that owns its tunnel:
- * `tailscaled` in the foreground, `tailscale up` once with the pre-auth key
- * from its state directory (mode 600). Its own netfilter rules are off
+ * `tailscaled` in the foreground, `tailscale up` once — with the pre-auth
+ * key from its state directory (mode 600) when there is one. Its
+ * `tailscaled.state` is seeded from `state` when missing: the same node
+ * after its directory was lost, logged in without a key. Its own netfilter rules are off
  * (`--netfilter-mode=off`): the image needs no network tools, its device
  * is wired from the host (masq, routes) like ZeroTier's. */
 function tailscaleApp(
@@ -546,7 +548,9 @@ function tailscaleApp(
     "tailscale",
     "up",
     `--login-server=${workload.loginServer}`,
-    `--auth-key=file:${inside}/authkey`,
+    ...(workload.authKey !== undefined
+      ? [`--auth-key=file:${inside}/authkey`]
+      : []),
     "--netfilter-mode=off",
     // The node's name at the control server: the router's, not the
     // container's random hostname — a reinstall shows up as the same name.
@@ -594,11 +598,21 @@ ${lines} \\
     volumes: [{ host: state, container: inside }],
     run: ["--dns", "1.1.1.1"],
     stateFiles: [
-      {
-        path: `${state}/authkey`,
-        content: `${workload.authKey}\n`,
-        mode: "600",
-      },
+      ...(workload.authKey !== undefined
+        ? [{
+          path: `${state}/authkey`,
+          content: `${workload.authKey}\n`,
+          mode: "600",
+        }]
+        : []),
+      ...(workload.state !== undefined
+        ? [{
+          path: `${state}/tailscaled.state`,
+          content: workload.state,
+          mode: "600",
+          keep: true,
+        }]
+        : []),
     ],
     securityGroups: masqGroup ? [masqGroup] : [],
     tunnel: {

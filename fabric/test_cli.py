@@ -126,6 +126,8 @@ class IrApplyLastLineTest(unittest.TestCase):
             command_timeout=None,
             keep_deployed=False,
             no_cleanup=False,
+            detach=False,
+            image_jobs=0,
         )
         out, err = io.StringIO(), io.StringIO()
         with (
