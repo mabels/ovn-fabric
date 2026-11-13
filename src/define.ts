@@ -19,6 +19,7 @@ import type {
   ServiceBuilder,
 } from "./builders.ts";
 import type { NetworkDefinition } from "./network-definition.ts";
+import { defineService } from "./service.ts";
 import {
   defaultPlatformServiceSetting,
   PLATFORM_SERVICE_IDS,
@@ -702,26 +703,7 @@ export class NetworkBuilder implements RouterEndpointContext {
     name: string,
     specOrBuild: ServiceBuilder | ((svc: ServiceBuilder) => ServiceBuilder),
   ): Service {
-    const build = typeof specOrBuild === "function"
-      ? specOrBuild
-      : (svc: ServiceBuilder) => ({ ...svc, ...specOrBuild });
-    const svc = build({ image: "" });
-    if (svc.image === "") {
-      throw new Error(`service "${name}": builder must set an image`);
-    }
-    const cmd = typeof svc.cmd === "string"
-      ? svc.cmd.trim().split(/\s+/).filter(Boolean)
-      : svc.cmd;
-    return {
-      name,
-      image: svc.image,
-      ...(cmd && cmd.length > 0 ? { cmd } : {}),
-      ...(svc.build ? { build: svc.build } : {}),
-      ...(svc.files && svc.files.length > 0 ? { files: svc.files } : {}),
-      ...(svc.env && Object.keys(svc.env).length > 0 ? { env: svc.env } : {}),
-      // Filled in by the endpoint builders when this service is attached.
-      endpointRefs: [],
-    };
+    return defineService(name, specOrBuild);
   }
 
   /** Declare a named security group — the ONE way a security group gets

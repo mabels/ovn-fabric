@@ -1,7 +1,7 @@
 """A host's abstract dependencies, from the IR — what `fabric ir-apply`
 asks abstract_deps for, and the `--spec` of `python3 -m fabric abstract-deps`:
 
-    python3 -m deployer.deps py.ir --host net-test-hh-b
+    python3 -m fabric.deps py.ir --host net-test-hh-b
     [{"name": "ovn"}, {"name": "ovn-central"}, {"name": "ovs"}, …]
 
 Only abstract names: which packages they are is the runtime's choice, by
@@ -32,7 +32,7 @@ def abstract_deps(host_node: pt.InfraHostNode) -> list[dict[str, Any]]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="deployer.deps")
+    parser = argparse.ArgumentParser(prog="fabric.deps")
     parser.add_argument("ir", help="the IR (JSON); - for stdin")
     parser.add_argument("--host", required=True)
     args = parser.parse_args()

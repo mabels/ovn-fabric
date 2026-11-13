@@ -14,7 +14,7 @@ What an apply does (the apply task owns the order; the unit executor runs
 each unit):
 
 1. create only (not on delete, not dry): the host's abstract dependencies
-   (deployer/deps.py) through the abstract deps service — the first thing,
+   (fabric/deps.py) through the abstract deps service — the first thing,
    before any unit;
 2. the plan: the IR cut into units of work on this host (fabric/plan.py);
 3. the units, one after the other, each as an internal UnitExecReq — in
@@ -42,7 +42,6 @@ import time
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from deployer.deps import abstract_deps
 from protocol import generated as pt
 from protocol.hydrate import hydrate_nodes
 from raw_reconciler.natural_key import all_keys
@@ -58,6 +57,7 @@ from .. import generated as g
 from ..addresses import AddressError, Addresses, live_view
 from ..boot import AllocatorState, boot_id, remove_old_oneshot
 from ..decide import STARTS_AFRESH
+from ..deps import abstract_deps
 from ..desired import (
     Reconciled,
     StepState,

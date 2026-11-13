@@ -275,7 +275,7 @@ def delete_route(prefix: str, dev: str, netns: str | None) -> None:
 
 
 # ── VLAN sub-interfaces (real-world binding for ovn.ls collision ────
-# domains — deployer/ir_common.py's per-host script) ───────────────
+# domains — fabric/emit.py's per-host script) ───────────────
 # Argv builders exposed separately from their run_in_netns wrappers,
 # same reasoning as ladops/ovn.py: the generator needs the exact argv
 # to print, not to execute.
@@ -305,7 +305,7 @@ def ensure_veth_argv(name: str, peer: str) -> list[str]:
     """Create a veth pair only if the `name` side is missing — `ip link
     add` has no --may-exist, same reasoning as ensure_vlan_argv above.
     Used for the per-segment legs between the XDP trunk bridge and the
-    segment bridge (deployer/ir_common.py's _emit_xdp_leg)."""
+    segment bridge (fabric/emit.py's _emit_xdp_leg)."""
     script = (
         f"ip link show {shlex.quote(name)} >/dev/null 2>&1 || "
         f"ip link add {shlex.quote(name)} type veth peer name {shlex.quote(peer)}"
@@ -324,7 +324,7 @@ def add_dummy_argv(name: str) -> list[str]:
 # A KernelRouter's own transit veth pair (types.ts's InterfaceKind "veth"
 # variant) — `name` is the ROOT-side leg (later attached to the transit
 # domain's OVS bridge), `peer` the leg moved into the kernel router's
-# netns by deployer/ir_common.py's _emit_kernel_router_create. Run from
+# netns by fabric/emit.py's _emit_kernel_router_create. Run from
 # the root namespace (2026-08-18).
 #
 # `peer_mac` pins the PEER leg's MAC (`address` after `peer name` applies
@@ -347,7 +347,7 @@ def set_link_up_argv(name: str) -> list[str]:
 
 
 # Set a sysctl knob in place — used to enable IPv4/IPv6 forwarding inside
-# a KernelRouter's netns (deployer/ir_common.py's _emit_kernel_router_
+# a KernelRouter's netns (fabric/emit.py's _emit_kernel_router_
 # create): a kernel router IS a router, and Linux won't forward between
 # its two sides until `net.ipv4.ip_forward`/`net.ipv6.conf.all.forwarding`
 # say so (2026-08-19).

@@ -183,8 +183,7 @@ const generateIr = command({
   description: "Emit the desired-state IR (toIR(), src/ir.ts) as JSON: one " +
     "{id, kind, key, data} node per host/collision-domain/router-port, " +
     "the same envelope shape the reconciler produces from live state. " +
-    "Feed this into the Python deployer (deployer/cli.py) to convert " +
-    "it into the generated deployer script.",
+    "Feed this to the runtime: `fabric ir-apply run` on the host.",
   args: {
     configPath: positional({
       type: string,
@@ -277,7 +276,7 @@ const serveGraph = command({
 // ── generate-pytypes: the protocol, TS -> Python ────────────────────
 // src/protocol.ts's ArkType schema is the one contract both languages
 // agree on for the desired-state IR crossing the boundary (toIR()'s
-// JSON -> deployer/ir_common.py) — the stabilizing factor against
+// JSON -> fabric/emit.py) — the stabilizing factor against
 // version skew between the two sides, built and deployed independently.
 // This command regenerates BOTH artifacts from that one schema:
 // protocol/ir-nodes.schema.json (JSON Schema, draft 2020-12) and

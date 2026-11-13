@@ -33,7 +33,7 @@ echo "== building $PEX" >&2
 (cd "$ROOT" && python3 -c '
 import sys
 from pathlib import Path
-from ovn_fabric.bundle import build_pex
+from fabric.bundle import build_pex
 build_pex(Path(sys.argv[1]), "primate",
           packages=("primate", "fabric", "raw_reconciler", "ladops", "protocol"))
 ' "$PEX") >&2

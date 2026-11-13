@@ -252,7 +252,7 @@ class OVSExternalId(CommandPrimitive):
 @dataclasses.dataclass(frozen=True)
 class OVSIpfix(CommandPrimitive):
     """One bridge's IPFIX sampler. CREATE attaches it with `script` (a
-    `sh -c` body, see ir_common._ipfix_enable_script); DELETE clears the
+    `sh -c` body, see fabric/emit.py _ipfix_enable_script); DELETE clears the
     weak ref, which lets OVSDB GC the orphaned IPFIX row."""
 
     bridge: str

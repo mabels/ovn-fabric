@@ -428,7 +428,7 @@ export const StatusRes = type({
 
 // ── unit executor (fabric/services/unit.py) ──────────────────────────────
 // A unit of work is data: its steps are the lifecycle operations of the
-// deployer (deployer/lifecycle.py), serialized. The executor turns them
+// deployer (fabric/lifecycle.py), serialized. The executor turns them
 // back into those operations and runs them on a LifecycleController:
 // create forward (strict), delete rewound (best effort).
 

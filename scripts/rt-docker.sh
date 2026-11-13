@@ -9,7 +9,7 @@
 #   scripts/rt-docker.sh version              ask the running server
 #   scripts/rt-docker.sh resolve curl jq
 #   scripts/rt-docker.sh docker-run --image busybox -- echo hi
-#   python3 -m deployer.containers py.ir --host H | scripts/rt-docker.sh docker-run --spec - --name N
+#   python3 -m fabric.containers py.ir --host H | scripts/rt-docker.sh docker-run --spec - --name N
 #   scripts/rt-docker.sh ir-put < py.ir   (stored IRs live in .rt-files/state, across restarts)
 #   scripts/rt-docker.sh ir-list
 #   scripts/rt-docker.sh serve --host H   then   scripts/rt-docker.sh ir-apply create < py.ir

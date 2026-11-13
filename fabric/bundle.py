@@ -6,15 +6,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-PACKAGES = (
-    "ovn_fabric",
-    "deployer",
-    "reconciler",
-    "raw_reconciler",
-    "ladops",
-    "protocol",
-    "generator",
-)
+# What a host runs: the runtime and fabric's services, and what they import.
+PACKAGES = ("fabric", "runtime", "protocol", "ladops", "raw_reconciler")
 
 
 # What the bundled code imports beyond the stdlib — pinned there, installed

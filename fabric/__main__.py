@@ -4,10 +4,10 @@ python3 -m fabric serve [--host H]
 python3 -m fabric version
 python3 -m fabric resolve curl traceroute --timeout 300
 python3 -m fabric abstract-deps docker ovn=ovn-central,ovn-host
-python3 -m deployer.deps py.ir --host H | python3 -m fabric abstract-deps --spec -
-python3 -m deployer.images py.ir --host H | python3 -m fabric docker-prepare --spec -
+python3 -m fabric.deps py.ir --host H | python3 -m fabric abstract-deps --spec -
+python3 -m fabric.images py.ir --host H | python3 -m fabric docker-prepare --spec -
 python3 -m fabric docker-run --follow --image busybox -- sh -c 'echo hi; echo oops >&2'
-python3 -m deployer.containers py.ir --host H | python3 -m fabric docker-run --spec - --name N
+python3 -m fabric.containers py.ir --host H | python3 -m fabric docker-run --spec - --name N
 python3 -m fabric ir-put < py.ir              # or: ir-put py.ir; --name N
 python3 -m fabric ir-list
 python3 -m fabric ir-get sha256:… > ir.json   # by hash or by name
@@ -580,7 +580,7 @@ async def _ir_delete(args: argparse.Namespace) -> int:
 
 
 # What the runtime and its services need on a host (their imports).
-BUNDLE_PACKAGES = ("fabric", "runtime", "deployer", "protocol", "ladops", "raw_reconciler")
+BUNDLE_PACKAGES = ("fabric", "runtime", "protocol", "ladops", "raw_reconciler")
 
 
 async def _follow(args: argparse.Namespace) -> int:
@@ -686,7 +686,7 @@ async def _runtime_list(args: argparse.Namespace) -> int:
 async def _bundle(args: argparse.Namespace) -> int:
     """Package the runtime with fabric's services as one PEX — what a host
     runs (`python3 fabric.pex serve`). Built from the source checkout."""
-    from ovn_fabric.bundle import build_pex, source_root  # build tooling: the checkout only
+    from .bundle import build_pex, source_root  # build tooling: the checkout only
 
     root = source_root()
     missing = [
@@ -776,7 +776,7 @@ def main() -> int:
     abstract.add_argument(
         "--spec",
         metavar="FILE",
-        help="JSON [{name, systemDeps}] (- for stdin), e.g. from deployer.deps",
+        help="JSON [{name, systemDeps}] (- for stdin), e.g. from fabric.deps",
     )
     abstract.add_argument(
         "--package-manager",
@@ -795,7 +795,7 @@ def main() -> int:
     prepare.add_argument(
         "--spec",
         metavar="FILE",
-        help='JSON list of {"image", "dockerfile"?} (- for stdin), e.g. from deployer.images',
+        help='JSON list of {"image", "dockerfile"?} (- for stdin), e.g. from fabric.images',
     )
     prepare.add_argument(
         "--package-manager",
@@ -816,7 +816,7 @@ def main() -> int:
     run_cmd.add_argument(
         "--spec",
         metavar="FILE",
-        help="JSON container spec(s) (- for stdin), e.g. from deployer.containers",
+        help="JSON container spec(s) (- for stdin), e.g. from fabric.containers",
     )
     run_cmd.add_argument("--name", help="the container (with --spec: which one)")
     run_cmd.add_argument("--image", help="without --spec: the image to run")

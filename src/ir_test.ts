@@ -1,5 +1,5 @@
 // src/ir_test.ts — covers pinnedIR()'s shortIfaceName derivation, moved
-// here from deployer/ir_common.py's own _bridge_name/_fnv1a_32
+// here from fabric/emit.py's own _bridge_name/_fnv1a_32
 // (2026-08-12 — see ir.ts's own shortIfaceName() doc comment for why:
 // the generator computes the FINAL name a real kernel object needs,
 // the translator only ever applies an already-resolved fact).
@@ -784,6 +784,8 @@ Deno.test("kernelRouterEndpoint: kernel.app services resolve to app descriptors 
       image: "ovn-fabric-router-wan",
       name: "router-wan-dhcpcd",
       cmd: ["/sbin/dhcpcd"],
+      // It configures the router's interfaces: that, and nothing more.
+      securityEnable: ["NET_CONFIG"],
       build: { from: "alpine:latest", packages: ["dhcpcd"] },
       // Interface-OWNING: NO veth fields at all — "owns the interfaces" is
       // exactly the ABSENCE of the veth machinery (no ip/routerIp/vethName).
@@ -1338,6 +1340,19 @@ Deno.test("tunnelRouterEndpoint: tailscale is a docker app with its key as a 600
     routes: ["100.64.0.0/10", "fd7a:115c:a1e0::/48"],
   });
   assertEquals(app?.securityGroups?.length, 1);
+});
+
+Deno.test("tunnelRouterEndpoint: a tailscale container may make its tun device, nothing more", () => {
+  const right = tailscaleRight({
+    kind: "tailscale",
+    loginServer: "https://hs.example",
+    authKey: "k",
+  });
+  const app = right.apps?.find((a) => a.kind === "docker") as
+    | { securityEnable?: string[] }
+    | undefined;
+  // Set by the fabric, never in the topology.
+  assertEquals(app?.securityEnable, ["TUN"]);
 });
 
 Deno.test("tunnelRouterEndpoint: a tailscale node's state is a 600 seed, its key optional", () => {
@@ -2957,9 +2972,12 @@ Deno.test("service: accepts a builder object or a callback that returns one", ()
         group: 102,
         mode: "640",
       }],
+      securityEnable: ["TUN"],
     }));
     return { hosts: [host], routers: [] };
   });
+  assertEquals(plain?.securityEnable, undefined); // default: nothing special
+  assertEquals(returned?.securityEnable, ["TUN"]);
   assertEquals(plain?.image, "img-a");
   assertEquals(plain?.cmd, ["sh", "-c", "true"]);
   assertEquals(returned?.image, "img-b");

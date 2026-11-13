@@ -185,7 +185,7 @@ function describeApp(app: KernelApp): { name: string; notes: string[] } {
 }
 
 /** The namespace a kernel router lives in: a container's, when a docker app
- * without an address owns its interfaces (deployer/ir_common.py's
+ * without an address owns its interfaces (fabric/emit.py's
  * _owning_app), else its own `ns-<name>`. */
 function netnsName(kr: KernelRouter): string {
   for (const app of [...(kr.left.apps ?? []), ...(kr.right.apps ?? [])]) {

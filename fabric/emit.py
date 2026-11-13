@@ -1,14 +1,12 @@
-# deployer/ir_common.py — the emitters behind the generated deployer
-# (deployer/ir_to_python.py's `generate_python_deployer`): the
-# desired-state IR (ovn-fabric's src/ir.ts toIR(), emitted as JSON by
+# fabric/emit.py — the emitters behind the runtime's plan (fabric/plan.py):
+# the desired-state IR (ovn-fabric's src/ir.ts toIR(), emitted as JSON by
 # `deno run src/cli.ts generate-ir`, then hydrated into protocol/
-# generated.py's typed dataclasses by protocol/hydrate.py) in,
-# RENDERER-AGNOSTIC OPERATIONS out (2026-08-23). Every _emit_* function
-# builds through an `Emitter` sink (see below) — the Python front-end
-# renders Python source from it that performs the operations at runtime
-# with its own logging/error handling. (A second front-end that rendered
-# the same operations as plain shell scripts was removed 2026-10-11; the
-# tests still read the operations through a text trace of that shape.)
+# generated.py's typed dataclasses by protocol/hydrate.py) in, OPERATIONS
+# out. Every _emit_* function builds through an `Emitter` sink (see
+# below); fabric/plan.py's PlanEmitter turns what it receives into the
+# units of work the runtime runs (ADR 0007). Until 2026-11 this module
+# was deployer/ir_common.py, shared with the generated deployer and its
+# shell rendering — both gone (tag legacy-pre-adr-0007).
 # Every node this module touches is one of
 # protocol.generated.InfraHostNode/OvnLsNode/OvnLrpNode — never a raw
 # dict. That's deliberate: the protocol (src/protocol.ts's ArkType
@@ -83,7 +81,6 @@ import dataclasses
 import hashlib
 import posixpath
 import re
-import shlex
 from collections.abc import Sequence
 from typing import Any, Protocol
 
@@ -117,10 +114,9 @@ _BINDABLE_IFACE_KINDS = {"vlan", "physical", "veth", "xdp"}
 class Ref:
     """A runtime VARIABLE reference inside an emitted command's argv —
     e.g. a chassis id resolved at runtime via `ovs-vsctl`/`ovn-sbctl`
-    (see lrp_set_gateway_chassis below). Rendering is backend-specific:
-    the Python front-end emits the Python variable `NAME`, a shell
-    rendering (_ShellBody, the tests' trace) emits `$NAME` — never a
-    quoted literal. Everything else in an argv is a plain string."""
+    (see lrp_set_gateway_chassis below): the plan turns it into a
+    reference to the value captured at run time — never a quoted
+    literal. Everything else in an argv is a plain string."""
 
     __slots__ = ("name",)
 
@@ -136,41 +132,15 @@ def _network_of(addr: str) -> str:
     return str(parsed.network().to_string())
 
 
-def _shell_token(token: str | Ref) -> str:
-    """One argv token for the SHELL front-end: a `Ref` becomes `"$NAME"`
-    (left for the shell to expand, double-quoted so word splitting/globbing
-    can't touch the value), anything else is quoted."""
-    return f'"${token.name}"' if isinstance(token, Ref) else shlex.quote(token)
-
-
-def _python_token(token: str | Ref) -> str:
-    """One argv token for the PYTHON front-end: a `Ref` becomes the bare
-    Python variable name, anything else a `repr` literal."""
-    return token.name if isinstance(token, Ref) else repr(token)
-
-
-def _sh(argv: list[str]) -> str:
-    return shlex.join(argv)
-
-
 # ── the emitter interface ─────────────────────────────────────────────
 # Every _emit_* function below builds its output through an `Emitter`
-# sink, NOT by returning shell lines. A front-end provides the Emitter
-# implementation (deployer/ir_to_python.py renders Python source that
-# performs the operations at runtime with logging/error handling; the
-# tests provide a text trace) — so the emitters never render, they only
-# APPEND operations. That's what gives the Python deployer real control over
-# its own execution (2026-08-23): a `sh()` command becomes a
-# run_cmd(...) call, an `append()` file-write becomes a write_file(...)
-# call, an `install()` a run_install(...) call, each with the Python
-# runtime's error/verbose policy — instead of
-# the old design where the whole shell block was embedded verbatim and
-# the runtime had to re-parse shell syntax (heredocs included) itself.
+# sink, NOT by returning shell lines: fabric/plan.py's PlanEmitter
+# implements it — so the emitters never render, they only APPEND
+# operations (units, their steps, files, captures), which the runtime
+# then runs with its own error and logging policy.
 #
 # `append(path, content)` semantics: the file ends up holding `content`
-# plus a single trailing newline (the Python backend's write_file()
-# writes content + "\n"; the nested _ShellBody renders a
-# `cat > path << 'EOF'` heredoc, whose body always ends in a newline).
+# plus a single trailing newline (fabric/lifecycle.py's write).
 def unit_name(kind: str, subject: str | None = None) -> str:
     """A unit's name: "<kind>: <subject>", or the kind alone."""
     return f"{kind}: {subject}" if subject else kind
@@ -231,15 +201,6 @@ class Emitter:
         run whether it is applied, skipped or replaced (fabric/decide.py)."""
         raise NotImplementedError
 
-    def assign(self, primitive: Any, var: str) -> None:
-        """Bind a primitive to a local without running it yet — used by
-        the kernel-router down path, where links are deleted before the
-        netns and the netns itself must go last."""
-        raise NotImplementedError
-
-    def run_var(self, var: str) -> None:
-        raise NotImplementedError
-
     def netns_symlink(self, container_expr: str, pid_var: str) -> None:
         raise NotImplementedError
 
@@ -273,10 +234,6 @@ class Emitter:
         each helper becomes a typed primitive."""
         raise NotImplementedError
 
-    def daemon_reload(self) -> None:
-        """`systemctl daemon-reload`, in both directions."""
-        raise NotImplementedError
-
     def append(self, path: str, content: str) -> None:
         raise NotImplementedError
 
@@ -292,25 +249,6 @@ class Emitter:
     ) -> None:
         """A file written only where there is none: a seed the app keeps
         up to date itself (a tailscaled.state)."""
-        raise NotImplementedError
-
-    def install_self(self, path: str) -> None:
-        """Copy the running generated program to `path` — what the boot
-        restore unit execs (Python: install_self(); the tests' trace
-        renders a comment; there is no shell rendering)."""
-        raise NotImplementedError
-
-    def start_unit(self, unit: str) -> None:
-        """Start a unit without waiting for it (`systemctl start
-        --no-block`); its rewind stops it if it still runs."""
-        raise NotImplementedError
-
-    def enable_unit(self, unit: str, optional: bool = True) -> None:
-        """Enable a unit and start it now — EXCEPT during the boot restore
-        pass (`--no-start`), which must only enable: the fabric units are
-        ordered After= the restore unit, so starting them from inside it
-        would deadlock (`systemctl` waits for a unit that waits for the
-        restore to finish)."""
         raise NotImplementedError
 
     def unit(self, kind: str, subject: str | None = None, *, key: str | None = None) -> Emitter:
@@ -330,45 +268,6 @@ class Emitter:
 
     def blank(self) -> None:
         self.lines.append("")
-
-    def begin_block(self, header: str) -> None:
-        """Open an indented block whose guard `header` is backend-specific
-        (Python: an `if ...:` line) — every operation emitted until the
-        matching end_block() nests one level deeper."""
-        raise NotImplementedError
-
-    def end_block(self) -> None:
-        raise NotImplementedError
-
-
-class _ShellBody(Emitter):
-    """A nested SHELL-ONLY emitter used to build a kernel router's
-    up/down script body. The router script is a literal shell file on
-    the host (systemd runs it) even though the Python deployer installs
-    it, so this renders shlex-joined command lines (with an optional
-    trailing ` &` to background a long-running/daemon app inside the
-    netns) and heredoc appends, never Python. `background=True` is only
-    meaningful here — the outer front-end ignores it."""
-
-    def sh(
-        self,
-        argv: Sequence[str | Ref],
-        background: bool = False,
-        optional: bool | None = None,
-    ) -> None:
-        if optional is None:
-            optional = self.action == "delete"
-        line = " ".join(_shell_token(token) for token in argv) + (" &" if background else "")
-        self.lines.append(line + (" || true" if optional else ""))
-
-    def append(self, path: str, content: str) -> None:
-        # A delimiter distinct from the outer front-ends' `OVN`, so the
-        # router script (itself written via an outer heredoc) can nest
-        # these app/conf heredocs without the outer heredoc terminating
-        # on the first inner `OVN` line.
-        self.lines.append(f"cat > {path} << 'OVNKERNEL'")
-        self.lines.append(content)
-        self.lines.append("OVNKERNEL")
 
 
 # An interface binding as either side of the IR carries it: an ovn.ls
@@ -907,7 +806,7 @@ def _emit_gateway_chassis_refs(
     2026-09-19: every pin naming a host name silently created no SB
     `Gateway_Chassis` row, leaving the chassis with zero local datapaths
     and the whole localnet fabric with no flows). Each host registers
-    `external_ids:hostname=<IR host name>` (see _emit_host), so the SB
+    `external_ids:hostname=<IR host name>` (see _emit_chassis_registration), so the SB
     lookup by that hostname is what bridges the IR's stable host name to
     the runtime system-id. The `test -n` guard makes an unregistered
     chassis fail loudly instead of pinning an empty name."""
@@ -1284,7 +1183,7 @@ def _emit_kernel_app_rules(
             else:
                 emit.comment(
                     f'# unsupported dhcp-client style "{app.style}" on {dev} in {netns} — '
-                    "skipped, see deployer/ir_common.py"
+                    "skipped, see fabric/emit.py"
                 )
                 continue
         elif app.kind == "docker":
@@ -1392,7 +1291,7 @@ def _emit_kernel_app_rules(
         else:
             emit.comment(
                 f'# unsupported kernel app kind "{app.kind}" on {dev} in {netns} — '
-                "skipped, see deployer/ir_common.py"
+                "skipped, see fabric/emit.py"
             )
             continue
 
@@ -1487,7 +1386,7 @@ def _emit_kernel_router_owner(
             emit.comment(
                 f'# unsupported kernel router side interface kind "{iface.kind}" '
                 f"for {owner.key.name} ({_side(side_node).value}) — skipped, "
-                "see deployer/ir_common.py"
+                "see fabric/emit.py"
             )
             continue
         if iface is not None and iface.kind == "veth":
@@ -1650,6 +1549,25 @@ def _emit_app_image(app: pt.DockerApp, container: str, host: HostPrimitive, emit
     )
 
 
+# What a container may do beyond Docker's defaults (SecurityEnable,
+# src/types.ts) — the concrete docker flags per abstract permission. A
+# container gets nothing else: no --privileged.
+_SECURITY_FLAGS: dict[str, tuple[str, ...]] = {
+    # A VPN client making its own tun device (tailscaled, zerotier-one).
+    "TUN": ("--cap-add", "NET_ADMIN", "--device", "/dev/net/tun"),
+    # Configuring the netns it lives in (dhcpcd owning a router's links).
+    "NET_CONFIG": ("--cap-add", "NET_ADMIN"),
+}
+
+
+def _security_flags(enable: Sequence[pt.SecurityEnableEnum] | None) -> tuple[str, ...]:
+    """The docker flags for what a container may do (each once, sorted)."""
+    flags: list[str] = []
+    for permission in sorted({e.value for e in enable or ()}):
+        flags += _SECURITY_FLAGS[permission]
+    return tuple(flags)
+
+
 def _start_owning_container(
     app: pt.DockerApp, container: str, host: HostPrimitive, unit: Emitter
 ) -> DockerPrimitive:
@@ -1703,9 +1621,8 @@ def _start_owning_container(
         container,
         image,
         command=("sleep", "infinity"),
-        privileged=True,
         volumes=tuple((volume["host"], volume["container"]) for volume in volumes),
-        run_flags=tuple(app.run or ()),
+        run_flags=(*_security_flags(app.securityEnable), *(app.run or ())),
         # Its natural key: the node address, the public part of its identity.
         natural_key=f"zt:{identity['public'].split(':')[0]}" if identity else None,
         # A changed identity or state file needs a restart: the daemon read it.
@@ -1723,35 +1640,6 @@ def _start_owning_container(
     unit.capture(pid_var, ["/usr/bin/docker", "inspect", "-f", "{{.State.Pid}}", container])
     unit.netns_symlink(repr(container), pid_var)
     return docker
-
-
-def _kernel_router_script(router: str, up_lines: list[str], down_lines: list[str]) -> str:
-    """One self-contained per-router script: `up` (create) and `down`
-    (stop/teardown). The case labels and bodies sit at column 0 so the
-    up/down bodies' own heredocs (the app wire scripts) keep their bodies
-    and delimiters unindented. `down` runs with `set -u` only (a stop
-    runs against whatever state is there and must not abort on a missing
-    object); `up` re-enables `set -e` (a failed create really is an
-    error). systemd calls this as `ExecStart=<script> up` and
-    `ExecStop=<script> down`."""
-    lines = [
-        "#!/bin/sh",
-        f"# ovn-fabric kernel router {router}: 'up' creates the netns, its",
-        "# veths/vlans, security-group rules and apps; 'down' stops the apps",
-        "# then tears the netns and the transit veth's root leg down. One",
-        "# service per router; systemd runs ExecStart=<script> up and",
-        "# ExecStop=<script> down. Generated by deployer/ir_common.py.",
-        "set -u",
-        'action="${1:-up}"',
-        'case "$action" in',
-        "up)",
-        "set -e",
-    ]
-    lines += up_lines
-    lines += [";;", "down)"]
-    lines += down_lines
-    lines += [";;", "esac"]
-    return "\n".join(lines)
 
 
 # The real (host, interface) pairs this host owns: CREATE creates the
@@ -1848,25 +1736,6 @@ def _emit_xdp_leg(
     emit.ovn(host.ovs_port(segment_bridge, seg_leg))
 
 
-def _emit_xdp_leg_delete(
-    host: HostPrimitive,
-    root_var: str,
-    segment_bridge: str,
-    emit: Emitter,
-) -> None:
-    suffix = _short_suffix(segment_bridge)
-    trunk_leg = f"veth-xdp-{suffix}"
-    seg_leg = f"veth-seg-{suffix}"
-    emit.ovn(host.ovs_port(segment_bridge, seg_leg))
-    emit.ovn(host.ovs_port(_XDP_TRUNK_BRIDGE, trunk_leg))
-    # Deleting one end removes the pair.
-    emit.ovn(
-        host.rootNs().add_if(trunk_leg, kind="veth", peer=seg_leg),
-        parent=root_var,
-    )
-    emit.ovn(host.ovs_bridge(segment_bridge))
-
-
 def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -> None:
     """Same body for the deploy pass and the boot bindings unit. It only
     ensures the OVS bridge/port rows and the netdevices it OWNS (kernel
@@ -1907,7 +1776,7 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
         if iface.kind not in _BINDABLE_IFACE_KINDS:
             emit.comment(
                 f'# unsupported interface kind "{iface.kind}" for domain '
-                f"{domain} on {host_name} — skipped, see deployer/ir_common.py"
+                f"{domain} on {host_name} — skipped, see fabric/emit.py"
             )
             continue
         by_bridge.setdefault(iface.bridge, []).append((domain, iface))
@@ -1955,35 +1824,6 @@ def _emit_iface_bindings(host_name: str, nodes: list[pt.Model], emit: Emitter) -
         emit.blank()
 
 
-# ── the one host service ──────────────────────────────────────────────
-# One systemd service per host; there are no per-router/service units.
-# For now it runs the lazy phase once (image pulls/builds, in the
-# background of CREATE); later it will run the job tree (`--action run`).
-_RESTORE_SCRIPT = "/usr/local/sbin/ovn-fabric-deployer.py"
-_FABRIC_UNIT = "ovn-fabric.service"
-_FABRIC_UNIT_PATH = f"/etc/systemd/system/{_FABRIC_UNIT}"
-
-
-def _fabric_unit(host_name: str) -> str:
-    return "\n".join(
-        [
-            "[Unit]",
-            f"Description=ovn-fabric ({host_name}): pull and build images",
-            "Wants=network-online.target",
-            "After=network-online.target docker.service",
-            "",
-            "[Service]",
-            # Runs to completion once — a pull or build takes as long as
-            # it takes. Not enabled: CREATE starts it, a reboot finds the
-            # images there.
-            "Type=oneshot",
-            "RemainAfterExit=yes",
-            "TimeoutStartSec=infinity",
-            f"ExecStart={_RESTORE_SCRIPT} --action lazy-create --host {host_name}",
-        ]
-    )
-
-
 def _emit_image(
     host: HostPrimitive, image: str, dockerfile: str | None, build_dir: str, emit: Emitter
 ) -> None:
@@ -1999,27 +1839,6 @@ def _emit_image(
     # Built anew only when its Dockerfile changed (its label).
     spec = hashlib.sha256(dockerfile.encode()).hexdigest()
     emit.ovn(host.docker_image(image, dockerfile_path, build_dir, spec), decide=Decide.docker_image)
-
-
-def _emit_fabric_unit(host_node: pt.InfraHostNode, emit: Emitter) -> None:
-    """Install the generated program and the ONE service (for now: the
-    lazy phase; _emit_fabric_start starts it). Rewound (DELETE) this
-    removes the unit and the program. A daemon-reload on each side of the
-    unit file keeps systemd's view right in both directions."""
-    host_name = host_node.key.host
-    service_unit = emit.unit("fabric service", _FABRIC_UNIT)
-    service_unit.install_self(_RESTORE_SCRIPT)
-    service_unit.daemon_reload()
-    service_unit.append(_FABRIC_UNIT_PATH, _fabric_unit(host_name))
-    service_unit.daemon_reload()
-    service_unit.blank()
-
-
-def _emit_fabric_start(host_node: pt.InfraHostNode, emit: Emitter) -> None:
-    """The host's last scope: start the service in the background, once
-    every scope's synchronous part exists — CREATE does not wait for the
-    lazy phase. Rewound (first on DELETE), this stops it if it still runs."""
-    emit.start_unit(_FABRIC_UNIT)
 
 
 # ── flow export (IPFIX) ───────────────────────────────────────────────
@@ -2053,7 +1872,7 @@ def _ipfix_setargs(ipfix: pt.IpfixData) -> str:
     # map-entry separator and rejects in a set element ("unexpected \":\"
     # parsing set of strings"). Quote it so it parses as one atom; the
     # backslash survives the outer shlex quoting and is unescaped by the
-    # `sh -c` both front-ends run, handing ovs-vsctl literal quotes.
+    # `sh -c` the step runs, handing ovs-vsctl literal quotes.
     args = [f'targets=\\"{ipfix.targets}\\"']
     if ipfix.sampling is not None:
         args.append(f"sampling={int(ipfix.sampling)}")
@@ -2098,102 +1917,6 @@ def _emit_ipfix(host_node: pt.InfraHostNode, nodes: list[pt.Model], emit: Emitte
     ipfix_unit.blank()
 
 
-# Abstract dependency -> concrete distro package (Ubuntu/Debian apt
-# names). `ovn` is role-dependent (always ovn-host, plus ovn-central on
-# the central) and `zerotier` is its curl installer — both handled
-# specially below.
-_PACKAGE_BY_DEP = {
-    "ovs": "openvswitch-switch",
-    "ip": "iproute2",
-    "iptables": "iptables",
-    "dhclient": "isc-dhcp-client",
-    "dhcpcd": "dhcpcd",
-    "wireguard": "wireguard-tools",
-    "docker": "docker.io",
-    # zerotier's generated wire script parses `zerotier-cli -j` with jq
-    # (src/ir.ts's hostDependencies adds it for the same reason).
-    "jq": "jq",
-    # base tooling — abstract names the generator adds to every host
-    # (src/ir.ts's hostDependencies), mapped here like every other dep.
-    "arp": "net-tools",
-    "ping": "iputils-ping",
-    "traceroute": "traceroute",
-    "curl": "curl",
-    "python": "python-is-python3",
-}
-
-
-# ── the install plan ─────────────────────────────────────────────────
-# Deploying a router can cut the host's own internet access while the
-# pass runs. The IR already carries everything the host needs — its
-# abstract `dependencies` (mapped to distro packages) and the docker
-# images its units run — so the generator merges that data into ONE
-# per-host install object (`INSTALL[host]` in the generated deployer).
-# The host pass executes it directly, before OVS/OVN: no spool directory,
-# no queue consumer, no separate service.
-_APT_OS = ("ubuntu", "debian")
-
-
-def _package_jobs(host_node: pt.InfraHostNode) -> tuple[list[dict[str, Any]], list[str]]:
-    """One install entry per ABSTRACT dependency of this host (the IR's
-    `dependencies` list, computed by src/ir.ts's hostDependencies — base
-    tooling plus `ovn`/`ovs`/`ip`/`iptables`/`dhclient`/`dhcpcd`/
-    `wireguard`/`zerotier`/`docker`, deliberately not distro packages),
-    mapped to the host OS's packages and install command — plus a note per
-    dependency that could NOT be mapped. Always resolved to a concrete OS
-    (assume Ubuntu when the config leaves it unset, 2026-08-23); no
-    deinstall ever happens."""
-    names = host_node.data.dependencies or []
-    if names and host_node.data.os.name not in _APT_OS:
-        os_name = host_node.data.os.name
-        return [], [f"unknown OS {os_name!r} — cannot install dependencies, skipping"]
-    jobs: list[dict[str, Any]] = []
-    notes: list[str] = []
-    for name in names:
-        job: dict[str, Any]
-        if name == "zerotier":
-            # Not a system package: the deployer has a dedicated
-            # install-zerotier job gated on the concrete curl dependency.
-            continue
-        else:
-            if name == "ovn":
-                # EVERY OVN host runs ovn-controller (ovn-host) — a
-                # central chassis included: it owns OVS bridges and
-                # registers as a gateway chassis too. The central one
-                # ADDITIONALLY hosts the shared NB/SB DBs + northd
-                # (ovn-central). Installing only ovn-central left the
-                # central with no ovn-controller, so no chassis ever
-                # joined the SB DB and the whole fabric carried no
-                # traffic (confirmed live 2026-09-19).
-                packages = (
-                    ["ovn-central", "ovn-host"]
-                    if host_node.data.ovnRole == pt.OvnRole.central
-                    else ["ovn-host"]
-                )
-            else:
-                package = _PACKAGE_BY_DEP.get(name)
-                if package is None:
-                    notes.append(f'unknown dependency "{name}" — skipped')
-                    continue
-                packages = [package]
-            job = {
-                "kind": "package",
-                "name": name,
-                "packages": packages,
-                "install": [
-                    "env",
-                    "DEBIAN_FRONTEND=noninteractive",
-                    "apt-get",
-                    "install",
-                    "-y",
-                    *packages,
-                ],
-                "apt": True,
-            }
-        jobs.append(job)
-    return jobs, notes
-
-
 def _image_jobs(host_id: str, nodes: list[pt.Model]) -> list[dict[str, Any]]:
     """One install entry per docker image a unit on this host runs — a
     kernel router's docker apps and the host's workload containers — with
@@ -2221,95 +1944,6 @@ def _image_jobs(host_id: str, nodes: list[pt.Model]) -> list[dict[str, Any]]:
         if node.kind == "kernel.app.container" and node.data.host == host_id:
             add(node.data.image, node.data.build)
     return [by_name[name] for name in sorted(by_name)]
-
-
-def _install_plan(host_node: pt.InfraHostNode, nodes: list[pt.Model]) -> dict[str, Any]:
-    """The one install object for this host: every package and image the
-    IR says it needs, in dependency-before-image order."""
-    packages, notes = _package_jobs(host_node)
-    os_data = host_node.data.os
-    return {
-        "host": host_node.key.host,
-        "os": f"{os_data.name} {os_data.version}",
-        "notes": notes,
-        "resolved": _dependency_resolution(host_node),
-        "jobs": packages + _image_jobs(host_node.id, nodes),
-    }
-
-
-def _abstract(name: str) -> dict[str, str]:
-    return {"kind": "abstract", "name": name}
-
-
-def _docker_image(image: str) -> dict[str, str]:
-    return {"kind": "docker-image", "image": image}
-
-
-def _dependency_resolution(
-    host_node: pt.InfraHostNode,
-) -> dict[str, dict[str, Any]]:
-    """The two-way table's IR side: for each abstract dependency, the
-    concrete action the package resolver will run."""
-    packages, _notes = _package_jobs(host_node)
-    return {
-        entry["name"]: (
-            {"kind": "apt", "packages": entry["packages"]}
-            if entry["apt"]
-            else {
-                "kind": "sys-cmd",
-                "cmd": entry["install"],
-                "requires": entry.get("requires", []),
-            }
-        )
-        for entry in packages
-    }
-
-
-def _configure_dependencies(
-    host_node: pt.InfraHostNode, nodes: list[pt.Model]
-) -> list[dict[str, str]]:
-    """Deps the configure job itself needs: OVN/OVS CLI + ip."""
-    has_kernel = bool(_kernel_router_owners(host_node.id, nodes)) or any(
-        n.kind == "kernel.app.container" and n.data.host == host_node.id for n in nodes
-    )
-    if host_node.data.ovnRole is not None:
-        return [_abstract("ovn"), _abstract("ovs"), _abstract("ip")]
-    if has_kernel:
-        return [_abstract("ovs"), _abstract("ip")]
-    return []
-
-
-def _job_dependencies(
-    host_node: pt.InfraHostNode, nodes: list[pt.Model]
-) -> dict[str, list[dict[str, str]]]:
-    """Per-job dependency descriptors, derived from the IR nodes on the
-    host. Abstract package names are emitted by the package resolver;
-    docker-image descriptors by the image resolver."""
-    deps: dict[str, list[dict[str, str]]] = {}
-    for owner in _kernel_router_owners(host_node.id, nodes):
-        wanted = [_abstract("configure"), _abstract("ip"), _abstract("iptables")]
-        for side in _kernel_router_sides(owner.key.name, nodes):
-            for app in side.data.apps or []:
-                if app.kind == "dhcp-client":
-                    wanted.append(_abstract(app.style.value))
-                elif app.kind == "wireguard":
-                    wanted.append(_abstract("wireguard"))
-                elif app.kind == "zerotier":
-                    wanted.extend((_abstract("zerotier"), _abstract("jq")))
-                elif app.kind == "docker":
-                    wanted.append(_abstract("docker"))
-                    container = app.name or f"{owner.key.name}-docker"
-                    wanted.append(_docker_image(app.image or f"ovn-fabric-{container}"))
-        deps[owner.key.name] = wanted
-    for node in nodes:
-        if node.kind != "kernel.app.container" or node.data.host != host_node.id:
-            continue
-        deps[node.key.name] = [
-            _abstract("configure"),
-            _abstract("docker"),
-            _docker_image(node.data.image),
-        ]
-    return deps
 
 
 # The OVS bridge (`br-<shortname>`) a segment is bound to ON this host — the
@@ -2437,10 +2071,9 @@ def _emit_service_body(
         container,
         node.data.image or "",
         command=tuple(node.data.cmd or ()),
-        privileged=True,
         environment=env,
         volumes=mounts,
-        run_flags=tuple(run_flags),
+        run_flags=(*_security_flags(node.data.securityEnable), *run_flags),
         # A changed file needs a restart: the service read it (its owner
         # and mode too: whether it may).
         files=files_hash(
@@ -2578,23 +2211,3 @@ def _emit_host_configure(host_node: pt.InfraHostNode, nodes: list[pt.Model], emi
     _emit_chassis_registration(host_node, nodes, registration_unit)
     _emit_iface_bindings(host_name, nodes, emit)
     _emit_ipfix(host_node, nodes, emit)
-
-
-def _emit_host(
-    host_node: pt.InfraHostNode,
-    nodes: list[pt.Model],
-    emit: Emitter,
-) -> None:
-    # Install the generated program and the ONE service that runs its
-    # tree (packages, images, bindings, chassis, kernel jobs) at boot.
-    _emit_fabric_unit(host_node, emit)
-
-
-# The per-host body emitter — the one entry point a front-end calls (the
-# Python generator hands it a PythonEmitter, the tests a trace emitter).
-def _emit_host_script(
-    host_node: pt.InfraHostNode,
-    nodes: list[pt.Model],
-    emit: Emitter,
-) -> None:
-    _emit_host(host_node, nodes, emit)

@@ -87,7 +87,7 @@ class DockerPrimitiveTest(unittest.TestCase):
                     "-e",
                     "A=1",
                     "-v",
-                    "/var/lib/ovn-fabric/dns:/etc/dns:ro",
+                    "/var/lib/ovn-fabric/dns:/etc/dns:ro,z",  # labelled for containers (SELinux)
                     "--dns",
                     "1.1.1.1",
                     "ovn-fabric-dns",

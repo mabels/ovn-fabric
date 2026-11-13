@@ -1,7 +1,7 @@
 """The containers a host runs, from the IR — the `--spec` of
 `python3 -m fabric docker-run`:
 
-    python3 -m deployer.containers py.ir --host net-test-hh-b
+    python3 -m fabric.containers py.ir --host net-test-hh-b
     [{"name": "router-zerotier-v2-zerotier", "image": "…", "dockerfile": "…",
       "command": ["sleep", "infinity"], "privileged": true, "network": "none", …}]
 
@@ -23,10 +23,9 @@ import json
 import sys
 from typing import Any
 
+from fabric.emit import _docker_dockerfile, _kernel_router_owners, _kernel_router_sides
 from protocol import generated as pt
 from protocol.hydrate import hydrate_nodes
-
-from .ir_common import _docker_dockerfile, _kernel_router_owners, _kernel_router_sides
 
 
 def containers(nodes: list[pt.Model], host: str) -> list[dict[str, Any]]:
@@ -84,7 +83,7 @@ def containers(nodes: list[pt.Model], host: str) -> list[dict[str, Any]]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="deployer.containers")
+    parser = argparse.ArgumentParser(prog="fabric.containers")
     parser.add_argument("ir", help="the IR (JSON); - for stdin")
     parser.add_argument("--host", required=True)
     args = parser.parse_args()

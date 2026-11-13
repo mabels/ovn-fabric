@@ -514,6 +514,10 @@ export type KernelApp =
   }
   | {
     readonly kind: "docker";
+    /** What it may do beyond Docker's defaults (a Service's); set by the
+     * endpoint builders — a VPN client's container gets "TUN" — never by
+     * the topology. */
+    readonly securityEnable?: readonly AppSecurityEnable[];
     /** The image to run — resolved by buildKernelRouterEndpoint from the
      * service's optional `image`, defaulting to `ovn-fabric-<router>` when
      * omitted (2026-08-31). */
@@ -884,7 +888,7 @@ export interface TunnelRouterEndpoint extends EndpointDefinition {
  * addresses/routes actually bind to (same shape as RouterEndpointBase.
  * ifaces — see its own doc comment above) — the deployer creates/moves
  * the interface into the netns instead of a dummy stand-in
- * (deployer/ir_common.py's own _emit_kernel_router_create). Only
+ * (fabric/emit.py's own _emit_kernel_router_create). Only
  * populated for `right` today (via NetworkBuilder.kernelRouterEndpoint(),
  * which copies the kernelRouterEndpoint() input's `ifaces` onto this
  * side in ADDITION to the OVN-side endpoint's own copy, 2026-08-18 —
@@ -1198,6 +1202,16 @@ export interface ServiceFile {
   readonly mode?: string;
 }
 
+/** What a container may do beyond Docker's defaults — abstract; the
+ * deployer (fabric/emit.py) turns each into its concrete docker flags.
+ * - "TUN": make tun devices (a VPN client: /dev/net/tun, NET_ADMIN). */
+export type SecurityEnable = "TUN";
+
+/** What the fabric's own containers may do — a Service's, and (never in
+ * the topology) "NET_CONFIG": configure the netns it lives in (dhcpcd
+ * owning a router's interfaces: NET_ADMIN). */
+export type AppSecurityEnable = SecurityEnable | "NET_CONFIG";
+
 export interface Service {
   readonly name: string;
   readonly image: string;
@@ -1211,6 +1225,9 @@ export interface Service {
   /** Environment variables for the container. Same caveat as `files`:
    * ENVIRONMENT is CONFIG — it travels through the IR, so no secrets. */
   readonly env?: Readonly<Record<string, string>>;
+  /** What it may do beyond Docker's defaults. Default: nothing special —
+   * the container runs unprivileged. */
+  readonly securityEnable?: readonly SecurityEnable[];
   readonly build?: {
     readonly from: string;
     readonly packages?: readonly string[];

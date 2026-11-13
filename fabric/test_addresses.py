@@ -284,7 +284,7 @@ class FilterSelectorTest(unittest.TestCase):
     """A filter rule's address of the fabric is rendered as its host prefix."""
 
     def test_a_reference_becomes_a_host_prefix_a_prefix_stays(self) -> None:
-        from deployer.ir_common import _selectors
+        from fabric.emit import _selectors
 
         addrs = Addresses.resolve(NODES)
         ref = pt.AddrRef(net="ipnet:ls:backbone", owner=LRP_BACKBONE, family=pt.Family.ipv4)

@@ -17,6 +17,7 @@ import type {
   RouterEndpointRoute,
   RouterEndpointService,
   RoutingDomain,
+  SecurityEnable,
   SecurityGroup,
   Service,
   ServiceFile,
@@ -178,6 +179,9 @@ export interface ServiceBuilder {
   files?: readonly ServiceFile[];
   /** Environment variables for the container — see Service.env. */
   env?: Readonly<Record<string, string>>;
+  /** What it may do beyond Docker's defaults, e.g. ["TUN"] — see
+   * Service.securityEnable. Default: nothing special. */
+  securityEnable?: readonly SecurityEnable[];
   build?: {
     readonly from: string;
     readonly packages?: readonly string[];

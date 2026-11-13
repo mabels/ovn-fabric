@@ -1,7 +1,7 @@
 """The docker images a host runs, from the IR — the `--spec` of
 `python3 -m fabric docker-prepare`:
 
-    python3 -m deployer.images py.ir --host net-test-hh-b
+    python3 -m fabric.images py.ir --host net-test-hh-b
     [{"image": "busybox"}, {"image": "ovn-fabric-…", "dockerfile": "FROM …"}]
 
 Each entry is built from its Dockerfile when the IR declares a `build`,
@@ -15,9 +15,8 @@ import argparse
 import json
 import sys
 
+from fabric.emit import _image_jobs
 from protocol.hydrate import hydrate_nodes
-
-from .ir_common import _image_jobs
 
 
 def images(nodes: list[object], host: str) -> list[dict[str, str]]:
@@ -32,7 +31,7 @@ def images(nodes: list[object], host: str) -> list[dict[str, str]]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="deployer.images")
+    parser = argparse.ArgumentParser(prog="fabric.images")
     parser.add_argument("ir", help="the IR (JSON); - for stdin")
     parser.add_argument("--host", required=True)
     args = parser.parse_args()

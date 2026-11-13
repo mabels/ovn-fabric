@@ -1,7 +1,7 @@
 // src/protocol.ts — the protocol of ovn-fabric: the one schema both
 // languages agree on for the desired-state IR that crosses the
 // TypeScript/Python boundary (toIR(), src/ir.ts, producing JSON ->
-// deployer/, consuming it). This is the stabilizing factor for that
+// fabric/, consuming it). This is the stabilizing factor for that
 // boundary — the two sides are built, tested, and deployed
 // independently, so nothing else guarantees a newer TS generator's IR
 // shape still matches what an older Python deployer bundle expects.
@@ -474,9 +474,13 @@ export const ZerotierApp = type({
   // plain {dst} objects; the deployer adds `ip route add <dst> dev <var>`.
   "routes?": KernelRouterRoute.array(),
 });
+// What a container may do beyond Docker's defaults (types.ts
+// SecurityEnable); fabric/emit.py has the concrete docker flags.
+export const SecurityEnable = type("'TUN' | 'NET_CONFIG'");
 export const DockerApp = type({
   kind: "'docker'",
   image: "string",
+  "securityEnable?": SecurityEnable.array(),
   "build?": DockerBuild,
   name: "string",
   "cmd?": "string[]",
@@ -680,6 +684,8 @@ export const KernelAppContainerData = type({
   // Files put into the container's filesystem (Service.files); the deployer
   // writes them on the host and bind-mounts each one read-only.
   "files?": KernelAppServiceFile.array(),
+  // What it may do beyond Docker's defaults (Service.securityEnable).
+  "securityEnable?": SecurityEnable.array(),
   "build?": DockerBuild,
   "deps?": "string[]",
 });

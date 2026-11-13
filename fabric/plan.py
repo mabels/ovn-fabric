@@ -1,6 +1,6 @@
 """The plan: an IR, on one host, cut into units of work.
 
-The declarations are the deployer's (deployer/ir_common.py) — the same
+The declarations are the deployer's (fabric/emit.py) — the same
 emitter calls that generated the old deployer. A PlanEmitter receives them
 and, instead of rendering Python code, keeps the lifecycle operations
 themselves, in the units the declarations open:
@@ -27,7 +27,7 @@ The scopes, in the order the old deployer ran them on create:
 
 Delete is the same plan rewound (the apply task reverses the units; the
 executor the steps of each). The host's abstract dependencies come before
-all of it, as their own request (deployer/deps.py), not as a unit.
+all of it, as their own request (fabric/deps.py), not as a unit.
 """
 
 from __future__ import annotations
@@ -38,7 +38,12 @@ import functools
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from deployer.ir_common import (
+from protocol import generated as pt
+
+from . import generated as g
+from .addresses import Addresses
+from .decide import Decide, spec
+from .emit import (
     Emitter,
     Ref,
     _emit_cluster_body,
@@ -50,11 +55,6 @@ from deployer.ir_common import (
     _service_faces,
     unit_name,
 )
-from protocol import generated as pt
-
-from . import generated as g
-from .addresses import Addresses
-from .decide import Decide, spec
 from .lifecycle import (
     CaptureOperation,
     RuntimeRef,

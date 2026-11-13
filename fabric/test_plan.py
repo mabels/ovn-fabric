@@ -5,7 +5,7 @@ import json
 import unittest
 from collections.abc import Callable
 
-from deployer.ir_common import Emitter
+from fabric.emit import Emitter
 from fabric.ir_fixture import NODES
 from protocol import generated as pt
 from protocol.hydrate import hydrate_nodes
@@ -61,6 +61,31 @@ class PlanTest(unittest.TestCase):
         refs = [a for argv in argvs for a in argv if isinstance(a, g.RefArg)]
         self.assertTrue(refs)
         self.assertEqual(refs[0].key, "CHASSIS_ID")
+
+    def test_a_workload_runs_unprivileged_unless_it_may_do_more(self) -> None:
+        def docker_run(security: list[pt.SecurityEnableEnum] | None) -> list[str]:
+            nodes = hydrate_nodes(IR_SAMPLE)
+            for i, node in enumerate(nodes):
+                if isinstance(node, pt.KernelAppContainerNode):
+                    data = dataclasses.replace(node.data, securityEnable=security)
+                    nodes[i] = dataclasses.replace(node, data=data)
+            units = {u.name: u for u in plan_units(nodes, "net-test-hh-b")}
+            workload = units["workload: cp-mam-hh-platform-platform.dns"]
+            return next(
+                [a for a in c.argv if isinstance(a, str)]
+                for s in workload.steps
+                if isinstance(s, g.PrimitiveStep)
+                for c in s.create
+                if c.argv[:2] == ["/usr/bin/docker", "run"] or c.argv[1:2] == ["run"]
+            )
+
+        plain = docker_run(None)
+        self.assertNotIn("--privileged", plain)
+        self.assertNotIn("--cap-add", plain)
+        tun = docker_run([pt.SecurityEnableEnum.TUN])
+        self.assertNotIn("--privileged", tun)
+        at = tun.index("--cap-add")
+        self.assertEqual(tun[at : at + 4], ["--cap-add", "NET_ADMIN", "--device", "/dev/net/tun"])
 
     def test_a_workload_file_carries_its_owner_and_mode(self) -> None:
         nodes = hydrate_nodes(IR_SAMPLE)

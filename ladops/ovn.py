@@ -2,8 +2,7 @@
 # `ovn-nbctl`/`ovn-sbctl`. list_lrps() is used by reconciler/ovn/
 # reconcile.py to build IR nodes (read only); every other function here
 # exists for the deployer (live execution, add_lrp/delete_lrp today) AND
-# for deployer/ir_common.py's emitters (deployer/cli.py -- convert IR
-# JSON into the generated Python deployer). Both share the exact same
+# for fabric/emit.py's emitters (the runtime's plan). Both share the exact same
 # *_argv() builders — this module is the ONE place that knows the real
 # ovn-nbctl/ovn-sbctl invocation syntax, so the generated script and
 # whatever eventually executes for real can never drift apart.
@@ -351,7 +350,7 @@ def lsp_add_localnet_argv(switch: str, lsp: str, network_name: str) -> list[list
     world": a localnet-type LSP binds a logical switch to whichever
     real OVS bridge ovn-bridge-mappings names `network_name` for on a
     given chassis (see ladops.ovs.add_br_argv/set_external_id_argv,
-    deployer/ir_common.py's host-script side) — same bundling
+    fabric/emit.py's host-script side) — same bundling
     reasoning as lsp_add_router_argv above."""
     return [
         [*_NBCTL, "lsp-add", switch, lsp],

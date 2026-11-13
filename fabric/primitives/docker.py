@@ -16,6 +16,15 @@ from .host import NetnsPrimitive
 # A build or pull may take long (a slow link, a big image) — but not forever.
 IMAGE_TIMEOUT = 1800.0
 
+
+def _labelled(container_path: str) -> str:
+    """A bind mount the container may use under SELinux: `z` labels the
+    host path for containers (shared). An unprivileged container runs as
+    container_t, which may not touch the host's var_lib_t files; without
+    SELinux docker ignores it. "/x" -> "/x:z", "/x:ro" -> "/x:ro,z"."""
+    return f"{container_path},z" if ":" in container_path else f"{container_path}:z"
+
+
 # The label a container or a built image carries: the hash of what it was
 # made from (fabric/decide.py compares it, a run restarts or rebuilds).
 from ladops.docker import NATURAL_KEY_LABEL  # noqa: E402
@@ -173,7 +182,7 @@ class DockerPrimitive(CommandPrimitive):
         for key, value in sorted(self.environment):
             argv += ["-e", f"{key}={value}"]
         for host_path, container_path in self.volumes:
-            argv += ["-v", f"{host_path}:{container_path}"]
+            argv += ["-v", f"{host_path}:{_labelled(container_path)}"]
         argv += list(self.run_flags)
         argv += [self.image, *self.command]
         return tuple(argv)

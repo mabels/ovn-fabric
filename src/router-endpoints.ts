@@ -33,6 +33,7 @@ import type {
   TunnelRouterEndpoint,
 } from "./types.ts";
 import { type Addr, IpNet, prefixOf, toAddr, toAddrs } from "./ipnet.ts";
+import { defineService, dockerAppOf } from "./service.ts";
 
 /** The slice of NetworkBuilder the endpoint builders need — state and
  * registration stay on the builder, this just names what they touch. */
@@ -367,6 +368,8 @@ export function buildKernelRouterEndpoint(
           image: `ovn-fabric-${routerName}`,
           name: `${routerName}-dhcpcd`,
           cmd: ["/sbin/dhcpcd"],
+          // It configures the router's interfaces itself: nothing else.
+          securityEnable: ["NET_CONFIG"],
           build: { from: "alpine:latest", packages: ["dhcpcd"] },
         });
       } else {
@@ -589,12 +592,18 @@ ${lines} \\
       > /usr/local/bin/tailscale-up \\
  && chmod 755 /usr/local/bin/tailscale-up
 `;
-  return {
-    kind: "docker",
+  // The container, as a Service: it makes its tun device itself
+  // (tailscaled --tun) — that, and nothing else.
+  const service = defineService(routerName, {
     image: `ovn-fabric-${routerName}-tailscale`,
-    name: routerName, // the container is the gateway (its netns)
     cmd: ["/usr/local/bin/tailscale-up"],
     build: { from: "ubuntu:24.04", dockerfile },
+    securityEnable: ["TUN"],
+  });
+  return {
+    kind: "docker",
+    ...dockerAppOf(service),
+    name: routerName, // the container is the gateway (its netns)
     volumes: [{ host: state, container: inside }],
     run: ["--dns", "1.1.1.1"],
     stateFiles: [
@@ -730,12 +739,18 @@ ${ztScriptLines} \\
       > /usr/local/bin/zerotier-up \\
  && chmod 755 /usr/local/bin/zerotier-up
 `;
-        return {
-          kind: "docker",
+        // The container, as a Service: it makes its tun device itself
+        // (zt0) — that, and nothing else.
+        const service = defineService(routerName, {
           image: `ovn-fabric-${routerName}-zerotier`,
-          name: routerName, // the container is the gateway (its netns)
           cmd: ["/usr/local/bin/zerotier-up"],
           build: { from: "ubuntu:24.04", dockerfile },
+          securityEnable: ["TUN"],
+        });
+        return {
+          kind: "docker",
+          ...dockerAppOf(service),
+          name: routerName, // the container is the gateway (its netns)
           volumes: [
             {
               host: ztState,

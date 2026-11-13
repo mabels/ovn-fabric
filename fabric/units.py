@@ -1,5 +1,5 @@
 """Units of work as data: their steps are the deployer's lifecycle
-operations (deployer/lifecycle.py), serialized.
+operations (fabric/lifecycle.py), serialized.
 
     to_operation(step) -> the lifecycle operation it describes
     to_step(operation) -> its serialized step

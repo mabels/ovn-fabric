@@ -349,8 +349,8 @@ function kernelRouterBackRoutes(
 // Addresses are already fully resolved facts (KernelRouterSide.ipaddrs)
 // — no real iface binding yet (deliberately deferred, see
 // KernelRouterSide's own doc comment, types.ts), so a dummy device
-// stands in as the thing addresses/routes actually bind to (deployer/
-// ir_common.py's own _emit_kernel_router_create) — assigning these to
+// stands in as the thing addresses/routes actually bind to (fabric/
+// emit.py's own _emit_kernel_router_create) — assigning these to
 // a REAL device is its own next step. `routes`: declared entries with a
 // `via` (a route with none means "handled elsewhere," e.g. IPv6 RA/DHCP
 // on the real segment, not yet modeled — same semantic computeRoutes
@@ -374,8 +374,8 @@ function kernelRouterBackRoutes(
 // buildKernelRouterEndpoint (define.ts, 2026-08-18) — is carried onto
 // the side node so the deployer creates/moves the real interface into
 // the netns and binds addresses/routes to IT instead of a dummy stand-
-// in; a side with no `ifaces` still gets the dummy (deployer/
-// ir_common.py's own _emit_kernel_router_create). `iface` stays
+// in; a side with no `ifaces` still gets the dummy (fabric/
+// emit.py's own _emit_kernel_router_create). `iface` stays
 // structurally unmodeled in the cross-language protocol, same as
 // ovn.ls's own entries (see protocol.ts's OvnLsInterface).
 function kernelRouterSideToIR(
@@ -420,7 +420,7 @@ function kernelRouterSideToIR(
   // device name, so the readable-when-it-fits/else-deterministic-hash
   // suffix is resolved HERE and the deployer builds the real pair
   // (`veth-krn-<shortName>`/`veth-ovn-<shortName>`) from it
-  // (deployer/ir_common.py's _emit_kernel_router_create) — same
+  // (fabric/emit.py's _emit_kernel_router_create) — same
   // "generator computes the final name" boundary as shortIfaceName.
   // No `mac`: the netns-side leg's MAC is derived from its resolved
   // address by the runtime (ADR 0011 §5), so the OVN router's MAC_Binding
@@ -666,12 +666,12 @@ function vethShortId(ifaceName: string): string {
 
 // Readable (`${prefix}${name}`) whenever it fits; only falls back to a
 // short deterministic hash (fnv1a32, addressing.ts) when it doesn't.
-// Resolved HERE, not in deployer/ir_common.py (the translator) — same
+// Resolved HERE, not in fabric/emit.py (the translator) — same
 // boundary reasoning as mac/gatewayChassis/routes throughout this file:
 // the generator computes the FINAL name a real kernel object needs, the
 // translator only ever applies an already-resolved fact. Moved here
-// 2026-08-12 — this used to live translator-side as deployer/
-// ir_common.py's own `_bridge_name`/`_fnv1a_32`.
+// 2026-08-12 — this used to live translator-side as fabric/
+// emit.py's own `_bridge_name`/`_fnv1a_32`.
 function shortIfaceName(prefix: string, name: string): string {
   const candidate = `${prefix}${name}`;
   if (candidate.length <= IFNAMSIZ_MAX) return candidate;
@@ -700,7 +700,7 @@ function transitBridgeName(parent: string, vlanId: number): string {
 // it rather than pretending it's already reconciled).
 //
 // `shortName`: the real OVS bridge name this domain binds to on any
-// chassis with a bindable interface (see deployer/ir_common.py's
+// chassis with a bindable interface (see fabric/emit.py's
 // _emit_iface_bindings_create/_delete) — see shortIfaceName() above.
 // Carried on EACH interface entry, not as its own data field: `iface`
 // is already the one place a real-world-binding fact lives per (host,
@@ -989,7 +989,7 @@ function resolveMac(endpoint: OvnRouterEndpoint): string | undefined {
 // Folds RouterEndpoint.services into the single ipv6_ra_configs smap
 // OVN actually has (see RouterEndpointService, types.ts, for why these
 // are two independently-toggleable services rather than one boolean).
-// Resolved HERE, not in deployer/ir_common.py, same boundary reasoning
+// Resolved HERE, not in fabric/emit.py, same boundary reasoning
 // as resolveMac/resolveEncapIp above: the IR carries the FINAL key/value
 // pairs to set, not "here's a services list, go figure out the ovn-nbctl
 // options syntax." Undefined (not an empty object) when no service is
@@ -1404,7 +1404,7 @@ function anchorAddressSharedWith(
 // `domain` names WHICH RoutingDomain produced this route (net.
 // routingDomain()'s own name) — every route, from either mechanism
 // below, always belongs to exactly one. Confirmed live, 2026-08-12:
-// without this, deployer/ir_common.py had no way to group a
+// without this, fabric/emit.py had no way to group a
 // router's routes into labeled blocks in the generated script — every
 // route landed in one flat, unlabeled dump instead of being grouped
 // with its router and its source, unlike every other section of the
@@ -1781,6 +1781,10 @@ function serviceNodes(network: NetworkDefinition): KernelAppContainerNode[] {
         image: service.image,
         ...(service.cmd ? { cmd: service.cmd } : {}),
         ...(service.build ? { build: service.build } : {}),
+        // Sorted and once each: the IR is diff-stable.
+        ...(service.securityEnable && service.securityEnable.length > 0
+          ? { securityEnable: [...new Set(service.securityEnable)].sort() }
+          : {}),
         // Environment variables — keys sorted so the IR is diff-stable
         // regardless of declaration order.
         ...(service.env && Object.keys(service.env).length > 0

@@ -9,7 +9,7 @@
 #
 # external_id write primitives exist for chassis registration
 # (ovn-remote/ovn-encap-ip/ovn-encap-type/ovn-cms-options — the real
-# consumer is deployer/ir_common.py's per-host script, converting
+# consumer is fabric/emit.py's per-host script, converting
 # infra.host IR nodes) — the concrete need this module's own header
 # comment used to say wasn't identified yet.
 #
@@ -151,7 +151,7 @@ def remove_external_id(key: str) -> None:
 
 
 # ── bridges + ports (real-world binding for ovn.ls collision domains —
-# deployer/ir_common.py's per-host script) ─────────────────────────
+# fabric/emit.py's per-host script) ─────────────────────────
 # Both adds FAIL if the object already exists: the create pass is a
 # desired-state pass, not a silent merge.
 # "make it so" (README's idempotency guarantee), and an existing bridge/
