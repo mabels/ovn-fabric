@@ -75,7 +75,7 @@ jobs:
       # "0.0.0" placeholder). See the "publish" job below for the real,
       # post-publish end-to-end check of that path.
 
-      # ── Python side: ladops/reconciler/deployer/protocol ────────────
+      # ── Python side: ladops/protocol/raw_reconciler/runtime/fabric/primate ────────────
       # .venv-build/ is build-time-only tooling (never shipped to a
       # router, see pyproject.toml's own comment) — created here, once,
       # with all the tools this job needs from it (black/ruff/mypy for
@@ -89,10 +89,10 @@ jobs:
           .venv-build/bin/pip install --quiet black ruff mypy -r requirements.txt
 
       - name: Python format check (black)
-        run: .venv-build/bin/black --check ladops/ deployer/ protocol/ reconciler/ runtime/ fabric/
+        run: .venv-build/bin/black --check ladops/ protocol/ raw_reconciler/ runtime/ fabric/ primate/
 
       - name: Python lint (ruff)
-        run: .venv-build/bin/ruff check ladops/ deployer/ protocol/ reconciler/ runtime/ fabric/
+        run: .venv-build/bin/ruff check ladops/ protocol/ raw_reconciler/ runtime/ fabric/ primate/
 
       # protocol/generated.py doesn't exist until this runs — it's
       # ephemeral, regenerated here fresh every CI run (see .gitignore),
@@ -120,7 +120,7 @@ jobs:
       - name: Python type check (mypy)
         run: .venv-build/bin/mypy
 
-      - name: Python unit tests (ladops, reconciler, deployer, protocol, runtime, fabric)
+      - name: Python unit tests (ladops, protocol, raw_reconciler, runtime, fabric, primate)
         # The venv's Python: it has requirements.txt (a host gets it in the PEX).
         run: .venv-build/bin/python -m unittest discover -s . -p "test_*.py" -v
 
