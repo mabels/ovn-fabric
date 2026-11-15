@@ -18,7 +18,7 @@ from runtime.runtime import Runtime
 from runtime.transport import connect
 
 from .. import generated as g
-from .packages import Apt
+from .packages import Apt, Repo
 from .sysdeps import UPDATE_EVERY, SystemDeps
 
 READY, FAILED, TIMEOUT = g.SystemDepState.ready, g.SystemDepState.failed, g.SystemDepState.timeout
@@ -29,14 +29,29 @@ class FakeApt:
 
     name: ClassVar[str] = "apt"
 
-    def __init__(self, installed: dict[str, str] | None = None, broken: Sequence[str] = ()) -> None:
+    def __init__(
+        self,
+        installed: dict[str, str] | None = None,
+        broken: Sequence[str] = (),
+        broken_repos: Sequence[str] = (),
+    ) -> None:
         self.installed = dict(installed or {})
         self.broken = set(broken)  # packages whose install fails
+        self.broken_repos = set(broken_repos)
         self.calls: list[tuple[str, ...]] = []
         self.gate: asyncio.Event | None = None  # when set: installs wait for it
         self.update_fails = 0  # fail the next N updates
         self.transient = 0  # fail the next N installs with a transient error
         self._active = 0
+
+    async def ensure_repos(
+        self, repos: Sequence[Repo], *, report: Report = command.nowhere
+    ) -> tuple[bool, str]:
+        self.calls.append(("repos", *(repo.id for repo in repos)))
+        broken = [repo.id for repo in repos if repo.id in self.broken_repos]
+        if broken:
+            return False, f"cannot enable {broken[0]}"
+        return True, ""
 
     async def version(self, package: str, *, report: Report = command.nowhere) -> str | None:
         return self.installed.get(package)
@@ -249,6 +264,32 @@ class ResolveTest(unittest.TestCase):
                 again = await client.ask(_req("jq"), timeout=5)
             self.assertEqual(_states(again.body), {"jq": READY})
             self.assertEqual(apt.calls.count(("install", "jq")), 1)
+
+        asyncio.run(run())
+
+    def test_repositories_are_ensured_before_packages(self) -> None:
+        async def run() -> None:
+            apt = FakeApt()
+            repo = g.DepRepo(kind="dep.repo", id="nfv", baseurl="https://example.invalid/nfv")
+            req = dataclasses.replace(_req("jq"), repositories=[repo])
+            async with _client(SystemDeps([apt], stamp=_stamp(60), sleep=FakeSleep())) as client:
+                res = await client.ask(req, timeout=5)
+            self.assertEqual(_states(res.body), {"jq": READY})
+            self.assertEqual(apt.calls, [("repos", "nfv"), ("update",), ("install", "jq")])
+
+        asyncio.run(run())
+
+    def test_a_failed_repository_fails_the_request(self) -> None:
+        async def run() -> None:
+            apt = FakeApt(broken_repos=["nfv"])
+            repo = g.DepRepo(kind="dep.repo", id="nfv", baseurl="https://example.invalid/nfv")
+            req = dataclasses.replace(_req("jq"), repositories=[repo])
+            async with _client(SystemDeps([apt], stamp=_stamp(60), sleep=FakeSleep())) as client:
+                with self.assertRaises(RemoteError) as caught:
+                    await client.ask(req, timeout=5)
+            self.assertEqual(caught.exception.code, "failed")
+            self.assertIn("cannot enable nfv", caught.exception.message)
+            self.assertEqual(apt.calls, [("repos", "nfv")])
 
         asyncio.run(run())
 

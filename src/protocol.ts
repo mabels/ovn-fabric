@@ -56,10 +56,38 @@ import { IPAddress } from "jsr:@adviser/ipaddress@0.2.12";
 
 export const InfraHostKey = type({ host: "string" });
 export const PackageManager = type("'apt' | 'dnf'");
+export const Distro = type("'ubuntu' | 'debian' | 'fedora' | 'rocky'");
+export const HostPlatform = type("'generic' | 'rpi'");
 export const HostOs = type({
+  distro: Distro,
+  "version?": "string",
+  "platform?": HostPlatform,
+});
+// One concrete thing an abstract dependency needs on the host. `dep.pkg`
+// is a package its manager installs (optionally at a version); `dep.pkgFile`
+// is a package file already on the host. Future kinds (`dep.repo`,
+// `dep.script`, ...) extend the union without changing the override map.
+export const DepPkg = type({
+  kind: "'dep.pkg'",
   name: "string",
-  version: "string",
-  packageManager: PackageManager,
+  "version?": "string",
+});
+export const DepPkgFile = type({
+  kind: "'dep.pkgFile'",
+  path: "string",
+  "sha256?": "string",
+});
+export const DepRepo = type({
+  kind: "'dep.repo'",
+  id: "string",
+  baseurl: "string",
+  "gpgkey?": "string",
+});
+export const DependencyEntry = DepPkg.or(DepPkgFile).or(DepRepo);
+// Per-host overrides of the runtime's distro translation, keyed by the
+// ABSTRACT dependency name (ovn, traceroute, docker, ...).
+export const DependencyOverrides = type({
+  "[string]": DependencyEntry.array(),
 });
 // The host's IPFIX flow-export config (2026-10-10), resolved from
 // Host.monitoring.ipfix (types.ts, IpfixExport): the collector endpoint
@@ -80,14 +108,15 @@ export const InfraHostData = type({
   connectAddress: "string",
   "ovnRole?": "'central'|'chassis'",
   "encapIp?": "string",
-  // Always resolved (assume Ubuntu when the config leaves it unset,
-  // 2026-08-23) — the deployer installs the dependencies in this OS's
-  // package form. No deinstall ever.
-  os: HostOs,
+  // The target the deployer translates the dependencies for. Absent: the
+  // runtime discovers it on the host. No deinstall ever.
+  "os?": HostOs,
   // The ABSTRACT dependencies this host needs (ovn, ovs, ip, iptables,
   // dhcpcd/dhclient, wireguard, docker) — the runtime maps them to its
-  // package manager's packages.
-  "dependencies?": "string[]",
+  // distro's packages.
+  "abstractDependencies?": "string[]",
+  // Concrete replacements for that translation, by abstract name.
+  "dependencyOverrides?": DependencyOverrides,
   // Flow export onto the collector — see IpfixData.
   "ipfix?": IpfixData,
   // What the runtime's reconcile leaves alone — see HostReconcile.
@@ -896,7 +925,14 @@ export function buildJsonSchema(): Record<string, unknown> {
   const shapes = refNamedShapes({
     InfraHostKey: shape(InfraHostKey),
     PackageManager: shape(PackageManager),
+    Distro: shape(Distro),
+    HostPlatform: shape(HostPlatform),
     HostOs: shape(HostOs),
+    DepPkg: shape(DepPkg),
+    DepPkgFile: shape(DepPkgFile),
+    DepRepo: shape(DepRepo),
+    DependencyEntry: shape(DependencyEntry),
+    DependencyOverrides: shape(DependencyOverrides),
     HostReconcile: shape(HostReconcile),
     IpfixData: shape(IpfixData),
     InfraHostData: shape(InfraHostData),

@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import tempfile
 import unittest
+from pathlib import Path
 from typing import Any
 from unittest import mock
 
 from .. import generated as g
 from .abstract_deps import SYSTEM_DEPS
-from .packages import MANAGERS, Dnf
+from .packages import MANAGERS, Apt, Dnf
 
 
 class ManagersTest(unittest.TestCase):
@@ -46,6 +48,51 @@ class DnfTest(unittest.TestCase):
         )
         self.assertTrue(Dnf().permanent("No match for argument: no-such-package"))
         self.assertFalse(Dnf().permanent("Curl error (6): Couldn't resolve host name"))
+
+
+class DnfRepoTest(unittest.TestCase):
+    def test_a_repo_file_is_written(self) -> None:
+        repo = g.DepRepo(
+            kind="dep.repo",
+            id="nfv",
+            baseurl="https://example.invalid/nfv",
+            gpgkey="https://example.invalid/nfv/key",
+        )
+        with tempfile.TemporaryDirectory() as root:
+            ok, out = asyncio.run(Dnf(repos_root=root).ensure_repos([repo]))
+            self.assertEqual((ok, out), (True, ""))
+            text = (Path(root) / "nfv.repo").read_text()
+        self.assertEqual(
+            text,
+            "[nfv]\n"
+            "name=nfv\n"
+            "baseurl=https://example.invalid/nfv\n"
+            "enabled=1\n"
+            "module_hotfixes=1\n"
+            "gpgcheck=1\n"
+            "gpgkey=https://example.invalid/nfv/key\n",
+        )
+
+    def test_no_key_means_no_gpg_check(self) -> None:
+        repo = g.DepRepo(kind="dep.repo", id="nfv", baseurl="https://example.invalid/nfv")
+        with tempfile.TemporaryDirectory() as root:
+            asyncio.run(Dnf(repos_root=root).ensure_repos([repo]))
+            text = (Path(root) / "nfv.repo").read_text()
+        self.assertIn("gpgcheck=0\n", text)
+        self.assertNotIn("gpgkey=", text)
+
+    def test_a_bad_id_is_refused(self) -> None:
+        repo = g.DepRepo(kind="dep.repo", id="../evil", baseurl="https://example.invalid")
+        with tempfile.TemporaryDirectory() as root:
+            ok, out = asyncio.run(Dnf(repos_root=root).ensure_repos([repo]))
+        self.assertFalse(ok)
+        self.assertIn("bad repository id", out)
+
+    def test_apt_has_no_repo_implementation(self) -> None:
+        repo = g.DepRepo(kind="dep.repo", id="nfv", baseurl="https://example.invalid/nfv")
+        ok, out = asyncio.run(Apt().ensure_repos([repo]))
+        self.assertFalse(ok)
+        self.assertIn("only implemented for dnf", out)
 
 
 class TableTest(unittest.TestCase):

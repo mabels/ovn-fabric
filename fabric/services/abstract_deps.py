@@ -8,11 +8,11 @@ system dependencies.
       → AbstractDepsReady { names }         once every one is ready
       → AbstractDepsRes { deps: [AbstractDepStatus] }
 
-What an abstract dependency means (its system dependencies) is this
-service's table (SYSTEM_DEPS): the packages per package manager — the
-column of the one the request names (the host's config chose it). A
-request entry may name them itself instead. A name the table does not
-know, or has no packages for on this manager, without its own system
+IR apply names each entry's system dependencies itself: they come from
+the host's distro/platform translation and its overrides
+(fabric/hostos.py). For callers that only name a package manager (the
+CLI and docker services), SYSTEM_DEPS is the fallback table — apt as
+Ubuntu, dnf as Fedora. A name neither knows, without its own system
 dependencies, fails. Other services ask by abstract name —
 docker prepare asks for `docker`. All system dependencies go to sysdeps in one request, so they
 share its queue and one apt run; an abstract dependency settles as soon as
@@ -35,6 +35,7 @@ from runtime.peer import Call, Peer
 from runtime.service import Service
 
 from .. import generated as g
+from ..hostos import ABSTRACT_DEPS, fallback_system_deps
 
 BODIES = {
     "AbstractDepsReq": BodySpec(g.AbstractDepsReq, "request"),
@@ -46,25 +47,11 @@ register_bodies(BODIES)  # clients decode these too
 
 log = logging.getLogger("fabric.abstract_deps")
 
-# What an abstract dependency means, per package manager (apt: the names in
-# use on Ubuntu; dnf: checked against Fedora 44's repositories). `ovn` is
-# ovn-controller (every OVN host runs one); the central additionally needs
-# `ovn-central` (the NB/SB DBs and northd). A manager missing from an entry:
-# not packaged there.
+# What an abstract dependency means for the path that only names a package
+# manager (the CLI and docker services). IR apply sends the distro-resolved
+# packages itself; apt here is Ubuntu, dnf is Fedora — the historical view.
 SYSTEM_DEPS: dict[str, dict[str, list[str]]] = {
-    "ovn": {"apt": ["ovn-host"], "dnf": ["ovn-host"]},
-    "ovn-central": {"apt": ["ovn-central"], "dnf": ["ovn-central"]},
-    "ovs": {"apt": ["openvswitch-switch"], "dnf": ["openvswitch"]},
-    "ip": {"apt": ["iproute2"], "dnf": ["iproute"]},
-    "iptables": {"apt": ["iptables"], "dnf": ["iptables-nft"]},
-    "dhclient": {"apt": ["isc-dhcp-client"], "dnf": ["dhcp-client"]},
-    "dhcpcd": {"apt": ["dhcpcd"], "dnf": ["dhcpcd"]},
-    "wireguard": {"apt": ["wireguard-tools"], "dnf": ["wireguard-tools"]},
-    "docker": {"apt": ["docker.io"], "dnf": ["moby-engine"]},
-    "arp": {"apt": ["net-tools"], "dnf": ["net-tools"]},
-    "ping": {"apt": ["iputils-ping"], "dnf": ["iputils"]},
-    "traceroute": {"apt": ["traceroute"], "dnf": ["traceroute"]},
-    "python": {"apt": ["python-is-python3"], "dnf": ["python-unversioned-command"]},
+    name: fallback_system_deps(name) for name in ABSTRACT_DEPS
 }
 
 # The systemd units an abstract dependency needs running, per package
@@ -169,8 +156,17 @@ class AbstractDeps:
 
         await announce_settled()  # the ones without system dependencies
         system = list(dict.fromkeys(dep for deps in wanted.values() for dep in deps))
-        if system:
-            await self._system(call, manager, system, req.timeout, settled, announce_settled)
+        repositories = list(req.repositories or [])
+        if system or repositories:
+            await self._system(
+                call,
+                manager,
+                system,
+                repositories,
+                req.timeout,
+                settled,
+                announce_settled,
+            )
 
         res = [announced[name] for name in names]
         if all(status.state is g.SystemDepState.ready for status in res):
@@ -194,6 +190,7 @@ class AbstractDeps:
         call: Call,
         manager: g.PackageManager,
         deps: list[str],
+        repositories: list[g.DepRepo],
         timeout: float | None,
         settled: dict[str, g.DepStatus],
         announce_settled: Callable[[], Awaitable[None]],
@@ -201,7 +198,11 @@ class AbstractDeps:
         client = await self._client()
         request = await client.request(
             g.ResolveSystemDepsReq(
-                kind="ResolveSystemDepsReq", packageManager=manager, deps=deps, timeout=timeout
+                kind="ResolveSystemDepsReq",
+                packageManager=manager,
+                deps=deps,
+                repositories=repositories or None,
+                timeout=timeout,
             ),
             parent=call.req_id,
         )

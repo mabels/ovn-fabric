@@ -156,11 +156,16 @@ export function describeIface(iface: InterfaceKind): string {
 }
 
 function describeHost(host: Host): string[] {
+  const os = host.os
+    ? [host.os.distro, host.os.version, host.os.platform]
+      .filter((part) => part !== undefined && part !== "generic")
+      .join(" ")
+    : "";
   return [
     host.access.method === "ssh"
       ? `ssh ${host.access.user}@${host.connectAddress}`
       : "local",
-    ...(host.os ? [`${host.os.name} ${host.os.version}`] : []),
+    ...(os ? [os] : []),
   ];
 }
 

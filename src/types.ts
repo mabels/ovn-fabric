@@ -123,22 +123,53 @@ export interface HostMonitoring {
   readonly ipfix?: IpfixExport;
 }
 
-/** The OS a Host runs (2026-08-23) — what the runtime needs to install
- * the topology's dependencies in the right package form: OVS/OVN for a
+/** The distros the runtime can translate a host's abstract dependencies
+ * for (fabric/services/abstract_deps.py). */
+export type Distro = "ubuntu" | "debian" | "fedora" | "rocky";
+
+/** The hardware/target flavour of a distro, when its packages differ —
+ * e.g. Raspberry Pi kernels and firmware. Omitted means `generic`. */
+export type HostPlatform = "generic" | "rpi";
+
+/** The OS a Host runs (2026-08-23) — what the runtime needs to translate
+ * the topology's dependencies into the right packages: OVS/OVN for a
  * chassis, iproute2/iptables for a kernel router's netns, dhcpcd or
- * isc-dhcp-client for a dhcp-client app, wireguard-tools, docker. `name`
- * is the distro, `version` its release ("24.04" for Ubuntu, "44" for
- * Fedora), `packageManager` the one the runtime installs them with — named
- * explicitly, never detected (2026-10-31). No deinstall ever happens. */
+ * isc-dhcp-client for a dhcp-client app, wireguard-tools, docker. `distro`
+ * names the distribution, `version` its release ("24.04" for Ubuntu, "44"
+ * for Fedora) when the translation needs it, `platform` a hardware flavour
+ * such as `rpi`. Missing fields — or the whole `os` — are discovered on the
+ * host. No deinstall ever happens. */
 export interface HostOs {
-  readonly name: "ubuntu" | "debian" | "fedora";
-  readonly version: string;
-  readonly packageManager: PackageManager;
+  readonly distro: Distro;
+  readonly version?: string;
+  readonly platform?: HostPlatform;
 }
 
 /** The package managers the runtime has an implementation for
- * (fabric/services/packages.py). */
+ * (fabric/services/packages.py). The distro translation picks one; a Host
+ * no longer declares it. */
 export type PackageManager = "apt" | "dnf";
+
+/** One concrete dependency a host's abstract name translates to, either a
+ * package its manager installs (optionally at a version) or a package file
+ * already on the host. */
+export type DependencyEntry =
+  | {
+    readonly kind: "dep.pkg";
+    readonly name: string;
+    readonly version?: string;
+  }
+  | {
+    readonly kind: "dep.pkgFile";
+    readonly path: string;
+    readonly sha256?: string;
+  }
+  | {
+    readonly kind: "dep.repo";
+    readonly id: string;
+    readonly baseurl: string;
+    readonly gpgkey?: string;
+  };
 
 export interface Host {
   readonly name: string;
@@ -149,9 +180,14 @@ export interface Host {
   readonly connectAddress: string;
   readonly access: AccessMethod;
   /** The distro/version the deployer installs dependencies for — see
-   * HostOs. Undefined = no dependencies can be installed (the host's
-   * own setup is the operator's responsibility). */
+   * HostOs. Undefined: the runtime discovers the host's OS. */
   readonly os?: HostOs;
+  /** Concrete replacements for the distro translation, by abstract
+   * dependency name (`ovn`, `traceroute`, `docker`, ...). The runtime
+   * installs these instead of what the distro table would choose. */
+  readonly dependencyOverrides?: Readonly<
+    Record<string, readonly DependencyEntry[]>
+  >;
   readonly monitoring?: HostMonitoring;
   /** What the runtime's reconcile leaves alone on this host — see
    * HostReconcile. */
@@ -175,6 +211,9 @@ export interface HostReconcile {
 export interface HostSpec {
   readonly name: string;
   readonly os?: HostOs;
+  readonly dependencyOverrides?: Readonly<
+    Record<string, readonly DependencyEntry[]>
+  >;
   readonly ovn?: OvnHostConfig;
   readonly monitoring?: HostMonitoring;
   readonly reconcile?: HostReconcile;
@@ -187,9 +226,10 @@ export interface SshHostSpec extends HostSpec {
 }
 
 function hostParts(spec: HostSpec) {
-  const { os, ovn, monitoring, reconcile } = spec;
+  const { os, dependencyOverrides, ovn, monitoring, reconcile } = spec;
   return {
     ...(os ? { os } : {}),
+    ...(dependencyOverrides ? { dependencyOverrides } : {}),
     ...(ovn ? { ovn } : {}),
     ...(monitoring ? { monitoring } : {}),
     ...(reconcile ? { reconcile } : {}),

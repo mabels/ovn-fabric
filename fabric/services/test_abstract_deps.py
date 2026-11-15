@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
 import unittest
 from collections.abc import AsyncIterator
 from typing import Any, ClassVar
@@ -76,6 +77,18 @@ def _events(seen: list[Any], cls: type) -> list[Any]:
 
 
 class AbstractDepsTest(unittest.TestCase):
+    def test_repositories_reach_sysdeps_first(self) -> None:
+        async def run() -> None:
+            apt = FakeApt()
+            repo = g.DepRepo(kind="dep.repo", id="nfv", baseurl="https://example.invalid/nfv")
+            req = dataclasses.replace(_req(jq=["jq"]), repositories=[repo])
+            async with _client(apt) as client:
+                res = await client.ask(req, timeout=5)
+            self.assertEqual(res.body.deps[0].state, READY)
+            self.assertEqual(apt.calls, [("repos", "nfv"), ("update",), ("install", "jq")])
+
+        asyncio.run(run())
+
     def test_each_abstract_dep_and_all_together(self) -> None:
         async def run() -> None:
             apt = FakeApt(installed={"iproute2": "6.1"})

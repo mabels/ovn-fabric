@@ -2,15 +2,17 @@
 current, through the host's package manager (packages.py: apt or dnf,
 found when the runtime starts).
 
-    ResolveSystemDepsReq { deps: [...], timeout? }
+    ResolveSystemDepsReq { deps: [...], repositories?, timeout? }
       → ResolveSystemDep { dep, state }   one event per dependency, as it settles
       → ResolveSystemDepsRes { deps: [DepStatus] }
 
 All package work goes through ONE queue drained by ONE worker, so the
 package manager never runs twice at a time from here (another one on the
 host — unattended-upgrades — is waited for by the manager itself). The
-queue carries two kinds of jobs:
+queue carries three kinds of jobs:
 
+- repositories: enable the request's repositories, then refresh the
+  index, BEFORE any of its packages are checked or installed.
 - install: the missing dependencies of a request. The package index is
   refreshed first when it is stale (at most every UPDATE_EVERY, the time
   persisted in a stamp file across restarts).
@@ -82,6 +84,13 @@ def _tail(output: str, lines: int = 5) -> str:
 
 
 @dataclasses.dataclass(frozen=True)
+class _Repos:
+    repos: list[g.DepRepo]
+    call: Call
+    done: asyncio.Future[tuple[bool, str]]
+
+
+@dataclasses.dataclass(frozen=True)
 class _Install:
     deps: list[str]
 
@@ -147,7 +156,7 @@ class _Resolver:
         self._packages = packages
         self._stamp = stamp
         self._sleep = sleep
-        self._queue: asyncio.Queue[_Install | _Refresh] = asyncio.Queue()
+        self._queue: asyncio.Queue[_Repos | _Install | _Refresh] = asyncio.Queue()
         # Every dependency queued or being installed → its coming status.
         self._pending: dict[str, asyncio.Future[g.DepStatus]] = {}
         # Every dependency queued or being installed → the requests waiting
@@ -168,6 +177,10 @@ class _Resolver:
         bad = [dep for dep in deps if not _PACKAGE.match(dep)]
         if bad:
             raise ProtocolError("bad-request", f"not a package name: {', '.join(bad)}")
+
+        repos = list({repo.id: repo for repo in req.repositories or []}.values())
+        if repos:
+            await self._ensure_repos(call, repos)
 
         settled: dict[str, g.DepStatus] = {}
         waiting: dict[str, asyncio.Future[g.DepStatus]] = {}
@@ -197,6 +210,15 @@ class _Resolver:
                 watchers[:] = [w for w in watchers if w is not call]
                 if not watchers:
                     self._watchers.pop(dep, None)
+
+    async def _ensure_repos(self, call: Call, repos: list[g.DepRepo]) -> None:
+        """Enable them (and refresh) before any package work; the job is
+        serialized with installs through the same queue."""
+        done: asyncio.Future[tuple[bool, str]] = asyncio.get_running_loop().create_future()
+        self._queue.put_nowait(_Repos(repos, call, done))
+        ok, out = await done
+        if not ok:
+            raise ProtocolError("failed", f"repositories: {_tail(out)}")
 
     async def _wait(
         self,
@@ -271,21 +293,39 @@ class _Resolver:
         while True:
             job = await self._queue.get()
             try:
-                if isinstance(job, _Install):
+                if isinstance(job, _Repos):
+                    await self._repos(job)
+                elif isinstance(job, _Install):
                     await self._install(job.deps)
                 else:
                     await self._refresh()
             except asyncio.CancelledError:
+                if isinstance(job, _Repos):
+                    self._repos_failed(job, "the resolver stopped")
                 if isinstance(job, _Install):
                     self._fail(job.deps, "the resolver stopped")
                 raise
             except Exception as exc:  # noqa: BLE001 — a job never kills the worker
                 log.exception("%s job failed", self._packages.name)
+                if isinstance(job, _Repos):
+                    self._repos_failed(job, f"{type(exc).__name__}: {exc}")
                 if isinstance(job, _Install):
                     self._fail(job.deps, f"{type(exc).__name__}: {exc}")
             finally:
                 if isinstance(job, _Refresh):
                     job.done.set()
+
+    async def _repos(self, job: _Repos) -> None:
+        ok, out = await self._packages.ensure_repos(job.repos, report=job.call.report)
+        if ok:
+            ok, out = await self._update(job.call.report)
+        if not job.done.done():
+            job.done.set_result((ok, out))
+
+    @staticmethod
+    def _repos_failed(job: _Repos, message: str) -> None:
+        if not job.done.done():
+            job.done.set_result((False, message))
 
     async def _install(self, deps: list[str]) -> None:
         report = self._report_to(deps)
@@ -326,7 +366,10 @@ class _Resolver:
 
     async def _refresh(self) -> None:
         known = sorted(self._known)
-        if not known or not await self._update(command.nowhere):  # no one waits on it
+        if not known:
+            return
+        ok, _ = await self._update(command.nowhere)  # no one waits on it
+        if not ok:
             return
         await self._retry(f"{self._packages.name} upgrade", lambda: self._packages.upgrade(known))
 
@@ -341,8 +384,8 @@ class _Resolver:
 
         return report
 
-    async def _update(self, report: Report) -> bool:
-        ok, _ = await self._retry(
+    async def _update(self, report: Report) -> tuple[bool, str]:
+        ok, out = await self._retry(
             f"{self._packages.name} refresh", lambda: self._packages.refresh(report=report)
         )
         if ok:
@@ -351,7 +394,7 @@ class _Resolver:
                 await asyncio.to_thread(_write_stamp, self._stamp, self._last_update)
             except OSError as exc:
                 log.warning("cannot save the index refresh time to %s: %s", self._stamp, exc)
-        return ok
+        return ok, out
 
     async def _retry(
         self, label: str, run: Callable[[], Awaitable[tuple[bool, str]]]

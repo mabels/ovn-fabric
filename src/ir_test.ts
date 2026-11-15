@@ -1423,9 +1423,8 @@ Deno.test("tunnelRouterEndpoint: zerotier state directory is derived from the ro
 
 // hostToIR carries the host's ABSTRACT OS dependencies (ovn/ovs for an
 // OVN-cluster host, ip/iptables for a kernel router, plus the app-level
-// ones) and the resolved OS (assume Ubuntu when unset) — the deployer
-// maps each abstract dep to the distro's package form (2026-08-23).
-Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
+// ones) — the deployer maps each abstract dep to the distro's packages.
+Deno.test("hostToIR: carries abstract OS dependencies", () => {
   const network = defineNetwork("test-net", (net) => {
     const host = net.localHost({
       name: "chassis-1",
@@ -1465,7 +1464,7 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
 
   const nodes = pinnedIR(network);
   const hostNode = node(nodes, "host:chassis-1");
-  assertEquals(hostNode.data["dependencies"], [
+  assertEquals(hostNode.data["abstractDependencies"], [
     "arp",
     "ping",
     "traceroute",
@@ -1476,11 +1475,88 @@ Deno.test("hostToIR: carries abstract OS dependencies and resolved OS", () => {
     "iptables",
     "dhclient",
   ]);
-  // os not set -> assume Ubuntu (2026-08-23).
+  // os not set -> the runtime discovers the host's OS.
+  assertEquals(hostNode.data["os"], undefined);
+});
+
+// An empty os object is "discover it", not a valid declared target.
+Deno.test("hostToIR: an empty os is omitted for discovery", () => {
+  const network = defineNetwork("test-net", (net) => {
+    net.localHost({ name: "chassis-1", os: {} as never });
+    return {};
+  });
+
+  const hostNode = node(pinnedIR(network), "host:chassis-1");
+  assertEquals(hostNode.data["os"], undefined);
+});
+
+// A declared target platform (e.g. a Raspberry Pi) rides the host OS into
+// the IR, where the runtime's translation can use it.
+Deno.test("hostToIR: carries the host's platform", () => {
+  const network = defineNetwork("test-net", (net) => {
+    net.localHost({
+      name: "chassis-1",
+      os: { distro: "ubuntu", version: "24.04", platform: "rpi" },
+    });
+    return {};
+  });
+
+  const hostNode = node(pinnedIR(network), "host:chassis-1");
   assertEquals(hostNode.data["os"], {
-    name: "ubuntu",
-    version: "26.04",
-    packageManager: "apt",
+    distro: "ubuntu",
+    version: "24.04",
+    platform: "rpi",
+  });
+});
+
+// The IR carries the host's concrete replacements for the distro
+// translation, keyed by abstract dependency name.
+Deno.test("hostToIR: carries dependency overrides by abstract name", () => {
+  const network = defineNetwork("test-net", (net) => {
+    net.localHost({
+      name: "chassis-1",
+      dependencyOverrides: {
+        ovn: [
+          {
+            kind: "dep.pkg",
+            name: "ovn-host",
+            version: "26.03.0-2+ravlocal11",
+          },
+          {
+            kind: "dep.pkgFile",
+            path: "/root/ovn-common_26.03.0-2+ravlocal11_amd64.deb",
+          },
+          {
+            kind: "dep.repo",
+            id: "centos-nfv-openvswitch",
+            baseurl: "https://example.invalid/nfv",
+            gpgkey: "https://example.invalid/nfv-key",
+          },
+        ],
+      },
+    });
+    return {};
+  });
+
+  const hostNode = node(pinnedIR(network), "host:chassis-1");
+  assertEquals(hostNode.data["dependencyOverrides"], {
+    ovn: [
+      {
+        kind: "dep.pkg",
+        name: "ovn-host",
+        version: "26.03.0-2+ravlocal11",
+      },
+      {
+        kind: "dep.pkgFile",
+        path: "/root/ovn-common_26.03.0-2+ravlocal11_amd64.deb",
+      },
+      {
+        kind: "dep.repo",
+        id: "centos-nfv-openvswitch",
+        baseurl: "https://example.invalid/nfv",
+        gpgkey: "https://example.invalid/nfv-key",
+      },
+    ],
   });
 });
 
@@ -1654,7 +1730,9 @@ Deno.test("net.service + ep.attachTo -> kernel.service node + endpoint serviceRe
   // The host runs a container, so it needs docker — even without a
   // kernel router.
   assertEquals(
-    node(nodes, "host:chassis-1").data["dependencies"]?.includes("docker"),
+    node(nodes, "host:chassis-1").data["abstractDependencies"]?.includes(
+      "docker",
+    ),
     true,
   );
   // …and the ENDPOINT references it (its NIC on that segment).

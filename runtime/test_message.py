@@ -37,9 +37,9 @@ IR_SAMPLE: list[dict[str, Any]] = [
             "connectAddress": "192.168.128.31",
             "ovnRole": "central",
             "encapIp": "192.168.128.31",
-            "os": {"name": "ubuntu", "version": "26.04", "packageManager": "apt"},
+            "os": {"distro": "ubuntu", "version": "26.04"},
             "reconcile": {"hostInterfaces": ["lo"]},
-            "dependencies": [
+            "abstractDependencies": [
                 "arp",
                 "ping",
                 "traceroute",

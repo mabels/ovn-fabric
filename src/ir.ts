@@ -129,8 +129,8 @@ function resolveEncapIp(host: Host): string | undefined {
 // `ip`+`iptables`, and the apps need their own (dhclient/dhcpcd,
 // wireguard, docker). A zerotier app needs nothing on the host: zerotier
 // runs in its container (2026-10-31). The runtime maps each abstract
-// dependency to the host's package manager's packages; there is
-// deliberately NO deinstall.
+// dependency to the host's distro's packages; there is deliberately NO
+// deinstall.
 function hostDependencies(host: Host, network: NetworkDefinition): string[] {
   const deps = new Set<string>(["arp", "ping", "traceroute", "python"]);
   if (host.ovn) {
@@ -174,6 +174,10 @@ function hostToIR(
 ): InfraHostNode {
   const id = `host:${host.name}`;
   const ipfix = host.monitoring?.ipfix;
+  const overrides = host.dependencyOverrides;
+  // An empty `os: {}` means "discover it": emitting it would fail the IR
+  // schema, so drop it. A populated but invalid os still fails there.
+  const os = host.os && Object.keys(host.os).length > 0 ? host.os : undefined;
   return {
     id,
     kind: "infra.host",
@@ -182,12 +186,21 @@ function hostToIR(
       connectAddress: host.connectAddress,
       ovnRole: host.ovn?.role.kind,
       encapIp: resolveEncapIp(host),
-      // OS always resolved — when the config leaves it unset, assume
-      // Ubuntu with apt (2026-08-23), so the runtime always knows the
-      // install form. A config that sets `os` names its package manager.
-      os: host.os ??
-        { name: "ubuntu", version: "26.04", packageManager: "apt" },
-      dependencies: dependencies.length > 0 ? dependencies : undefined,
+      // A declared target rides the IR; when the config leaves it unset,
+      // the runtime discovers the host's OS itself.
+      os,
+      abstractDependencies: dependencies.length > 0 ? dependencies : undefined,
+      // Concrete replacements for the distro translation, by abstract
+      // name (e.g. local patched packages for this host).
+      ...(overrides
+        ? {
+          dependencyOverrides: Object.fromEntries(
+            Object.entries(overrides).map((
+              [name, entries],
+            ) => [name, [...entries]]),
+          ),
+        }
+        : {}),
       // WHERE to export flows (types.ts IpfixExport -> protocol IpfixData)
       // — the per-leg WHETHER rides each ovn.ls interface instead (see
       // collisionDomainToIR's `flow`). `target` becomes `targets`, the

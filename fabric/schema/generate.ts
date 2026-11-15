@@ -6,7 +6,12 @@
 //
 //   deno run -A fabric/schema/generate.ts
 
-import { buildJsonSchema, refNamedShapes, shape } from "../../src/protocol.ts";
+import {
+  buildJsonSchema,
+  DepRepo,
+  refNamedShapes,
+  shape,
+} from "../../src/protocol.ts";
 import { generate } from "../../runtime/schema/generate.ts";
 import {
   AbstractDep,
@@ -89,6 +94,7 @@ import {
 } from "./protocol.ts";
 
 const shapes = refNamedShapes({
+  DepRepo: shape(DepRepo),
   VersionReq: shape(VersionReq),
   VersionRes: shape(VersionRes),
   SystemDepState: shape(SystemDepState),

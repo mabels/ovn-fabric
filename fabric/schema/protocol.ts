@@ -8,7 +8,7 @@
 // `deno run -A fabric/schema/generate.ts`.
 
 import { type } from "arktype";
-import { IRNode, PackageManager } from "../../src/protocol.ts";
+import { DepRepo, IRNode, PackageManager } from "../../src/protocol.ts";
 
 export const VersionReq = type({
   kind: "'VersionReq'",
@@ -44,6 +44,8 @@ export const ResolveSystemDepsReq = type({
    * infra.host os), never detected. */
   packageManager: PackageManager,
   deps: "string[]",
+  // Enabled before the packages are installed (dnf only, for now).
+  "repositories?": DepRepo.array(),
   "timeout?": "number",
 });
 
@@ -183,6 +185,8 @@ export const AbstractDepsReq = type({
   /** As ResolveSystemDepsReq's: picks the packages' column. */
   packageManager: PackageManager,
   deps: AbstractDepSpec.array(),
+  // Every repository named by the effective dependencies, host-global.
+  "repositories?": DepRepo.array(),
   "timeout?": "number",
 });
 

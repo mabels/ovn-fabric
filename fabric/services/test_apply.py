@@ -292,6 +292,7 @@ class ApplyTest(unittest.TestCase):
             progress = [m.body.unit for m in seen if isinstance(m.body, g.IrApplyProgress)]
             self.assertEqual([p.state for p in progress[:2]], [g.ApplyState.running, DONE])
             logs = [m.body.message for m in seen if isinstance(m.body, rg.LogMsg)]
+            self.assertIn("target (declared): ubuntu 26.04 generic apt", logs)
             self.assertIn(f"create unit: {PLAN[0]}", logs)  # the executor's logs, relayed
 
         asyncio.run(run())

@@ -70,6 +70,7 @@ from ..desired import (
     missing_nodes,
     step_state,
 )
+from ..hostos import HostOsError, resolve_host_os
 from ..lifecycle import LifecycleAction, resolve
 from ..plan import PlanError, plan_operations, plan_units
 from ..supervise import POLL, SETTLE, Supervisor, docker_states, watch_docker
@@ -566,14 +567,47 @@ class Apply:
     async def _deps(self, call: Call, nodes: list[pt.Model], host: str) -> str | None:
         """Resolve the host's abstract dependencies; None when all are ready."""
         host_node = next(n for n in nodes if isinstance(n, pt.InfraHostNode) and n.key.host == host)
-        deps = abstract_deps(host_node)
+        names = [d["name"] for d in abstract_deps(host_node)]
+        try:
+            target = resolve_host_os(
+                host_node.data.os,
+                host_node.data.dependencyOverrides,
+                names,
+            )
+        except HostOsError as exc:
+            return f"cannot determine the host's OS: {exc}"
+        source = "declared" if host_node.data.os is not None else "discovered"
+        platform = target.os.platform.value if target.os.platform else "generic"
+        await call.log(
+            "info",
+            f"target ({source}): {target.os.distro.value} "
+            f"{target.os.version or '-'} {platform} {target.package_manager}",
+        )
+        for name in target.dependencies:
+            if name not in names:
+                names.append(name)
+        repos = target.repositories()
+        if repos:
+            await call.log("info", f"repositories: {', '.join(repo.id for repo in repos)}")
+        repositories = [
+            g.DepRepo(
+                kind=repo.kind,
+                id=repo.id,
+                baseurl=repo.baseurl,
+                gpgkey=repo.gpgkey,
+            )
+            for repo in repos
+        ]
         client = await self._client()
         request = await client.request(
             g.AbstractDepsReq(
                 kind="AbstractDepsReq",
-                # The host's config names it (the IR's infra.host os).
-                packageManager=g.PackageManager(host_node.data.os.packageManager.value),
-                deps=[g.AbstractDepSpec(name=d["name"]) for d in deps],
+                packageManager=g.PackageManager(target.package_manager),
+                deps=[
+                    g.AbstractDepSpec(name=name, systemDeps=target.system_deps(name))
+                    for name in names
+                ],
+                repositories=repositories or None,
             ),
             parent=call.req_id,
         )
