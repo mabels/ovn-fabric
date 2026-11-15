@@ -46,6 +46,29 @@ def _nodes() -> dict[str, dict[str, Any]]:
             "chain": "POSTROUTING",
             "rule": {"action": "MASQUERADE", "fields": {"src": "172.17.0.0/16"}},
         },
+        # docker < 28: its ACCEPTs straight in FORWARD, on its bridge
+        {
+            "id": "iptables:d",
+            "kind": "iptables.rule",
+            "netnsRef": f"netns:{G}",
+            "chain": "FORWARD",
+            "rule": {"action": "ACCEPT", "fields": {"oif": "docker0"}},
+        },
+        {
+            "id": "iptables:e",
+            "kind": "iptables.rule",
+            "netnsRef": f"netns:{G}",
+            "chain": "FORWARD",
+            "rule": {"action": "ACCEPT", "fields": {"iif": "docker0", "oif": "docker0"}},
+        },
+        # an ACCEPT in FORWARD on another interface stays ours
+        {
+            "id": "iptables:forward-ours",
+            "kind": "iptables.rule",
+            "netnsRef": f"netns:{G}",
+            "chain": "FORWARD",
+            "rule": {"action": "ACCEPT", "fields": {"iif": "ovnkern.1128"}},
+        },
         {
             "id": "iptables:ours",
             "kind": "iptables.rule",
@@ -99,6 +122,8 @@ class OwnersTest(unittest.TestCase):
             "iptables:a",  # its chain
             "iptables:b",  # a jump into it
             "iptables:c",  # the masquerade of its subnet
+            "iptables:d",  # docker < 28: an ACCEPT in FORWARD out of its bridge
+            "iptables:e",  # … and one on its bridge both ways
         ):
             self.assertEqual(owner[node_id], "docker", node_id)
         for node_id in (f"link:{G}|ovs-system", f"link:{G}|genev_sys_6081"):
@@ -113,7 +138,12 @@ class OwnersTest(unittest.TestCase):
             "ovs.port:patch-x",
         ):
             self.assertEqual(owner[node_id], "ovn-controller", node_id)
-        for node_id in ("iptables:ours", "ovs.external-id:ovn-remote", "ovs.bridge:br-home"):
+        for node_id in (
+            "iptables:ours",
+            "iptables:forward-ours",
+            "ovs.external-id:ovn-remote",
+            "ovs.bridge:br-home",
+        ):
             self.assertEqual(owner[node_id], "ovn-fabric", node_id)
 
     def test_what_the_kernel_and_a_container_make_is_theirs(self) -> None:

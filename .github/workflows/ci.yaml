@@ -41,9 +41,9 @@ jobs:
 
       - uses: actions/setup-node@v5
         with:
-          node-version: 22.x
+          node-version: 24.x
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -137,7 +137,7 @@ jobs:
 
       - uses: actions/setup-node@v5
         with:
-          node-version: 22.x
+          node-version: 24.x
           registry-url: "https://registry.npmjs.org"
 
       - name: Install (pulls in `deno` as an npm dependency)

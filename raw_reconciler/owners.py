@@ -8,7 +8,8 @@ those nodes are never touched:
   a link, or from a router advertisement; SLAAC and link-local addresses;
   the fallback tunnel devices of a netns; the root netns);
 - docker: its networks' bridge interfaces, its iptables chains, jumps into
-  them, the masquerade of its subnets (`docker network inspect`);
+  them, rules on its bridges, the masquerade of its subnets (`docker
+  network inspect`);
   containers we did not start (no spec label), and whatever is inside
   the namespace of a running container (the app's own tunnel, its routes);
 - openvswitch: its datapath device and tunnel ports (`ovs-dpctl show`),
@@ -170,6 +171,7 @@ def _kernel(nodes: Nodes) -> None:
 def _docker(nodes: Nodes) -> None:
     networks = list_networks()
     subnets = [_network(s).to_string() for n in networks for s in n["subnets"]]
+    bridges = {n["bridge"] for n in networks}
     containers = _containers()
     # A running container's namespace, by both names it is collected under.
     inside = {f"netns:{prefix}{c['name']}" for c in containers for prefix in ("", "docker:")}
@@ -180,7 +182,14 @@ def _docker(nodes: Nodes) -> None:
             return True
         if str(rule.get("target") or "").startswith("DOCKER"):
             return True
-        source = (rule.get("fields") or {}).get("src")
+        fields = rule.get("fields") or {}
+        # A rule on one of its bridges: docker before 28 puts its ACCEPTs
+        # straight into FORWARD (`-i docker0 ! -o docker0`, `-o docker0
+        # … RELATED,ESTABLISHED`), 28+ into DOCKER-FORWARD. Debian 13
+        # ships 26 — removed as ours, its containers had no network.
+        if fields.get("iif") in bridges or fields.get("oif") in bridges:
+            return True
+        source = fields.get("src")
         if rule.get("action") == "MASQUERADE" and source:
             addr = IPAddress.parse(str(source))
             return addr is not None and addr.to_string() in subnets
