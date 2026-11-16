@@ -27,9 +27,6 @@ inputs:
   ovn-mac:
     description: MAC address of the isolated OVN NIC
     required: true
-  ovn-ip:
-    description: Static IPv4 address of the isolated OVN NIC
-    required: true
   ovn-mode:
     description: listen or connect on the OVN socket segment
     required: true
@@ -72,7 +69,6 @@ runs:
         SSH_KEY: ${{ inputs.ssh-private-key }}
         HOST_MAC: ${{ inputs.host-mac }}
         OVN_MAC: ${{ inputs.ovn-mac }}
-        OVN_IP: ${{ inputs.ovn-ip }}
         OVN_MODE: ${{ inputs.ovn-mode }}
         OVN_PORT: ${{ inputs.ovn-port }}
         MEMORY: ${{ inputs.memory }}
@@ -103,7 +99,12 @@ runs:
           - type: physical
             name: eth0
             subnets:
-              - type: dhcp4
+              - type: static
+                address: 10.0.2.15/24
+                gateway: 10.0.2.2
+          - type: nameserver
+            address:
+              - 10.0.2.3
         EOF
 
         cat >"$work/user-data" <<EOF
@@ -117,15 +118,7 @@ runs:
         ssh_pwauth: false
         disable_root: true
         runcmd:
-          - |
-            for i in /sys/class/net/*; do
-              if [ "\$(cat "\$i/address")" = "$OVN_MAC" ]; then
-                iface=\$(basename "\$i")
-                ip link set dev "\$iface" up
-                ip addr add "$OVN_IP/24" dev "\$iface"
-              fi
-            done
-            touch /var/run/qemu-ready
+          - touch /var/run/qemu-ready
         EOF
 
         cloud-localds --network-config="$work/network-config" "$work/seed.iso" "$work/user-data" "$work/meta-data"
@@ -154,6 +147,12 @@ runs:
         pid="$(cat "$work/qemu.pid")"
         echo "pid=$pid" >>"$GITHUB_OUTPUT"
         echo "workdir=$work" >>"$GITHUB_OUTPUT"
+
+        # Stream the guest serial console into the job log while we wait.
+        touch "$work/serial.log"
+        tail -n +1 -F "$work/serial.log" 2>/dev/null | sed -u "s/^/[$NAME] /" &
+        tail_pid=$!
+        trap 'kill "$tail_pid" 2>/dev/null || true' EXIT
 
         deadline=$((SECONDS + TIMEOUT))
         while [ "$SECONDS" -lt "$deadline" ]; do
