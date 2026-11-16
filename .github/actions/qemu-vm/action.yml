@@ -46,6 +46,10 @@ inputs:
     description: How long to wait for cloud-init and SSH
     required: false
     default: "900"
+  wait:
+    description: Wait for SSH and the cloud-init marker before returning
+    required: false
+    default: "true"
 
 outputs:
   pid:
@@ -74,6 +78,7 @@ runs:
         MEMORY: ${{ inputs.memory }}
         CPUS: ${{ inputs.cpus }}
         TIMEOUT: ${{ inputs.timeout-seconds }}
+        WAIT: ${{ inputs.wait }}
       run: |
         set -euo pipefail
         for tool in qemu-system-x86_64 qemu-img cloud-localds ssh; do
@@ -147,9 +152,14 @@ runs:
         pid="$(cat "$work/qemu.pid")"
         echo "pid=$pid" >>"$GITHUB_OUTPUT"
         echo "workdir=$work" >>"$GITHUB_OUTPUT"
+        touch "$work/serial.log"
+
+        if [ "$WAIT" != "true" ]; then
+          echo "QEMU $NAME started on 127.0.0.1:$SSH_PORT"
+          exit 0
+        fi
 
         # Stream the guest serial console into the job log while we wait.
-        touch "$work/serial.log"
         tail -n +1 -F "$work/serial.log" 2>/dev/null | sed -u "s/^/[$NAME] /" &
         tail_pid=$!
         trap 'kill "$tail_pid" 2>/dev/null || true' EXIT
