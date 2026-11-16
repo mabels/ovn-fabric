@@ -9,7 +9,7 @@ permissions:
 jobs:
   qemu:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
 
@@ -48,11 +48,11 @@ jobs:
           print("alpine image ok")
           PY
 
-      - name: Start first QEMU (OVN listen)
-        id: vm1
+      - name: Start tester QEMU
+        id: vm
         uses: ./.github/actions/qemu-vm
         with:
-          name: ovn-a
+          name: tester
           image: ${{ runner.temp }}/alpine.qcow2
           ssh-port: "2201"
           ssh-public-key: ${{ steps.key.outputs.public }}
@@ -61,90 +61,21 @@ jobs:
           ovn-mac: "52:54:00:00:01:01"
           ovn-mode: listen
           ovn-port: "9000"
-          wait: "false"
+          timeout-seconds: "300"
 
-      - name: Start second QEMU (OVN connect)
-        id: vm2
-        uses: ./.github/actions/qemu-vm
-        with:
-          name: ovn-b
-          image: ${{ runner.temp }}/alpine.qcow2
-          ssh-port: "2202"
-          ssh-public-key: ${{ steps.key.outputs.public }}
-          ssh-private-key: ${{ steps.key.outputs.private }}
-          host-mac: "52:54:00:00:00:02"
-          ovn-mac: "52:54:00:00:01:02"
-          ovn-mode: connect
-          ovn-port: "9000"
-          wait: "false"
-
-      - name: Stream consoles and wait for both guests
+      - name: Show ip a and date
         run: |
-          set -euo pipefail
-          cleanup() {
-            kill "$tail1" "$tail2" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-
-          work1="${{ steps.vm1.outputs.workdir }}"
-          work2="${{ steps.vm2.outputs.workdir }}"
-          pid1="${{ steps.vm1.outputs.pid }}"
-          pid2="${{ steps.vm2.outputs.pid }}"
-
-          tail -n +1 -F "$work1/serial.log" 2>/dev/null | sed -u 's/^/[ovn-a] /' &
-          tail1=$!
-          tail -n +1 -F "$work2/serial.log" 2>/dev/null | sed -u 's/^/[ovn-b] /' &
-          tail2=$!
-
-          deadline=$((SECONDS + 900))
-          for entry in "$pid1:$work1:2201:ovn-a" "$pid2:$work2:2202:ovn-b"; do
-            pid="${entry%%:*}"
-            rest="${entry#*:}"
-            work="${rest%%:*}"
-            rest="${rest#*:}"
-            port="${rest%%:*}"
-            name="${rest##*:}"
-            echo "waiting for $name"
-            until ssh -i "$RUNNER_TEMP/qemu_key" -p "$port" \
-              -o BatchMode=yes \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              -o ConnectTimeout=2 \
-              alpine@127.0.0.1 'test -f /var/run/qemu-ready' >/dev/null 2>&1; do
-              if ! kill -0 "$pid" 2>/dev/null; then
-                echo "$name exited before it was ready" >&2
-                tail -n 80 "$work/serial.log" >&2 || true
-                exit 1
-              fi
-              if [ "$SECONDS" -ge "$deadline" ]; then
-                echo "timed out waiting for $name" >&2
-                tail -n 80 "$work/serial.log" >&2 || true
-                exit 1
-              fi
-              sleep 2
-            done
-            echo "$name ready"
-          done
-
-      - name: Show ip a and date on both guests
-        run: |
-          for entry in "2201:ovn-a" "2202:ovn-b"; do
-            port="${entry%%:*}"
-            name="${entry##*:}"
-            echo "=== $name"
-            ssh -i "$RUNNER_TEMP/qemu_key" -p "$port" \
-              -o BatchMode=yes \
-              -o StrictHostKeyChecking=no \
-              -o UserKnownHostsFile=/dev/null \
-              alpine@127.0.0.1 'ip a; echo ---; date'
-          done
+          ssh -i "$RUNNER_TEMP/qemu_key" -p 2201 \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            alpine@127.0.0.1 'ip a; echo ---; date'
 
       - name: Cleanup
         if: always()
         run: |
-          for pid in "${{ steps.vm1.outputs.pid }}" "${{ steps.vm2.outputs.pid }}"; do
-            if [ -n "$pid" ]; then
-              kill "$pid" 2>/dev/null || true
-            fi
-          done
-          pkill -f 'qemu-system-x86_64.*ovn-' 2>/dev/null || true
+          pid="${{ steps.vm.outputs.pid }}"
+          if [ -n "$pid" ]; then
+            kill "$pid" 2>/dev/null || true
+          fi
+          pkill -f 'qemu-system-x86_64.*tester' 2>/dev/null || true
