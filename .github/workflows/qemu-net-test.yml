@@ -1,0 +1,102 @@
+name: QEMU network smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  qemu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install QEMU and cloud-init tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 cloud-image-utils openssh-client
+
+      - name: Temporary SSH key
+        id: key
+        run: |
+          ssh-keygen -t ed25519 -N '' -f "$RUNNER_TEMP/qemu_key"
+          echo "private=$RUNNER_TEMP/qemu_key" >> "$GITHUB_OUTPUT"
+          echo "public=$RUNNER_TEMP/qemu_key.pub" >> "$GITHUB_OUTPUT"
+
+      - name: Download Alpine cloud image
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import os
+          import urllib.request
+
+          base = "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/"
+          name = "alpine-3.22.8-x86_64-bios-cloudinit-r0.qcow2"
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "alpine.qcow2")
+          urllib.request.urlretrieve(base + name, dest)
+          expected = urllib.request.urlopen(
+              base + name + ".sha512", timeout=60
+          ).read().decode().split()[0]
+          digest = hashlib.sha512()
+          with open(dest, "rb") as handle:
+              for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                  digest.update(chunk)
+          if digest.hexdigest() != expected:
+              raise SystemExit("alpine image checksum mismatch")
+          print("alpine image ok")
+          PY
+
+      - name: Start first QEMU (OVN listen)
+        id: vm1
+        uses: ./.github/actions/qemu-vm
+        with:
+          name: ovn-a
+          image: ${{ runner.temp }}/alpine.qcow2
+          ssh-port: "2201"
+          ssh-public-key: ${{ steps.key.outputs.public }}
+          ssh-private-key: ${{ steps.key.outputs.private }}
+          host-mac: "52:54:00:00:00:01"
+          ovn-mac: "52:54:00:00:01:01"
+          ovn-ip: "192.168.128.11"
+          ovn-mode: listen
+          ovn-port: "9000"
+
+      - name: Start second QEMU (OVN connect)
+        id: vm2
+        uses: ./.github/actions/qemu-vm
+        with:
+          name: ovn-b
+          image: ${{ runner.temp }}/alpine.qcow2
+          ssh-port: "2202"
+          ssh-public-key: ${{ steps.key.outputs.public }}
+          ssh-private-key: ${{ steps.key.outputs.private }}
+          host-mac: "52:54:00:00:00:02"
+          ovn-mac: "52:54:00:00:01:02"
+          ovn-ip: "192.168.128.12"
+          ovn-mode: connect
+          ovn-port: "9000"
+
+      - name: Show ip a and date on both guests
+        run: |
+          for entry in "2201:ovn-a" "2202:ovn-b"; do
+            port="${entry%%:*}"
+            name="${entry##*:}"
+            echo "=== $name"
+            ssh -i "$RUNNER_TEMP/qemu_key" -p "$port" \
+              -o BatchMode=yes \
+              -o StrictHostKeyChecking=no \
+              -o UserKnownHostsFile=/dev/null \
+              alpine@127.0.0.1 'ip a; echo ---; date'
+          done
+
+      - name: Cleanup
+        if: always()
+        run: |
+          for pid in "${{ steps.vm1.outputs.pid }}" "${{ steps.vm2.outputs.pid }}"; do
+            if [ -n "$pid" ]; then
+              kill "$pid" 2>/dev/null || true
+            fi
+          done
+          pkill -f 'qemu-system-x86_64.*ovn-' 2>/dev/null || true

@@ -1,0 +1,179 @@
+name: QEMU VM
+description: Start one QEMU VM with a NAT host NIC and an isolated OVN NIC.
+
+inputs:
+  name:
+    description: VM name
+    required: true
+  image:
+    description: Path to the base qcow2 cloud image
+    required: true
+  ssh-port:
+    description: Local TCP port forwarded to the guest's SSH
+    required: true
+  ssh-user:
+    description: Guest SSH user
+    required: false
+    default: alpine
+  ssh-public-key:
+    description: Path to the temporary public key injected into the guest
+    required: true
+  ssh-private-key:
+    description: Path to the matching private key used to wait for SSH
+    required: true
+  host-mac:
+    description: MAC address of the NAT host NIC
+    required: true
+  ovn-mac:
+    description: MAC address of the isolated OVN NIC
+    required: true
+  ovn-ip:
+    description: Static IPv4 address of the isolated OVN NIC
+    required: true
+  ovn-mode:
+    description: listen or connect on the OVN socket segment
+    required: true
+  ovn-port:
+    description: Local TCP port of the OVN socket segment
+    required: false
+    default: "9000"
+  memory:
+    description: Guest memory in MiB
+    required: false
+    default: "512"
+  cpus:
+    description: Guest vCPUs
+    required: false
+    default: "2"
+  timeout-seconds:
+    description: How long to wait for cloud-init and SSH
+    required: false
+    default: "900"
+
+outputs:
+  pid:
+    description: QEMU process id
+    value: ${{ steps.start.outputs.pid }}
+  workdir:
+    description: Directory holding the overlay, seed, pidfile and serial log
+    value: ${{ steps.start.outputs.workdir }}
+
+runs:
+  using: composite
+  steps:
+    - id: start
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        IMAGE: ${{ inputs.image }}
+        SSH_PORT: ${{ inputs.ssh-port }}
+        SSH_USER: ${{ inputs.ssh-user }}
+        SSH_PUB: ${{ inputs.ssh-public-key }}
+        SSH_KEY: ${{ inputs.ssh-private-key }}
+        HOST_MAC: ${{ inputs.host-mac }}
+        OVN_MAC: ${{ inputs.ovn-mac }}
+        OVN_IP: ${{ inputs.ovn-ip }}
+        OVN_MODE: ${{ inputs.ovn-mode }}
+        OVN_PORT: ${{ inputs.ovn-port }}
+        MEMORY: ${{ inputs.memory }}
+        CPUS: ${{ inputs.cpus }}
+        TIMEOUT: ${{ inputs.timeout-seconds }}
+      run: |
+        set -euo pipefail
+        for tool in qemu-system-x86_64 qemu-img cloud-localds ssh; do
+          command -v "$tool" >/dev/null || {
+            echo "missing $tool" >&2
+            exit 1
+          }
+        done
+
+        work="$RUNNER_TEMP/qemu-$NAME"
+        rm -rf "$work"
+        mkdir -p "$work"
+        pub="$(cat "$SSH_PUB")"
+
+        cat >"$work/meta-data" <<EOF
+        instance-id: $NAME
+        local-hostname: $NAME
+        EOF
+
+        cat >"$work/network-config" <<EOF
+        version: 1
+        config:
+          - type: physical
+            name: eth0
+            subnets:
+              - type: dhcp4
+        EOF
+
+        cat >"$work/user-data" <<EOF
+        #cloud-config
+        hostname: $NAME
+        preserve_hostname: false
+        users:
+          - name: alpine
+            ssh_authorized_keys:
+              - $pub
+        ssh_pwauth: false
+        disable_root: true
+        runcmd:
+          - |
+            for i in /sys/class/net/*; do
+              if [ "\$(cat "\$i/address")" = "$OVN_MAC" ]; then
+                iface=\$(basename "\$i")
+                ip link set dev "\$iface" up
+                ip addr add "$OVN_IP/24" dev "\$iface"
+              fi
+            done
+            touch /var/run/qemu-ready
+        EOF
+
+        cloud-localds --network-config="$work/network-config" "$work/seed.iso" "$work/user-data" "$work/meta-data"
+        qemu-img create -f qcow2 -b "$IMAGE" -F qcow2 "$work/overlay.qcow2" 4G >/dev/null
+
+        qemu-system-x86_64 \
+          -name "$NAME" \
+          -machine pc \
+          -accel tcg,thread=multi \
+          -cpu max \
+          -smp "$CPUS" \
+          -m "$MEMORY" \
+          -drive file="$work/overlay.qcow2",if=virtio,format=qcow2 \
+          -drive file="$work/seed.iso",if=virtio,format=raw,readonly=on \
+          -netdev user,id=hostnet,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22 \
+          -device virtio-net-pci,netdev=hostnet,mac="$HOST_MAC" \
+          -netdev socket,id=ovnnet,${OVN_MODE}=127.0.0.1:${OVN_PORT} \
+          -device virtio-net-pci,netdev=ovnnet,mac="$OVN_MAC" \
+          -display none \
+          -serial "file:$work/serial.log" \
+          -monitor none \
+          -daemonize \
+          -pidfile "$work/qemu.pid" \
+          -no-reboot
+
+        pid="$(cat "$work/qemu.pid")"
+        echo "pid=$pid" >>"$GITHUB_OUTPUT"
+        echo "workdir=$work" >>"$GITHUB_OUTPUT"
+
+        deadline=$((SECONDS + TIMEOUT))
+        while [ "$SECONDS" -lt "$deadline" ]; do
+          if ! kill -0 "$pid" 2>/dev/null; then
+            echo "QEMU $NAME exited before it was ready" >&2
+            tail -n 80 "$work/serial.log" >&2 || true
+            exit 1
+          fi
+          if ssh -i "$SSH_KEY" -p "$SSH_PORT" \
+            -o BatchMode=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            -o ConnectTimeout=2 \
+            "$SSH_USER@127.0.0.1" 'test -f /var/run/qemu-ready' >/dev/null 2>&1; then
+            echo "QEMU $NAME ready on 127.0.0.1:$SSH_PORT"
+            exit 0
+          fi
+          sleep 2
+        done
+
+        echo "QEMU $NAME did not become ready within ${TIMEOUT}s" >&2
+        tail -n 80 "$work/serial.log" >&2 || true
+        exit 1
