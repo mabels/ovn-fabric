@@ -65,14 +65,49 @@ jobs:
           ovn-port: "9000"
           timeout-seconds: "300"
 
-      - name: Show ip a and date
+      - name: Install tester netns tooling
         run: |
           ssh -i "$RUNNER_TEMP/qemu_key" -p 2201 \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
-            root@127.0.0.1 'ip a; echo ---; date'
+            root@127.0.0.1 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y iptables radvd'
+
+      - name: Inject and run tester netns setup
+        run: |
+          scp -i "$RUNNER_TEMP/qemu_key" -P 2201 \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            .github/scripts/tester/test-isp.sh \
+            .github/scripts/tester/test-segments.sh \
+            root@127.0.0.1:/root/
+          ssh -i "$RUNNER_TEMP/qemu_key" -p 2201 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            root@127.0.0.1 'chmod +x /root/test-isp.sh /root/test-segments.sh; /root/test-segments.sh up; /root/test-isp.sh up'
+
+      - name: Show ip a, netns and date
+        run: |
+          ssh -i "$RUNNER_TEMP/qemu_key" -p 2201 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            root@127.0.0.1 'sh -s' <<'EOF'
+          ip a
+          echo ---
+          ip netns ls
+          for ns in $(ip netns ls | awk '{print $1}'); do
+            echo "=== $ns"
+            ip netns exec "$ns" ip a
+          done
+          echo ---
+          date
+          EOF
 
       - name: Cleanup
         if: always()
