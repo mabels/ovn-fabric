@@ -99,18 +99,15 @@ runs:
         EOF
 
         cat >"$work/network-config" <<EOF
-        version: 1
-        config:
-          - type: physical
-            name: eth0
-            subnets:
-              - type: static
-                address: 10.0.2.15
-                netmask: 255.255.255.0
-                gateway: 10.0.2.2
-          - type: nameserver
-            address:
-              - 10.0.2.3
+        version: 2
+        ethernets:
+          host:
+            match: {macaddress: "$HOST_MAC"}
+            addresses: [10.0.2.15/24]
+            routes: [{to: 0.0.0.0/0, via: 10.0.2.2}]
+            nameservers: {addresses: [10.0.2.3]}
+            dhcp4: false
+            dhcp6: false
         EOF
 
         cat >"$work/user-data" <<EOF
@@ -119,9 +116,6 @@ runs:
         preserve_hostname: false
         users:
           - name: root
-            ssh_authorized_keys:
-              - $pub
-          - name: alpine
             ssh_authorized_keys:
               - $pub
         ssh_pwauth: false
@@ -134,17 +128,23 @@ runs:
             chmod 600 /root/.ssh/authorized_keys
             for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
               [ -f "\$f" ] || continue
-              sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "\$f"
+              sed -i -E 's/^[[:space:]]*#?[[:space:]]*PermitRootLogin.*/PermitRootLogin prohibit-password/' "\$f"
             done
-            rc-service sshd restart || true
-            if ! id alpine >/dev/null 2>&1; then
-              adduser -D -s /bin/sh alpine
-            fi
-            mkdir -p /home/alpine/.ssh
-            printf '%s\n' "$pub" > /home/alpine/.ssh/authorized_keys
-            chown -R alpine:alpine /home/alpine/.ssh
-            chmod 700 /home/alpine/.ssh
-            chmod 600 /home/alpine/.ssh/authorized_keys
+            systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+            {
+              echo "=== qemu test: users ==="
+              id root || true
+              echo "=== qemu test: sshd effective ==="
+              sshd -T 2>&1 | grep -Ei '^(permitrootlogin|pubkeyauthentication|authorizedkeysfile|allowusers|denyusers|usepam|strictmodes|passwordauthentication)' || true
+              echo "=== qemu test: keys ==="
+              ls -ld /root /root/.ssh || true
+              ls -l /root/.ssh/authorized_keys || true
+              ssh-keygen -lf /root/.ssh/authorized_keys || true
+              echo "=== qemu test: sshd procs ==="
+              ps | grep -E '[s]shd' || true
+              echo "=== qemu test: sshd config ==="
+              grep -Ei 'permitrootlogin|authorizedkeysfile|allowusers|denyusers|^match' /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null || true
+            } >/dev/ttyS0 2>&1
             touch /var/run/qemu-ready
         EOF
 
@@ -197,7 +197,7 @@ runs:
           fi
 
           set +e
-          out="$(ssh -i "$SSH_KEY" -p "$SSH_PORT" \
+          out="$(ssh -v -i "$SSH_KEY" -p "$SSH_PORT" \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=no \

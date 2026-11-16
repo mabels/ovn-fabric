@@ -32,20 +32,21 @@ jobs:
           import os
           import urllib.request
 
-          base = "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/"
-          name = "nocloud_alpine-3.22.4-x86_64-bios-cloudinit-r0.qcow2"
-          dest = os.path.join(os.environ["RUNNER_TEMP"], "alpine.qcow2")
+          base = "https://cloud.debian.org/images/cloud/trixie/latest/"
+          name = "debian-13-genericcloud-amd64.qcow2"
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "debian.qcow2")
           urllib.request.urlretrieve(base + name, dest)
-          expected = urllib.request.urlopen(
-              base + name + ".sha512", timeout=60
-          ).read().decode().split()[0]
+          sums = urllib.request.urlopen(base + "SHA512SUMS", timeout=60).read().decode()
+          expected = next(
+              line.split()[0] for line in sums.splitlines() if name in line
+          )
           digest = hashlib.sha512()
           with open(dest, "rb") as handle:
               for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                   digest.update(chunk)
           if digest.hexdigest() != expected:
-              raise SystemExit("alpine image checksum mismatch")
-          print("alpine image ok")
+              raise SystemExit("debian image checksum mismatch")
+          print("debian image ok")
           PY
 
       - name: Start tester QEMU
@@ -53,7 +54,7 @@ jobs:
         uses: ./.github/actions/qemu-vm
         with:
           name: tester
-          image: ${{ runner.temp }}/alpine.qcow2
+          image: ${{ runner.temp }}/debian.qcow2
           ssh-port: "2201"
           ssh-user: root
           ssh-public-key: ${{ steps.key.outputs.public }}
