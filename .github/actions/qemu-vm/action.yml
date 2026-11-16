@@ -133,7 +133,7 @@ runs:
           -m "$MEMORY" \
           -drive file="$work/overlay.qcow2",if=virtio,format=qcow2 \
           -drive file="$work/seed.iso",if=virtio,format=raw,readonly=on \
-          -netdev user,id=hostnet,hostfwd=tcp:127.0.0.1:${SSH_PORT}-:22 \
+          -netdev user,id=hostnet,hostfwd=tcp:127.0.0.1:${SSH_PORT}-10.0.2.15:22 \
           -device virtio-net-pci,netdev=hostnet,mac="$HOST_MAC" \
           -netdev socket,id=ovnnet,${OVN_MODE}=127.0.0.1:${OVN_PORT} \
           -device virtio-net-pci,netdev=ovnnet,mac="$OVN_MAC" \

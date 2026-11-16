@@ -33,7 +33,7 @@ jobs:
           import urllib.request
 
           base = "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/cloud/"
-          name = "alpine-3.22.8-x86_64-bios-cloudinit-r0.qcow2"
+          name = "nocloud_alpine-3.22.4-x86_64-bios-cloudinit-r0.qcow2"
           dest = os.path.join(os.environ["RUNNER_TEMP"], "alpine.qcow2")
           urllib.request.urlretrieve(base + name, dest)
           expected = urllib.request.urlopen(
