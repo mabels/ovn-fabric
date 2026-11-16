@@ -67,6 +67,7 @@ jobs:
         run: |
           ssh -i "$RUNNER_TEMP/qemu_key" -p 2201 \
             -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             alpine@127.0.0.1 'ip a; echo ---; date'
