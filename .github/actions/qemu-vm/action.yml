@@ -118,13 +118,34 @@ runs:
         hostname: $NAME
         preserve_hostname: false
         users:
+          - name: root
+            ssh_authorized_keys:
+              - $pub
           - name: alpine
             ssh_authorized_keys:
               - $pub
         ssh_pwauth: false
-        disable_root: true
+        disable_root: false
         runcmd:
-          - touch /var/run/qemu-ready
+          - |
+            mkdir -p /root/.ssh
+            printf '%s\n' "$pub" > /root/.ssh/authorized_keys
+            chmod 700 /root/.ssh
+            chmod 600 /root/.ssh/authorized_keys
+            for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+              [ -f "\$f" ] || continue
+              sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "\$f"
+            done
+            rc-service sshd restart || true
+            if ! id alpine >/dev/null 2>&1; then
+              adduser -D -s /bin/sh alpine
+            fi
+            mkdir -p /home/alpine/.ssh
+            printf '%s\n' "$pub" > /home/alpine/.ssh/authorized_keys
+            chown -R alpine:alpine /home/alpine/.ssh
+            chmod 700 /home/alpine/.ssh
+            chmod 600 /home/alpine/.ssh/authorized_keys
+            touch /var/run/qemu-ready
         EOF
 
         cloud-localds --network-config="$work/network-config" "$work/seed.iso" "$work/user-data" "$work/meta-data"

@@ -55,6 +55,7 @@ jobs:
           name: tester
           image: ${{ runner.temp }}/alpine.qcow2
           ssh-port: "2201"
+          ssh-user: root
           ssh-public-key: ${{ steps.key.outputs.public }}
           ssh-private-key: ${{ steps.key.outputs.private }}
           host-mac: "52:54:00:00:00:01"
@@ -70,7 +71,7 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
-            alpine@127.0.0.1 'ip a; echo ---; date'
+            root@127.0.0.1 'ip a; echo ---; date'
 
       - name: Cleanup
         if: always()
