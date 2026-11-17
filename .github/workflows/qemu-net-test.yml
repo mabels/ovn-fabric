@@ -109,11 +109,39 @@ jobs:
           date
           EOF
 
+      - name: Start ovn-fabric-debian QEMU
+        id: target
+        uses: ./.github/actions/qemu-vm
+        with:
+          name: ovn-fabric-debian
+          image: ${{ runner.temp }}/debian.qcow2
+          ssh-port: "2202"
+          ssh-user: root
+          ssh-public-key: ${{ steps.key.outputs.public }}
+          ssh-private-key: ${{ steps.key.outputs.private }}
+          host-mac: "52:54:00:00:02:01"
+          ovn-mac: "52:54:00:00:01:02"
+          ovn-name: ovnkern
+          ovn-mode: connect
+          ovn-port: "9000"
+          timeout-seconds: "600"
+
+      - name: SSH root into ovn-fabric-debian
+        run: |
+          ssh -i "$RUNNER_TEMP/qemu_key" -p 2202 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            root@127.0.0.1 'hostname; ip a; echo ---; ip -br link; echo ---; date'
+
       - name: Cleanup
         if: always()
         run: |
-          pid="${{ steps.vm.outputs.pid }}"
-          if [ -n "$pid" ]; then
-            kill "$pid" 2>/dev/null || true
-          fi
+          for pid in "${{ steps.vm.outputs.pid }}" "${{ steps.target.outputs.pid }}"; do
+            if [ -n "$pid" ]; then
+              kill "$pid" 2>/dev/null || true
+            fi
+          done
           pkill -f 'qemu-system-x86_64.*tester' 2>/dev/null || true
+          pkill -f 'qemu-system-x86_64.*ovn-fabric-debian' 2>/dev/null || true
