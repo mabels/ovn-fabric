@@ -13,6 +13,18 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Write topology secrets
+        env:
+          TOPOLOGY_SECRETS_TS: ${{ secrets.TOPOLOGY_SECRETS_TS }}
+        run: |
+          umask 077
+          printf '%s\n' "$TOPOLOGY_SECRETS_TS" > examples/topology.cluster-tenants.secrets.ts
+          chmod 600 examples/topology.cluster-tenants.secrets.ts
+
       - name: Install QEMU and cloud-init tools
         run: |
           sudo apt-get update
@@ -134,6 +146,24 @@ jobs:
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
             root@127.0.0.1 'hostname; ip a; echo ---; ip -br link; echo ---; date'
+
+      - name: Configure SSH for the deploy target
+        run: |
+          mkdir -p "$HOME/.ssh"
+          chmod 700 "$HOME/.ssh"
+          cat >> "$HOME/.ssh/config" <<EOF
+          Host 127.0.0.1
+            StrictHostKeyChecking no
+            UserKnownHostsFile /dev/null
+            IdentityFile $RUNNER_TEMP/qemu_key
+            IdentitiesOnly yes
+          EOF
+
+      - name: Deploy fabric to ovn-fabric-debian
+        run: |
+          deno run -A src/cli.ts generate-ir \
+            --runtime ctx=test-e examples/topology.cluster-tenants.ts \
+            | scripts/fabric-deploy.sh root@127.0.0.1 --port 2202 ir-apply run
 
       - name: Cleanup
         if: always()

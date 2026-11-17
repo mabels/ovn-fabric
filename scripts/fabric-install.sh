@@ -7,6 +7,7 @@
 # back to what ran before).
 #
 #   scripts/fabric-install.sh root@192.168.128.31
+#   scripts/fabric-install.sh root@192.168.128.31 --port 2202
 #   scripts/fabric-install.sh root@192.168.128.31 --ref previous   # switch back
 #
 # On the host:
@@ -18,7 +19,7 @@
 set -eu
 
 if [ $# -lt 1 ]; then
-  echo "usage: $0 user@host [--ref previous|sha256:…]" >&2
+  echo "usage: $0 user@host [--port N] [--ref previous|sha256:…]" >&2
   exit 2
 fi
 ROOT=$(cd "$(dirname "$0")/.." && pwd)

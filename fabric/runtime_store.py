@@ -206,21 +206,28 @@ def listing(state_root: str = STATE_ROOT) -> list[str]:
     return lines
 
 
-def deploy(target: str, pex: Path | None, ref: str | None) -> int:
+def deploy(
+    target: str,
+    pex: Path | None,
+    ref: str | None,
+    port: int | None = None,
+) -> int:
     """Where a PEX is built: put it onto `target` and install it there — or,
     with `ref`, switch the host to a runtime it already stores."""
+    ssh = ["ssh"] + (["-p", str(port)] if port is not None else [])
+    scp = ["scp", "-q"] + (["-P", str(port)] if port is not None else [])
     remote_env = f"PEX_ROOT={PEX_ROOT}"
     if ref is not None:
         command = f"{remote_env} python3 {LINK} runtime-install --ref {shlex.quote(ref)}"
-        return subprocess.run(["ssh", target, command]).returncode
+        return subprocess.run([*ssh, target, command]).returncode
     if pex is None:
         print("error: no PEX to deploy (build one with `bundle`, or --pex)", file=sys.stderr)
         return 2
     digest = hashlib.sha256(pex.read_bytes()).hexdigest()
     remote = f"/tmp/ovn-fabric-{digest[:16]}.pex"
-    if subprocess.run(["scp", "-q", str(pex), f"{target}:{remote}"]).returncode != 0:
+    if subprocess.run([*scp, str(pex), f"{target}:{remote}"]).returncode != 0:
         return 1
     command = (
         f"{remote_env} python3 {remote} runtime-install; status=$?; rm -f {remote}; exit $status"
     )
-    return subprocess.run(["ssh", target, command]).returncode
+    return subprocess.run([*ssh, target, command]).returncode

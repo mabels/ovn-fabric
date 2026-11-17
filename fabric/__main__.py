@@ -657,7 +657,7 @@ async def _deploy(args: argparse.Namespace) -> int:
     from .runtime_store import deploy, own_pex
 
     if args.ref is not None:
-        return deploy(args.target, None, args.ref)
+        return deploy(args.target, None, args.ref, args.port)
     pex = Path(args.pex) if args.pex else own_pex()
     if pex is None:  # from a source checkout: build it first
         args.output = "dist/fabric.pex"
@@ -665,7 +665,7 @@ async def _deploy(args: argparse.Namespace) -> int:
         if code != 0:
             return code
         pex = Path(args.output).resolve()
-    return await asyncio.to_thread(deploy, args.target, pex, None)
+    return await asyncio.to_thread(deploy, args.target, pex, None, args.port)
 
 
 async def _runtime_install(args: argparse.Namespace) -> int:
@@ -911,6 +911,7 @@ def main() -> int:
         help="make this PEX (or, from a checkout, a fresh bundle) the runtime of a host",
     )
     deploy_cmd.add_argument("target", help="the host over ssh, e.g. root@192.168.128.32")
+    deploy_cmd.add_argument("--port", type=int, help="the host's ssh port (default 22)")
     deploy_cmd.add_argument("--pex", help="deploy this PEX file instead")
     deploy_cmd.add_argument(
         "--ref", help="switch the host to a runtime it stores: `previous` or a hash"

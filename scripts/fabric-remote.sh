@@ -4,17 +4,31 @@
 # piped in.
 #
 #   scripts/fabric-remote.sh root@192.168.128.31 version
+#   scripts/fabric-remote.sh root@192.168.128.31 --port 2202 version
 #   scripts/fabric-remote.sh root@192.168.128.31 ir-apply create < py.ir
 #   scripts/fabric-remote.sh root@192.168.128.31 ir-list
 #   scripts/fabric-remote.sh root@192.168.128.31 --log remote=debug ir-apply create < py.ir
 set -eu
 
-if [ $# -lt 2 ]; then
-  echo "usage: $0 user@host <fabric command> [args…]" >&2
+if [ $# -lt 1 ]; then
+  echo "usage: $0 user@host [--port N] <fabric command> [args…]" >&2
   exit 2
 fi
 TARGET=$1
 shift
+PORT=
+if [ $# -gt 0 ] && [ "$1" = "--port" ]; then
+  [ $# -ge 2 ] || {
+    echo "--port needs a value" >&2
+    exit 2
+  }
+  PORT=$2
+  shift 2
+fi
+if [ $# -lt 1 ]; then
+  echo "usage: $0 user@host [--port N] <fabric command> [args…]" >&2
+  exit 2
+fi
 
 # ssh hands the remote side one command line: quote every argument.
 quote() {
@@ -32,6 +46,9 @@ tty=""
 # ssh would forward this machine's LC_ALL — a locale the host may not have.
 unset LC_ALL
 PEX=/usr/local/lib/ovn-fabric/fabric.pex
-exec ssh $tty "$TARGET" \
-  "if [ ! -f $PEX ]; then echo 'the runtime is not installed on $TARGET: run scripts/fabric-install.sh $TARGET' >&2; exit 2; fi
+remote="if [ ! -f $PEX ]; then echo 'the runtime is not installed on $TARGET: run scripts/fabric-install.sh $TARGET' >&2; exit 2; fi
 PEX_ROOT=/var/cache/ovn-fabric/pex exec python3 $PEX --socket /run/ovn-fabric.sock$args"
+if [ -n "$PORT" ]; then
+  exec ssh $tty -p "$PORT" "$TARGET" "$remote"
+fi
+exec ssh $tty "$TARGET" "$remote"
