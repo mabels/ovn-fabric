@@ -5,6 +5,10 @@ inputs:
   name:
     description: VM name
     required: true
+  hostname:
+    description: Guest hostname (defaults to name)
+    required: false
+    default: ""
   image:
     description: Path to the base qcow2 cloud image
     required: true
@@ -70,6 +74,7 @@ runs:
       shell: bash
       env:
         NAME: ${{ inputs.name }}
+        GUEST_HOSTNAME: ${{ inputs.hostname }}
         IMAGE: ${{ inputs.image }}
         SSH_PORT: ${{ inputs.ssh-port }}
         SSH_USER: ${{ inputs.ssh-user }}
@@ -96,11 +101,12 @@ runs:
         work="$RUNNER_TEMP/qemu-$NAME"
         rm -rf "$work"
         mkdir -p "$work"
+        guest_hostname="${GUEST_HOSTNAME:-$NAME}"
         pub="$(cat "$SSH_PUB")"
 
         cat >"$work/meta-data" <<EOF
         instance-id: $NAME
-        local-hostname: $NAME
+        local-hostname: $guest_hostname
         EOF
 
         cat >"$work/network-config" <<EOF
@@ -127,7 +133,7 @@ runs:
 
         cat >"$work/user-data" <<EOF
         #cloud-config
-        hostname: $NAME
+        hostname: $guest_hostname
         preserve_hostname: false
         users:
           - name: root

@@ -137,6 +137,7 @@ jobs:
         uses: ./.github/actions/qemu-vm
         with:
           name: ovn-fabric-debian
+          hostname: net-test-hh-c
           image: ${{ runner.temp }}/debian.qcow2
           ssh-port: "2202"
           ssh-user: root
@@ -173,7 +174,7 @@ jobs:
       - name: Deploy fabric to ovn-fabric-debian
         run: |
           deno run -A src/cli.ts generate-ir \
-            --runtime ctx=test-e examples/topology.cluster-tenants.ts \
+            --runtime ctx=test-c examples/topology.cluster-tenants.ts \
             | scripts/fabric-deploy.sh root@127.0.0.1 --port 2202 ir-apply run
 
       - name: Cleanup
