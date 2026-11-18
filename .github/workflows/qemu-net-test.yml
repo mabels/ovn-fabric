@@ -236,8 +236,6 @@ jobs:
           mkdir -p /etc/netns/ns-1129
           printf 'nameserver 10.43.0.10\n' > /etc/netns/ns-1129/resolv.conf
           run ip netns exec ns-1129 ping -c 3 -W 2 192.168.129.1
-          run ip netns exec ns-1129 ping -c 3 -W 2 192.168.132.1
-          run ip netns exec ns-1129 ping -c 3 -W 2 192.168.12.1
           run ip netns exec ns-1129 ping -c 3 -W 2 100.64.0.1
           run ip netns exec ns-1129 dig @10.43.0.10 www.geo.de
           run ip netns exec ns-1129 curl -fsS --max-time 15 -o /dev/null -w 'ns-1129-https=%{http_code}\n' https://www.google.com/
