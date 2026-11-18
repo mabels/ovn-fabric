@@ -15,12 +15,14 @@ python3 -m fabric ir-delete sha256:…
 python3 -m fabric ir-apply create < py.ir     # store from stdin, then apply
 python3 -m fabric ir-apply create --put py.ir # store from a file, then apply
 python3 -m fabric ir-apply delete sha256:…    # a stored IR, by hash or name
+python3 -m fabric ir-apply cloudinit --host H -o user-data < py.ir  # PEX + IR, no runtime asked
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import signal
@@ -513,6 +515,54 @@ async def _ir_apply(args: argparse.Namespace) -> int:
     return 0
 
 
+# Not an action the runtime knows: done here, where the PEX is built.
+CLOUDINIT = "cloudinit"
+
+
+async def _ir_cloudinit(args: argparse.Namespace) -> int:
+    """One cloud-init user-data file that deploys a host on its first boot:
+    the PEX (this one, --pex, or a fresh bundle) and the IR (--put FILE or
+    stdin), installed and applied (`run`) by runcmd — fabric/cloudinit.py."""
+    from . import cloudinit
+    from .runtime_store import own_pex
+
+    if args.ref not in (None, "-"):
+        print(
+            "error: cloudinit takes the IR from a file (--put FILE) or stdin, not a stored one",
+            file=sys.stderr,
+        )
+        return 2
+    ir_ = _read_ir(args.put if args.put is not None else "-")
+    if ir_ is None:
+        return 2
+    data = plain(ir_)
+    assert isinstance(data, dict)
+    if args.host is not None:
+        hosts = cloudinit.ir_hosts(data["collection"])
+        if args.host not in hosts:
+            print(
+                f"error: {args.host} is not a host of the IR (its hosts: "
+                f"{', '.join(hosts) or '-'})",
+                file=sys.stderr,
+            )
+            return 2
+    pex = Path(args.pex) if args.pex else own_pex()
+    if pex is None:  # from a source checkout: build it first
+        bundle_args = argparse.Namespace(**{**vars(args), "output": "dist/fabric.pex"})
+        with contextlib.redirect_stdout(sys.stderr):  # stdout may be the user-data
+            code = await _bundle(bundle_args)
+        if code != 0:
+            return code
+        pex = Path(bundle_args.output).resolve()
+    text = cloudinit.render(pex.read_bytes(), data, args.host, args.name)
+    if args.output in (None, "-"):
+        sys.stdout.write(text)
+    else:
+        Path(args.output).write_text(text)
+        print(args.output, file=sys.stderr)
+    return 0
+
+
 def _print_apply(res: g.IrApplyRes, req_id: str) -> None:
     print(
         f"{res.action.value} {res.hash} on {res.host}: {res.state.value} ({len(res.units)} units)"
@@ -861,7 +911,7 @@ def main() -> int:
         "— converge to the deployed IR: create what is missing, remove the leftovers; "
         "--dry-run: the comparison and what it would do)",
     )
-    ir_apply.add_argument("action", choices=[a.value for a in g.ApplyAction])
+    ir_apply.add_argument("action", choices=[*(a.value for a in g.ApplyAction), CLOUDINIT])
     ir_apply.add_argument(
         "ref",
         nargs="?",
@@ -909,6 +959,15 @@ def main() -> int:
         action="store_true",
         help="create/run: once the network is done, follow its background job "
         "(images, containers) to its end; fails when it fails (default: leave it running)",
+    )
+    ir_apply.add_argument(
+        "-o",
+        "--output",
+        metavar="FILE",
+        help="cloudinit: write the user-data here (default, or -: stdout)",
+    )
+    ir_apply.add_argument(
+        "--pex", help="cloudinit: carry this PEX (default: this one, or a fresh bundle)"
     )
     ir_apply.set_defaults(run=_ir_apply)
     follow_cmd = commands.add_parser("follow", help="follow a job: its log so far, then live")
@@ -973,9 +1032,11 @@ def main() -> int:
         parser.error(str(exc))
     _show_remote_by_component()
     args.address = args.socket if "://" in args.socket else f"unix://{args.socket}"
+    if args.command == "ir-apply" and args.action == CLOUDINIT:
+        args.run = _ir_cloudinit  # local: asks no runtime
     # Only the deployed executable is a host's CLI (ADR 0012 §0); a PEX
     # elsewhere deploys, builds, or serves (the runtime itself).
-    if args.run not in (_deploy, _runtime_install, _runtime_list, _bundle, _serve):
+    if args.run not in (_deploy, _runtime_install, _runtime_list, _bundle, _serve, _ir_cloudinit):
         refused = _refuse_not_deployed()
         if refused is not None:
             print(f"error: {refused}", file=sys.stderr)

@@ -40,6 +40,7 @@ def ensure_pex(root: Path) -> str:
             "pex",
         ],
         check=True,
+        stdout=sys.stderr,  # stdout may be what the caller writes (cloudinit's user-data)
     )
     if not pex.is_file():
         raise RuntimeError(f"pex installed but {pex} is missing")
