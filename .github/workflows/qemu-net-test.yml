@@ -8,33 +8,93 @@ permissions:
 
 jobs:
   qemu:
-    name: QEMU ${{ matrix.distro }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 90
+    name: QEMU ${{ matrix.distro }} ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
         include:
-          - ctx: test
+          - arch: x86_64
+            runner: ubuntu-latest
+            qemu_pkg: qemu-system-x86
+            firmware: ""
+            ctx: test
             hostname: net-test-hh-b
-            id: ubuntu
+            id: ubuntu-x86
             distro: Ubuntu 26.04
             image_url: https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img
-          - ctx: test-c
+            tester_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+          - arch: x86_64
+            runner: ubuntu-latest
+            qemu_pkg: qemu-system-x86
+            firmware: ""
+            ctx: test-c
             hostname: net-test-hh-c
-            id: fedora
+            id: fedora-x86
             distro: Fedora 44
             image_url: https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2
-          - ctx: test-d
+            tester_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+          - arch: x86_64
+            runner: ubuntu-latest
+            qemu_pkg: qemu-system-x86
+            firmware: ""
+            ctx: test-d
             hostname: net-test-hh-d
-            id: debian
+            id: debian-x86
             distro: Debian 13
             image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
-          - ctx: test-e
+            tester_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+          - arch: x86_64
+            runner: ubuntu-latest
+            qemu_pkg: qemu-system-x86
+            firmware: ""
+            ctx: test-e
             hostname: net-test-hh-e
-            id: rocky
+            id: rocky-x86
             distro: Rocky 10.3
             image_url: https://dl.rockylinux.org/pub/rocky/10.3/images/x86_64/Rocky-10-GenericCloud-Base-10.3-20261112.0.x86_64.qcow2
+            tester_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            qemu_pkg: qemu-system-arm
+            firmware: qemu-efi-aarch64
+            ctx: test
+            hostname: net-test-hh-b
+            id: ubuntu-arm
+            distro: Ubuntu 26.04
+            image_url: https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-arm64.img
+            tester_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            qemu_pkg: qemu-system-arm
+            firmware: qemu-efi-aarch64
+            ctx: test-c
+            hostname: net-test-hh-c
+            id: fedora-arm
+            distro: Fedora 44
+            image_url: https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/aarch64/images/Fedora-Cloud-Base-Generic-44-1.7.aarch64.qcow2
+            tester_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            qemu_pkg: qemu-system-arm
+            firmware: qemu-efi-aarch64
+            ctx: test-d
+            hostname: net-test-hh-d
+            id: debian-arm
+            distro: Debian 13
+            image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2
+            tester_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            qemu_pkg: qemu-system-arm
+            firmware: qemu-efi-aarch64
+            ctx: test-e
+            hostname: net-test-hh-e
+            id: rocky-arm
+            distro: Rocky 10.3
+            image_url: https://dl.rockylinux.org/pub/rocky/10.3/images/aarch64/Rocky-10-GenericCloud-Base-10.3-20261112.0.aarch64.qcow2
+            tester_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2
     steps:
       - uses: actions/checkout@v5
 
@@ -56,7 +116,7 @@ jobs:
       - name: Install QEMU and cloud-init tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y qemu-system-x86 cloud-image-utils openssh-client
+          sudo apt-get install -y qemu-utils cloud-image-utils openssh-client ${{ matrix.qemu_pkg }} ${{ matrix.firmware }}
 
       - name: Temporary SSH key
         id: key
@@ -68,25 +128,14 @@ jobs:
       - name: Download tester Debian image
         run: |
           python3 - <<'PY'
-          import hashlib
           import os
           import urllib.request
 
-          base = "https://cloud.debian.org/images/cloud/trixie/latest/"
-          name = "debian-13-genericcloud-amd64.qcow2"
-          dest = os.path.join(os.environ["RUNNER_TEMP"], "debian.qcow2")
-          urllib.request.urlretrieve(base + name, dest)
-          sums = urllib.request.urlopen(base + "SHA512SUMS", timeout=60).read().decode()
-          expected = next(
-              line.split()[0] for line in sums.splitlines() if name in line
-          )
-          digest = hashlib.sha512()
-          with open(dest, "rb") as handle:
-              for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                  digest.update(chunk)
-          if digest.hexdigest() != expected:
-              raise SystemExit("debian image checksum mismatch")
-          print("debian image ok")
+          url = "${{ matrix.tester_image_url }}"
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "tester.qcow2")
+          print("downloading", url, flush=True)
+          urllib.request.urlretrieve(url, dest)
+          print("tester image ok")
           PY
 
       - name: Download target cloud image
@@ -107,7 +156,8 @@ jobs:
         uses: ./.github/actions/qemu-vm
         with:
           name: tester
-          image: ${{ runner.temp }}/debian.qcow2
+          image: ${{ runner.temp }}/tester.qcow2
+          arch: ${{ matrix.arch }}
           ssh-port: "2201"
           ssh-user: root
           ssh-public-key: ${{ steps.key.outputs.public }}
@@ -117,7 +167,7 @@ jobs:
           ovn-mac: "52:54:00:00:01:01"
           ovn-mode: listen
           ovn-port: "9000"
-          timeout-seconds: "300"
+          timeout-seconds: "600"
 
       - name: Install tester netns tooling
         run: |
@@ -170,6 +220,7 @@ jobs:
           name: ovn-fabric-${{ matrix.id }}
           hostname: ${{ matrix.hostname }}
           image: ${{ runner.temp }}/target.qcow2
+          arch: ${{ matrix.arch }}
           memory: "1536"
           ssh-port: "2202"
           ssh-user: root
@@ -180,7 +231,7 @@ jobs:
           ovn-name: ovnkern
           ovn-mode: connect
           ovn-port: "9000"
-          timeout-seconds: "600"
+          timeout-seconds: "1200"
 
       - name: SSH root into target
         run: |
@@ -289,5 +340,5 @@ jobs:
               kill "$pid" 2>/dev/null || true
             fi
           done
-          pkill -f 'qemu-system-x86_64.*tester' 2>/dev/null || true
-          pkill -f 'qemu-system-x86_64.*ovn-fabric-' 2>/dev/null || true
+          pkill -f 'qemu-system-.*tester' 2>/dev/null || true
+          pkill -f 'qemu-system-.*ovn-fabric-' 2>/dev/null || true

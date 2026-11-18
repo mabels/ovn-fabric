@@ -5,6 +5,10 @@ inputs:
   name:
     description: VM name
     required: true
+  arch:
+    description: Guest architecture (x86_64 or arm64)
+    required: false
+    default: x86_64
   hostname:
     description: Guest hostname (defaults to name)
     required: false
@@ -78,6 +82,7 @@ runs:
       shell: bash
       env:
         NAME: ${{ inputs.name }}
+        ARCH: ${{ inputs.arch }}
         GUEST_HOSTNAME: ${{ inputs.hostname }}
         IMAGE: ${{ inputs.image }}
         SSH_PORT: ${{ inputs.ssh-port }}
@@ -96,7 +101,14 @@ runs:
         WAIT: ${{ inputs.wait }}
       run: |
         set -euo pipefail
-        for tool in qemu-system-x86_64 qemu-img cloud-localds ssh; do
+        if [ "$ARCH" = "arm64" ]; then
+          QEMU=qemu-system-aarch64
+          MACHINE_ARGS="-machine virt -accel tcg,thread=multi -cpu max -bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd"
+        else
+          QEMU=qemu-system-x86_64
+          MACHINE_ARGS="-machine pc -accel tcg,thread=multi -cpu max"
+        fi
+        for tool in "$QEMU" qemu-img cloud-localds ssh; do
           command -v "$tool" >/dev/null || {
             echo "missing $tool" >&2
             exit 1
@@ -198,11 +210,9 @@ runs:
         cloud-localds --network-config="$work/network-config" "$work/seed.iso" "$work/user-data" "$work/meta-data"
         qemu-img create -f qcow2 -b "$IMAGE" -F qcow2 "$work/overlay.qcow2" 12G >/dev/null
 
-        qemu-system-x86_64 \
+        "$QEMU" \
           -name "$NAME" \
-          -machine pc \
-          -accel tcg,thread=multi \
-          -cpu max \
+          $MACHINE_ARGS \
           -smp "$CPUS" \
           -m "$MEMORY" \
           -drive file="$work/overlay.qcow2",if=virtio,format=qcow2 \
