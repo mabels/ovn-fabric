@@ -164,6 +164,40 @@ jobs:
             IdentitiesOnly yes
           EOF
 
+      - name: Verify tester/target OVN L2 link
+        run: |
+          ssh -i "$RUNNER_TEMP/qemu_key" -p 2202 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            root@127.0.0.1 'ip link add link ovnkern name ovnkern.4000 type vlan id 4000; ip addr add 192.168.200.2/24 dev ovnkern.4000; ip link set ovnkern.4000 up'
+          ssh -i "$RUNNER_TEMP/qemu_key" -p 2201 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            root@127.0.0.1 'sh -s' <<'EOF'
+          set -e
+          ovn=$(ip -o link | awk '/52:54:00:00:01:01/ {gsub(":","",$2); print $2; exit}')
+          [ -n "$ovn" ] || { echo "tester OVN NIC not found" >&2; exit 1; }
+          ip netns del ns-link 2>/dev/null || true
+          ip link del "$ovn.4000" 2>/dev/null || true
+          ip netns add ns-link
+          ip link add link "$ovn" name "$ovn.4000" type vlan id 4000
+          ip link set "$ovn.4000" netns ns-link
+          ip netns exec ns-link ip addr add 192.168.200.1/24 dev "$ovn.4000"
+          ip netns exec ns-link ip link set "$ovn.4000" up
+          ip netns exec ns-link ping -c 3 -W 2 192.168.200.2
+          ip netns del ns-link
+          EOF
+          ssh -i "$RUNNER_TEMP/qemu_key" -p 2202 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            root@127.0.0.1 'ip link del ovnkern.4000 2>/dev/null || true'
+
       - name: Deploy fabric to ovn-fabric-debian
         env:
           # the secrets' TypeScript source; the topology imports it as a
