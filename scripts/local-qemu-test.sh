@@ -146,7 +146,7 @@ EOF
   fi
 
   cloud-localds --network-config="$dir/network-config" "$dir/seed.iso" "$dir/user-data" "$dir/meta-data"
-  qemu-img create -f qcow2 -b "$IMAGE" -F qcow2 "$dir/overlay.qcow2" 8G >/dev/null
+  qemu-img create -f qcow2 -b "$IMAGE" -F qcow2 "$dir/overlay.qcow2" 12G >/dev/null
 
   # shellcheck disable=SC2086
   qemu-system-x86_64 \

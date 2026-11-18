@@ -8,8 +8,33 @@ permissions:
 
 jobs:
   qemu:
+    name: QEMU ${{ matrix.distro }}
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - ctx: test
+            hostname: net-test-hh-b
+            id: ubuntu
+            distro: Ubuntu 26.04
+            image_url: https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-amd64.img
+          - ctx: test-c
+            hostname: net-test-hh-c
+            id: fedora
+            distro: Fedora 44
+            image_url: https://download.fedoraproject.org/pub/fedora/linux/releases/44/Cloud/x86_64/images/Fedora-Cloud-Base-Generic-44-1.7.x86_64.qcow2
+          - ctx: test-d
+            hostname: net-test-hh-d
+            id: debian
+            distro: Debian 13
+            image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+          - ctx: test-e
+            hostname: net-test-hh-e
+            id: rocky
+            distro: Rocky 10.3
+            image_url: https://dl.rockylinux.org/pub/rocky/10.3/images/x86_64/Rocky-10-GenericCloud-Base-10.3-20261112.0.x86_64.qcow2
     steps:
       - uses: actions/checkout@v5
 
@@ -40,7 +65,7 @@ jobs:
           echo "private=$RUNNER_TEMP/qemu_key" >> "$GITHUB_OUTPUT"
           echo "public=$RUNNER_TEMP/qemu_key.pub" >> "$GITHUB_OUTPUT"
 
-      - name: Download Alpine cloud image
+      - name: Download tester Debian image
         run: |
           python3 - <<'PY'
           import hashlib
@@ -62,6 +87,19 @@ jobs:
           if digest.hexdigest() != expected:
               raise SystemExit("debian image checksum mismatch")
           print("debian image ok")
+          PY
+
+      - name: Download target cloud image
+        run: |
+          python3 - <<'PY'
+          import os
+          import urllib.request
+
+          url = "${{ matrix.image_url }}"
+          dest = os.path.join(os.environ["RUNNER_TEMP"], "target.qcow2")
+          print("downloading", url, flush=True)
+          urllib.request.urlretrieve(url, dest)
+          print("target image ok")
           PY
 
       - name: Start tester QEMU
@@ -125,14 +163,14 @@ jobs:
           date
           EOF
 
-      - name: Start ovn-fabric-debian QEMU
+      - name: Start target QEMU
         id: target
         uses: ./.github/actions/qemu-vm
         with:
-          name: ovn-fabric-debian
-          hostname: net-test-hh-c
-          image: ${{ runner.temp }}/debian.qcow2
-          memory: "1024"
+          name: ovn-fabric-${{ matrix.id }}
+          hostname: ${{ matrix.hostname }}
+          image: ${{ runner.temp }}/target.qcow2
+          memory: "1536"
           ssh-port: "2202"
           ssh-user: root
           ssh-public-key: ${{ steps.key.outputs.public }}
@@ -144,7 +182,7 @@ jobs:
           ovn-port: "9000"
           timeout-seconds: "600"
 
-      - name: SSH root into ovn-fabric-debian
+      - name: SSH root into target
         run: |
           ssh -i "$RUNNER_TEMP/qemu_key" -p 2202 \
             -o BatchMode=yes \
@@ -199,14 +237,14 @@ jobs:
             -o UserKnownHostsFile=/dev/null \
             root@127.0.0.1 'ip link del ovnkern.4000 2>/dev/null || true'
 
-      - name: Deploy fabric to ovn-fabric-debian
+      - name: Deploy fabric to target
         env:
           # the secrets' TypeScript source; the topology imports it as a
           # data: module, nothing is written to disk
           TOPOLOGY_SECRETS_TS: ${{ secrets.TOPOLOGY_SECRETS_TS }}
         run: |
           deno run -A src/cli.ts generate-ir \
-            --runtime ctx=test-c examples/topology.cluster-tenants.ts \
+            --runtime ctx=${{ matrix.ctx }} examples/topology.cluster-tenants.ts \
             | scripts/fabric-deploy.sh root@127.0.0.1 --port 2202 ir-apply run --wait-background
 
       - name: Test connectivity from tester and ns-1129
@@ -252,4 +290,4 @@ jobs:
             fi
           done
           pkill -f 'qemu-system-x86_64.*tester' 2>/dev/null || true
-          pkill -f 'qemu-system-x86_64.*ovn-fabric-debian' 2>/dev/null || true
+          pkill -f 'qemu-system-x86_64.*ovn-fabric-' 2>/dev/null || true

@@ -196,7 +196,7 @@ runs:
         EOF
 
         cloud-localds --network-config="$work/network-config" "$work/seed.iso" "$work/user-data" "$work/meta-data"
-        qemu-img create -f qcow2 -b "$IMAGE" -F qcow2 "$work/overlay.qcow2" 4G >/dev/null
+        qemu-img create -f qcow2 -b "$IMAGE" -F qcow2 "$work/overlay.qcow2" 12G >/dev/null
 
         qemu-system-x86_64 \
           -name "$NAME" \
