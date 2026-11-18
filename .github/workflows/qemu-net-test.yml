@@ -209,14 +209,39 @@ jobs:
             --runtime ctx=test-c examples/topology.cluster-tenants.ts \
             | scripts/fabric-deploy.sh root@127.0.0.1 --port 2202 ir-apply run --wait-background
 
-      - name: Test connectivity from tester netns ns-1129
+      - name: Test connectivity from tester and ns-1129
         run: |
           ssh -i "$RUNNER_TEMP/qemu_key" -p 2201 \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
-            root@127.0.0.1 'ip netns exec ns-1129 sh -c "set -e; ping -c 3 -W 2 1.1.1.1; ping -c 3 -W 2 192.168.12.1; ping -c 3 -W 2 100.64.0.1; dig @10.43.0.10 www.geo.de"'
+            root@127.0.0.1 'sh -s' <<'EOF'
+          fail=0
+          run() {
+            echo "=== $*"
+            if "$@"; then
+              echo "OK: $*"
+            else
+              rc=$?
+              echo "FAIL($rc): $*"
+              fail=1
+            fi
+          }
+
+          echo "=== tester root"
+          run ping -c 3 -W 2 1.1.1.1
+
+          echo "=== ns-1129"
+          run ip netns exec ns-1129 ping -c 3 -W 2 192.168.129.1
+          run ip netns exec ns-1129 ping -c 3 -W 2 192.168.132.1
+          run ip netns exec ns-1129 ping -c 3 -W 2 1.1.1.1
+          run ip netns exec ns-1129 ping -c 3 -W 2 192.168.12.1
+          run ip netns exec ns-1129 ping -c 3 -W 2 100.64.0.1
+          run ip netns exec ns-1129 dig @10.43.0.10 www.geo.de
+
+          exit "$fail"
+          EOF
 
       - name: Cleanup
         if: always()
