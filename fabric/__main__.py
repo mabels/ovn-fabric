@@ -492,6 +492,9 @@ async def _ir_apply(args: argparse.Namespace) -> int:
         imageJobs=args.image_jobs or None,
     )
     if args.detach:
+        if args.wait_background:
+            print("error: either --detach or --wait-background, not both", file=sys.stderr)
+            return 2
         return await _detach(args.address, req)
     # Its last line says how to find it: journalctl -u ovn-fabric --grep <req>.
     req_ids: list[str] = []
@@ -501,7 +504,13 @@ async def _ir_apply(args: argparse.Namespace) -> int:
             print(f"req={req_ids[0]} ir={ref}", file=sys.stderr)
         return 1
     _print_apply(res, req_ids[0])
-    return 0 if res.state is g.IrApplyOutcome.done else 1
+    if res.state is not g.IrApplyOutcome.done:
+        return 1
+    if args.wait_background and res.background is not None:
+        # The background job runs on its own (ADR 0012 §3); this only
+        # follows it to its end — a finished job is kept, so no race.
+        return await _follow_job(args.address, res.background.reqId)
+    return 0
 
 
 def _print_apply(res: g.IrApplyRes, req_id: str) -> None:
@@ -584,10 +593,15 @@ BUNDLE_PACKAGES = ("fabric", "runtime", "protocol", "ladops", "raw_reconciler")
 
 
 async def _follow(args: argparse.Namespace) -> int:
+    return await _follow_job(args.address, args.req)
+
+
+async def _follow_job(address: str, req_id: str) -> int:
     """Follow a job: what it logged so far, the rest as it comes, its end."""
-    res = await _ask(args.address, rg.FollowReq(kind="FollowReq", reqId=args.req))
+    _FOLLOWING.append(req_id)
+    res = await _ask(address, rg.FollowReq(kind="FollowReq", reqId=req_id))
     if isinstance(res, g.IrApplyRes):
-        _print_apply(res, args.req)
+        _print_apply(res, req_id)
         return 0 if res.state is g.IrApplyOutcome.done else 1
     return 0 if res is not None else 1
 
@@ -889,6 +903,12 @@ def main() -> int:
         "--detach",
         action="store_true",
         help="leave the run going once it started (fabric follow <req> attaches again)",
+    )
+    ir_apply.add_argument(
+        "--wait-background",
+        action="store_true",
+        help="create/run: once the network is done, follow its background job "
+        "(images, containers) to its end; fails when it fails (default: leave it running)",
     )
     ir_apply.set_defaults(run=_ir_apply)
     follow_cmd = commands.add_parser("follow", help="follow a job: its log so far, then live")
