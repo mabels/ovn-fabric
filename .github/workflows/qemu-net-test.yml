@@ -131,6 +131,7 @@ jobs:
           name: ovn-fabric-debian
           hostname: net-test-hh-c
           image: ${{ runner.temp }}/debian.qcow2
+          memory: "1024"
           ssh-port: "2202"
           ssh-user: root
           ssh-public-key: ${{ steps.key.outputs.public }}
