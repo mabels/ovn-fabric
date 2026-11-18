@@ -21,12 +21,26 @@ import * as exampleSecrets from "./topology.cluster-tenants.secrets.ts";
 // carries which network — comes from the secrets, for the context the
 // CLI names: `--runtime ctx=test` (prod when unset). This file holds none.
 //
-// Which secrets: `--runtime secrets=<file>` (relative to the working
-// directory), else the made-up ones next to this file.
+// Which secrets, first match wins:
+//   1. the env var TOPOLOGY_SECRETS_TS holding the TypeScript source itself
+//      (CI): imported as a data: module, so no file is ever written. Its
+//      imports must use the specifiers deno.json maps, not relative paths.
+//   2. `--runtime secrets=<file>` (relative to the working directory)
+//   3. the made-up ones next to this file
+const secretsTs = Deno.env.get("TOPOLOGY_SECRETS_TS");
 const secretsFile = runtime().args["secrets"];
-const { getSecrets }: SecretsModule = secretsFile === undefined
-  ? exampleSecrets
-  : await import(new URL(secretsFile, `file://${Deno.cwd()}/`).href);
+const { getSecrets }: SecretsModule = secretsTs !== undefined
+  ? await importSecretsTs(secretsTs)
+  : secretsFile !== undefined
+  ? await import(new URL(secretsFile, `file://${Deno.cwd()}/`).href)
+  : exampleSecrets;
+
+function importSecretsTs(source: string): Promise<SecretsModule> {
+  Deno.env.delete("TOPOLOGY_SECRETS_TS"); // no subprocess inherits it
+  return import(
+    "data:application/typescript;charset=utf-8," + encodeURIComponent(source)
+  );
+}
 //
 // This is one way to handle secrets, not a requirement: a topology can just
 // as well write its addresses, keys and names inline. We split them out so

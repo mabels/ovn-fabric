@@ -7,10 +7,16 @@
 // The topology asks getSecrets(ctx) for everything that is the site: keys,
 // names, addresses, and per context the chassis and its interfaces. The
 // context comes from the CLI: `--runtime ctx=test` (prod when unset).
+//
+// Imports go through specifiers deno.json maps (jsr:@adviser/ovn-fabric…),
+// never relative paths: the same source must also load from the
+// TOPOLOGY_SECRETS_TS env var as a data: module, which has no base URL.
 
 import { IPAddress } from "jsr:@adviser/ipaddress@0.2.13";
-import { IPv4 } from "../src/mod.ts";
-import type { Context, Secrets } from "../src/secret-types.ts";
+// deno-lint-ignore no-unversioned-import -- mapped to ../src by deno.json
+import { IPv4 } from "jsr:@adviser/ovn-fabric";
+// deno-lint-ignore no-unversioned-import -- mapped to ../src by deno.json
+import type { Context, Secrets } from "jsr:@adviser/ovn-fabric/secret-types";
 
 function parse(text: string): IPAddress {
   const addr = IPAddress.parse(text);
