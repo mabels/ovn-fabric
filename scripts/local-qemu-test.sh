@@ -5,11 +5,11 @@
 #                          guest hostname net-test-hh-c, OVN NIC ovnkern
 #
 # Requirements: qemu-system-x86_64, qemu-img, cloud-localds, ssh-keygen.
-# Run from the repository root, or pass WORK=/some/dir.
+# Run from the repository root, or pass WORK=/some/dir (default /root/qemu-test).
 set -eu
 
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-WORK=${WORK:-/var/tmp/ovn-fabric-qemu}
+WORK=${WORK:-/root/qemu-test}
 IMAGE=${IMAGE:-$WORK/debian-13-genericcloud-amd64.qcow2}
 OVN_PORT=${OVN_PORT:-9000}
 TESTER_PORT=${TESTER_PORT:-2201}
@@ -53,6 +53,7 @@ if [ ! -f "$KEY" ]; then
   ssh-keygen -t ed25519 -N '' -C local-qemu-test -f "$KEY" >/dev/null
 fi
 PUB=$(cat "$KEY.pub")
+USER_PUB='ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQDIQpC2scaVXEaNuwtq4n6Vtht2WHYxtDFKe44JNFEsZGyQjyL9c2qkmQQGCF+2g3HrIPDTCCCWQ3GUiXGAlQ0/rf6sLqcm4YMXt+hgHU5VeciUIDEySCKdCPC419wFPBw6oKdcN1pLoIdWoF4LRDcjcrKKAlkdNJ/oLnl716piLdchABO9NXGxBpkLsJGK8qw390O1ZqZMe9wEAL9l/A1/49v8LfzELp0/fhSmiXphTVI/zNVIp/QIytXzRg74xcYpBjHk1TQZHuz/HYYsWwccnu7vYaTDX0CCoAyEt599f9u+JQ4oW0qyLO0ie7YcmR6nGEW4DMsPcfdqqo2VyYy4ix3U5RI2JcObfP0snYwPtAdVeeeReXi3c/E7bGLeCcwdFeFBfHSA9PDGxWVlxh/oCJaE7kP7eBhXNjN05FodVdNczKI5T9etfQ9VHILFrvpEREg1+OTiI58RmwjxS5ThloqXvr/nZzhIwTsED0KNW8wE4pjyotDJ8jaW2d7oVIMdWqE2M9Z1sLqDDdhHdVMFxk6Hl2XfqeqO2Jnst7qzbHAN/S3hvSwysixWJEcLDVG+cg1KRwz4qafCU5oHSp8aNNOk4RZozboFjac17nOmfPfnjC/LLayjSkEBZ+eFi+njZRLDN92k3PvHYFEB3USbHYzICsuDcf+L4cslX03g7w== men.abels@adviser.com'
 
 if [ "$ACCEL" = "kvm" ]; then
   ACCEL_ARGS="-accel kvm -cpu host"
@@ -111,6 +112,7 @@ users:
   - name: root
     ssh_authorized_keys:
       - $PUB
+      - $USER_PUB
 ssh_pwauth: false
 disable_root: false
 runcmd:
@@ -128,7 +130,10 @@ runcmd:
       done
     fi
     mkdir -p /root/.ssh
-    printf '%s\n' "$PUB" > /root/.ssh/authorized_keys
+    {
+      printf '%s\n' "$PUB"
+      printf '%s\n' "$USER_PUB"
+    } > /root/.ssh/authorized_keys
     chmod 700 /root/.ssh
     chmod 600 /root/.ssh/authorized_keys
     systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
@@ -198,6 +203,25 @@ for spec in "$TESTER_PORT:tester" "$TARGET_PORT:ovn-fabric-debian"; do
     exit 1
   fi
 done
+
+echo
+if [ "${SETUP_TESTER:-1}" = "1" ]; then
+  echo "installing tester tools and starting netns setup..."
+  ssh -i "$KEY" -p "$TESTER_PORT" \
+    -o BatchMode=yes -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    root@127.0.0.1 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y iptables radvd iputils-ping dnsutils dhcpcd-base'
+  scp -i "$KEY" -P "$TESTER_PORT" \
+    -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
+    -o UserKnownHostsFile=/dev/null \
+    "$ROOT/.github/scripts/tester/test-segments.sh" \
+    "$ROOT/.github/scripts/tester/test-isp.sh" \
+    root@127.0.0.1:/root/
+  ssh -i "$KEY" -p "$TESTER_PORT" \
+    -o BatchMode=yes -o IdentitiesOnly=yes \
+    -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+    root@127.0.0.1 'chmod +x /root/test-segments.sh /root/test-isp.sh; /root/test-segments.sh up; /root/test-isp.sh up'
+fi
 
 echo
 echo "tester:"
