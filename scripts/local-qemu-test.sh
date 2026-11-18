@@ -210,7 +210,7 @@ if [ "${SETUP_TESTER:-1}" = "1" ]; then
   ssh -i "$KEY" -p "$TESTER_PORT" \
     -o BatchMode=yes -o IdentitiesOnly=yes \
     -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-    root@127.0.0.1 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y iptables radvd iputils-ping dnsutils dhcpcd-base'
+    root@127.0.0.1 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y iptables radvd iputils-ping dnsutils dhcpcd-base curl ca-certificates'
   scp -i "$KEY" -P "$TESTER_PORT" \
     -o IdentitiesOnly=yes -o StrictHostKeyChecking=no \
     -o UserKnownHostsFile=/dev/null \

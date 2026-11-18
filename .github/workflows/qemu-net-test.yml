@@ -88,7 +88,7 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
-            root@127.0.0.1 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y iptables radvd iputils-ping dnsutils dhcpcd-base'
+            root@127.0.0.1 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y iptables radvd iputils-ping dnsutils dhcpcd-base curl ca-certificates'
 
       - name: Inject and run tester netns setup
         run: |
@@ -230,15 +230,17 @@ jobs:
           }
 
           echo "=== tester root"
-          run ping -c 3 -W 2 1.1.1.1
+          run curl -fsS --max-time 15 -o /dev/null -w 'tester-https=%{http_code}\n' https://www.google.com/
 
           echo "=== ns-1129"
+          mkdir -p /etc/netns/ns-1129
+          printf 'nameserver 10.43.0.10\n' > /etc/netns/ns-1129/resolv.conf
           run ip netns exec ns-1129 ping -c 3 -W 2 192.168.129.1
           run ip netns exec ns-1129 ping -c 3 -W 2 192.168.132.1
-          run ip netns exec ns-1129 ping -c 3 -W 2 1.1.1.1
           run ip netns exec ns-1129 ping -c 3 -W 2 192.168.12.1
           run ip netns exec ns-1129 ping -c 3 -W 2 100.64.0.1
           run ip netns exec ns-1129 dig @10.43.0.10 www.geo.de
+          run ip netns exec ns-1129 curl -fsS --max-time 15 -o /dev/null -w 'ns-1129-https=%{http_code}\n' https://www.google.com/
 
           exit "$fail"
           EOF
