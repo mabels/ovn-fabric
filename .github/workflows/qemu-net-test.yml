@@ -17,14 +17,6 @@ jobs:
         with:
           deno-version: v2.x
 
-      - name: Write topology secrets
-        env:
-          TOPOLOGY_SECRETS_TS: ${{ secrets.TOPOLOGY_SECRETS_TS }}
-        run: |
-          umask 077
-          printf '%s\n' "$TOPOLOGY_SECRETS_TS" > examples/topology.cluster-tenants.secrets.ts
-          chmod 600 examples/topology.cluster-tenants.secrets.ts
-
       - name: Set up Python build venv
         run: |
           python3 -m venv .venv-build
@@ -95,7 +87,7 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
-            root@127.0.0.1 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y iptables radvd'
+            root@127.0.0.1 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y iptables radvd iputils-ping dnsutils'
 
       - name: Inject and run tester netns setup
         run: |
@@ -172,10 +164,23 @@ jobs:
           EOF
 
       - name: Deploy fabric to ovn-fabric-debian
+        env:
+          # the secrets' TypeScript source; the topology imports it as a
+          # data: module, nothing is written to disk
+          TOPOLOGY_SECRETS_TS: ${{ secrets.TOPOLOGY_SECRETS_TS }}
         run: |
           deno run -A src/cli.ts generate-ir \
             --runtime ctx=test-c examples/topology.cluster-tenants.ts \
-            | scripts/fabric-deploy.sh root@127.0.0.1 --port 2202 ir-apply run
+            | scripts/fabric-deploy.sh root@127.0.0.1 --port 2202 ir-apply run --wait-background
+
+      - name: Test connectivity from tester netns ns-1129
+        run: |
+          ssh -i "$RUNNER_TEMP/qemu_key" -p 2201 \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile=/dev/null \
+            root@127.0.0.1 'ip netns exec ns-1129 sh -c "set -e; ping -c 3 -W 2 1.1.1.1; ping -c 3 -W 2 192.168.12.1; ping -c 3 -W 2 100.64.0.1; dig @10.43.0.10 www.geo.de"'
 
       - name: Cleanup
         if: always()
