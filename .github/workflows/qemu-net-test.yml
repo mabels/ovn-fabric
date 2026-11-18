@@ -25,6 +25,17 @@ jobs:
           printf '%s\n' "$TOPOLOGY_SECRETS_TS" > examples/topology.cluster-tenants.secrets.ts
           chmod 600 examples/topology.cluster-tenants.secrets.ts
 
+      - name: Set up Python build venv
+        run: |
+          python3 -m venv .venv-build
+          .venv-build/bin/pip install --quiet black ruff mypy -r requirements.txt
+
+      - name: Generate Python protocol modules
+        run: |
+          deno run -A src/cli.ts generate-pytypes
+          deno run -A runtime/schema/generate.ts
+          deno run -A fabric/schema/generate.ts
+
       - name: Install QEMU and cloud-init tools
         run: |
           sudo apt-get update
