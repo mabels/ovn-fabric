@@ -137,7 +137,6 @@ function hostDependencies(host: Host, network: NetworkDefinition): string[] {
     "ping",
     "traceroute",
     "python",
-    "nftables",
   ]);
   if (host.ovn) {
     deps.add("ovn");

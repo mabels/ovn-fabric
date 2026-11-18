@@ -21,11 +21,16 @@ from typing import Any
 from protocol import generated as pt
 from protocol.hydrate import hydrate_nodes
 
+# The live RawIR collector needs nft on every host; this is runtime
+# knowledge, so it is added here rather than generated into the IR.
+CORE_DEPS = ("nftables",)
+
 
 def abstract_deps(host_node: pt.InfraHostNode) -> list[dict[str, Any]]:
     """[{name}] — the host's dependencies, in the IR's order."""
     out: list[dict[str, Any]] = []
-    for name in host_node.data.abstractDependencies or []:
+    names = dict.fromkeys([*(host_node.data.abstractDependencies or []), *CORE_DEPS])
+    for name in names:
         out.append({"name": name})
         if name == "ovn" and host_node.data.ovnRole == pt.OvnRole.central:
             out.append({"name": "ovn-central"})  # the NB/SB DBs and northd too
