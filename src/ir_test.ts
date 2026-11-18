@@ -1469,6 +1469,7 @@ Deno.test("hostToIR: carries abstract OS dependencies", () => {
     "ping",
     "traceroute",
     "python",
+    "nftables",
     "ovn",
     "ovs",
     "ip",

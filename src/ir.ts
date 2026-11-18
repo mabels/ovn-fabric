@@ -132,7 +132,13 @@ function resolveEncapIp(host: Host): string | undefined {
 // dependency to the host's distro's packages; there is deliberately NO
 // deinstall.
 function hostDependencies(host: Host, network: NetworkDefinition): string[] {
-  const deps = new Set<string>(["arp", "ping", "traceroute", "python"]);
+  const deps = new Set<string>([
+    "arp",
+    "ping",
+    "traceroute",
+    "python",
+    "nftables",
+  ]);
   if (host.ovn) {
     deps.add("ovn");
     deps.add("ovs");
