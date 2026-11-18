@@ -75,6 +75,7 @@ jobs:
           ssh-public-key: ${{ steps.key.outputs.public }}
           ssh-private-key: ${{ steps.key.outputs.private }}
           host-mac: "52:54:00:00:00:01"
+          wan-mac: "52:54:00:00:03:01"
           ovn-mac: "52:54:00:00:01:01"
           ovn-mode: listen
           ovn-port: "9000"
@@ -87,7 +88,7 @@ jobs:
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=no \
             -o UserKnownHostsFile=/dev/null \
-            root@127.0.0.1 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y iptables radvd iputils-ping dnsutils'
+            root@127.0.0.1 'export DEBIAN_FRONTEND=noninteractive; apt-get update; apt-get install -y iptables radvd iputils-ping dnsutils dhcpcd-base'
 
       - name: Inject and run tester netns setup
         run: |

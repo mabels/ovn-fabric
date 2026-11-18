@@ -28,6 +28,10 @@ inputs:
   host-mac:
     description: MAC address of the NAT host NIC
     required: true
+  wan-mac:
+    description: Optional MAC for a second user-mode NAT NIC (tester ISP outer)
+    required: false
+    default: ""
   ovn-mac:
     description: MAC address of the isolated OVN NIC
     required: true
@@ -81,6 +85,7 @@ runs:
         SSH_PUB: ${{ inputs.ssh-public-key }}
         SSH_KEY: ${{ inputs.ssh-private-key }}
         HOST_MAC: ${{ inputs.host-mac }}
+        WAN_MAC: ${{ inputs.wan-mac }}
         OVN_MAC: ${{ inputs.ovn-mac }}
         OVN_NAME: ${{ inputs.ovn-name }}
         OVN_MODE: ${{ inputs.ovn-mode }}
@@ -103,6 +108,10 @@ runs:
         mkdir -p "$work"
         guest_hostname="${GUEST_HOSTNAME:-$NAME}"
         pub="$(cat "$SSH_PUB")"
+        WAN_ARGS=""
+        if [ -n "$WAN_MAC" ]; then
+          WAN_ARGS="-netdev user,id=wannet -device virtio-net-pci,netdev=wannet,mac=$WAN_MAC"
+        fi
 
         cat >"$work/meta-data" <<EOF
         instance-id: $NAME
@@ -197,6 +206,7 @@ runs:
           -device virtio-net-pci,netdev=hostnet,mac="$HOST_MAC" \
           -netdev socket,id=ovnnet,${OVN_MODE}=127.0.0.1:${OVN_PORT} \
           -device virtio-net-pci,netdev=ovnnet,mac="$OVN_MAC" \
+          $WAN_ARGS \
           -display none \
           -serial "file:$work/serial.log" \
           -monitor none \
