@@ -7,6 +7,8 @@
 #
 #   python -m fabric ir-apply cloudinit --host net-test-hh-c -o user-data < ir.json
 #   scripts/cloud-init-test.sh user-data
+#   scripts/cloud-init-test.sh ir.json     # an IR: made into that file first
+#                                          # (--host $GUEST_HOSTNAME, $WORK/user-data)
 #
 # The target's user-data is the file, unchanged, as one part of a multipart
 # user-data; a second part (a shell script, which cloud-init runs before the
@@ -14,7 +16,9 @@
 # keys. ACCESS=0 boots the file alone: no ssh then, only the serial log.
 #
 # Then it waits for cloud-init on the target to finish and shows how it ended
-# (`cloud-init status`, the tail of cloud-init-output.log).
+# (`cloud-init status`). Meanwhile the target's serial console (its boot,
+# cloud-init and fabric's output) is shown live, every line `[target] …`;
+# SHOW_BOOT=0 shows only the tail of cloud-init-output.log at the end.
 #
 # Requirements: qemu-system-x86_64, qemu-img, cloud-localds, ssh-keygen.
 # WORK=/some/dir (default /root/qemu-test); GUEST_HOSTNAME is the target's
@@ -23,10 +27,11 @@
 set -eu
 
 if [ $# -ne 1 ] || [ ! -f "$1" ]; then
-  echo "usage: $0 CLOUD-INIT-FILE   (from: fabric ir-apply cloudinit -o FILE)" >&2
+  echo "usage: $0 CLOUD-INIT-FILE|IR.json   (cloud-init from: fabric ir-apply cloudinit -o FILE)" >&2
   exit 2
 fi
-USER_DATA_FILE=$(CDPATH='' cd -- "$(dirname "$1")" && pwd)/$(basename "$1")
+GIVEN=$(CDPATH='' cd -- "$(dirname "$1")" && pwd)/$(basename "$1")
+USER_DATA_FILE=$GIVEN
 
 ROOT=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
 WORK=${WORK:-/root/qemu-test}
@@ -36,6 +41,7 @@ TESTER_PORT=${TESTER_PORT:-2201}
 TARGET_PORT=${TARGET_PORT:-2202}
 GUEST_HOSTNAME=${GUEST_HOSTNAME:-net-test-hh-c}
 ACCESS=${ACCESS:-1}
+SHOW_BOOT=${SHOW_BOOT:-1}
 if [ -z "${ACCEL:-}" ]; then
   if [ -w /dev/kvm ]; then
     ACCEL=kvm
@@ -47,6 +53,22 @@ TESTER_MEMORY=${TESTER_MEMORY:-512}
 TARGET_MEMORY=${TARGET_MEMORY:-2048}
 # The fabric run (packages, images) happens inside cloud-init: give it time.
 TARGET_TIMEOUT=${TARGET_TIMEOUT:-1800}
+
+# An IR (JSON: a node list or an IrCollection) becomes the cloud-init file
+# here, for the target's hostname — with the build venv, as
+# fabric-install.sh does (the PEX is bundled from this checkout).
+case $(tr -d ' \t\r\n' <"$GIVEN" | head -c 1) in
+  '[' | '{')
+    mkdir -p "$WORK"
+    USER_DATA_FILE="$WORK/user-data"
+    PY="$ROOT/.venv-build/bin/python"
+    [ -x "$PY" ] || python3 -m venv "$ROOT/.venv-build"
+    "$PY" -m pip install --quiet --disable-pip-version-check -r "$ROOT/requirements.txt" >&2
+    echo "$GIVEN is an IR: making $USER_DATA_FILE (--host $GUEST_HOSTNAME)" >&2
+    (cd "$ROOT" && unset LC_ALL && "$PY" -m fabric ir-apply cloudinit \
+      --host "$GUEST_HOSTNAME" --put "$GIVEN" -o "$USER_DATA_FILE")
+    ;;
+esac
 
 if [ "$ACCESS" = "1" ] && [ "$(head -n 1 "$USER_DATA_FILE")" != "#cloud-config" ]; then
   echo "$USER_DATA_FILE does not start with #cloud-config (ACCESS=0 boots it as it is)" >&2
@@ -300,23 +322,54 @@ if [ "${SETUP_TESTER:-1}" = "1" ]; then
   on "$TESTER_PORT" 'chmod +x /root/test-segments.sh /root/test-isp.sh; /root/test-segments.sh up; /root/test-isp.sh up'
 fi
 
-# The target runs the fabric deploy inside cloud-init: wait for its end.
+# The target's serial console, live, from its first line: the tail writes
+# into a fifo, the reader prefixes each line (and drops the console's CR);
+# stopping the tail ends the reader.
 TARGET_SERIAL="$WORK/ovn-fabric-debian/serial.log"
+CONSOLE_FIFO="$WORK/ovn-fabric-debian/console.fifo"
+CONSOLE_PID=
+show_console() {
+  rm -f "$CONSOLE_FIFO"
+  mkfifo "$CONSOLE_FIFO"
+  cr=$(printf '\r')
+  sed "s/$cr//g; s/^/[target] /" <"$CONSOLE_FIFO" &
+  tail -n +1 -F "$TARGET_SERIAL" >"$CONSOLE_FIFO" 2>/dev/null &
+  CONSOLE_PID=$!
+}
+stop_console() {
+  if [ -n "$CONSOLE_PID" ]; then
+    sleep 1 # the last lines
+    kill "$CONSOLE_PID" 2>/dev/null || true
+    wait 2>/dev/null || true
+    CONSOLE_PID=
+    rm -f "$CONSOLE_FIFO"
+  fi
+}
+trap stop_console EXIT INT TERM
+
+# The target runs the fabric deploy inside cloud-init: wait for its end.
 echo
 echo "waiting for cloud-init on the target (fabric runs inside it; up to ${TARGET_TIMEOUT}s)..."
+[ "$SHOW_BOOT" = "1" ] && show_console
 deadline=$(($(date +%s) + TARGET_TIMEOUT))
 status=1
 if [ "$ACCESS" = "1" ]; then
   wait_ssh "$TARGET_PORT" ovn-fabric-debian
   remaining=$((deadline - $(date +%s)))
   # cloud-init status --wait: 0 done, 1 error, 2 done with recoverable errors.
-  if on "$TARGET_PORT" "timeout $remaining cloud-init status --wait --long"; then
+  # Its progress dots are not shown: the console is.
+  if on "$TARGET_PORT" "timeout $remaining cloud-init status --wait" >/dev/null; then
     status=0
   fi
+  stop_console
   echo
-  echo "--- target: /var/log/cloud-init-output.log (tail) ---"
-  on "$TARGET_PORT" 'tail -60 /var/log/cloud-init-output.log' || true
-  echo "---"
+  on "$TARGET_PORT" 'cloud-init status --long' || true
+  if [ "$SHOW_BOOT" != "1" ]; then
+    echo
+    echo "--- target: /var/log/cloud-init-output.log (tail) ---"
+    on "$TARGET_PORT" 'tail -60 /var/log/cloud-init-output.log' || true
+    echo "---"
+  fi
 else
   # No ssh: the console says when cloud-init's final stage is over.
   while [ "$(date +%s)" -lt "$deadline" ]; do
@@ -325,9 +378,12 @@ else
     fi
     sleep 5
   done
-  echo "--- target: serial console (tail) ---"
-  tail -60 "$TARGET_SERIAL" || true
-  echo "---"
+  stop_console
+  if [ "$SHOW_BOOT" != "1" ]; then
+    echo "--- target: serial console (tail) ---"
+    tail -60 "$TARGET_SERIAL" || true
+    echo "---"
+  fi
   if grep -q "Cloud-init v\..* finished at" "$TARGET_SERIAL" 2>/dev/null &&
     ! grep -qi "Failed to run module scripts.user\|scripts-user.*failed" "$TARGET_SERIAL"; then
     status=0
