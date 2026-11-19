@@ -206,6 +206,32 @@ async function sshStream(
   if (!status.success) throw new Error(`ssh ${ip} failed (${status.code})`);
 }
 
+async function sshOutput(
+  ip: string,
+  key: string,
+  remote: string,
+): Promise<string> {
+  const res = await new Deno.Command("ssh", {
+    args: [
+      "-i", key,
+      "-o", "IdentitiesOnly=yes",
+      "-o", "BatchMode=yes",
+      "-o", "StrictHostKeyChecking=no",
+      "-o", "UserKnownHostsFile=/dev/null",
+      "-o", "ConnectTimeout=8",
+      `root@${ip}`,
+      remote,
+    ],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  const dec = new TextDecoder();
+  if (!res.success) {
+    throw new Error(`ssh ${ip} failed: ${dec.decode(res.stderr).trim()}`);
+  }
+  return dec.decode(res.stdout).trim();
+}
+
 async function scpTo(ip: string, key: string, files: string[]): Promise<void> {
   const res = await new Deno.Command("scp", {
     args: [
@@ -699,6 +725,24 @@ const cmd = command({
         try {
           if (aborted) throw new Error("aborted");
           const pex = await ensurePex();
+          // The apply service keys the live RawIR by socket.gethostname()
+          // (the kernel hostname). Use that exact name as the IR host too.
+          let chassisName = info.tested.hostname;
+          try {
+            const h = await sshOutput(
+              info.tested.publicIpv4,
+              key.priv,
+              "hostname",
+            );
+            if (h) chassisName = h;
+          } catch (e) {
+            log(
+              `hostname lookup failed, assuming ${chassisName}: ${
+                e instanceof Error ? e.message : String(e)
+              }`,
+            );
+          }
+          log(`runtime hostname: ${chassisName}`);
           log("preparing tester (segments + ISP --use-host)");
           await scpTo(info.tester.publicIpv4, key.priv, [
             ".github/scripts/tester/test-isp.sh",
@@ -719,7 +763,7 @@ const cmd = command({
             : "";
           const deployCmd =
             `deno run -A src/cli.ts generate-ir --runtime ctx=test` +
-            ` --runtime ${shq(`chassis.name=${info.tested.hostname}`)}` +
+            ` --runtime ${shq(`chassis.name=${chassisName}`)}` +
             ` --runtime ${shq(`chassis.ipv4=${info.tested.privateIpv4}`)}` +
             secretsArg +
             ` examples/topology.cluster-tenants.ts` +
