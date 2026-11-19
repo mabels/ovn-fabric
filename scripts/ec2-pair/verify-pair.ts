@@ -60,7 +60,7 @@ async function sshRun(
     "-o",
     "UserKnownHostsFile=/dev/null",
     "-o",
-    "ConnectTimeout=8",
+    "ConnectTimeout=1",
     `root@${ip}`,
     remote,
   );

@@ -25,7 +25,7 @@ import {
 } from "npm:cmd-ts@0.13.0";
 import { EC2Client as EC2 } from "npm:@aws-sdk/client-ec2@3";
 import {
-  DEFAULT_KEY,
+  DEFAULT_KEYS,
   destroyPair,
   ensureNetwork,
   instanceInfo,
@@ -90,6 +90,36 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
       },
     );
   });
+}
+
+async function powerOff(ips: string[], key: string): Promise<void> {
+  await Promise.all(ips.map(async (ip) => {
+    try {
+      await new Deno.Command("ssh", {
+        args: [
+          "-i",
+          key,
+          "-o",
+          "IdentitiesOnly=yes",
+          "-o",
+          "BatchMode=yes",
+          "-o",
+          "StrictHostKeyChecking=no",
+          "-o",
+          "UserKnownHostsFile=/dev/null",
+          "-o",
+          "ConnectTimeout=1",
+          `root@${ip}`,
+          "systemctl poweroff || poweroff",
+        ],
+        stdout: "null",
+        stderr: "null",
+        signal: AbortSignal.timeout(5_000),
+      }).output();
+    } catch {
+      // ssh drops the connection as the host powers off
+    }
+  }));
 }
 
 interface SessionKey {
@@ -183,7 +213,7 @@ const cmd = command({
     const rig = a.rig ?? `rig-${suffix}`;
     const ttlMin = a.ttlMinutes;
     const key = await sessionKey(a.sshKey);
-    const sshKeys = [...new Set([DEFAULT_KEY, key.pub])];
+    const sshKeys = [...new Set([...DEFAULT_KEYS, key.pub])];
     const templates = {
       tester: await Deno.readTextFile(
         new URL("./tester.cloud-init.yaml", import.meta.url),
@@ -306,12 +336,20 @@ const cmd = command({
             },
           });
           launched.push({ m, pair, ids });
-          console.log(`launched ${m.base} (${pair})`);
+          console.log(
+            `launched ${m.base} (${pair}) private tester=${m.testerIp} tested=${m.testedIp}`,
+          );
         } catch (e) {
           const error = e instanceof Error ? e.message : String(e);
           launched.push({ m, pair, error });
           console.log(`LAUNCH FAIL ${m.base}: ${error}`);
         }
+      }
+
+      // Give the just-launched instances a moment before the first check.
+      if (!aborted && launched.length > 0) {
+        console.log(`waiting 10s for ${launched.length} pair(s) to settle`);
+        await sleep(10_000);
       }
 
       // ── phase 2: retry-queue scheduler until all pairs are settled ─────
@@ -322,6 +360,8 @@ const cmd = command({
         nextAt: number;
         line?: string;
         error?: string;
+        testerPublicIp?: string;
+        testedPublicIp?: string;
         recorded: boolean;
       }
       const checks: CheckState[] = launched.map((item) => ({
@@ -334,6 +374,13 @@ const cmd = command({
       }));
       const settle = async (c: CheckState) => {
         if (c.state === "queued") return;
+        if (c.state === "ok" && !a.keepPairs) {
+          if (c.testerPublicIp && c.testedPublicIp) {
+            console.log(`poweroff ${c.item.m.base} (success)`);
+            await powerOff([c.testerPublicIp, c.testedPublicIp], key.priv);
+            await sleep(3000);
+          }
+        }
         if (!a.keepPairs) {
           await destroyPair(ec2, c.item.pair).catch((e) =>
             console.error(`destroy ${c.item.pair}: ${e.message}`)
@@ -385,6 +432,12 @@ const cmd = command({
               ]),
               checkTimeoutMs,
               "instanceInfo",
+            );
+            c.testerPublicIp = tester.publicIpv4;
+            c.testedPublicIp = tested.publicIpv4;
+            console.log(
+              `check ${c.item.m.base} attempt ${c.attempts}/${maxAttempts} ` +
+                `tester=${tester.publicIpv4} tested=${tested.publicIpv4}`,
             );
             const r = await withTimeout(
               checkPairOnce({
