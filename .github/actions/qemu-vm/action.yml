@@ -103,11 +103,26 @@ runs:
         set -euo pipefail
         if [ "$ARCH" = "arm64" ]; then
           QEMU=qemu-system-aarch64
-          MACHINE_ARGS="-machine virt -accel tcg,thread=multi -cpu max -bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd"
+          MACHINE="-machine virt"
+          BIOS="-bios /usr/share/qemu-efi-aarch64/QEMU_EFI.fd"
         else
           QEMU=qemu-system-x86_64
-          MACHINE_ARGS="-machine pc -accel tcg,thread=multi -cpu max"
+          MACHINE="-machine pc"
+          BIOS=""
         fi
+        # Use KVM only when the guest arch matches the host and the runner
+        # exposes a usable /dev/kvm. GitHub-hosted runners do not, so this
+        # falls back to TCG there; a self-hosted/metal runner gets KVM for free.
+        accel=tcg
+        if [ "$(uname -m)" = "$ARCH" ] && [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+          accel=kvm
+        fi
+        accel_args() {
+          case "$1" in
+            kvm) printf '%s' "-accel kvm -cpu host" ;;
+            *) printf '%s' "-accel tcg,thread=multi -cpu max" ;;
+          esac
+        }
         for tool in "$QEMU" qemu-img cloud-localds ssh; do
           command -v "$tool" >/dev/null || {
             echo "missing $tool" >&2
@@ -210,24 +225,48 @@ runs:
         cloud-localds --network-config="$work/network-config" "$work/seed.iso" "$work/user-data" "$work/meta-data"
         qemu-img create -f qcow2 -b "$IMAGE" -F qcow2 "$work/overlay.qcow2" 12G >/dev/null
 
-        "$QEMU" \
-          -name "$NAME" \
-          $MACHINE_ARGS \
-          -smp "$CPUS" \
-          -m "$MEMORY" \
-          -drive file="$work/overlay.qcow2",if=virtio,format=qcow2 \
-          -drive file="$work/seed.iso",if=virtio,format=raw,readonly=on \
-          -netdev user,id=hostnet,hostfwd=tcp:127.0.0.1:${SSH_PORT}-10.0.2.15:22 \
-          -device virtio-net-pci,netdev=hostnet,mac="$HOST_MAC" \
-          -netdev socket,id=ovnnet,${OVN_MODE}=127.0.0.1:${OVN_PORT} \
-          -device virtio-net-pci,netdev=ovnnet,mac="$OVN_MAC" \
-          $WAN_ARGS \
-          -display none \
-          -serial "file:$work/serial.log" \
-          -monitor none \
-          -daemonize \
-          -pidfile "$work/qemu.pid" \
-          -no-reboot
+        start_vm() {
+          "$QEMU" \
+            -name "$NAME" \
+            $MACHINE \
+            $(accel_args "$1") \
+            $BIOS \
+            -smp "$CPUS" \
+            -m "$MEMORY" \
+            -drive file="$work/overlay.qcow2",if=virtio,format=qcow2 \
+            -drive file="$work/seed.iso",if=virtio,format=raw,readonly=on \
+            -netdev user,id=hostnet,hostfwd=tcp:127.0.0.1:${SSH_PORT}-10.0.2.15:22 \
+            -device virtio-net-pci,netdev=hostnet,mac="$HOST_MAC" \
+            -netdev socket,id=ovnnet,${OVN_MODE}=127.0.0.1:${OVN_PORT} \
+            -device virtio-net-pci,netdev=ovnnet,mac="$OVN_MAC" \
+            $WAN_ARGS \
+            -display none \
+            -serial "file:$work/serial.log" \
+            -monitor none \
+            -daemonize \
+            -pidfile "$work/qemu.pid" \
+            -no-reboot
+        }
+
+        if ! start_vm "$accel"; then
+          if [ "$accel" = "kvm" ]; then
+            echo "QEMU $NAME failed to start with KVM, retrying with TCG" >&2
+            rm -f "$work/qemu.pid"
+            accel=tcg
+            start_vm "$accel"
+          else
+            echo "QEMU $NAME failed to start" >&2
+            exit 1
+          fi
+        fi
+        sleep 2
+        if [ "$accel" = "kvm" ] && ! kill -0 "$(cat "$work/qemu.pid" 2>/dev/null)" 2>/dev/null; then
+          echo "QEMU $NAME exited under KVM, retrying with TCG" >&2
+          rm -f "$work/qemu.pid"
+          accel=tcg
+          start_vm "$accel"
+        fi
+        echo "QEMU $NAME using $accel"
 
         pid="$(cat "$work/qemu.pid")"
         echo "pid=$pid" >>"$GITHUB_OUTPUT"

@@ -29,6 +29,16 @@ jobs:
             runner: ubuntu-latest
             qemu_pkg: qemu-system-x86
             firmware: ""
+            ctx: test
+            hostname: net-test-hh-b
+            id: ubuntu2404-x86
+            distro: Ubuntu 24.04
+            image_url: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img
+            tester_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2
+          - arch: x86_64
+            runner: ubuntu-latest
+            qemu_pkg: qemu-system-x86
+            firmware: ""
             ctx: test-c
             hostname: net-test-hh-c
             id: fedora-x86
@@ -64,6 +74,16 @@ jobs:
             id: ubuntu-arm
             distro: Ubuntu 26.04
             image_url: https://cloud-images.ubuntu.com/releases/26.04/release/ubuntu-26.04-server-cloudimg-arm64.img
+            tester_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            qemu_pkg: qemu-system-arm
+            firmware: qemu-efi-aarch64
+            ctx: test
+            hostname: net-test-hh-b
+            id: ubuntu2404-arm
+            distro: Ubuntu 24.04
+            image_url: https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img
             tester_image_url: https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-arm64.qcow2
           - arch: arm64
             runner: ubuntu-24.04-arm

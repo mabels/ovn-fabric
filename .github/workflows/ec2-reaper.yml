@@ -1,0 +1,38 @@
+name: EC2 pair reaper
+
+# Safety net for cancelled/killed ec2-net-test runs: terminates instances whose
+# ExpiresAt has passed (or that were stopped), and deletes tagged base networks
+# whose TTL passed with no live instances left.
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: eu-central-1
+
+jobs:
+  reap:
+    name: reap expired EC2 pairs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+          cache: true
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN || 'arn:aws:iam::973800055156:role/developers-paradise-github-runner' }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: GitHubAction
+      - name: Reap
+        run: |
+          deno run -A scripts/ec2-pair/create-pair.ts --reap --region "$AWS_REGION"

@@ -1,0 +1,97 @@
+#cloud-config
+# Tester half of an EC2 pair. The TS creator substitutes the tokens below.
+hostname: __HOSTNAME__
+preserve_hostname: false
+manage_etc_hosts: true
+ssh_pwauth: false
+disable_root: false
+# Ubuntu cloud images ship root locked ("!" in shadow); sshd then refuses even a
+# valid key. Unlock it early, before anyone can connect.
+bootcmd:
+  - mkdir -p /root/.ssh
+  - chmod 700 /root/.ssh
+  - usermod -p '*' root || true
+  - chage -E -1 root || true
+users:
+  - name: root
+    lock_passwd: false
+    shell: /bin/bash
+    ssh_authorized_keys:
+__SSH_KEYS__
+write_files:
+  - path: /root/.ssh/authorized_keys
+    owner: root:root
+    permissions: "0600"
+    content: |
+__SSH_KEYS_BLOCK__
+  - path: /etc/ssh/sshd_config.d/99-pair-root.conf
+    permissions: "0600"
+    content: |
+      PermitRootLogin prohibit-password
+      PubkeyAuthentication yes
+      PasswordAuthentication no
+  - path: /usr/local/sbin/pair-setup.sh
+    permissions: "0755"
+    content: |
+      #!/usr/bin/env bash
+      set -euo pipefail
+      # distro-agnostic package install (tester: adds ISP tooling)
+      if command -v apt-get >/dev/null; then
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y openvswitch-switch iproute2 iptables iputils-ping \
+          dnsutils curl ca-certificates radvd dhcpcd-base
+      elif command -v dnf >/dev/null; then
+        . /etc/os-release
+        if [ "${ID:-}" = "rocky" ]; then
+          cat >/etc/yum.repos.d/centos-nfv-openvswitch.repo <<"REPO"
+      [centos-nfv-openvswitch]
+      name=CentOS Stream NFV OpenVSwitch
+      baseurl=https://mirror.stream.centos.org/SIGs/$releasever-stream/nfv/$basearch/openvswitch-2/
+      enabled=1
+      gpgcheck=0
+      REPO
+          dnf install -y openvswitch3.5 iproute iptables iputils bind-utils \
+            curl ca-certificates radvd dhcpcd \
+            || dnf install -y openvswitch iproute iptables iputils bind-utils \
+              curl ca-certificates radvd dhcpcd
+        else
+          dnf install -y openvswitch iproute iptables iputils bind-utils \
+            curl ca-certificates radvd dhcpcd
+        fi
+      elif command -v apk >/dev/null; then
+        apk add --no-cache openvswitch iproute2 iptables iputils bind-tools \
+          curl ca-certificates radvd dhcpcd
+      fi
+      for svc in openvswitch-switch openvswitch; do
+        systemctl enable --now "$svc" 2>/dev/null && break || true
+      done
+      modprobe openvswitch 2>/dev/null || true
+      modprobe geneve 2>/dev/null || true
+
+      BR=br-gen TUN=gen0 VNI=__VNI__
+      ovs-vsctl --if-exists del-br "$BR"
+      ovs-vsctl add-br "$BR"
+      ovs-vsctl set bridge "$BR" fail-mode=standalone
+      ovs-vsctl add-port "$BR" "$TUN" -- set interface "$TUN" type=geneve \
+        options:local_ip=__SELF_IP__ options:remote_ip=__PEER_IP__ \
+        options:key="$VNI" mtu_request=1400
+      ip link set "$BR" up mtu 1400
+
+      ip link del veth-br 2>/dev/null || true
+      ip link add veth-br type veth peer name veth-l2
+      ovs-vsctl --may-exist add-port "$BR" veth-br
+      ip link set veth-br up
+      ip link set veth-l2 up mtu 1400
+      ip addr flush dev veth-l2 2>/dev/null || true
+      ip addr add __SELF_L2__ dev veth-l2
+      echo "pair bridge up: vni $VNI -> __PEER_IP__ l2 __SELF_L2__"
+
+runcmd:
+  # arm the TTL self-destruct first, even if later steps fail
+  - systemd-run --on-active=__TTL__ --unit=pair-expire /usr/sbin/shutdown -h now || shutdown -h +__TTL_MIN__ || true
+  - [ bash, /usr/local/sbin/pair-setup.sh ]
+  - sh -c 'chown root:root /root/.ssh/authorized_keys; chmod 600 /root/.ssh/authorized_keys; chmod 700 /root/.ssh'
+  - sh -c 'for f in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do [ -f "$f" ] || continue; sed -i -E "s/^[[:space:]]*#?[[:space:]]*PermitRootLogin.*/PermitRootLogin prohibit-password/" "$f"; done'
+  - sh -c 'systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true'
+  - touch /var/run/pair-ready
