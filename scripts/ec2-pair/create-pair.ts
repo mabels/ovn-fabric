@@ -549,9 +549,13 @@ export interface CreatePairOptions {
 }
 
 /** Launch the tester+tested instances, wait until running, return their info. */
-export async function createPair(
-  o: CreatePairOptions,
-): Promise<{ tester: Info; tested: Info }> {
+export interface PairIds {
+  testerId: string;
+  testedId: string;
+}
+
+/** Launch tester+tested (RunInstances only; does NOT wait for boot). */
+export async function launchPair(o: CreatePairOptions): Promise<PairIds> {
   const vni = deriveVni(o.pair);
   const testerId = await launch({
     ec2: o.ec2,
@@ -591,21 +595,35 @@ export async function createPair(
     ttlMin: o.ttlMin,
     template: o.templates.tested,
   });
+  return { testerId, testedId };
+}
 
+/** Wait until both instances of a pair are running; return their addresses. */
+export async function waitPair(
+  ec2: EC2Client,
+  pair: string,
+  ids: PairIds,
+): Promise<{ tester: Info; tested: Info }> {
   await Promise.all(
-    [testerId, testedId].map((id) =>
+    [ids.testerId, ids.testedId].map((id) =>
       waitUntilInstanceRunning(
-        { client: o.ec2, maxWaitTime: 300, minDelay: 5, maxDelay: 20 },
+        { client: ec2, maxWaitTime: 300, minDelay: 5, maxDelay: 20 },
         { InstanceIds: [id] },
       )
     ),
   );
-
   const [tester, tested] = await Promise.all([
-    instanceInfo(o.ec2, testerId, `${o.pair}-tester`),
-    instanceInfo(o.ec2, testedId, `${o.pair}-tested`),
+    instanceInfo(ec2, ids.testerId, `${pair}-tester`),
+    instanceInfo(ec2, ids.testedId, `${pair}-tested`),
   ]);
   return { tester, tested };
+}
+
+export async function createPair(
+  o: CreatePairOptions,
+): Promise<{ tester: Info; tested: Info }> {
+  const ids = await launchPair(o);
+  return waitPair(o.ec2, o.pair, ids);
 }
 
 export async function findInstances(

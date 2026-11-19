@@ -1,15 +1,17 @@
 #!/usr/bin/env -S deno run -A
 // matrix.ts — create + verify + destroy the OS/arch matrix in ONE process.
 //
-// One EC2 client with adaptive retries and a shared launch pacer, a bounded
-// worker pool, and guaranteed teardown on success, failure, SIGINT or SIGTERM.
+// Two sequential loops, because GitHub is cheap and AWS does the heavy lifting:
+//   1. launch every pair (RunInstances only — fast), so all boot concurrently
+//   2. wait + verify each pair, then destroy it
 //
-//   deno run -A scripts/ec2-pair/matrix.ts --concurrency 4
+//   deno run -A scripts/ec2-pair/matrix.ts
+//   deno run -A scripts/ec2-pair/matrix.ts --only m-ub2404-x86,m-deb13-x86
 //   deno run -A scripts/ec2-pair/matrix.ts --rig rig-demo --ttl-minutes 30
-//   deno run -A scripts/ec2-pair/matrix.ts --vpc-id vpc-… --subnet-id subnet-… --sg-id sg-…
 //
-// A generated session key is added beside the owner key in cloud-init; the
-// verifier signs in with it. Prints a JSON summary; exits non-zero on failure.
+// One EC2 client with adaptive retries and a shared launch pacer, a generated
+// session key added beside the owner key, and guaranteed teardown on success,
+// failure, SIGINT or SIGTERM. Prints a JSON summary; exits non-zero on failure.
 
 import {
   command,
@@ -22,12 +24,14 @@ import {
 } from "npm:cmd-ts@0.13.0";
 import { EC2Client as EC2 } from "npm:@aws-sdk/client-ec2@3";
 import {
-  createPair,
   DEFAULT_KEY,
   destroyPair,
   ensureNetwork,
+  launchPair,
   type Net,
+  type PairIds,
   resolveAmi,
+  waitPair,
   type Arch,
 } from "./create-pair.ts";
 import { verifyPair } from "./verify-pair.ts";
@@ -66,24 +70,6 @@ interface PairResult {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-async function pool<T>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<void>,
-): Promise<void> {
-  let next = 0;
-  const n = Math.max(1, Math.min(limit, items.length));
-  await Promise.all(
-    Array.from({ length: n }, async () => {
-      while (true) {
-        const i = next++;
-        if (i >= items.length) return;
-        await fn(items[i]!);
-      }
-    }),
-  );
-}
 
 interface SessionKey {
   priv: string;
@@ -128,11 +114,6 @@ const cmd = command({
   args: {
     rig: option({ long: "rig", type: optional(string) }),
     suffix: option({ long: "suffix", type: optional(string) }),
-    concurrency: option({
-      long: "concurrency",
-      type: number,
-      defaultValue: () => 4,
-    }),
     ttlMinutes: option({
       long: "ttl-minutes",
       type: number,
@@ -197,7 +178,6 @@ const cmd = command({
       if (aborted) return;
       aborted = true;
       console.error("\nsignal received, cleaning up...");
-      // grace: let an in-flight RunInstances land so cleanup can see it
       sleep(3000).then(cleanup).finally(() => Deno.exit(130));
     };
     Deno.addSignalListener("SIGINT", onSignal);
@@ -205,6 +185,11 @@ const cmd = command({
 
     const results: PairResult[] = [];
     try {
+      const selected = a.only
+        ? MATRIX.filter((m) => a.only!.split(",").includes(m.base))
+        : MATRIX;
+      if (selected.length === 0) throw new Error("--only matched no matrix rows");
+
       net = await ensureNetwork(ec2, {
         pair: rig,
         ttlMin,
@@ -230,25 +215,29 @@ const cmd = command({
         return v;
       };
 
-      const selected = a.only
-        ? MATRIX.filter((m) => a.only!.split(",").includes(m.base))
-        : MATRIX;
-      if (selected.length === 0) throw new Error("--only matched no matrix rows");
-      await pool(selected, a.concurrency, async (m) => {
+      // ── phase 1: launch all pairs (fast; AWS boots them concurrently) ──
+      interface Launched {
+        m: MatrixItem;
+        pair: string;
+        ids?: PairIds;
+        error?: string;
+      }
+      const launched: Launched[] = [];
+      for (const m of selected) {
         const pair = `${m.base}-${suffix}`;
         created.add(pair);
-        const type = m.arch === "arm64" ? "t4g.micro" : "t3.micro";
-        let ok = false;
-        let line: string | undefined;
-        let error: string | undefined;
+        if (aborted) {
+          launched.push({ m, pair, error: "aborted" });
+          continue;
+        }
         try {
-          if (aborted) throw new Error("aborted");
+          const type = m.arch === "arm64" ? "t4g.micro" : "t3.micro";
           const testerAmi = await amiFor("ubuntu", "24.04", m.arch);
           const testedAmi = await amiFor(m.os, m.version, m.arch);
-          const info = await createPair({
+          const ids = await launchPair({
             ec2,
             pair,
-            net: net!,
+            net: net,
             ttlMin,
             sshKeys,
             templates,
@@ -271,36 +260,56 @@ const cmd = command({
               instanceType: type,
             },
           });
-          if (aborted) throw new Error("aborted");
-          const v = await verifyPair({
-            json: { pair, tester: info.tester, tested: info.tested },
-            sshKey: key.priv,
-            readyTimeoutSec: 480,
-          });
-          ok = v.ok;
-          line = v.line;
+          launched.push({ m, pair, ids });
+          console.log(`launched ${m.base} (${pair})`);
         } catch (e) {
-          error = e instanceof Error ? e.message : String(e);
-        } finally {
-          if (!a.keepPairs) {
-            await destroyPair(ec2, pair).catch((e) =>
-              console.error(`destroy ${pair}: ${e.message}`)
-            );
-          }
-          created.delete(pair);
+          const error = e instanceof Error ? e.message : String(e);
+          launched.push({ m, pair, error });
+          console.log(`LAUNCH FAIL ${m.base}: ${error}`);
         }
+      }
+
+      // ── phase 2: wait + verify + destroy each pair (sequential loop) ──
+      for (const item of launched) {
+        let ok = false;
+        let line: string | undefined;
+        let error = item.error;
+        if (!error && item.ids && !aborted) {
+          try {
+            const info = await waitPair(ec2, item.pair, item.ids);
+            const v = await verifyPair({
+              json: { pair: item.pair, tester: info.tester, tested: info.tested },
+              sshKey: key.priv,
+              readyTimeoutSec: 480,
+            });
+            ok = v.ok;
+            line = v.line;
+          } catch (e) {
+            error = e instanceof Error ? e.message : String(e);
+          }
+        } else if (aborted) {
+          error = "aborted";
+        }
+        if (!a.keepPairs) {
+          await destroyPair(ec2, item.pair).catch((e) =>
+            console.error(`destroy ${item.pair}: ${e.message}`)
+          );
+        }
+        created.delete(item.pair);
         results.push({
-          pair,
-          base: m.base,
-          arch: m.arch,
-          os: m.os,
-          version: m.version,
+          pair: item.pair,
+          base: item.m.base,
+          arch: item.m.arch,
+          os: item.m.os,
+          version: item.m.version,
           ok,
           line,
           error,
         });
-        console.log(`${ok ? "OK  " : "FAIL"} ${m.base} ${line ?? error ?? ""}`);
-      });
+        console.log(
+          `${ok ? "OK  " : "FAIL"} ${item.m.base} ${line ?? error ?? ""}`,
+        );
+      }
     } finally {
       await cleanup();
       Deno.removeSignalListener("SIGINT", onSignal);
@@ -309,7 +318,7 @@ const cmd = command({
 
     results.sort((x, y) => x.base.localeCompare(y.base));
     console.log(JSON.stringify({ rig, region, results }, null, 2));
-    if (results.some((r) => !r.ok)) Deno.exit(1);
+    if (results.length === 0 || results.some((r) => !r.ok)) Deno.exit(1);
   },
 });
 

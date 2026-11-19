@@ -1,18 +1,14 @@
 name: EC2 network smoke test
 
-# Spins up throwaway dual-stack EC2 pairs (tester + tested OS), proves the
-# Geneve L2 bridge and IPv4 egress, then destroys everything.
+# Create a throwaway dual-stack EC2 pair per OS/arch, verify the Geneve L2
+# bridge + IPv4 egress, then destroy everything.
 #
-# Auth: GitHub OIDC -> AWS role (same pattern as developers-paradise). The role
-# needs EC2 VPC/instance lifecycle permissions; override the ARN with the repo
-# variable AWS_ROLE_ARN.
+# Two sequential loops (one process): launch all pairs (fast; AWS boots them
+# concurrently), then wait/verify each pair. GitHub is cheap; AWS does the work.
 #
-# Cancel safety:
-#   * concurrency: never cancel an in-flight run (avoids half-torn-down state)
-#   * each pair step has an EXIT/INT/TERM trap that destroys its pair
-#   * every pair step is followed by an `if: always()` destroy
-#   * a teardown job (`if: always()`) reaps all pairs + the base network
-#   * ec2-reaper.yml runs every 15 min to catch hard cancellations
+# Auth: GitHub OIDC -> AWS role (variable AWS_ROLE_ARN).
+# Cancel safety: matrix.ts traps SIGINT/SIGTERM and destroys; the teardown job
+# is `if: always()`; ec2-reaper.yml catches hard cancellations every 15 min.
 
 on:
   workflow_dispatch:
@@ -38,14 +34,10 @@ env:
   TTL_MINUTES: ${{ inputs.ttl_minutes || '45' }}
 
 jobs:
-  rig:
-    name: base network
+  matrix:
+    name: create + verify pairs
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    outputs:
-      vpc_id: ${{ steps.net.outputs.vpc_id }}
-      subnet_id: ${{ steps.net.outputs.subnet_id }}
-      sg_id: ${{ steps.net.outputs.sg_id }}
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v5
       - uses: denoland/setup-deno@v2
@@ -55,90 +47,20 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN || 'arn:aws:iam::973800055156:role/developers-paradise-github-runner' }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubAction
-      - name: Create base network
-        id: net
+      - name: Launch all pairs, then verify each
         run: |
-          set -euo pipefail
-          deno run -A scripts/ec2-pair/create-pair.ts \
-            --pair "$RIG" --region "$AWS_REGION" --network-only \
+          deno run -A scripts/ec2-pair/matrix.ts \
+            --rig "$RIG" \
+            --suffix "${GITHUB_RUN_NUMBER}" \
             --ttl-minutes "$TTL_MINUTES" \
-            --vpc-cidr 10.42.0.0/16 --subnet-cidr 10.42.0.0/24 | tee rig.json
-          echo "vpc_id=$(jq -r .network.vpcId rig.json)" >> "$GITHUB_OUTPUT"
-          echo "subnet_id=$(jq -r .network.subnetId rig.json)" >> "$GITHUB_OUTPUT"
-          echo "sg_id=$(jq -r .network.securityGroupId rig.json)" >> "$GITHUB_OUTPUT"
-
-  pair:
-    name: ${{ matrix.base }}
-    needs: rig
-    runs-on: ubuntu-latest
-    timeout-minutes: 35
-    strategy:
-      fail-fast: false
-      max-parallel: 4
-      matrix:
-        include:
-          - { base: m-ub2404-x86,  os: ubuntu,  version: "24.04", arch: amd64, testerIp: 10.42.0.10, testedIp: 10.42.0.11 }
-          - { base: m-ub2404-arm,  os: ubuntu,  version: "24.04", arch: arm64, testerIp: 10.42.0.12, testedIp: 10.42.0.13 }
-          - { base: m-ub2604-x86,  os: ubuntu,  version: "26.04", arch: amd64, testerIp: 10.42.0.14, testedIp: 10.42.0.15 }
-          - { base: m-ub2604-arm,  os: ubuntu,  version: "26.04", arch: arm64, testerIp: 10.42.0.16, testedIp: 10.42.0.17 }
-          - { base: m-deb13-x86,   os: debian,  version: "13",    arch: amd64, testerIp: 10.42.0.18, testedIp: 10.42.0.19 }
-          - { base: m-deb13-arm,   os: debian,  version: "13",    arch: arm64, testerIp: 10.42.0.20, testedIp: 10.42.0.21 }
-          - { base: m-fed44-x86,   os: fedora,  version: "44",    arch: amd64, testerIp: 10.42.0.22, testedIp: 10.42.0.23 }
-          - { base: m-fed44-arm,   os: fedora,  version: "44",    arch: arm64, testerIp: 10.42.0.24, testedIp: 10.42.0.25 }
-          - { base: m-rocky10-x86, os: rocky,   version: "10",    arch: amd64, testerIp: 10.42.0.26, testedIp: 10.42.0.27 }
-          - { base: m-rocky10-arm, os: rocky,   version: "10",    arch: arm64, testerIp: 10.42.0.28, testedIp: 10.42.0.29 }
-    steps:
-      - uses: actions/checkout@v5
-      - uses: denoland/setup-deno@v2
-        with:
-          deno-version: v2.x
-          cache: true
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v6
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN || 'arn:aws:iam::973800055156:role/developers-paradise-github-runner' }}
-          aws-region: ${{ env.AWS_REGION }}
-          role-session-name: GitHubAction
-      - name: Ephemeral SSH key
-        run: |
-          ssh-keygen -t ed25519 -N '' -f "$RUNNER_TEMP/key"
-      - name: Create, verify, clean up pair
-        run: |
-          set -euo pipefail
-          export PAIR="${{ matrix.base }}-${GITHUB_RUN_NUMBER}"
-          KEY="$RUNNER_TEMP/key"
-          cleanup() {
-            deno run -A scripts/ec2-pair/create-pair.ts \
-              --pair "$PAIR" --destroy --region "$AWS_REGION" >/dev/null 2>&1 || true
-          }
-          # runs on SIGINT/SIGTERM (workflow cancel) and on step exit
-          trap cleanup EXIT INT TERM
-
-          deno run -A scripts/ec2-pair/create-pair.ts \
-            --pair "$PAIR" --region "$AWS_REGION" --ttl-minutes "$TTL_MINUTES" \
-            --tester-os ubuntu --tester-version 24.04 --tester-arch "${{ matrix.arch }}" \
-            --tested-os "${{ matrix.os }}" --tested-version "${{ matrix.version }}" \
-            --tested-arch "${{ matrix.arch }}" \
-            --vpc-id "${{ needs.rig.outputs.vpc_id }}" \
-            --subnet-id "${{ needs.rig.outputs.subnet_id }}" \
-            --sg-id "${{ needs.rig.outputs.sg_id }}" \
-            --tester-ip "${{ matrix.testerIp }}" --tested-ip "${{ matrix.testedIp }}" \
-            --ssh-key "$(cat "$KEY.pub")" | tee pair.json
-
-          deno run -A scripts/ec2-pair/verify-pair.ts --json pair.json --ssh-key "$KEY"
-      - name: Destroy pair (backstop)
-        if: always()
-        run: |
-          deno run -A scripts/ec2-pair/create-pair.ts \
-            --pair "${{ matrix.base }}-${GITHUB_RUN_NUMBER}" \
-            --destroy --region "$AWS_REGION" || true
+            --region "$AWS_REGION"
 
   teardown:
     name: teardown (always)
-    needs: [rig, pair]
+    needs: matrix
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -163,10 +85,10 @@ jobs:
       - name: Configure AWS Credentials
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN || 'arn:aws:iam::973800055156:role/developers-paradise-github-runner' }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubAction
-      - name: Reap pairs and base network
+      - name: Destroy pairs and base network
         run: |
           set -uo pipefail
           for base in $BASES; do
@@ -176,5 +98,4 @@ jobs:
           done
           deno run -A scripts/ec2-pair/create-pair.ts \
             --pair "$RIG" --destroy --region "$AWS_REGION" || true
-          # final sweep: expired instances, and expired orphaned networks
           deno run -A scripts/ec2-pair/create-pair.ts --reap --region "$AWS_REGION" || true
