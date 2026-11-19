@@ -652,22 +652,30 @@ function pairOf(inst: Instance): string | undefined {
   return inst.Tags?.find((t) => t.Key === PAIR_TAG)?.Value;
 }
 
-export async function destroyPair(ec2: EC2Client, pair: string): Promise<void> {
-  const insts = await findInstances(ec2, pair);
-  const live = insts.filter((i) =>
-    !["terminated", "shutting-down"].includes(i.State?.Name ?? "")
-  );
-  if (live.length) {
-    const ids = live.map((i) => i.InstanceId!).filter(Boolean);
-    await ec2.send(new TerminateInstancesCommand({ InstanceIds: ids }));
-    await Promise.all(ids.map((id) =>
-      waitUntilInstanceTerminated(
-        { client: ec2, maxWaitTime: 300, minDelay: 5, maxDelay: 20 },
-        { InstanceIds: [id] },
-      )
-    ));
-  }
+export async function findInstancesByPairs(
+  ec2: EC2Client,
+  pairs: readonly string[],
+): Promise<Instance[]> {
+  if (pairs.length === 0) return [];
+  const out: Instance[] = [];
+  let next: string | undefined;
+  do {
+    const r = await ec2.send(
+      new DescribeInstancesCommand({
+        Filters: [{ Name: `tag:${PAIR_TAG}`, Values: [...pairs] }],
+        NextToken: next,
+      }),
+    );
+    for (const res of r.Reservations ?? []) out.push(...(res.Instances ?? []));
+    next = r.NextToken;
+  } while (next);
+  return out;
+}
 
+export async function destroyNetwork(
+  ec2: EC2Client,
+  pair: string,
+): Promise<void> {
   // VPCs this script created (tagged with the pair); reuse-mode networks are
   // left alone.
   const vpcs = await ec2.send(
@@ -730,6 +738,27 @@ export async function destroyPair(ec2: EC2Client, pair: string): Promise<void> {
       ec2.send(new DeleteSecurityGroupCommand({ GroupId: sg.GroupId! }))
     );
   }
+}
+
+export async function destroyPair(
+  ec2: EC2Client,
+  pair: string,
+): Promise<void> {
+  const insts = await findInstances(ec2, pair);
+  const live = insts.filter((i) =>
+    !["terminated", "shutting-down"].includes(i.State?.Name ?? "")
+  );
+  if (live.length) {
+    const ids = live.map((i) => i.InstanceId!).filter(Boolean);
+    await ec2.send(new TerminateInstancesCommand({ InstanceIds: ids }));
+    await Promise.all(ids.map((id) =>
+      waitUntilInstanceTerminated(
+        { client: ec2, maxWaitTime: 300, minDelay: 5, maxDelay: 20 },
+        { InstanceIds: [id] },
+      )
+    ));
+  }
+  await destroyNetwork(ec2, pair);
 }
 
 export async function reap(ec2: EC2Client): Promise<string[]> {

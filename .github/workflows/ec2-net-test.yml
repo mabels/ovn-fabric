@@ -74,17 +74,7 @@ jobs:
     needs: matrix
     if: always()
     runs-on: ubuntu-latest
-    timeout-minutes: 20
-    env:
-      BASES: |
-        m-ub2604-x86
-        m-ub2604-arm
-        m-deb13-x86
-        m-deb13-arm
-        m-fed44-x86
-        m-fed44-arm
-        m-rocky10-x86
-        m-rocky10-arm
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
       - uses: denoland/setup-deno@v2
@@ -97,14 +87,8 @@ jobs:
           role-to-assume: ${{ vars.AWS_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubAction
-      - name: Destroy pairs and base network
+      - name: Terminate pairs + network (batched)
         run: |
-          set -uo pipefail
-          for base in $BASES; do
-            deno run -A scripts/ec2-pair/create-pair.ts \
-              --pair "${base}-${GITHUB_RUN_NUMBER}" \
-              --destroy --region "$AWS_REGION" || true
-          done
-          deno run -A scripts/ec2-pair/create-pair.ts \
-            --pair "$RIG" --destroy --region "$AWS_REGION" || true
-          deno run -A scripts/ec2-pair/create-pair.ts --reap --region "$AWS_REGION" || true
+          deno run -A scripts/ec2-pair/matrix.ts --teardown \
+            --rig "$RIG" --suffix "${GITHUB_RUN_NUMBER}" \
+            --region "$AWS_REGION"

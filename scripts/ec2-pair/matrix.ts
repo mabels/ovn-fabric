@@ -28,11 +28,18 @@ import {
   run,
   string,
 } from "npm:cmd-ts@0.13.0";
-import { EC2Client as EC2 } from "npm:@aws-sdk/client-ec2@3";
+import {
+  type EC2Client,
+  EC2Client as EC2,
+  TerminateInstancesCommand,
+  waitUntilInstanceTerminated,
+} from "npm:@aws-sdk/client-ec2@3";
 import {
   DEFAULT_KEYS,
+  destroyNetwork,
   destroyPair,
   ensureNetwork,
+  findInstancesByPairs,
   type Info,
   instanceInfo,
   launchPair,
@@ -317,6 +324,43 @@ async function sshWrappers(key: string): Promise<{
   };
 }
 
+/** Batch teardown: terminate every instance of the pairs in one API call,
+ * wait for them in parallel, then delete the network(s). */
+async function teardownAll(
+  ec2: EC2Client,
+  pairs: readonly string[],
+  rig: string,
+  destroyRig: boolean,
+): Promise<void> {
+  const insts = await findInstancesByPairs(ec2, pairs);
+  const live = insts.filter((i) =>
+    !["terminated", "shutting-down"].includes(i.State?.Name ?? "")
+  );
+  const ids = live.map((i) => i.InstanceId!).filter(Boolean);
+  if (ids.length > 0) {
+    console.log(
+      `teardown: terminating ${ids.length} instance(s) for ${pairs.length} pair(s)`,
+    );
+    await ec2.send(new TerminateInstancesCommand({ InstanceIds: ids }));
+    await Promise.all(ids.map((id) =>
+      waitUntilInstanceTerminated(
+        { client: ec2, maxWaitTime: 300, minDelay: 3, maxDelay: 10 },
+        { InstanceIds: [id] },
+      )
+    ));
+  }
+  await Promise.all(pairs.map((p) =>
+    destroyNetwork(ec2, p).catch((e) =>
+      console.error(`destroy network ${p}: ${e.message}`)
+    )
+  ));
+  if (destroyRig) {
+    await destroyPair(ec2, rig).catch((e) =>
+      console.error(`destroy ${rig}: ${e.message}`)
+    );
+  }
+}
+
 const cmd = command({
   name: "matrix",
   description: "Create, verify, deploy and test the EC2 OS/arch matrix.",
@@ -380,11 +424,23 @@ const cmd = command({
       long: "keep-failed",
       description: "leave failed pairs running for debugging",
     }),
+    teardown: flag({
+      long: "teardown",
+      description: "terminate all pairs for --suffix and the --rig, then exit",
+    }),
   },
   handler: async (a) => {
     const region = a.region ?? Deno.env.get("AWS_REGION") ??
       Deno.env.get("AWS_DEFAULT_REGION") ?? "eu-central-1";
     const ec2 = new EC2({ region, maxAttempts: 10, retryMode: "adaptive" });
+    if (a.teardown) {
+      if (!a.suffix) throw new Error("--teardown needs --suffix");
+      const rig = a.rig ?? `rig-${a.suffix}`;
+      const pairs = MATRIX.map((m) => `${m.base}-${a.suffix}`);
+      await teardownAll(ec2, pairs, rig, true);
+      console.log(JSON.stringify({ teardown: { rig, suffix: a.suffix, pairs } }, null, 2));
+      return;
+    }
     const suffix = a.suffix ?? Date.now().toString(36).slice(-4);
     const rig = a.rig ?? `rig-${suffix}`;
     const ttlMin = a.ttlMinutes;
@@ -412,16 +468,17 @@ const cmd = command({
     const cleanup = async () => {
       if (cleaned) return;
       cleaned = true;
-      for (const p of created) {
-        await destroyPair(ec2, p).catch((e) =>
-          console.error(`destroy ${p}: ${e.message}`)
+      if (!a.keepPairs && !a.keepFailed) {
+        const remaining = [...created];
+        created.clear();
+        await teardownAll(
+          ec2,
+          remaining,
+          rig,
+          net !== undefined && !a.keep,
         );
-      }
-      created.clear();
-      if (net && !a.keep && !a.keepPairs) {
-        await destroyPair(ec2, rig).catch((e) =>
-          console.error(`destroy ${rig}: ${e.message}`)
-        );
+      } else {
+        created.clear();
       }
       await wrap.cleanup();
       // keep the generated IRs when pairs are kept for debugging
