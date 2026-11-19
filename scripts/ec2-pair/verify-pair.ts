@@ -1,12 +1,11 @@
 #!/usr/bin/env -S deno run -A
-// verify-pair.ts — verify one EC2 pair created by create-pair.ts.
+// verify-pair.ts — check one EC2 pair.
 //
-//   deno run -A scripts/ec2-pair/verify-pair.ts --json pair.json
-//   deno run -A scripts/ec2-pair/verify-pair.ts --json pair.json --ssh-key /tmp/key
+//   checkPairOnce(): ONE attempt (short readiness), for the matrix scheduler.
+//   verifyPair():    CLI helper that loops checkPairOnce with retries.
 //
-// Asserts: both cloud-inits finished AND the Geneve port exists, L2 ping both
-// directions, IPv4 egress. Each check runs with a bounded ping window and is
-// retried (default 6 attempts, 5 s apart) so a just-booted bridge doesn't flake.
+// A check asserts: cloud-init done + Geneve port present, L2 ping both
+// directions, IPv4 egress. Each SSH runs with its own hard timeout.
 
 import {
   command,
@@ -34,16 +33,13 @@ export interface VerifyResult {
   l2Fwd: boolean;
   l2Rev: boolean;
   ipv4: boolean;
-  attempts: number;
 }
 
-export interface VerifyOptions {
+export interface CheckOptions {
   json: string | PairJson;
   sshKey?: string;
+  /** Per-attempt readiness wait (default 20s). */
   readyTimeoutSec?: number;
-  attempts?: number;
-  retryDelaySec?: number;
-  log?: (line: string) => void;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -82,8 +78,7 @@ async function sshRun(
   return dec.decode(res.stdout).trim();
 }
 
-// Ready = cloud-init done AND the Geneve port exists (pair-setup may still be
-// running when /var/run/pair-ready is not yet written, and vice versa).
+// Ready = cloud-init done AND the Geneve port exists.
 const READY_CMD =
   "test -f /var/run/pair-ready && ovs-vsctl show 2>/dev/null | grep -q 'type: geneve'";
 
@@ -94,10 +89,10 @@ async function waitReady(
 ): Promise<boolean> {
   while (Date.now() < deadline) {
     try {
-      await sshRun(ip, READY_CMD, key, 20_000);
+      await sshRun(ip, READY_CMD, key, 15_000);
       return true;
     } catch {
-      await sleep(5_000);
+      await sleep(4_000);
     }
   }
   return false;
@@ -106,7 +101,7 @@ async function waitReady(
 const TESTER_CMD = [
   'r=$(test -f /var/run/pair-ready && echo 1 || echo 0)',
   'g=$(ovs-vsctl show 2>/dev/null | grep -c "type: geneve")',
-  'l=$(ping -c5 -i1 -W2 10.222.0.2 >/dev/null 2>&1 && echo ok || echo fail)',
+  'l=$(ping -c3 -i1 -W2 10.222.0.2 >/dev/null 2>&1 && echo ok || echo fail)',
   'e=$(ping -4 -c2 -W2 1.1.1.1 >/dev/null 2>&1 && echo ok || echo fail)',
   'o=$(grep ^PRETTY_NAME /etc/os-release | cut -d= -f2- | tr -d \'"\')',
   'echo "$r|$g|$l|$e|$o"',
@@ -115,12 +110,12 @@ const TESTER_CMD = [
 const TESTED_CMD = [
   'r=$(test -f /var/run/pair-ready && echo 1 || echo 0)',
   'g=$(ovs-vsctl show 2>/dev/null | grep -c "type: geneve")',
-  'l=$(ping -c5 -i1 -W2 10.222.0.1 >/dev/null 2>&1 && echo ok || echo fail)',
+  'l=$(ping -c3 -i1 -W2 10.222.0.1 >/dev/null 2>&1 && echo ok || echo fail)',
   'o=$(grep ^PRETTY_NAME /etc/os-release | cut -d= -f2- | tr -d \'"\')',
   'echo "$r|$g|$l|$o"',
 ].join("; ");
 
-function failed(line: string, attempts: number): VerifyResult {
+export function failedCheck(line: string): VerifyResult {
   return {
     ok: false,
     line,
@@ -131,64 +126,90 @@ function failed(line: string, attempts: number): VerifyResult {
     l2Fwd: false,
     l2Rev: false,
     ipv4: false,
-    attempts,
   };
 }
 
-export async function verifyPair(o: VerifyOptions): Promise<VerifyResult> {
-  const data: PairJson = typeof o.json === "string"
-    ? JSON.parse(await Deno.readTextFile(o.json))
-    : o.json;
+function resolvePair(json: string | PairJson): PairJson {
+  if (typeof json !== "string") return json;
+  return JSON.parse(Deno.readTextFileSync(json));
+}
+
+async function runChecks(
+  A: string,
+  B: string,
+  key: string | undefined,
+): Promise<VerifyResult> {
+  const [aOut, bOut] = await Promise.all([
+    sshRun(A, TESTER_CMD, key, 35_000),
+    sshRun(B, TESTED_CMD, key, 35_000),
+  ]);
+  const [ra, ga, la, ea, osa] = aOut.split("|");
+  const [rb, gb, lb, osb] = bOut.split("|");
+  return {
+    ok: Number(ga) >= 1 && Number(gb) >= 1 && la === "ok" && lb === "ok" &&
+      ea === "ok" && ra === "1" && rb === "1",
+    line:
+      `tester(${osa}) geneve=${ga} l2-fwd=${la} ipv4=${ea} | tested(${osb}) geneve=${gb} l2-rev=${lb}`,
+    testerOs: osa ?? "?",
+    testedOs: osb ?? "?",
+    geneveTester: Number(ga) || 0,
+    geneveTested: Number(gb) || 0,
+    l2Fwd: la === "ok",
+    l2Rev: lb === "ok",
+    ipv4: ea === "ok",
+  };
+}
+
+/** One attempt: short readiness wait, then the checks once. */
+export async function checkPairOnce(
+  o: CheckOptions,
+): Promise<VerifyResult> {
+  const data = resolvePair(o.json);
   const A = data.tester.publicIpv4;
   const B = data.tested.publicIpv4;
-  const deadline = Date.now() + (o.readyTimeoutSec ?? 480) * 1000;
-  const attempts = Math.max(1, o.attempts ?? 6);
-  const retryDelay = Math.max(0, o.retryDelaySec ?? 5) * 1000;
+  const deadline = Date.now() + (o.readyTimeoutSec ?? 20) * 1000;
 
   const readyA = await waitReady(A, o.sshKey, deadline);
   const readyB = await waitReady(B, o.sshKey, deadline);
   if (!readyA || !readyB) {
-    const line = `not ready (cloud-init+geneve): tester=${readyA} tested=${readyB}`;
-    o.log?.(line);
-    return failed(line, 0);
+    return failedCheck(`not ready: tester=${readyA} tested=${readyB}`);
   }
+  return runChecks(A, B, o.sshKey);
+}
 
-  let last: VerifyResult = failed("not attempted", 0);
-  for (let attempt = 1; attempt <= attempts; attempt++) {
+export interface VerifyOptions extends CheckOptions {
+  readyTimeoutSec?: number;
+  attempts?: number;
+  retryDelaySec?: number;
+  log?: (line: string) => void;
+}
+
+/** CLI helper: readiness with a long wait, then retry the checks. */
+export async function verifyPair(o: VerifyOptions): Promise<VerifyResult> {
+  const data = resolvePair(o.json);
+  const A = data.tester.publicIpv4;
+  const B = data.tested.publicIpv4;
+  const deadline = Date.now() + (o.readyTimeoutSec ?? 480) * 1000;
+  if (
+    !await waitReady(A, o.sshKey, deadline) ||
+    !await waitReady(B, o.sshKey, deadline)
+  ) {
+    return failedCheck("cloud-init/geneve timeout");
+  }
+  const attempts = Math.max(1, o.attempts ?? 6);
+  const retryDelay = Math.max(0, o.retryDelaySec ?? 5) * 1000;
+  let last = failedCheck("not attempted");
+  for (let i = 1; i <= attempts; i++) {
     try {
-      const [aOut, bOut] = await Promise.all([
-        sshRun(A, TESTER_CMD, o.sshKey, 40_000),
-        sshRun(B, TESTED_CMD, o.sshKey, 40_000),
-      ]);
-      const [ra, ga, la, ea, osa] = aOut.split("|");
-      const [rb, gb, lb, osb] = bOut.split("|");
-      last = {
-        ok: Number(ga) >= 1 && Number(gb) >= 1 && la === "ok" && lb === "ok" &&
-          ea === "ok" && ra === "1" && rb === "1",
-        line:
-          `tester(${osa}) geneve=${ga} l2-fwd=${la} ipv4=${ea} | tested(${osb}) geneve=${gb} l2-rev=${lb}`,
-        testerOs: osa ?? "?",
-        testedOs: osb ?? "?",
-        geneveTester: Number(ga) || 0,
-        geneveTested: Number(gb) || 0,
-        l2Fwd: la === "ok",
-        l2Rev: lb === "ok",
-        ipv4: ea === "ok",
-        attempts: attempt,
-      };
+      last = await runChecks(A, B, o.sshKey);
     } catch (e) {
-      last = failed(
+      last = failedCheck(
         `check error: ${e instanceof Error ? e.message : String(e)}`,
-        attempt,
       );
     }
     if (last.ok) return last;
-    if (attempt < attempts) {
-      o.log?.(
-        `attempt ${attempt}/${attempts} failed (${last.line}); retry in ${
-          retryDelay / 1000
-        }s`,
-      );
+    if (i < attempts) {
+      o.log?.(`attempt ${i}/${attempts} failed (${last.line}); retrying`);
       await sleep(retryDelay);
     }
   }

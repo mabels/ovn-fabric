@@ -1,13 +1,14 @@
 #!/usr/bin/env -S deno run -A
 // matrix.ts — create + verify + destroy the OS/arch matrix in ONE process.
 //
-// Two sequential loops, because GitHub is cheap and AWS does the heavy lifting:
+// Two phases, both sequential at the top level:
 //   1. launch every pair (RunInstances only — fast), so all boot concurrently
-//   2. wait + verify each pair, then destroy it
+//   2. a work-queue scheduler: test each pair with a hard timeout; on
+//      timeout/error requeue it (bounded retry/error counts); on success mark
+//      it done. Continue until every pair is success or exhausted.
 //
 //   deno run -A scripts/ec2-pair/matrix.ts
 //   deno run -A scripts/ec2-pair/matrix.ts --only m-ub2404-x86,m-deb13-x86
-//   deno run -A scripts/ec2-pair/matrix.ts --rig rig-demo --ttl-minutes 30
 //
 // One EC2 client with adaptive retries and a shared launch pacer, a generated
 // session key added beside the owner key, and guaranteed teardown on success,
@@ -27,14 +28,14 @@ import {
   DEFAULT_KEY,
   destroyPair,
   ensureNetwork,
+  instanceInfo,
   launchPair,
   type Net,
   type PairIds,
   resolveAmi,
-  waitPair,
   type Arch,
 } from "./create-pair.ts";
-import { verifyPair } from "./verify-pair.ts";
+import { checkPairOnce } from "./verify-pair.ts";
 
 interface MatrixItem {
   base: string;
@@ -65,11 +66,31 @@ interface PairResult {
   os: string;
   version: string;
   ok: boolean;
+  attempts: number;
   line?: string;
   error?: string;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`${what} timed out after ${ms}ms`)),
+      ms,
+    );
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
 
 interface SessionKey {
   priv: string;
@@ -131,6 +152,26 @@ const cmd = command({
       description: "comma-separated matrix base names to run",
       type: optional(string),
     }),
+    checkConcurrency: option({
+      long: "check-concurrency",
+      type: number,
+      defaultValue: () => 4,
+    }),
+    checkTimeout: option({
+      long: "check-timeout-seconds",
+      type: number,
+      defaultValue: () => 25,
+    }),
+    maxAttempts: option({
+      long: "max-attempts",
+      type: number,
+      defaultValue: () => 12,
+    }),
+    retryBackoff: option({
+      long: "retry-backoff-seconds",
+      type: number,
+      defaultValue: () => 3,
+    }),
     keep: flag({ long: "keep" }),
     keepPairs: flag({ long: "keep-pairs" }),
   },
@@ -151,6 +192,10 @@ const cmd = command({
         new URL("./tested.cloud-init.yaml", import.meta.url),
       ),
     };
+    const checkTimeoutMs = Math.max(5000, a.checkTimeout * 1000);
+    const maxAttempts = Math.max(1, a.maxAttempts);
+    const backoffMs = Math.max(0, a.retryBackoff * 1000);
+    const checkConcurrency = Math.max(1, a.checkConcurrency);
 
     let net: Net | undefined;
     const created = new Set<string>();
@@ -215,7 +260,7 @@ const cmd = command({
         return v;
       };
 
-      // ── phase 1: launch all pairs (fast; AWS boots them concurrently) ──
+      // ── phase 1: launch all pairs (fast) ──────────────────────────────
       interface Launched {
         m: MatrixItem;
         pair: string;
@@ -237,7 +282,7 @@ const cmd = command({
           const ids = await launchPair({
             ec2,
             pair,
-            net: net,
+            net,
             ttlMin,
             sshKeys,
             templates,
@@ -269,47 +314,123 @@ const cmd = command({
         }
       }
 
-      // ── phase 2: wait + verify + destroy each pair (sequential loop) ──
-      for (const item of launched) {
-        let ok = false;
-        let line: string | undefined;
-        let error = item.error;
-        if (!error && item.ids && !aborted) {
-          try {
-            const info = await waitPair(ec2, item.pair, item.ids);
-            const v = await verifyPair({
-              json: { pair: item.pair, tester: info.tester, tested: info.tested },
-              sshKey: key.priv,
-              readyTimeoutSec: 480,
-            });
-            ok = v.ok;
-            line = v.line;
-          } catch (e) {
-            error = e instanceof Error ? e.message : String(e);
-          }
-        } else if (aborted) {
-          error = "aborted";
-        }
+      // ── phase 2: retry-queue scheduler until all pairs are settled ─────
+      interface CheckState {
+        item: Launched;
+        attempts: number;
+        state: "queued" | "ok" | "failed";
+        nextAt: number;
+        line?: string;
+        error?: string;
+        recorded: boolean;
+      }
+      const checks: CheckState[] = launched.map((item) => ({
+        item,
+        attempts: 0,
+        state: item.error ? "failed" : "queued",
+        nextAt: 0,
+        error: item.error,
+        recorded: false,
+      }));
+      const settle = async (c: CheckState) => {
+        if (c.state === "queued") return;
         if (!a.keepPairs) {
-          await destroyPair(ec2, item.pair).catch((e) =>
-            console.error(`destroy ${item.pair}: ${e.message}`)
+          await destroyPair(ec2, c.item.pair).catch((e) =>
+            console.error(`destroy ${c.item.pair}: ${e.message}`)
           );
         }
-        created.delete(item.pair);
-        results.push({
-          pair: item.pair,
-          base: item.m.base,
-          arch: item.m.arch,
-          os: item.m.os,
-          version: item.m.version,
-          ok,
-          line,
-          error,
-        });
-        console.log(
-          `${ok ? "OK  " : "FAIL"} ${item.m.base} ${line ?? error ?? ""}`,
+        created.delete(c.item.pair);
+        if (!c.recorded) {
+          c.recorded = true;
+          results.push({
+            pair: c.item.pair,
+            base: c.item.m.base,
+            arch: c.item.m.arch,
+            os: c.item.m.os,
+            version: c.item.m.version,
+            ok: c.state === "ok",
+            attempts: c.attempts,
+            line: c.line,
+            error: c.error,
+          });
+          console.log(
+            `${c.state === "ok" ? "OK  " : "FAIL"} ${c.item.m.base} ` +
+              `(attempt ${c.attempts}) ${c.line ?? c.error ?? ""}`,
+          );
+        }
+      };
+
+      while (true) {
+        if (aborted) break;
+        const pending = checks.filter((c) => c.state === "queued");
+        if (pending.length === 0) break;
+        const now = Date.now();
+        const ready = pending.filter((c) => c.nextAt <= now).slice(
+          0,
+          checkConcurrency,
         );
+        if (ready.length === 0) {
+          const next = Math.min(...pending.map((c) => c.nextAt));
+          await sleep(Math.max(50, next - now));
+          continue;
+        }
+
+        await Promise.all(ready.map(async (c) => {
+          c.attempts += 1;
+          try {
+            const [tester, tested] = await withTimeout(
+              Promise.all([
+                instanceInfo(ec2, c.item.ids!.testerId, `${c.item.pair}-tester`),
+                instanceInfo(ec2, c.item.ids!.testedId, `${c.item.pair}-tested`),
+              ]),
+              checkTimeoutMs,
+              "instanceInfo",
+            );
+            const r = await withTimeout(
+              checkPairOnce({
+                json: { pair: c.item.pair, tester, tested },
+                sshKey: key.priv,
+                readyTimeoutSec: Math.max(5, Math.floor(checkTimeoutMs / 2000)),
+              }),
+              checkTimeoutMs,
+              "check",
+            );
+            c.line = r.line;
+            if (r.ok) {
+              c.state = "ok";
+            } else {
+              c.error = r.line;
+              c.state = c.attempts >= maxAttempts ? "failed" : "queued";
+              c.nextAt = Date.now() + backoffMs * c.attempts;
+              if (c.state === "queued") {
+                console.log(
+                  `retry ${c.item.m.base} ${c.attempts}/${maxAttempts}: ${r.line}`,
+                );
+              }
+            }
+          } catch (e) {
+            c.error = e instanceof Error ? e.message : String(e);
+            c.state = c.attempts >= maxAttempts ? "failed" : "queued";
+            c.nextAt = Date.now() + backoffMs * c.attempts;
+            if (c.state === "queued") {
+              console.log(
+                `retry ${c.item.m.base} ${c.attempts}/${maxAttempts}: ${c.error}`,
+              );
+            }
+          }
+          await settle(c);
+        }));
       }
+
+      // record anything not settled (aborted / launch failures)
+      for (const c of checks) {
+        if (c.state === "queued") {
+          c.state = "failed";
+          c.error = c.error ?? "aborted";
+        }
+        await settle(c);
+      }
+
     } finally {
       await cleanup();
       Deno.removeSignalListener("SIGINT", onSignal);
