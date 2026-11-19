@@ -23,11 +23,11 @@ on:
         description: "comma-separated matrix bases (empty = all)"
         default: ""
       check_concurrency:
-        description: "parallel L2 checks (1 = serial, for debugging)"
-        default: "1"
+        description: "parallel L2 checks (0 = unlimited)"
+        default: "0"
       deploy_concurrency:
-        description: "parallel deploys (1 = serial, for debugging)"
-        default: "1"
+        description: "parallel deploys (0 = unlimited)"
+        default: "0"
       keep_failed:
         description: "leave failed pairs running (skips teardown)"
         type: boolean

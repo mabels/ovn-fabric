@@ -417,6 +417,7 @@ const cmd = command({
     checkConcurrency: option({
       long: "check-concurrency",
       type: number,
+      description: "0 = unlimited",
       defaultValue: () => 4,
     }),
     checkTimeout: option({
@@ -437,6 +438,7 @@ const cmd = command({
     deployConcurrency: option({
       long: "deploy-concurrency",
       type: number,
+      description: "0 = unlimited",
       defaultValue: () => 4,
     }),
     skipDeploy: flag({
@@ -481,6 +483,12 @@ const cmd = command({
     };
     const wrap = await sshWrappers(key.priv);
     const irDir = await Deno.makeTempDir({ prefix: "ec2-ir-" });
+    const checkConcurrency = a.checkConcurrency <= 0
+      ? Number.POSITIVE_INFINITY
+      : a.checkConcurrency;
+    const deployConcurrency = a.deployConcurrency <= 0
+      ? Number.POSITIVE_INFINITY
+      : a.deployConcurrency;
     const checkTimeoutMs = Math.max(5000, a.checkTimeout * 1000);
     const maxAttempts = Math.max(1, a.maxAttempts);
     const backoffMs = Math.max(0, a.retryBackoff * 1000);
@@ -683,7 +691,7 @@ const cmd = command({
       // Pipeline: a verified pair starts prepare/deploy/test at once,
       // bounded by --deploy-concurrency, without waiting for the others.
       const deployTasks: Promise<void>[] = [];
-      const deploySlot = semaphore(Math.max(1, a.deployConcurrency));
+      const deploySlot = semaphore(deployConcurrency);
       const pexPath = `${irDir}/fabric-${suffix}.pex`;
       let pexPromise: Promise<string> | undefined;
       const ensurePex = (): Promise<string> => {
@@ -847,7 +855,7 @@ const cmd = command({
         const now = Date.now();
         const ready = pending.filter((c) => c.nextAt <= now).slice(
           0,
-          a.checkConcurrency,
+          checkConcurrency,
         );
         if (ready.length === 0) {
           const next = Math.min(...pending.map((c) => c.nextAt));
