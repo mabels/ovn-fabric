@@ -665,7 +665,12 @@ const cmd = command({
         pexPromise ??= (async () => {
           console.log(`building runtime PEX once -> ${pexPath}`);
           await runStreamed(
-            `python3 -m fabric bundle -o ${shq(pexPath)}`,
+            // use the build venv: fabric imports requirements (ip_address)
+            `set -e; ` +
+              `if [ ! -x .venv-build/bin/python ]; then ` +
+              `python3 -m venv .venv-build; ` +
+              `.venv-build/bin/pip install --quiet -r requirements.txt; fi; ` +
+              `.venv-build/bin/python -m fabric bundle -o ${shq(pexPath)}`,
             Deno.env.toObject(),
             "[bundle]",
           );
