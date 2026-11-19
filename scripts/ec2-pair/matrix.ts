@@ -726,7 +726,7 @@ const cmd = command({
             ` examples/topology.cluster-tenants.ts` +
             ` | tee ${shq(irFile)}` +
             ` | PATH=${shq(wrap.path)} scripts/fabric-deploy.sh root@${info.tested.publicIpv4}` +
-            ` --pex ${shq(pex)} ir-apply run --no-cleanup --wait-background`;
+            ` --pex ${shq(pex)} ir-apply run --host ${shq(info.tested.hostname)} --no-cleanup --wait-background`;
           log(`deploy: ${deployCmd}`);
           await runStreamed(deployCmd, Deno.env.toObject(), prefix);
 

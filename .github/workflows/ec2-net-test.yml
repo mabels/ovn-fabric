@@ -19,6 +19,19 @@ on:
       region:
         description: "AWS region"
         default: "eu-central-1"
+      only:
+        description: "comma-separated matrix bases (empty = all)"
+        default: ""
+      check_concurrency:
+        description: "parallel L2 checks (1 = serial, for debugging)"
+        default: "1"
+      deploy_concurrency:
+        description: "parallel deploys (1 = serial, for debugging)"
+        default: "1"
+      keep_failed:
+        description: "leave failed pairs running (skips teardown)"
+        type: boolean
+        default: false
 
 permissions:
   id-token: write
@@ -62,17 +75,29 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
           role-session-name: GitHubAction
       - name: Launch all pairs, then verify each
+        env:
+          ONLY: ${{ inputs.only }}
+          CHECK_CONCURRENCY: ${{ inputs.check_concurrency }}
+          DEPLOY_CONCURRENCY: ${{ inputs.deploy_concurrency }}
+          KEEP_FAILED: ${{ inputs.keep_failed }}
         run: |
-          deno run -A scripts/ec2-pair/matrix.ts \
-            --rig "$RIG" \
-            --suffix "${GITHUB_RUN_NUMBER}" \
-            --ttl-minutes "$TTL_MINUTES" \
+          set -euo pipefail
+          args=(
+            --rig "$RIG"
+            --suffix "${GITHUB_RUN_NUMBER}"
+            --ttl-minutes "$TTL_MINUTES"
             --region "$AWS_REGION"
+            --check-concurrency "$CHECK_CONCURRENCY"
+            --deploy-concurrency "$DEPLOY_CONCURRENCY"
+          )
+          if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
+          if [ "$KEEP_FAILED" = "true" ]; then args+=(--keep-failed); fi
+          deno run -A scripts/ec2-pair/matrix.ts "${args[@]}"
 
   teardown:
     name: teardown (always)
     needs: matrix
-    if: always()
+    if: ${{ always() && !inputs.keep_failed }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

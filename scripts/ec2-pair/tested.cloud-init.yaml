@@ -84,6 +84,15 @@ __SSH_KEYS_BLOCK__
       ip addr add __SELF_L2__ dev ovnkern
       echo "pair bridge up: vni $VNI -> __PEER_IP__ l2 __SELF_L2__"
 
+      # 2 GiB swap: building the service images OOM-kills docker build (137)
+      # on the 1 GiB instances.
+      if [ ! -f /swapfile ] && ! swapon --show=NAME --noheadings 2>/dev/null | grep -q /swapfile; then
+        fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048
+        chmod 600 /swapfile
+        mkswap /swapfile >/dev/null
+        swapon /swapfile
+      fi
+
 runcmd:
   # arm the TTL self-destruct first, even if later steps fail
   - systemd-run --on-active=__TTL__ --unit=pair-expire /usr/sbin/shutdown -h now || shutdown -h +__TTL_MIN__ || true
