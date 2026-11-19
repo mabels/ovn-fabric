@@ -13,7 +13,7 @@
 // called there. Addresses follow ADR 0011: a router's own address is pinned
 // (`.host(1)`), a leg on a core is allocated by the runtime.
 
-import { defineNetwork, runtime, transitNetwork } from "../src/mod.ts";
+import { defineNetwork, IPv4, runtime, transitNetwork } from "../src/mod.ts";
 import { type SecretsModule, transitBlocks } from "../src/secret-types.ts";
 import * as exampleSecrets from "./topology.cluster-tenants.secrets.ts";
 
@@ -47,7 +47,18 @@ function importSecretsTs(source: string): Promise<SecretsModule> {
 // this example can be the live topology of a real site and still be public
 // without leaking anything about it — the real values sit in a secrets file
 // next to it that is never committed; examples/ ships a made-up one.
-const secrets = getSecrets(runtime().args["ctx"]);
+const rawSecrets = getSecrets(runtime().args["ctx"]);
+// The chassis can be overridden per run (an EC2 pair's hostname + address)
+// without the secrets file knowing about runtime(); patch what it returned.
+const chassisName = runtime().args["chassis.name"];
+const chassisIpv4 = runtime().args["chassis.ipv4"];
+const secrets = {
+  ...rawSecrets,
+  chassis: {
+    name: chassisName ?? rawSecrets.chassis.name,
+    ipv4: chassisIpv4 ? IPv4.parse(chassisIpv4) : rawSecrets.chassis.ipv4,
+  },
+};
 
 // The transit cables (the svc of a wan or VPN gateway) take the next
 // /28 + /124 of the site's pool, in the order they appear below.

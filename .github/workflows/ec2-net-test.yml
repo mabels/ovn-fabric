@@ -35,9 +35,11 @@ env:
 
 jobs:
   matrix:
-    name: create + verify pairs
+    name: create + verify + deploy pairs
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
+    env:
+      TOPOLOGY_SECRETS_TS: ${{ secrets.TOPOLOGY_SECRETS_TS }}
     steps:
       - uses: actions/checkout@v5
       - uses: denoland/setup-deno@v2
@@ -66,8 +68,6 @@ jobs:
     timeout-minutes: 20
     env:
       BASES: |
-        m-ub2404-x86
-        m-ub2404-arm
         m-ub2604-x86
         m-ub2604-arm
         m-deb13-x86

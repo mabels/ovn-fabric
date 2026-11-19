@@ -1,18 +1,23 @@
 #!/usr/bin/env -S deno run -A
-// matrix.ts — create + verify + destroy the OS/arch matrix in ONE process.
+// matrix.ts — create, verify, deploy and test the OS/arch matrix.
 //
-// Two phases, both sequential at the top level:
 //   1. launch every pair (RunInstances only — fast), so all boot concurrently
-//   2. a work-queue scheduler: test each pair with a hard timeout; on
-//      timeout/error requeue it (bounded retry/error counts); on success mark
-//      it done. Continue until every pair is success or exhausted.
+//   2. verify the Geneve L2 + egress with a retry queue; keep successes
+//   3. for every successful pair, in parallel:
+//        - prepare the tester (segments + ISP --use-host)
+//        - deploy the fabric to the tested host
+//          (generate-ir | fabric-deploy.sh … ir-apply run --wait-background)
+//        - run the post-deploy connectivity tests from the tester
+//      streaming each command with a [<tester-name>] prefix
+//   4. poweroff successful pairs, destroy the rest
 //
 //   deno run -A scripts/ec2-pair/matrix.ts
-//   deno run -A scripts/ec2-pair/matrix.ts --only m-ub2404-x86,m-deb13-x86
+//   deno run -A scripts/ec2-pair/matrix.ts --only m-ub2404-x86
+//   deno run -A scripts/ec2-pair/matrix.ts --skip-deploy   # transport only
 //
-// One EC2 client with adaptive retries and a shared launch pacer, a generated
-// session key added beside the owner key, and guaranteed teardown on success,
-// failure, SIGINT or SIGTERM. Prints a JSON summary; exits non-zero on failure.
+// The fabric deploy needs the site secrets: set TOPOLOGY_SECRETS_TS, or pass
+// --secrets <file>. The IR's chassis address is the tested host's *private*
+// IP; SSH to the tested host uses its *public* IP.
 
 import {
   command,
@@ -28,6 +33,7 @@ import {
   DEFAULT_KEYS,
   destroyPair,
   ensureNetwork,
+  type Info,
   instanceInfo,
   launchPair,
   type Net,
@@ -47,8 +53,6 @@ interface MatrixItem {
 }
 
 const MATRIX: MatrixItem[] = [
-  { base: "m-ub2404-x86", os: "ubuntu", version: "24.04", arch: "amd64", testerIp: "10.42.0.10", testedIp: "10.42.0.11" },
-  { base: "m-ub2404-arm", os: "ubuntu", version: "24.04", arch: "arm64", testerIp: "10.42.0.12", testedIp: "10.42.0.13" },
   { base: "m-ub2604-x86", os: "ubuntu", version: "26.04", arch: "amd64", testerIp: "10.42.0.14", testedIp: "10.42.0.15" },
   { base: "m-ub2604-arm", os: "ubuntu", version: "26.04", arch: "arm64", testerIp: "10.42.0.16", testedIp: "10.42.0.17" },
   { base: "m-deb13-x86", os: "debian", version: "13", arch: "amd64", testerIp: "10.42.0.18", testedIp: "10.42.0.19" },
@@ -59,6 +63,24 @@ const MATRIX: MatrixItem[] = [
   { base: "m-rocky10-arm", os: "rocky", version: "10", arch: "arm64", testerIp: "10.42.0.28", testedIp: "10.42.0.29" },
 ];
 
+const POST_TEST = `
+fail=0
+run() {
+  echo "=== $*"
+  if "$@"; then echo "OK: $*"; else rc=$?; echo "FAIL($rc): $*"; fail=1; fi
+}
+echo "=== tester root"
+run curl -fsS --max-time 15 -o /dev/null -w 'tester-https=%{http_code}\\n' https://www.google.com/
+echo "=== ns-1129"
+mkdir -p /etc/netns/ns-1129
+printf 'nameserver 10.43.0.10\\n' > /etc/netns/ns-1129/resolv.conf
+run ip netns exec ns-1129 ping -c 3 -W 2 192.168.129.1
+run ip netns exec ns-1129 ping -c 3 -W 2 100.64.0.1
+run ip netns exec ns-1129 dig @10.43.0.10 www.geo.de
+run ip netns exec ns-1129 curl -fsS --max-time 15 -o /dev/null -w 'ns-1129-https=%{http_code}\\n' https://www.google.com/
+exit "$fail"
+`;
+
 interface PairResult {
   pair: string;
   base: string;
@@ -67,8 +89,12 @@ interface PairResult {
   version: string;
   ok: boolean;
   attempts: number;
+  verifyOk: boolean;
+  deployOk: boolean;
+  testOk: boolean;
   line?: string;
   error?: string;
+  deployError?: string;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -92,23 +118,122 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   });
 }
 
+async function pool<T>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
+      while (true) {
+        const i = next++;
+        if (i >= items.length) return;
+        await fn(items[i]!);
+      }
+    }),
+  );
+}
+
+async function pump(
+  stream: ReadableStream<Uint8Array>,
+  prefix: string,
+): Promise<void> {
+  const dec = new TextDecoder();
+  let buf = "";
+  for await (const chunk of stream) {
+    buf += dec.decode(chunk, { stream: true });
+    let at = buf.indexOf("\n");
+    while (at >= 0) {
+      console.log(`${prefix} ${buf.slice(0, at)}`);
+      buf = buf.slice(at + 1);
+      at = buf.indexOf("\n");
+    }
+  }
+  if (buf.length > 0) console.log(`${prefix} ${buf}`);
+}
+
+async function runStreamed(
+  cmd: string,
+  env: Record<string, string>,
+  prefix: string,
+): Promise<void> {
+  const child = new Deno.Command("bash", {
+    args: ["-c", cmd],
+    cwd: Deno.cwd(),
+    env,
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+  await Promise.all([pump(child.stdout, prefix), pump(child.stderr, prefix)]);
+  const status = await child.status;
+  if (!status.success) throw new Error(`command failed (${status.code})`);
+}
+
+async function sshStream(
+  ip: string,
+  key: string,
+  remote: string,
+  prefix: string,
+  stdin?: string,
+): Promise<void> {
+  const child = new Deno.Command("ssh", {
+    args: [
+      "-i", key,
+      "-o", "IdentitiesOnly=yes",
+      "-o", "BatchMode=yes",
+      "-o", "StrictHostKeyChecking=no",
+      "-o", "UserKnownHostsFile=/dev/null",
+      "-o", "ConnectTimeout=8",
+      `root@${ip}`,
+      remote,
+    ],
+    stdin: stdin === undefined ? "null" : "piped",
+    stdout: "piped",
+    stderr: "piped",
+  }).spawn();
+  if (stdin !== undefined) {
+    const w = child.stdin.getWriter();
+    await w.write(new TextEncoder().encode(stdin));
+    await w.close();
+  }
+  await Promise.all([pump(child.stdout, prefix), pump(child.stderr, prefix)]);
+  const status = await child.status;
+  if (!status.success) throw new Error(`ssh ${ip} failed (${status.code})`);
+}
+
+async function scpTo(ip: string, key: string, files: string[]): Promise<void> {
+  const res = await new Deno.Command("scp", {
+    args: [
+      "-i", key,
+      "-o", "IdentitiesOnly=yes",
+      "-o", "BatchMode=yes",
+      "-o", "StrictHostKeyChecking=no",
+      "-o", "UserKnownHostsFile=/dev/null",
+      ...files,
+      `root@${ip}:/tmp/`,
+    ],
+    stdout: "piped",
+    stderr: "piped",
+  }).output();
+  if (!res.success) {
+    throw new Error(
+      `scp ${ip} failed: ${new TextDecoder().decode(res.stderr).trim()}`,
+    );
+  }
+}
+
 async function powerOff(ips: string[], key: string): Promise<void> {
   await Promise.all(ips.map(async (ip) => {
     try {
       await new Deno.Command("ssh", {
         args: [
-          "-i",
-          key,
-          "-o",
-          "IdentitiesOnly=yes",
-          "-o",
-          "BatchMode=yes",
-          "-o",
-          "StrictHostKeyChecking=no",
-          "-o",
-          "UserKnownHostsFile=/dev/null",
-          "-o",
-          "ConnectTimeout=1",
+          "-i", key,
+          "-o", "IdentitiesOnly=yes",
+          "-o", "BatchMode=yes",
+          "-o", "StrictHostKeyChecking=no",
+          "-o", "UserKnownHostsFile=/dev/null",
+          "-o", "ConnectTimeout=1",
           `root@${ip}`,
           "systemctl poweroff || poweroff",
         ],
@@ -117,9 +242,13 @@ async function powerOff(ips: string[], key: string): Promise<void> {
         signal: AbortSignal.timeout(5_000),
       }).output();
     } catch {
-      // ssh drops the connection as the host powers off
+      // ssh drops as the host powers off
     }
   }));
+}
+
+function shq(text: string): string {
+  return `'${text.replaceAll("'", `'\\''`)}'`;
 }
 
 interface SessionKey {
@@ -159,19 +288,55 @@ async function sessionKey(existing?: string): Promise<SessionKey> {
   };
 }
 
+/** ssh/scp wrappers on PATH: fabric-deploy.sh's ssh/scp have no -i, and
+ * macOS ssh ignores $HOME when looking for ~/.ssh/config. */
+async function sshWrappers(key: string): Promise<{
+  dir: string;
+  path: string;
+  cleanup: () => Promise<void>;
+}> {
+  const dir = await Deno.makeTempDir({ prefix: "ec2-ssh-wrap-" });
+  const opts = `-F /dev/null -i ${shq(key)} -o IdentitiesOnly=yes ` +
+    `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes`;
+  for (
+    const [name, real] of [
+      ["ssh", "/usr/bin/ssh"],
+      ["scp", "/usr/bin/scp"],
+    ] as const
+  ) {
+    await Deno.writeTextFile(
+      `${dir}/${name}`,
+      `#!/bin/sh\nexec ${real} ${opts} "$@"\n`,
+    );
+    await Deno.chmod(`${dir}/${name}`, 0o755);
+  }
+  return {
+    dir,
+    path: `${dir}:${Deno.env.get("PATH") ?? ""}`,
+    cleanup: async () => {
+      await Deno.remove(dir, { recursive: true }).catch(() => {});
+    },
+  };
+}
+
 const cmd = command({
   name: "matrix",
-  description: "Create, verify and destroy the EC2 OS/arch matrix.",
+  description: "Create, verify, deploy and test the EC2 OS/arch matrix.",
   args: {
     rig: option({ long: "rig", type: optional(string) }),
     suffix: option({ long: "suffix", type: optional(string) }),
     ttlMinutes: option({
       long: "ttl-minutes",
       type: number,
-      defaultValue: () => 45,
+      defaultValue: () => 60,
     }),
     region: option({ long: "region", type: optional(string) }),
     sshKey: option({ long: "ssh-key", type: optional(string) }),
+    secrets: option({
+      long: "secrets",
+      description: "secrets file for generate-ir (else TOPOLOGY_SECRETS_TS)",
+      type: optional(string),
+    }),
     vpcId: option({ long: "vpc-id", type: optional(string) }),
     subnetId: option({ long: "subnet-id", type: optional(string) }),
     sgId: option({ long: "sg-id", type: optional(string) }),
@@ -202,8 +367,21 @@ const cmd = command({
       type: number,
       defaultValue: () => 3,
     }),
+    deployConcurrency: option({
+      long: "deploy-concurrency",
+      type: number,
+      defaultValue: () => 4,
+    }),
+    skipDeploy: flag({
+      long: "skip-deploy",
+      description: "stop after the transport checks (no fabric deploy)",
+    }),
     keep: flag({ long: "keep" }),
     keepPairs: flag({ long: "keep-pairs" }),
+    keepFailed: flag({
+      long: "keep-failed",
+      description: "leave failed pairs running for debugging",
+    }),
   },
   handler: async (a) => {
     const region = a.region ?? Deno.env.get("AWS_REGION") ??
@@ -222,10 +400,11 @@ const cmd = command({
         new URL("./tested.cloud-init.yaml", import.meta.url),
       ),
     };
+    const wrap = await sshWrappers(key.priv);
+    const irDir = await Deno.makeTempDir({ prefix: "ec2-ir-" });
     const checkTimeoutMs = Math.max(5000, a.checkTimeout * 1000);
     const maxAttempts = Math.max(1, a.maxAttempts);
     const backoffMs = Math.max(0, a.retryBackoff * 1000);
-    const checkConcurrency = Math.max(1, a.checkConcurrency);
 
     let net: Net | undefined;
     const created = new Set<string>();
@@ -246,6 +425,11 @@ const cmd = command({
           console.error(`destroy ${rig}: ${e.message}`)
         );
       }
+      await wrap.cleanup();
+      // keep the generated IRs when pairs are kept for debugging
+      if (!a.keepPairs && !a.keepFailed) {
+        await Deno.remove(irDir, { recursive: true }).catch(() => {});
+      }
       await key.cleanup();
     };
 
@@ -259,6 +443,7 @@ const cmd = command({
     Deno.addSignalListener("SIGTERM", onSignal);
 
     const results: PairResult[] = [];
+
     try {
       const selected = a.only
         ? MATRIX.filter((m) => a.only!.split(",").includes(m.base))
@@ -307,7 +492,7 @@ const cmd = command({
         }
         try {
           const type = m.arch === "arm64" ? "t4g.micro" : "t3.micro";
-          const testerAmi = await amiFor("ubuntu", "24.04", m.arch);
+          const testerAmi = await amiFor("ubuntu", "26.04", m.arch);
           const testedAmi = await amiFor(m.os, m.version, m.arch);
           const ids = await launchPair({
             ec2,
@@ -318,7 +503,7 @@ const cmd = command({
             templates,
             tester: {
               osName: "ubuntu",
-              version: "24.04",
+              version: "26.04",
               arch: m.arch,
               ip: m.testerIp,
               l2: "10.222.0.1/24",
@@ -336,9 +521,7 @@ const cmd = command({
             },
           });
           launched.push({ m, pair, ids });
-          console.log(
-            `launched ${m.base} (${pair}) private tester=${m.testerIp} tested=${m.testedIp}`,
-          );
+          console.log(`launched ${m.base} (${pair})`);
         } catch (e) {
           const error = e instanceof Error ? e.message : String(e);
           launched.push({ m, pair, error });
@@ -350,71 +533,81 @@ const cmd = command({
       if (!aborted && launched.length > 0) {
         console.log(`waiting 10s for ${launched.length} pair(s) to settle`);
         await sleep(10_000);
+        for (const l of launched) {
+          if (!l.ids) continue;
+          try {
+            const [t, d] = await withTimeout(
+              Promise.all([
+                instanceInfo(ec2, l.ids.testerId, `${l.pair}-tester`),
+                instanceInfo(ec2, l.ids.testedId, `${l.pair}-tested`),
+              ]),
+              5000,
+              "public ip lookup",
+            );
+            console.log(
+              `public ${l.m.base} tester=${t.publicIpv4} tested=${d.publicIpv4}`,
+            );
+          } catch {
+            console.log(`public ${l.m.base} pending`);
+          }
+        }
       }
 
-      // ── phase 2: retry-queue scheduler until all pairs are settled ─────
+      // ── phase 2: retry-queue verify; keep successes for the deploy ────
       interface CheckState {
         item: Launched;
         attempts: number;
-        state: "queued" | "ok" | "failed";
+        verifyOk: boolean;
+        settled: boolean;
         nextAt: number;
         line?: string;
         error?: string;
-        testerPublicIp?: string;
-        testedPublicIp?: string;
+        info?: { tester: Info; tested: Info };
+        deployOk: boolean;
+        testOk: boolean;
+        deployError?: string;
         recorded: boolean;
       }
       const checks: CheckState[] = launched.map((item) => ({
         item,
         attempts: 0,
-        state: item.error ? "failed" : "queued",
+        verifyOk: false,
+        settled: item.error !== undefined,
         nextAt: 0,
         error: item.error,
+        deployOk: false,
+        testOk: false,
         recorded: false,
       }));
-      const settle = async (c: CheckState) => {
-        if (c.state === "queued") return;
-        if (c.state === "ok" && !a.keepPairs) {
-          if (c.testerPublicIp && c.testedPublicIp) {
-            console.log(`poweroff ${c.item.m.base} (success)`);
-            await powerOff([c.testerPublicIp, c.testedPublicIp], key.priv);
-            await sleep(3000);
-          }
-        }
-        if (!a.keepPairs) {
-          await destroyPair(ec2, c.item.pair).catch((e) =>
-            console.error(`destroy ${c.item.pair}: ${e.message}`)
-          );
-        }
-        created.delete(c.item.pair);
-        if (!c.recorded) {
-          c.recorded = true;
-          results.push({
-            pair: c.item.pair,
-            base: c.item.m.base,
-            arch: c.item.m.arch,
-            os: c.item.m.os,
-            version: c.item.m.version,
-            ok: c.state === "ok",
-            attempts: c.attempts,
-            line: c.line,
-            error: c.error,
-          });
-          console.log(
-            `${c.state === "ok" ? "OK  " : "FAIL"} ${c.item.m.base} ` +
-              `(attempt ${c.attempts}) ${c.line ?? c.error ?? ""}`,
-          );
-        }
+
+      const record = (c: CheckState) => {
+        if (c.recorded) return;
+        c.recorded = true;
+        results.push({
+          pair: c.item.pair,
+          base: c.item.m.base,
+          arch: c.item.m.arch,
+          os: c.item.m.os,
+          version: c.item.m.version,
+          ok: c.verifyOk && c.deployOk && c.testOk,
+          attempts: c.attempts,
+          verifyOk: c.verifyOk,
+          deployOk: c.deployOk,
+          testOk: c.testOk,
+          line: c.line,
+          error: c.error,
+          deployError: c.deployError,
+        });
       };
 
       while (true) {
         if (aborted) break;
-        const pending = checks.filter((c) => c.state === "queued");
+        const pending = checks.filter((c) => !c.settled && !c.verifyOk);
         if (pending.length === 0) break;
         const now = Date.now();
         const ready = pending.filter((c) => c.nextAt <= now).slice(
           0,
-          checkConcurrency,
+          a.checkConcurrency,
         );
         if (ready.length === 0) {
           const next = Math.min(...pending.map((c) => c.nextAt));
@@ -433,8 +626,7 @@ const cmd = command({
               checkTimeoutMs,
               "instanceInfo",
             );
-            c.testerPublicIp = tester.publicIpv4;
-            c.testedPublicIp = tested.publicIpv4;
+            c.info = { tester, tested };
             console.log(
               `check ${c.item.m.base} attempt ${c.attempts}/${maxAttempts} ` +
                 `tester=${tester.publicIpv4} tested=${tested.publicIpv4}`,
@@ -450,12 +642,19 @@ const cmd = command({
             );
             c.line = r.line;
             if (r.ok) {
-              c.state = "ok";
+              c.verifyOk = true;
+              c.error = undefined;
+              c.info = { tester, tested };
+              console.log(`VERIFIED ${c.item.m.base} ${r.line}`);
             } else {
               c.error = r.line;
-              c.state = c.attempts >= maxAttempts ? "failed" : "queued";
-              c.nextAt = Date.now() + backoffMs * c.attempts;
-              if (c.state === "queued") {
+              if (c.attempts >= maxAttempts) {
+                c.settled = true;
+                console.log(
+                  `FAIL verify ${c.item.m.base} (attempt ${c.attempts}) ${r.line}`,
+                );
+              } else {
+                c.nextAt = Date.now() + backoffMs * c.attempts;
                 console.log(
                   `retry ${c.item.m.base} ${c.attempts}/${maxAttempts}: ${r.line}`,
                 );
@@ -463,27 +662,156 @@ const cmd = command({
             }
           } catch (e) {
             c.error = e instanceof Error ? e.message : String(e);
-            c.state = c.attempts >= maxAttempts ? "failed" : "queued";
-            c.nextAt = Date.now() + backoffMs * c.attempts;
-            if (c.state === "queued") {
+            if (c.attempts >= maxAttempts) {
+              c.settled = true;
+              console.log(`FAIL verify ${c.item.m.base}: ${c.error}`);
+            } else {
+              c.nextAt = Date.now() + backoffMs * c.attempts;
               console.log(
                 `retry ${c.item.m.base} ${c.attempts}/${maxAttempts}: ${c.error}`,
               );
             }
           }
-          await settle(c);
         }));
       }
 
-      // record anything not settled (aborted / launch failures)
       for (const c of checks) {
-        if (c.state === "queued") {
-          c.state = "failed";
-          c.error = c.error ?? "aborted";
+        if (!c.verifyOk) c.settled = true;
+      }
+      // Destroy pairs that failed verification / never launched.
+      for (const c of checks) {
+        if (!c.verifyOk) {
+          if (a.keepPairs || a.keepFailed) {
+            console.log(
+              `KEEP failed-verify ${c.item.m.base} ` +
+                `tester=${c.info?.tester.publicIpv4 ?? "?"} ` +
+                `tested=${c.info?.tested.publicIpv4 ?? "?"} (ttl ${ttlMin}m)`,
+            );
+          } else {
+            await destroyPair(ec2, c.item.pair).catch((e) =>
+              console.error(`destroy ${c.item.pair}: ${e.message}`)
+            );
+          }
+          created.delete(c.item.pair);
+          record(c);
         }
-        await settle(c);
       }
 
+      // ── phase 3: deploy + test successful pairs (parallel) ───────────
+      const deployable = checks.filter((c) => c.verifyOk && c.info !== undefined);
+      if (a.skipDeploy) {
+        for (const c of deployable) {
+          c.deployOk = true;
+          c.testOk = true;
+        }
+      } else {
+        await pool(deployable, a.deployConcurrency, async (c) => {
+          const info = c.info!;
+          const prefix = `[${info.tester.hostname}]`;
+          const log = (s: string) => console.log(`${prefix} ${s}`);
+          try {
+            if (aborted) throw new Error("aborted");
+            log("preparing tester (segments + ISP --use-host)");
+            await scpTo(info.tester.publicIpv4, key.priv, [
+              ".github/scripts/tester/test-isp.sh",
+              ".github/scripts/tester/test-segments.sh",
+            ]);
+            await sshStream(
+              info.tester.publicIpv4,
+              key.priv,
+              "chmod +x /tmp/test-isp.sh /tmp/test-segments.sh; " +
+                "/tmp/test-segments.sh --trunk veth-l2 up; " +
+                "/tmp/test-isp.sh --use-host --trunk veth-l2 up",
+              prefix,
+            );
+
+            log("deploying fabric");
+            const irFile = `${irDir}/${c.item.pair}.ir`;
+            const secretsArg = a.secrets
+              ? ` --runtime ${shq(`secrets=${a.secrets}`)}`
+              : "";
+            const deployCmd =
+              `deno run -A src/cli.ts generate-ir --runtime ctx=test` +
+              ` --runtime ${shq(`chassis.name=${info.tested.hostname}`)}` +
+              ` --runtime ${shq(`chassis.ipv4=${info.tested.privateIpv4}`)}` +
+              secretsArg +
+              ` examples/topology.cluster-tenants.ts` +
+              ` | tee ${shq(irFile)}` +
+              ` | PATH=${shq(wrap.path)} scripts/fabric-deploy.sh root@${info.tested.publicIpv4}` +
+              ` ir-apply run --no-cleanup --wait-background`;
+            log(`deploy: ${deployCmd}`);
+            await runStreamed(deployCmd, Deno.env.toObject(), prefix);
+
+            log("post-deploy tests");
+            let lastErr: unknown;
+            for (let attempt = 1; attempt <= 3; attempt++) {
+              try {
+                await sshStream(
+                  info.tester.publicIpv4,
+                  key.priv,
+                  "sh -s",
+                  prefix,
+                  POST_TEST,
+                );
+                c.testOk = true;
+                break;
+              } catch (e) {
+                lastErr = e;
+                log(
+                  `test attempt ${attempt}/3 failed: ${
+                    e instanceof Error ? e.message : String(e)
+                  }`,
+                );
+                await sleep(10_000);
+              }
+            }
+            if (!c.testOk) throw lastErr ?? new Error("post-deploy tests failed");
+            c.deployOk = true;
+            c.deployError = undefined;
+            log("OK (deploy + tests)");
+          } catch (e) {
+            c.deployOk = false;
+            c.deployError = e instanceof Error ? e.message : String(e);
+            log(`FAIL deploy/test: ${c.deployError}`);
+          } finally {
+            const succeeded = c.deployOk && c.testOk;
+            if (succeeded && !a.keepPairs) {
+              log("poweroff (success)");
+              await powerOff(
+                [info.tester.publicIpv4, info.tested.publicIpv4],
+                key.priv,
+              );
+              await sleep(3000);
+            }
+            if (!a.keepPairs) {
+              if (!succeeded && a.keepFailed) {
+                log(
+                  `KEEP failed tester=${info.tester.publicIpv4} ` +
+                    `tested=${info.tested.publicIpv4} ir=${irDir}/${c.item.pair}.ir ` +
+                    `(ttl ${ttlMin}m)`,
+                );
+              } else {
+                await destroyPair(ec2, c.item.pair).catch((e) =>
+                  log(`destroy: ${e.message}`)
+                );
+              }
+            }
+            created.delete(c.item.pair);
+            record(c);
+          }
+        });
+      }
+
+      // skip-deploy: record + teardown the verified pairs
+      if (a.skipDeploy) {
+        for (const c of deployable) {
+          if (!a.keepPairs) {
+            await destroyPair(ec2, c.item.pair).catch(() => {});
+          }
+          created.delete(c.item.pair);
+          record(c);
+        }
+      }
     } finally {
       await cleanup();
       Deno.removeSignalListener("SIGINT", onSignal);

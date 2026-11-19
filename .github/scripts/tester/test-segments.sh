@@ -3,12 +3,23 @@
 set -eu
 
 OVN_MAC=52:54:00:00:01:01
+TRUNK=
+ACTION=up
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --trunk) TRUNK=$2; shift ;;
+    up|down) ACTION=$1 ;;
+    *) echo "usage: $0 [--trunk DEV] [up|down]" >&2; exit 2 ;;
+  esac
+  shift
+done
 
 iface_by_mac() {
   ip -o link | awk -v mac="$1" 'tolower($0) ~ tolower(mac) {gsub(":","",$2); print $2; exit}'
 }
 
-if [ "${1:-up}" = "down" ]; then
+if [ "$ACTION" = "down" ]; then
   for vlan in 1128 1129 1130 1131 128 129 130 131; do
     ip netns del "ns-$vlan" 2>/dev/null || true
   done
@@ -16,7 +27,8 @@ if [ "${1:-up}" = "down" ]; then
   exit 0
 fi
 
-VLAN_PARENT="$(iface_by_mac "$OVN_MAC")"
+VLAN_PARENT=${TRUNK:-$(iface_by_mac "$OVN_MAC")}
+[ -n "$VLAN_PARENT" ] || VLAN_PARENT=veth-l2
 [ -n "$VLAN_PARENT" ] || { echo "OVN NIC ($OVN_MAC) not found" >&2; exit 1; }
 ip link set dev "$VLAN_PARENT" up
 

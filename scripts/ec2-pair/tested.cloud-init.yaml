@@ -76,12 +76,12 @@ __SSH_KEYS_BLOCK__
       ip link set "$BR" up mtu 1400
 
       ip link del veth-br 2>/dev/null || true
-      ip link add veth-br type veth peer name veth-l2
+      ip link add veth-br type veth peer name ovnkern
       ovs-vsctl --may-exist add-port "$BR" veth-br
       ip link set veth-br up
-      ip link set veth-l2 up mtu 1400
-      ip addr flush dev veth-l2 2>/dev/null || true
-      ip addr add __SELF_L2__ dev veth-l2
+      ip link set ovnkern up mtu 1400
+      ip addr flush dev ovnkern 2>/dev/null || true
+      ip addr add __SELF_L2__ dev ovnkern
       echo "pair bridge up: vni $VNI -> __PEER_IP__ l2 __SELF_L2__"
 
 runcmd:

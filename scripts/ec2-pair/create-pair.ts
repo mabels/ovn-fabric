@@ -8,7 +8,7 @@
 //
 //     [pair]-tester  <-- br-gen / geneve udp/6081 -->  [pair]-tested
 //
-// The tested side defaults to Ubuntu 24.04 x86_64; tester and tested OS,
+// The tester defaults to Ubuntu 26.04; the tested side to Ubuntu 24.04 x86_64;
 // version and arch are selectable (ubuntu|debian|rocky|fedora). Both
 // instances self-destruct after --ttl-minutes (default 60) and terminate on
 // any OS shutdown (InstanceInitiatedShutdownBehavior=terminate).
@@ -881,7 +881,7 @@ const cmd = command({
     const testedArch = pickArch(a.testedArch ?? "amd64", "--tested-arch");
     const testerOs = pickOs(a.testerOs ?? "ubuntu", "--tester-os");
     const testedOs = pickOs(a.testedOs ?? "ubuntu", "--tested-os");
-    const testerVersion = a.testerVersion ?? "24.04";
+    const testerVersion = a.testerVersion ?? "26.04";
     const testedVersion = a.testedVersion ?? "24.04";
     const defaultType = (arch: Arch) => arch === "arm64" ? "t4g.micro" : "t3.micro";
     const testerType = a.testerInstanceType ?? defaultType(testerArch);
