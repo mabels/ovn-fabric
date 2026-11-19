@@ -118,21 +118,19 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   });
 }
 
-async function pool<T>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<void>,
-): Promise<void> {
-  let next = 0;
-  await Promise.all(
-    Array.from({ length: Math.max(1, Math.min(limit, items.length)) }, async () => {
-      while (true) {
-        const i = next++;
-        if (i >= items.length) return;
-        await fn(items[i]!);
-      }
-    }),
-  );
+function semaphore(limit: number) {
+  let active = 0;
+  const waiters: Array<() => void> = [];
+  return async <T>(fn: () => Promise<T>): Promise<T> => {
+    if (active >= limit) await new Promise<void>((r) => waiters.push(r));
+    active += 1;
+    try {
+      return await fn();
+    } finally {
+      active -= 1;
+      waiters.shift()?.();
+    }
+  };
 }
 
 async function pump(
@@ -553,7 +551,7 @@ const cmd = command({
         }
       }
 
-      // ── phase 2: retry-queue verify; keep successes for the deploy ────
+      // ── phase 2: verify; each success goes straight to a deploy slot ──
       interface CheckState {
         item: Launched;
         attempts: number;
@@ -598,6 +596,143 @@ const cmd = command({
           error: c.error,
           deployError: c.deployError,
         });
+      };
+
+      // Pipeline: a verified pair starts prepare/deploy/test at once,
+      // bounded by --deploy-concurrency, without waiting for the others.
+      const deployTasks: Promise<void>[] = [];
+      const deploySlot = semaphore(Math.max(1, a.deployConcurrency));
+      const pexPath = `${irDir}/fabric-${suffix}.pex`;
+      let pexPromise: Promise<string> | undefined;
+      const ensurePex = (): Promise<string> => {
+        pexPromise ??= (async () => {
+          console.log(`building runtime PEX once -> ${pexPath}`);
+          await runStreamed(
+            `python3 -m fabric bundle -o ${shq(pexPath)}`,
+            Deno.env.toObject(),
+            "[bundle]",
+          );
+          return pexPath;
+        })();
+        return pexPromise;
+      };
+
+      const finalizeVerifyOnly = async (c: CheckState): Promise<void> => {
+        c.deployOk = true;
+        c.testOk = true;
+        if (!a.keepPairs) {
+          await destroyPair(ec2, c.item.pair).catch((e) =>
+            console.error(`destroy ${c.item.pair}: ${e.message}`)
+          );
+        }
+        created.delete(c.item.pair);
+        record(c);
+        console.log(`OK (verify only) ${c.item.m.base}`);
+      };
+
+      const deployAndTest = async (c: CheckState): Promise<void> => {
+        const info = c.info!;
+        const prefix = `[${info.tester.hostname}]`;
+        const log = (s: string) => console.log(`${prefix} ${s}`);
+        const irFile = `${irDir}/${c.item.pair}.ir`;
+        try {
+          if (aborted) throw new Error("aborted");
+          const pex = await ensurePex();
+          log("preparing tester (segments + ISP --use-host)");
+          await scpTo(info.tester.publicIpv4, key.priv, [
+            ".github/scripts/tester/test-isp.sh",
+            ".github/scripts/tester/test-segments.sh",
+          ]);
+          await sshStream(
+            info.tester.publicIpv4,
+            key.priv,
+            "chmod +x /tmp/test-isp.sh /tmp/test-segments.sh; " +
+              "/tmp/test-segments.sh --trunk veth-l2 up; " +
+              "/tmp/test-isp.sh --use-host --trunk veth-l2 up",
+            prefix,
+          );
+
+          log("deploying fabric");
+          const secretsArg = a.secrets
+            ? ` --runtime ${shq(`secrets=${a.secrets}`)}`
+            : "";
+          const deployCmd =
+            `deno run -A src/cli.ts generate-ir --runtime ctx=test` +
+            ` --runtime ${shq(`chassis.name=${info.tested.hostname}`)}` +
+            ` --runtime ${shq(`chassis.ipv4=${info.tested.privateIpv4}`)}` +
+            secretsArg +
+            ` examples/topology.cluster-tenants.ts` +
+            ` | tee ${shq(irFile)}` +
+            ` | PATH=${shq(wrap.path)} scripts/fabric-deploy.sh root@${info.tested.publicIpv4}` +
+            ` --pex ${shq(pex)} ir-apply run --no-cleanup --wait-background`;
+          log(`deploy: ${deployCmd}`);
+          await runStreamed(deployCmd, Deno.env.toObject(), prefix);
+
+          log("post-deploy tests");
+          let lastErr: unknown;
+          for (let attempt = 1; attempt <= 3; attempt++) {
+            try {
+              await sshStream(
+                info.tester.publicIpv4,
+                key.priv,
+                "sh -s",
+                prefix,
+                POST_TEST,
+              );
+              c.testOk = true;
+              break;
+            } catch (e) {
+              lastErr = e;
+              log(
+                `test attempt ${attempt}/3 failed: ${
+                  e instanceof Error ? e.message : String(e)
+                }`,
+              );
+              await sleep(10_000);
+            }
+          }
+          if (!c.testOk) throw lastErr ?? new Error("post-deploy tests failed");
+          c.deployOk = true;
+          c.deployError = undefined;
+          log("OK (deploy + tests)");
+        } catch (e) {
+          c.deployOk = false;
+          c.deployError = e instanceof Error ? e.message : String(e);
+          log(`FAIL deploy/test: ${c.deployError}`);
+        } finally {
+          const succeeded = c.deployOk && c.testOk;
+          if (succeeded && !a.keepPairs) {
+            log("poweroff (success)");
+            await powerOff(
+              [info.tester.publicIpv4, info.tested.publicIpv4],
+              key.priv,
+            );
+            await sleep(3000);
+          }
+          if (!a.keepPairs) {
+            if (!succeeded && a.keepFailed) {
+              log(
+                `KEEP failed tester=${info.tester.publicIpv4} ` +
+                  `tested=${info.tested.publicIpv4} ir=${irFile} ` +
+                  `(ttl ${ttlMin}m)`,
+              );
+            } else {
+              await destroyPair(ec2, c.item.pair).catch((e) =>
+                log(`destroy: ${e.message}`)
+              );
+            }
+          }
+          created.delete(c.item.pair);
+          record(c);
+        }
+      };
+
+      const startPair = (c: CheckState) => {
+        if (a.skipDeploy) {
+          deployTasks.push(finalizeVerifyOnly(c));
+        } else {
+          deployTasks.push(deploySlot(() => deployAndTest(c)));
+        }
       };
 
       while (true) {
@@ -646,6 +781,7 @@ const cmd = command({
               c.error = undefined;
               c.info = { tester, tested };
               console.log(`VERIFIED ${c.item.m.base} ${r.line}`);
+              startPair(c);
             } else {
               c.error = r.line;
               if (c.attempts >= maxAttempts) {
@@ -697,130 +833,8 @@ const cmd = command({
         }
       }
 
-      // ── phase 3: deploy + test successful pairs (parallel) ───────────
-      const deployable = checks.filter((c) => c.verifyOk && c.info !== undefined);
-      if (a.skipDeploy) {
-        for (const c of deployable) {
-          c.deployOk = true;
-          c.testOk = true;
-        }
-      } else {
-        // One PEX per run, built once: parallel deploys must never share
-        // dist/fabric.pex (the bundle writes fabric.pex~ there).
-        const pexPath = `${irDir}/fabric-${suffix}.pex`;
-        console.log(`building runtime PEX once -> ${pexPath}`);
-        await runStreamed(
-          `python3 -m fabric bundle -o ${shq(pexPath)}`,
-          Deno.env.toObject(),
-          "[bundle]",
-        );
-        await pool(deployable, a.deployConcurrency, async (c) => {
-          const info = c.info!;
-          const prefix = `[${info.tester.hostname}]`;
-          const log = (s: string) => console.log(`${prefix} ${s}`);
-          try {
-            if (aborted) throw new Error("aborted");
-            log("preparing tester (segments + ISP --use-host)");
-            await scpTo(info.tester.publicIpv4, key.priv, [
-              ".github/scripts/tester/test-isp.sh",
-              ".github/scripts/tester/test-segments.sh",
-            ]);
-            await sshStream(
-              info.tester.publicIpv4,
-              key.priv,
-              "chmod +x /tmp/test-isp.sh /tmp/test-segments.sh; " +
-                "/tmp/test-segments.sh --trunk veth-l2 up; " +
-                "/tmp/test-isp.sh --use-host --trunk veth-l2 up",
-              prefix,
-            );
+      await Promise.all(deployTasks);
 
-            log("deploying fabric");
-            const irFile = `${irDir}/${c.item.pair}.ir`;
-            const secretsArg = a.secrets
-              ? ` --runtime ${shq(`secrets=${a.secrets}`)}`
-              : "";
-            const deployCmd =
-              `deno run -A src/cli.ts generate-ir --runtime ctx=test` +
-              ` --runtime ${shq(`chassis.name=${info.tested.hostname}`)}` +
-              ` --runtime ${shq(`chassis.ipv4=${info.tested.privateIpv4}`)}` +
-              secretsArg +
-              ` examples/topology.cluster-tenants.ts` +
-              ` | tee ${shq(irFile)}` +
-              ` | PATH=${shq(wrap.path)} scripts/fabric-deploy.sh root@${info.tested.publicIpv4}` +
-              ` --pex ${shq(pexPath)} ir-apply run --no-cleanup --wait-background`;
-            log(`deploy: ${deployCmd}`);
-            await runStreamed(deployCmd, Deno.env.toObject(), prefix);
-
-            log("post-deploy tests");
-            let lastErr: unknown;
-            for (let attempt = 1; attempt <= 3; attempt++) {
-              try {
-                await sshStream(
-                  info.tester.publicIpv4,
-                  key.priv,
-                  "sh -s",
-                  prefix,
-                  POST_TEST,
-                );
-                c.testOk = true;
-                break;
-              } catch (e) {
-                lastErr = e;
-                log(
-                  `test attempt ${attempt}/3 failed: ${
-                    e instanceof Error ? e.message : String(e)
-                  }`,
-                );
-                await sleep(10_000);
-              }
-            }
-            if (!c.testOk) throw lastErr ?? new Error("post-deploy tests failed");
-            c.deployOk = true;
-            c.deployError = undefined;
-            log("OK (deploy + tests)");
-          } catch (e) {
-            c.deployOk = false;
-            c.deployError = e instanceof Error ? e.message : String(e);
-            log(`FAIL deploy/test: ${c.deployError}`);
-          } finally {
-            const succeeded = c.deployOk && c.testOk;
-            if (succeeded && !a.keepPairs) {
-              log("poweroff (success)");
-              await powerOff(
-                [info.tester.publicIpv4, info.tested.publicIpv4],
-                key.priv,
-              );
-              await sleep(3000);
-            }
-            if (!a.keepPairs) {
-              if (!succeeded && a.keepFailed) {
-                log(
-                  `KEEP failed tester=${info.tester.publicIpv4} ` +
-                    `tested=${info.tested.publicIpv4} ir=${irDir}/${c.item.pair}.ir ` +
-                    `(ttl ${ttlMin}m)`,
-                );
-              } else {
-                await destroyPair(ec2, c.item.pair).catch((e) =>
-                  log(`destroy: ${e.message}`)
-                );
-              }
-            }
-            created.delete(c.item.pair);
-            record(c);
-          }
-        });
-      }
-
-      // skip-deploy: record + teardown the verified pairs
-      if (a.skipDeploy) {
-        for (const c of deployable) {
-          if (!a.keepPairs) {
-            await destroyPair(ec2, c.item.pair).catch(() => {});
-          }
-          created.delete(c.item.pair);
-          record(c);
-        }
-      }
     } finally {
       await cleanup();
       Deno.removeSignalListener("SIGINT", onSignal);
