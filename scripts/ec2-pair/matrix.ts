@@ -705,6 +705,15 @@ const cmd = command({
           c.testOk = true;
         }
       } else {
+        // One PEX per run, built once: parallel deploys must never share
+        // dist/fabric.pex (the bundle writes fabric.pex~ there).
+        const pexPath = `${irDir}/fabric-${suffix}.pex`;
+        console.log(`building runtime PEX once -> ${pexPath}`);
+        await runStreamed(
+          `python3 -m fabric bundle -o ${shq(pexPath)}`,
+          Deno.env.toObject(),
+          "[bundle]",
+        );
         await pool(deployable, a.deployConcurrency, async (c) => {
           const info = c.info!;
           const prefix = `[${info.tester.hostname}]`;
@@ -738,7 +747,7 @@ const cmd = command({
               ` examples/topology.cluster-tenants.ts` +
               ` | tee ${shq(irFile)}` +
               ` | PATH=${shq(wrap.path)} scripts/fabric-deploy.sh root@${info.tested.publicIpv4}` +
-              ` ir-apply run --no-cleanup --wait-background`;
+              ` --pex ${shq(pexPath)} ir-apply run --no-cleanup --wait-background`;
             log(`deploy: ${deployCmd}`);
             await runStreamed(deployCmd, Deno.env.toObject(), prefix);
 
