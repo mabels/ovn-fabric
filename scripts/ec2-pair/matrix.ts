@@ -412,6 +412,7 @@ const cmd = command({
     suffix: option({ long: "suffix", type: optional(string) }),
     ttlMinutes: option({
       long: "ttl-minutes",
+      description: "1..60 (maximum EC2 lifetime)",
       type: number,
       defaultValue: () => 60,
     }),
@@ -493,7 +494,13 @@ const cmd = command({
     }
     const suffix = a.suffix ?? Date.now().toString(36).slice(-4);
     const rig = a.rig ?? `rig-${suffix}`;
-    const ttlMin = a.ttlMinutes;
+    const ttlRequested = a.ttlMinutes;
+    if (ttlRequested > 60) {
+      console.warn(
+        `--ttl-minutes ${ttlRequested} capped at 60 (maximum EC2 lifetime)`,
+      );
+    }
+    const ttlMin = Math.min(ttlRequested, 60);
     const key = await sessionKey(a.sshKey);
     const sshKeys = [...new Set([...DEFAULT_KEYS, key.pub])];
     const templates = {

@@ -14,7 +14,7 @@ on:
   workflow_dispatch:
     inputs:
       ttl_minutes:
-        description: "self-destruct pair + network after N minutes"
+        description: "self-destruct pair + network after N minutes (max 60)"
         default: "45"
       region:
         description: "AWS region"

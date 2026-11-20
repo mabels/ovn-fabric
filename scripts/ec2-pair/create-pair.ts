@@ -854,6 +854,7 @@ const cmd = command({
     }),
     ttlMinutes: option({
       long: "ttl-minutes",
+      description: "1..60 (maximum EC2 lifetime)",
       type: number,
       defaultValue: () => 60,
     }),
@@ -933,10 +934,16 @@ const cmd = command({
     const defaultType = (arch: Arch) => arch === "arm64" ? "t4g.micro" : "t3.micro";
     const testerType = a.testerInstanceType ?? defaultType(testerArch);
     const testedType = a.testedInstanceType ?? defaultType(testedArch);
-    const ttlMin = a.ttlMinutes;
-    if (!Number.isFinite(ttlMin) || ttlMin <= 0) {
+    const ttlRequested = a.ttlMinutes;
+    if (!Number.isFinite(ttlRequested) || ttlRequested <= 0) {
       throw new Error("--ttl-minutes must be > 0");
     }
+    if (ttlRequested > 60) {
+      console.warn(
+        `--ttl-minutes ${ttlRequested} capped at 60 (maximum EC2 lifetime)`,
+      );
+    }
+    const ttlMin = Math.min(ttlRequested, 60);
 
     const subnetCidr = a.subnetCidr ?? "10.42.0.0/24";
     const testerIp = a.testerIp ?? "10.42.0.10";
