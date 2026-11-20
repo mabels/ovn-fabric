@@ -12,7 +12,7 @@
 //   4. poweroff successful pairs, destroy the rest
 //
 //   deno run -A scripts/ec2-pair/matrix.ts
-//   deno run -A scripts/ec2-pair/matrix.ts --only m-ub2404-x86
+//   deno run -A scripts/ec2-pair/matrix.ts --only m-deb13-x86
 //   deno run -A scripts/ec2-pair/matrix.ts --skip-deploy   # transport only
 //
 // The fabric deploy needs the site secrets: set TOPOLOGY_SECRETS_TS, or pass
