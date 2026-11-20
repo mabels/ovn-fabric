@@ -22,6 +22,18 @@ on:
       only:
         description: "comma-separated matrix bases (empty = all)"
         default: ""
+      vpc_id:
+        description: "reuse this VPC (empty = create a per-run rig)"
+        default: "vpc-de3591b6"
+      subnet_id:
+        description: "reuse this subnet"
+        default: "subnet-29516963"
+      sg_id:
+        description: "reuse this security group (empty = per-run SG)"
+        default: ""
+      ip_base:
+        description: "first private IPv4 (empty = derive from run number)"
+        default: ""
       check_concurrency:
         description: "parallel L2 checks (0 = unlimited)"
         default: "0"
@@ -77,6 +89,10 @@ jobs:
       - name: Launch all pairs, then verify each
         env:
           ONLY: ${{ inputs.only }}
+          VPC_ID: ${{ inputs.vpc_id }}
+          SUBNET_ID: ${{ inputs.subnet_id }}
+          SG_ID: ${{ inputs.sg_id }}
+          IP_BASE: ${{ inputs.ip_base }}
           CHECK_CONCURRENCY: ${{ inputs.check_concurrency }}
           DEPLOY_CONCURRENCY: ${{ inputs.deploy_concurrency }}
           KEEP_FAILED: ${{ inputs.keep_failed }}
@@ -91,6 +107,15 @@ jobs:
             --deploy-concurrency "$DEPLOY_CONCURRENCY"
           )
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
+          if [ -n "$VPC_ID" ]; then
+            args+=(--vpc-id "$VPC_ID")
+            if [ -n "$SUBNET_ID" ]; then args+=(--subnet-id "$SUBNET_ID"); fi
+            if [ -n "$SG_ID" ]; then args+=(--sg-id "$SG_ID"); fi
+            if [ -z "$IP_BASE" ]; then
+              IP_BASE="172.31.$((32 + GITHUB_RUN_NUMBER % 16)).10"
+            fi
+            args+=(--ip-base "$IP_BASE")
+          fi
           if [ "$KEEP_FAILED" = "true" ]; then args+=(--keep-failed); fi
           deno run -A scripts/ec2-pair/matrix.ts "${args[@]}"
 

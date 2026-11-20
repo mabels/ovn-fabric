@@ -124,6 +124,21 @@ function withTimeout<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
   });
 }
 
+function addIp(base: string, n: number): string {
+  const m = base.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (!m) throw new Error(`bad IPv4 ${base}`);
+  const p = m.slice(1).map(Number) as [number, number, number, number];
+  if (p.some((x) => x > 255)) throw new Error(`bad IPv4 ${base}`);
+  const v = (((p[0] * 256 + p[1]) * 256 + p[2]) * 256 + p[3]) + n;
+  if (v < 0 || v > 0xffffffff) throw new Error(`IPv4 overflow ${base}+${n}`);
+  return [
+    Math.floor(v / 16777216) % 256,
+    Math.floor(v / 65536) % 256,
+    Math.floor(v / 256) % 256,
+    v % 256,
+  ].join(".");
+}
+
 function semaphore(limit: number) {
   let active = 0;
   const waiters: Array<() => void> = [];
@@ -405,6 +420,11 @@ const cmd = command({
       type: optional(string),
     }),
     vpcId: option({ long: "vpc-id", type: optional(string) }),
+    ipBase: option({
+      long: "ip-base",
+      description: "first private IPv4 for the pairs (reuse mode)",
+      type: optional(string),
+    }),
     subnetId: option({ long: "subnet-id", type: optional(string) }),
     sgId: option({ long: "sg-id", type: optional(string) }),
     vpcCidr: option({ long: "vpc-cidr", type: optional(string) }),
@@ -571,7 +591,12 @@ const cmd = command({
         error?: string;
       }
       const launched: Launched[] = [];
+      const ipBase = a.ipBase;
+      let rowIndex = 0;
       for (const m of selected) {
+        const testerIp = ipBase ? addIp(ipBase, rowIndex * 2) : m.testerIp;
+        const testedIp = ipBase ? addIp(ipBase, rowIndex * 2 + 1) : m.testedIp;
+        rowIndex += 1;
         const pair = `${m.base}-${suffix}`;
         created.add(pair);
         if (aborted) {
@@ -593,7 +618,7 @@ const cmd = command({
               osName: "ubuntu",
               version: "26.04",
               arch: m.arch,
-              ip: m.testerIp,
+              ip: testerIp,
               l2: "10.222.0.1/24",
               ami: testerAmi,
               instanceType: type,
@@ -602,7 +627,7 @@ const cmd = command({
               osName: m.os,
               version: m.version,
               arch: m.arch,
-              ip: m.testedIp,
+              ip: testedIp,
               l2: "10.222.0.2/24",
               ami: testedAmi,
               instanceType: type,
