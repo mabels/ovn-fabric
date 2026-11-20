@@ -60,6 +60,8 @@ interface MatrixItem {
 }
 
 const MATRIX: MatrixItem[] = [
+  { base: "m-ub2404-x86", os: "ubuntu", version: "24.04", arch: "amd64", testerIp: "10.42.0.10", testedIp: "10.42.0.11" },
+  { base: "m-ub2404-arm", os: "ubuntu", version: "24.04", arch: "arm64", testerIp: "10.42.0.12", testedIp: "10.42.0.13" },
   { base: "m-ub2604-x86", os: "ubuntu", version: "26.04", arch: "amd64", testerIp: "10.42.0.14", testedIp: "10.42.0.15" },
   { base: "m-ub2604-arm", os: "ubuntu", version: "26.04", arch: "arm64", testerIp: "10.42.0.16", testedIp: "10.42.0.17" },
   { base: "m-deb13-x86", os: "debian", version: "13", arch: "amd64", testerIp: "10.42.0.18", testedIp: "10.42.0.19" },
