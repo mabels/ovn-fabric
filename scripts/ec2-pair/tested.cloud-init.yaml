@@ -12,6 +12,8 @@ bootcmd:
   - chmod 700 /root/.ssh
   - usermod -p '*' root || true
   - chage -E -1 root || true
+  - mkdir -p /etc/docker
+  - chmod 755 /etc/docker
 users:
   - name: root
     lock_passwd: false
@@ -19,6 +21,10 @@ users:
     ssh_authorized_keys:
 __SSH_KEYS__
 write_files:
+  - path: /etc/docker/daemon.json
+    permissions: "0644"
+    content: |
+      {"registry-mirrors": ["__DOCKER_MIRROR__"]}
   - path: /root/.ssh/authorized_keys
     owner: root:root
     permissions: "0600"

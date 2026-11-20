@@ -418,6 +418,11 @@ const cmd = command({
     }),
     region: option({ long: "region", type: optional(string) }),
     sshKey: option({ long: "ssh-key", type: optional(string) }),
+    dockerMirror: option({
+      long: "docker-mirror",
+      description: "Docker Hub registry mirror for the tested hosts",
+      type: optional(string),
+    }),
     secrets: option({
       long: "secrets",
       description: "secrets file for generate-ir (else TOPOLOGY_SECRETS_TS)",
@@ -503,6 +508,7 @@ const cmd = command({
     const ttlMin = Math.min(ttlRequested, 60);
     const key = await sessionKey(a.sshKey);
     const sshKeys = [...new Set([...DEFAULT_KEYS, key.pub])];
+    const dockerMirror = a.dockerMirror ?? "https://mirror.gcr.io";
     const templates = {
       tester: await Deno.readTextFile(
         new URL("./tester.cloud-init.yaml", import.meta.url),
@@ -629,6 +635,7 @@ const cmd = command({
             net,
             ttlMin,
             sshKeys,
+            dockerMirror,
             templates,
             tester: {
               osName: "ubuntu",

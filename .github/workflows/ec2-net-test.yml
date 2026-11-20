@@ -34,6 +34,9 @@ on:
       ip_base:
         description: "first private IPv4 (empty = derive from run number)"
         default: ""
+      docker_mirror:
+        description: "Docker Hub registry mirror for the tested hosts"
+        default: "https://mirror.gcr.io"
       check_concurrency:
         description: "parallel L2 checks (0 = unlimited)"
         default: "0"
@@ -93,6 +96,7 @@ jobs:
           SUBNET_ID: ${{ inputs.subnet_id }}
           SG_ID: ${{ inputs.sg_id }}
           IP_BASE: ${{ inputs.ip_base }}
+          DOCKER_MIRROR: ${{ inputs.docker_mirror }}
           CHECK_CONCURRENCY: ${{ inputs.check_concurrency }}
           DEPLOY_CONCURRENCY: ${{ inputs.deploy_concurrency }}
           KEEP_FAILED: ${{ inputs.keep_failed }}
@@ -107,6 +111,7 @@ jobs:
             --deploy-concurrency "$DEPLOY_CONCURRENCY"
           )
           if [ -n "$ONLY" ]; then args+=(--only "$ONLY"); fi
+          if [ -n "$DOCKER_MIRROR" ]; then args+=(--docker-mirror "$DOCKER_MIRROR"); fi
           if [ -n "$VPC_ID" ]; then
             args+=(--vpc-id "$VPC_ID")
             if [ -n "$SUBNET_ID" ]; then args+=(--subnet-id "$SUBNET_ID"); fi

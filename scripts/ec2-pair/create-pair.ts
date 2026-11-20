@@ -422,6 +422,7 @@ export interface LaunchArgs {
   net: Net;
   vni: number;
   sshKeys: string[];
+  dockerMirror: string;
   ttlMin: number;
   template: string;
 }
@@ -445,6 +446,7 @@ export async function launch(a: LaunchArgs): Promise<string> {
     HOSTNAME: a.name,
     SSH_KEYS: a.sshKeys.map((k) => `      - ${k}`).join("\n"),
     SSH_KEYS_BLOCK: a.sshKeys.map((k) => `      ${k}`).join("\n"),
+    DOCKER_MIRROR: a.dockerMirror,
     SELF_IP: a.ip,
     PEER_IP: a.peerIp,
     SELF_L2: a.l2,
@@ -546,6 +548,7 @@ export interface CreatePairOptions {
   net: Net;
   ttlMin: number;
   sshKeys: string[];
+  dockerMirror: string;
   templates: { tester: string; tested: string };
 }
 
@@ -574,6 +577,7 @@ export async function launchPair(o: CreatePairOptions): Promise<PairIds> {
     net: o.net,
     vni,
     sshKeys: o.sshKeys,
+    dockerMirror: o.dockerMirror,
     ttlMin: o.ttlMin,
     template: o.templates.tester,
   });
@@ -593,6 +597,7 @@ export async function launchPair(o: CreatePairOptions): Promise<PairIds> {
     net: o.net,
     vni,
     sshKeys: o.sshKeys,
+    dockerMirror: o.dockerMirror,
     ttlMin: o.ttlMin,
     template: o.templates.tested,
   });
@@ -874,6 +879,11 @@ const cmd = command({
       type: array(string),
       description: "authorized key; repeat for several",
     }),
+    dockerMirror: option({
+      long: "docker-mirror",
+      description: "Docker Hub registry mirror for the tested host",
+      type: optional(string),
+    }),
     destroy: flag({ long: "destroy", description: "terminate pair + network" }),
     reap: flag({
       long: "reap",
@@ -974,6 +984,7 @@ const cmd = command({
 
     // The owner key is always installed; session keys (CI) are added beside it.
     const sshKeys = [...new Set([...DEFAULT_KEYS, ...a.sshKey])];
+    const dockerMirror = a.dockerMirror ?? "https://mirror.gcr.io";
     const vni = deriveVni(pair);
     const net = await ensureNetwork(ec2, {
       pair,
@@ -1037,6 +1048,7 @@ const cmd = command({
       net,
       ttlMin,
       sshKeys,
+      dockerMirror,
       templates: { tester: testerTpl, tested: testedTpl },
     });
 
