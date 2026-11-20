@@ -796,6 +796,24 @@ export async function reap(ec2: EC2Client): Promise<string[]> {
     );
     if (!live) pairs.add(pair);
   }
+
+  // Expired per-run security groups (reuse mode leaves no VPC to destroy).
+  // Deleting a still-in-use SG fails harmlessly; the next reap retries.
+  const sgs = await ec2.send(
+    new DescribeSecurityGroupsCommand({
+      Filters: [{ Name: "tag-key", Values: [PAIR_TAG] }],
+    }),
+  );
+  for (const sg of sgs.SecurityGroups ?? []) {
+    const exp = sg.Tags?.find((t) => t.Key === "ExpiresAt")?.Value;
+    if (!exp || Date.parse(exp) >= now) continue;
+    try {
+      await ec2.send(new DeleteSecurityGroupCommand({ GroupId: sg.GroupId! }));
+      console.log(`reap: deleted expired security group ${sg.GroupId}`);
+    } catch {
+      // still attached to terminating ENIs; retry on the next reap
+    }
+  }
   return [...pairs];
 }
 
