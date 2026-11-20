@@ -553,8 +553,14 @@ const cmd = command({
     const results: PairResult[] = [];
 
     try {
-      const selected = a.only
-        ? MATRIX.filter((m) => a.only!.split(",").includes(m.base))
+      const only = a.only
+        ?.split(",")
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      const selected = only && only.length > 0
+        ? MATRIX.filter((m) =>
+          only.some((o) => o === m.base || o.startsWith(`${m.base}-`))
+        )
         : MATRIX;
       if (selected.length === 0) throw new Error("--only matched no matrix rows");
 
@@ -802,7 +808,7 @@ const cmd = command({
             ` examples/topology.cluster-tenants.ts` +
             ` | tee ${shq(irFile)}` +
             ` | PATH=${shq(wrap.path)} scripts/fabric-deploy.sh root@${info.tested.publicIpv4}` +
-            ` --pex ${shq(pex)} ir-apply run --host ${shq(info.tested.hostname)} --no-cleanup --wait-background`;
+            ` --pex ${shq(pex)} ir-apply run --host ${shq(chassisName)} --no-cleanup --wait-background`;
           log(`deploy: ${deployCmd}`);
           await runStreamed(deployCmd, Deno.env.toObject(), prefix);
 

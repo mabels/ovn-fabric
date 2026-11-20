@@ -20,7 +20,7 @@ on:
         description: "AWS region"
         default: "eu-central-1"
       only:
-        description: "comma-separated matrix bases (empty = all)"
+        description: "matrix base or pair name, e.g. m-fed44-arm or m-fed44-arm-18 (empty = all)"
         default: ""
       vpc_id:
         description: "reuse this VPC (empty = create a per-run rig)"
