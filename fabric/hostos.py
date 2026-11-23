@@ -146,10 +146,12 @@ PLATFORM_DEPS: dict[
             pt.DepPkg(kind="dep.pkg", name="linux-firmware"),
         ),
     },
+    # Debian / Raspberry Pi OS has no `linux-firmware` (Ubuntu's name); the
+    # Pi's GPU firmware and bootloaders ship as `raspi-firmware`.
     (pt.Distro.debian, pt.HostPlatform.rpi): {
         "platform": (
             pt.DepPkg(kind="dep.pkg", name="raspi-config"),
-            pt.DepPkg(kind="dep.pkg", name="linux-firmware"),
+            pt.DepPkg(kind="dep.pkg", name="raspi-firmware"),
         ),
     },
 }

@@ -115,6 +115,10 @@ class ResolveHostOsTest(unittest.TestCase):
         target = resolve_host_os(_declared(pt.Distro.ubuntu, platform=pt.HostPlatform.rpi))
         self.assertEqual(target.system_deps("platform"), ["raspi-config", "linux-firmware"])
 
+    def test_rpi_defaults_debian(self) -> None:
+        target = resolve_host_os(_declared(pt.Distro.debian, platform=pt.HostPlatform.rpi))
+        self.assertEqual(target.system_deps("platform"), ["raspi-config", "raspi-firmware"])
+
     def test_platform_defaults_merge_with_user_overrides(self) -> None:
         target = resolve_host_os(
             _declared(pt.Distro.ubuntu, platform=pt.HostPlatform.rpi),
