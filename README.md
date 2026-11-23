@@ -13,8 +13,12 @@ reboot and bringing back containers that died.
 
 No netplan, no hand-written `ovn-nbctl`/`ovs-vsctl` invocations, no
 configuration drift between "what I meant to set up" and "what's actually
-running." The config is the single source of truth; the IR and the generated
-scripts are disposable, regeneratable artifacts.
+running." The config is the single source of truth; the IR is a disposable,
+regeneratable artifact.
+
+**Documentation:** [mabels.github.io/ovn-fabric](https://mabels.github.io/ovn-fabric/)
+(getting started, the topology DSL, the API reference, deploying, host
+requirements, troubleshooting, architecture).
 
 ## Install
 
@@ -55,20 +59,18 @@ shapes, the service/workload shapes) all live at the same
 import { defineNetwork, IPv4 } from "jsr:@adviser/ovn-fabric";
 
 export const network = defineNetwork("minimal", (net) => {
-  const central = net.sshHost(
-    "central",
-    { ipv4: IPv4.parse("10.99.0.1/32") },
-    "root",
-    undefined,
-    { role: { kind: "central" } },
-  );
-  const chassis = net.sshHost(
-    "chassis",
-    { ipv4: IPv4.parse("10.99.0.2/32") },
-    "root",
-    undefined,
-    { role: { kind: "chassis" } },
-  );
+  const central = net.sshHost({
+    name: "central",
+    address: { ipv4: IPv4.parse("10.99.0.1/32") },
+    user: "root",
+    ovn: { role: { kind: "central" } },
+  });
+  const chassis = net.sshHost({
+    name: "chassis",
+    address: { ipv4: IPv4.parse("10.99.0.2/32") },
+    user: "root",
+    ovn: { role: { kind: "chassis" } },
+  });
 
   const lan = net.collisionDomain("lan");
   const upstream = net.collisionDomain("upstream");
@@ -80,7 +82,10 @@ export const network = defineNetwork("minimal", (net) => {
         l2Segment: lan,
         ipaddrs: [IPv4.parse("192.168.10.1/24")],
         ifaces: [
-          { host: chassis, iface: { kind: "vlan", vlanParent: "eth1", vlanId: 10 } },
+          {
+            host: chassis,
+            iface: { kind: "vlan", vlanParent: "eth1", vlanId: 10 },
+          },
         ],
         services: [{ kind: "ipv6.slaac" }, { kind: "ipv6.ra" }],
       }),
@@ -181,7 +186,7 @@ retries for one that keeps dying.
 ## Model
 
 - **Host** — where a router's config actually gets applied
-  (`net.sshHost(name, address, user)` or `net.localHost(name)`). Every
+  (`net.sshHost({ name, address, user, … })` or `net.localHost({ name, … })`). Every
   router endpoint declares the host its interfaces live on, so a
   multi-chassis topology is a config change, not a redesign.
 - **CollisionDomain** — a bare OVN logical switch (L2 only):

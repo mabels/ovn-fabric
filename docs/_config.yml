@@ -1,5 +1,5 @@
 title: ovn-fabric
-description: Write-ups on ovn-fabric, a declarative OVN/OVS network topology generator.
+description: Documentation and write-ups for ovn-fabric, a declarative OVN/OVS network fabric.
 theme: minima
 
 # Keep default (non-pretty) permalinks: the write-ups embed images with plain
@@ -11,3 +11,13 @@ exclude:
   - Gemfile
   - Gemfile.lock
   - adr
+
+# The pages in the site header, in this order.
+header_pages:
+  - guide/getting-started.md
+  - guide/topology.md
+  - reference.md
+  - guide/deploying.md
+  - guide/hosts.md
+  - guide/troubleshooting.md
+  - guide/architecture.md

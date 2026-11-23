@@ -1,4 +1,5 @@
-# Builds and deploys docs/ (Jekyll) to GitHub Pages on every push to main.
+# Builds and deploys docs/ (Jekyll) plus the API reference (deno doc, under
+# /api/) to GitHub Pages on every push to main.
 # Requires one manual, one-time step in the repo:
 # Settings -> Pages -> Build and deployment -> Source: "GitHub Actions".
 name: Deploy Jekyll site to Pages
@@ -36,6 +37,15 @@ jobs:
         run: bundle exec jekyll build --source docs --destination _site --baseurl "${{ steps.pages.outputs.base_path }}"
         env:
           JEKYLL_ENV: production
+      # The topology API reference, generated from the source's doc comments
+      # (the package's public entry points, as deno.json exports them).
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24.x
+      - name: Install (pulls in `deno` as an npm dependency)
+        run: npm install
+      - name: Build the API reference
+        run: npx deno doc --html --name="ovn-fabric" --output=_site/api src/mod.ts src/secret-types.ts
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v5
 

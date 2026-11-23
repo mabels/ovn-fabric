@@ -7,7 +7,7 @@ title: AF_XDP in a Proxmox LXC
 
 A small, hands-on note for making OVS inside a Proxmox **LXC container** use
 AF_XDP on the container's uplink. This is the first slice of the larger
-userspace-datapath work in [ADR 0004](adr/0004-userspace-datapath-and-container-ports.md).
+userspace-datapath work in [ADR 0004](https://github.com/mabels/ovn-fabric/blob/main/docs/adr/0004-userspace-datapath-and-container-ports.md).
 
 ## Read this first
 
