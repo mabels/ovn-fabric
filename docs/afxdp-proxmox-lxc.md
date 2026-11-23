@@ -234,10 +234,21 @@ means the driver refused every mode.
 
 ## 8. Persistence
 
-`ovn-fabric` does not emit `afxdp` ports yet — its binding emitter only knows
-`vlan`, `veth` and `physical`. Until that changes, keep the `ovs-vsctl`
-above in a small unit or a script run after `ovs-vswitchd`, and do not put it
-in the generated deployer yet.
+`ovn-fabric` emits `afxdp` ports itself: declare the NIC as an `xdp`
+interface, either directly or as a VLAN's parent, and the runtime's interface
+bindings (`fabric/emit/bindings.py`) do the rest. They create one netdev
+bridge per host, `br-xdp`, which owns every AF_XDP port, and give each
+collision domain a tagged veth into its own `system` segment bridge. The VLAN
+split happens in OVS (`tag=`), not in the kernel, so an `xdp` parent has no
+`<parent>.<vlan>` device. `mode` and `nRxq` default to `best-effort` and `1`.
+
+```ts
+const nic = { kind: "xdp", name: "enp1s0", mode: "native" } as const;
+// … ifaces: [{ host, iface: { kind: "vlan", vlanParent: nic, vlanId: 10 } }]
+```
+
+The runtime replays the deployed IR at boot, so the `ovs-vsctl` above is
+only needed for trying AF_XDP by hand, outside a topology.
 
 ## Troubleshooting
 

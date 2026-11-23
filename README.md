@@ -3,13 +3,13 @@
 A declarative OVN/OVS network topology generator. You describe a network —
 hosts, routers, collision domains, VPN tunnels — as plain TypeScript, and
 ovn-fabric emits a desired-state **IR** (JSON): one `{id, kind, key, data}`
-node per host / collision domain / router port / workload. Feed that IR to
-the Python deployer (`deployer/`), which turns it into **one self-contained
-executable PEX** carrying every host's pass. Copy that PEX to a host and
-run it: it creates the OVS bridges/interfaces, builds the full OVN logical
-topology (routers, switches, NAT), and installs the interface bindings,
-kernel routers and workloads as boot-time systemd units — idempotently, so
-re-running it is always safe.
+node per host / collision domain / router port / workload. Each host runs
+**one Python service**, the fabric runtime (`fabric/` on top of the generic
+event runtime in `runtime/`), shipped as a single PEX. Hand it the IR and it
+makes the host match: OVS bridges and VLANs, the OVN logical topology
+(routers, switches, NAT), kernel-router namespaces, WireGuard, and docker
+workloads. It also keeps them that way, by replaying the deployed IR after a
+reboot and bringing back containers that died.
 
 No netplan, no hand-written `ovn-nbctl`/`ovs-vsctl` invocations, no
 configuration drift between "what I meant to set up" and "what's actually
@@ -122,68 +122,61 @@ const site = rt.env["SITE"] ?? "hh"; // SITE=... in the environment
 npx -p @adviser/ovn-fabric ovn-fabric generate-ir --runtime debug=1 topology.ts
 ```
 
-Then hand the IR to the Python deployer, which builds one executable PEX:
+## Deploying to a host
+
+From a checkout, `scripts/fabric-deploy.sh` does both steps over ssh: it
+deploys the runtime to the host, then runs a `fabric` command there with the
+IR on stdin:
 
 ```sh
-npx -p @adviser/ovn-fabric ovn-fabric generate-ir topology.ts \
-  | python3 -m deployer.cli - > install.py
-chmod +x install.py
+deno run -A src/cli.ts generate-ir topology.ts \
+  | scripts/fabric-deploy.sh root@HOST ir-apply run          # converge to this IR
+scripts/fabric-deploy.sh root@HOST ir-apply delete < ir.json  # rewind it
+scripts/fabric-deploy.sh root@HOST ir-apply run --dry-run < ir.json
 ```
 
-`install.py` is a single-file PEX and needs only `python3` on the target. It holds the cluster-wide
-OVN pass and every host's own pass, for both directions; pick what runs:
-
-```sh
-python3 install.py                      # create: every host, then the cluster pass
-python3 install.py --action delete      # the reverse
-python3 install.py --host NAME          # only that host's pass (run it on that host)
-python3 install.py --cluster            # only the cluster-wide ovn-nbctl pass
-python3 install.py --ovn-purge          # wipe the OVS database and, on the central, OVN's NB/SB
-```
-
-`--verbose` echoes every command; `--skip-deps` leaves the install queue
-out altogether; `--no-start` writes and enables the fabric's units without
-starting them (the boot restore pass uses it).
-
-A create pass also installs its own generated program as
-`/usr/local/sbin/ovn-fabric-deployer.py` and enables
-`ovn-fabric-restore.service`, which re-runs that host's pass at boot —
-`--host NAME --skip-deps --no-start`, after OVS and the interface bindings.
-The fabric's units are ordered after it, so the create pass stays the
-source of truth on the host: anything it set up that a kernel netdevice or
-OVS row does not survive a reboot with is put back. (A run from stdin has
-no file to install, so it only warns and the unit's `ExecCondition` skips
-itself.)
-
-Deploying a router can cut the host's own internet access while the deploy
-runs, so nothing is installed inline. Each host's create **queues** what the
-host needs instead — one JSON job file per package, docker image and systemd
-unit in `/var/spool/ovn-fabric/install`, each named after the moment it was
-queued:
+**Deploying the runtime** (`scripts/fabric-install.sh`, a wrapper around
+`python3 -m fabric deploy`) builds the PEX (`dist/fabric.pex`) and copies it
+into the host's store by hash. It links the service to it, restarts it, and
+checks that it answers with that hash; if it doesn't, it goes back to the
+previous one. `--ref previous` switches back by hand. On the host:
 
 ```text
-20261011T195501.000101Z-package-ovs.json
-20261011T195501.000417Z-image-coredns_coredns_latest.json
-20261011T195533.120008Z-unit-ovn-kernel-router-x.service.json
+/var/lib/ovn-fabric/runtime/             stored runtimes (the last 10 are kept)
+/usr/local/lib/ovn-fabric/fabric.pex     -> the deployed one
+/etc/systemd/system/ovn-fabric.service   the one service
+/run/ovn-fabric.sock                     where it listens
 ```
 
-and installs the queue's consumer, `ovn-fabric-install.service`. It looks at
-the directory every 10 seconds and works on the files in name order — the
-order they were queued in: a job for something the host already has is
-dropped without a connection, a missing package or image is installed
-whenever the host is online (a public DNS resolver — `1.1.1.1`, `8.8.8.8`
-or `9.9.9.9`, asked by address — resolves a query), and a router or workload unit
-that did not come up is restarted once the packages and images queued
-before it are there. A job's file is removed when the job is done, so what
-is left in the directory is what the host still lacks
-(`journalctl -u ovn-fabric-install` says why). A host that is online when
-the deploy starts gets everything right away: the pass runs the consumer
-once in the foreground before it goes on. `--skip-deps` leaves the queue
-and its consumer out altogether.
+The host's hostname says which of the IR's hosts it is.
 
-`--ovn-purge` runs INSTEAD of an action and resets OVS/OVN to
-a freshly-installed state — the logical topology of the whole cluster goes
-with the NB/SB databases, so deploy again afterwards.
+**On the host, the deployed PEX is the CLI** (`fabric …`). It talks to the
+runtime over the socket, and every request runs as a job that outlives the
+ssh session:
+
+```sh
+fabric status                    # deployed IR, last apply, background jobs, kept-alive containers
+fabric jobs                      # running and recent jobs
+fabric follow JOB                # a job's log so far, then live
+fabric ir-list | ir-get | ir-put | ir-delete
+fabric ir-apply run deployed     # run the deployed IR again
+```
+
+`ir-apply` has three actions. Only `run` looks at the live state:
+
+- `create` makes everything the IR describes,
+- `delete` rewinds it,
+- `run` converges: it compares the IR with what is live, creates what is
+  missing and, unless `--no-cleanup` is given, removes leftovers.
+
+Docker images are built in the background, so a run is done as soon as the
+network is up. Workloads follow when their images are ready.
+
+The runtime installs the host's packages itself, for each distro and
+platform (apt or dnf; Debian, Ubuntu, Fedora or Rocky; generic or
+Raspberry Pi). After a reboot it replays the deployed IR. While an IR is
+applied, it keeps that IR's containers alive, waiting longer between
+retries for one that keeps dying.
 
 ## Model
 
@@ -232,24 +225,45 @@ an explanation of what it's for and why it's shaped the way it is.
 
 ## Design notes worth knowing before you rely on this
 
-- Boot safety: the router and workload units install no packages — a
-  missing tool never blocks router startup. Packages only ever come through
-  the install queue (above), whose consumer waits for the internet instead
-  of failing and puts a time limit on every command it runs.
-- Boot order: `ovn-fabric-bindings.service` (real VLANs and OVS
-  bridges/ports) runs first, then `ovn-fabric-restore.service` (the host
-  pass with `--no-start`), then the router/workload units. The restore pass
-  enables the fabric units but does not start them — it is ordered before
-  them, so starting one from inside it would deadlock; systemd starts them
-  once it finishes.
-- Idempotency throughout: `--may-exist`/`--if-exists` on every
-  `ovs-vsctl`/`ovn-nbctl` call, `ip link show ... || ...` guards, `cmp -s`
-  before overwriting any file (including WireGuard confs — the tunnel only
-  bounces if the content actually changed).
+- One writer: the runtime is the only thing that changes the host's
+  fabric state. The CLI only sends requests to it, and every apply is a job
+  you can `follow`.
+- Plan, then act: an apply plans the IR into units of primitives
+  (`fabric/primitives`). What each primitive does to the live state was
+  learned on a real system (`primate`, ADR 0008). The live state is read
+  through `ladops` (`ip -j`, `ovs-vsctl`, `ovn-nbctl`, `nft -j`, docker).
+- Natural keys and stable addresses: a resource is identified by what it
+  is, not by its generated name (ADR 0010). Allocated addresses are
+  remembered across reboots (`/var/lib/ovn-fabric/allocator.json`,
+  ADR 0011/0012).
+- The physical uplink is the host's job: fabric creates VLANs on the NIC the
+  topology names (e.g. `ovnkern`). The NIC itself must exist under that
+  name and be brought up by the host's own network configuration.
 - WireGuard tunnels use `wg-quick`, not hand-rolled `wg setconf` — this
   relies on `wg-quick`'s own fwmark + policy-routing so the tunnel's own
   traffic keeps using the kernel netns's upstream leg while everything else
   gets diverted into the tunnel.
+
+## Repository layout
+
+- `src/` is the TypeScript DSL and the `ovn-fabric` CLI (`generate`,
+  `generate-ir`). `src/protocol.ts` defines the IR schema.
+- `protocol/` holds the Python dataclasses generated from that schema (the
+  desired-state IR and the raw live-state snapshot).
+- `runtime/` is the generic event runtime (ADR 0007): messages, peers,
+  transports, jobs, journal. It knows nothing about networks.
+- `fabric/` is ovn-fabric on top of it: the services (`ir`, `apply`,
+  `sysdeps`, `docker`, …), planning and reconciliation, host-OS discovery,
+  the PEX bundle and deploy, and the CLI (`python3 -m fabric`).
+- `ladops/` reads and drives the live system: Linux networking, netns, OVS,
+  OVN, OVSDB, iptables/nftables, docker.
+- `raw_reconciler/` collects the live host state as a raw graph snapshot
+  (`python3 -m raw_reconciler`).
+- `primate/` learns what each primitive does to that snapshot, on a real
+  system (`python3 -m primate list | learn`).
+- `scripts/` contains `fabric-deploy.sh`, `fabric-install.sh`,
+  `fabric-remote.sh` and the QEMU, cloud-init and Proxmox test helpers.
+- `docs/adr/` records the architecture decisions behind all of the above.
 
 ## Write-ups
 
