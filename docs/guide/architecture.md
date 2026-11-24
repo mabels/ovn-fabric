@@ -5,11 +5,7 @@ title: Architecture
 
 # Architecture
 
-```text
-topology.ts ──(src/, Deno)──▶ IR (JSON) ──▶ fabric runtime on each host ──▶ OVS / OVN / kernel / docker
-                                  │              │
-                         protocol/ (typed)    ladops/ (reads and drives the live system)
-```
+![ovn-fabric architecture](diagram-architecture.svg)
 
 1. **The DSL** (`src/`) evaluates a topology into a network definition, and
    `toIR()` turns that into the **desired-state IR**: a flat set of
