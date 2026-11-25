@@ -60,6 +60,10 @@ __SSH_KEYS_BLOCK__
       REPO
           dnf install -y openvswitch3.5 iproute iptables iputils curl ca-certificates \
             || dnf install -y openvswitch iproute iptables iputils curl ca-certificates
+          # Rocky 10's running kernel can lack the xt_* modules Docker's default
+          # iptables backend needs (xt_addrtype, …), so its bridge NAT setup
+          # fails; the native nftables backend does not use them.
+          sed -i 's/}$/, "firewall-backend": "nftables"}/' /etc/docker/daemon.json
         else
           dnf install -y openvswitch iproute iptables iputils curl ca-certificates
         fi
@@ -69,6 +73,9 @@ __SSH_KEYS_BLOCK__
       for svc in openvswitch-switch openvswitch; do
         systemctl enable --now "$svc" 2>/dev/null && break || true
       done
+      # Docker's nftables backend (Rocky) does not raise this itself; harmless
+      # where the iptables backend would already set it.
+      sysctl -w net.ipv4.ip_forward=1
       modprobe openvswitch 2>/dev/null || true
       modprobe geneve 2>/dev/null || true
 

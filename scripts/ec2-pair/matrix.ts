@@ -104,6 +104,8 @@ interface PairResult {
   line?: string;
   error?: string;
   deployError?: string;
+  testerIp?: string;
+  testedIp?: string;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -336,15 +338,15 @@ async function sessionKey(existing?: string): Promise<SessionKey> {
   };
 }
 
-/** ssh/scp wrappers on PATH: fabric-deploy.sh's ssh/scp have no -i, and
- * macOS ssh ignores $HOME when looking for ~/.ssh/config. */
+/** ssh/scp wrappers on PATH: fabric-deploy.sh's ssh/scp have no -i.
+ * Reads ~/.ssh/config (control multiplexing) unless the caller sets -F. */
 async function sshWrappers(key: string): Promise<{
   dir: string;
   path: string;
   cleanup: () => Promise<void>;
 }> {
   const dir = await Deno.makeTempDir({ prefix: "ec2-ssh-wrap-" });
-  const opts = `-F /dev/null -i ${shq(key)} -o IdentitiesOnly=yes ` +
+  const opts = `-i ${shq(key)} -o IdentitiesOnly=yes ` +
     `-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o BatchMode=yes`;
   for (
     const [name, real] of [
@@ -733,6 +735,8 @@ const cmd = command({
           line: c.line,
           error: c.error,
           deployError: c.deployError,
+          testerIp: c.info?.tester.publicIpv4,
+          testedIp: c.info?.tested.publicIpv4,
         });
       };
 

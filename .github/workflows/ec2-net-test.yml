@@ -70,6 +70,17 @@ jobs:
       TOPOLOGY_SECRETS_TS: ${{ secrets.TOPOLOGY_SECRETS_TS }}
     steps:
       - uses: actions/checkout@v5
+      - name: Enable SSH connection multiplexing
+        run: |
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          cat >> ~/.ssh/config <<'EOF'
+          Host *
+            ControlMaster auto
+            ControlPath ~/.ssh/cm-%C
+            ControlPersist 60m
+          EOF
+          chmod 600 ~/.ssh/config
       - uses: denoland/setup-deno@v2
         with:
           deno-version: v2.x
